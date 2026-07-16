@@ -18,7 +18,7 @@
 
 ## Prerequisites (before Phase 0)
 
-- [ ] GitHub repository created for Camino; initial commit of `docs/` (git is initialized locally; first commit awaits David's word)
+- [x] GitHub repository created — public, personal account: https://github.com/hierosir1984/Camino — initial commit pushed (commits use the repo-local noreply identity)
 - [ ] Node 22, Docker Desktop, Playwright installed
 - [ ] Claude Code, Codex CLI, Grok Build CLI authenticated on David's subscriptions
 - [ ] Funded API fallback accounts confirmed (Anthropic + OpenAI Console) — CAM-ROUTE-08 prerequisite
