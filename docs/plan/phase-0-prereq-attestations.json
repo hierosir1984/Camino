@@ -2,7 +2,7 @@
   "$comment": "Human-attested Phase-0 prerequisites (BUILD.md). David edits this file; scripts/check-prereqs.mjs reads it. Machine-checkable items are probed directly by the script.",
   "fundedFallbackAccounts": {
     "anthropic": false,
-    "openai": false,
+    "openai": true,
     "$comment": "CAM-ROUTE-08 prerequisite — set true when the Console accounts are confirmed funded."
   },
   "xaiSanctionedPath": {
