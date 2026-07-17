@@ -7,18 +7,20 @@
 //   npm run spike:dispatch -- --cancel     # + a real mid-run cancel per adapter
 //   npm run spike:dispatch -- --only=codex # restrict to named adapters
 //
-// Transcripts land in spikes/dispatch/transcripts/: REPORT.md + per-adapter
-// summary.json are the durable evidence; raw .jsonl streams are gitignored.
+// Transcripts land in spikes/dispatch/transcripts/: REPORT.md + summary.json
+// are the durable, portable evidence (relative paths, sampled parsed events);
+// raw .jsonl streams are gitignored.
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { dispatch, type KillConfirmTimings } from "./lifecycle.js";
 import { buildRegistry } from "./registry.js";
 import { committedSince, headSha, makeWorkspace } from "./workspace.js";
-import type { AdapterSpec, DispatchRecord } from "./types.js";
+import type { AdapterSpec, DispatchRecord, StreamEvent } from "./types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const OUT = join(here, "transcripts");
+const REPO_ROOT = join(here, "..", "..");
 
 const SOLVE_PROMPT = (adapter: string) =>
   `Create a file named GREETING.txt in the current directory whose only contents are the single line:\n` +
@@ -33,21 +35,34 @@ const REAL_TIMEOUT_MS = 180_000;
 const CANCEL_AFTER_MS = 1_500;
 const CANCEL_TIMINGS: KillConfirmTimings = { graceMs: 3_000, sigkillWaitMs: 3_000 };
 
-interface AdapterEvidence {
+export interface AdapterEvidence {
   adapter: string;
   enabled: boolean;
   disabledReason?: string;
-  solve?: Omit<DispatchRecord, "events"> & { transcriptFile: string };
+  solve?: Omit<DispatchRecord, "events"> & { transcript: string; sampleEvents: StreamEvent[] };
   cancel?: Pick<DispatchRecord, "outcome" | "killConfirm" | "streamedEvents" | "durationMs">;
 }
 
-function redactSummary(rec: DispatchRecord, transcriptFile: string) {
-  const rest: Omit<DispatchRecord, "events"> & { events?: unknown } = { ...rec };
-  delete rest.events;
-  return { ...(rest as Omit<DispatchRecord, "events">), transcriptFile };
+/** First + last few parsed events — portable proof of live parsing in summary.json. */
+function sampleEvents(events: StreamEvent[]): StreamEvent[] {
+  if (events.length <= 6) return events;
+  return [...events.slice(0, 3), ...events.slice(-3)];
 }
 
-async function runSolve(adapter: AdapterSpec): Promise<AdapterEvidence["solve"]> {
+function summarizeSolve(
+  rec: DispatchRecord,
+  transcriptAbs: string,
+): NonNullable<AdapterEvidence["solve"]> {
+  const rest: Omit<DispatchRecord, "events"> & { events?: unknown } = { ...rec };
+  delete rest.events;
+  return {
+    ...(rest as Omit<DispatchRecord, "events">),
+    transcript: relative(REPO_ROOT, transcriptAbs), // repo-relative, portable
+    sampleEvents: sampleEvents(rec.events),
+  };
+}
+
+async function runSolve(adapter: AdapterSpec): Promise<NonNullable<AdapterEvidence["solve"]>> {
   const ws = makeWorkspace();
   const before = headSha(ws);
   const transcript = join(OUT, `${adapter.name}.solve.jsonl`);
@@ -63,13 +78,13 @@ async function runSolve(adapter: AdapterSpec): Promise<AdapterEvidence["solve"]>
       },
     );
     rec.committedSha = committedSince(ws, before);
-    return redactSummary(rec, transcript);
+    return summarizeSolve(rec, transcript);
   } finally {
     rmSync(ws, { recursive: true, force: true }); // workspace cleanup
   }
 }
 
-async function runCancel(adapter: AdapterSpec): Promise<AdapterEvidence["cancel"]> {
+async function runCancel(adapter: AdapterSpec): Promise<NonNullable<AdapterEvidence["cancel"]>> {
   const ws = makeWorkspace();
   const transcript = join(OUT, `${adapter.name}.cancel.jsonl`);
   writeFileSync(transcript, "");
@@ -96,6 +111,28 @@ async function runCancel(adapter: AdapterSpec): Promise<AdapterEvidence["cancel"
   }
 }
 
+/**
+ * One adapter → its evidence. A DISABLED adapter is never dispatched: `plan()`
+ * is not called, and the recorded reason is carried through (CAM-EXEC-01
+ * negative path). Exported so a test can prove the skip deterministically.
+ */
+export async function runAdapter(
+  adapter: AdapterSpec,
+  doCancel: boolean,
+): Promise<AdapterEvidence> {
+  if (!adapter.enabled) {
+    return {
+      adapter: adapter.name,
+      enabled: false,
+      ...(adapter.disabledReason ? { disabledReason: adapter.disabledReason } : {}),
+    };
+  }
+  const entry: AdapterEvidence = { adapter: adapter.name, enabled: true };
+  entry.solve = await runSolve(adapter);
+  if (doCancel) entry.cancel = await runCancel(adapter);
+  return entry;
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   const doCancel = argv.includes("--cancel");
@@ -111,28 +148,18 @@ async function main() {
       continue;
     }
     if (!adapter.enabled) {
-      // CAM-EXEC-01 negative path: installable-but-disabled, reason recorded.
-      evidence.push({
-        adapter: adapter.name,
-        enabled: false,
-        ...(adapter.disabledReason ? { disabledReason: adapter.disabledReason } : {}),
-      });
       console.log(`[${adapter.name}] DISABLED — ${adapter.disabledReason}`);
+      evidence.push(await runAdapter(adapter, doCancel));
       continue;
     }
     console.log(`[${adapter.name}] solve dispatch…`);
-    const solve = await runSolve(adapter);
+    const entry = await runAdapter(adapter, doCancel);
     console.log(
-      `[${adapter.name}] outcome=${solve?.outcome} events=${solve?.streamedEvents} committed=${solve?.committedSha ? solve.committedSha.slice(0, 8) : "no"}`,
+      `[${adapter.name}] outcome=${entry.solve?.outcome} events=${entry.solve?.streamedEvents} committed=${entry.solve?.committedSha ? entry.solve.committedSha.slice(0, 8) : "no"}`,
     );
-    const entry: AdapterEvidence = { adapter: adapter.name, enabled: true };
-    if (solve) entry.solve = solve;
-    if (doCancel) {
-      console.log(`[${adapter.name}] cancel dispatch…`);
-      const cancel = await runCancel(adapter);
-      if (cancel) entry.cancel = cancel;
+    if (entry.cancel) {
       console.log(
-        `[${adapter.name}] cancel outcome=${cancel?.outcome} escalated=${cancel?.killConfirm?.escalatedToSigkill} treeGone=${cancel?.killConfirm?.treeGone}`,
+        `[${adapter.name}] cancel outcome=${entry.cancel.outcome} escalated=${entry.cancel.killConfirm?.escalatedToSigkill} treeGone=${entry.cancel.killConfirm?.treeGone}`,
       );
     }
     evidence.push(entry);
@@ -143,20 +170,23 @@ async function main() {
   console.log(`\nWrote ${join(OUT, "REPORT.md")}`);
 }
 
-function renderReport(evidence: AdapterEvidence[], didCancel: boolean): string {
+export function renderReport(evidence: AdapterEvidence[], didCancel: boolean): string {
   const lines: string[] = [
     "# WP-001 dispatch spike — run report",
     "",
     "Real dispatches on live subscriptions. Mechanics (kill-confirm escalation,",
     "quota classification, env posture) are proven quota-free in `lifecycle.test.ts`;",
     "this report is the real-CLI evidence for CAM-EXEC-01 / CAM-EXEC-06 / CAM-SEC-06.",
+    "Per-parsed-event samples and repo-relative transcript paths are in `summary.json`.",
     "",
     "| Adapter | Enabled | Solve outcome | Stream events | Local commit | Env: GH creds | Cancel outcome | Kill-confirm |",
     "|---|---|---|---|---|---|---|---|",
   ];
   for (const e of evidence) {
     if (!e.enabled) {
-      lines.push(`| ${e.adapter} | disabled — ${e.disabledReason} | — | — | — | — | — | — |`);
+      lines.push(
+        `| ${e.adapter} | disabled — ${e.disabledReason ?? "no reason"} | — | — | — | — | — | — |`,
+      );
       continue;
     }
     const s = e.solve;
@@ -175,9 +205,12 @@ function renderReport(evidence: AdapterEvidence[], didCancel: boolean): string {
   return lines.join("\n") + "\n";
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+// Only run when invoked as a script (not when imported by a test).
+if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  main()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}

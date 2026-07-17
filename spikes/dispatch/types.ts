@@ -40,8 +40,10 @@ export interface AdapterContext {
 
 /**
  * An adapter is pure configuration + pure parsing. All process handling,
- * env composition, and kill-confirm live in the shared lifecycle so every
- * adapter gets identical, tested cancellation semantics.
+ * env composition, kill-confirm, AND outcome classification live in the shared
+ * lifecycle so every adapter gets identical, tested semantics — in particular,
+ * quota-vs-failure classification is centralized (over parsed events *and* raw
+ * output) so no adapter can independently misclassify (CAM-EXEC-06).
  */
 export interface AdapterSpec {
   readonly name: string;
@@ -49,14 +51,12 @@ export interface AdapterSpec {
   readonly disabledReason?: string;
   /** Build the headless spawn plan for one dispatch. */
   plan(ctx: AdapterContext): SpawnPlan;
-  /** Parse one line of stdout/stderr into a normalized event (or null to skip). */
-  parseLine(line: string, channel: "stdout" | "stderr"): StreamEvent | null;
   /**
-   * Classify a nonzero-exit dispatch from its collected events + exit info.
-   * Must return "quota-blocked" for rate-limit conditions, never
-   * "requirement-failed" (CAM-EXEC-06).
+   * Parse one line of stdout/stderr into a normalized event (or null to skip).
+   * Must be total: a parser that throws is caught by the lifecycle and the line
+   * is treated as unparseable, never crashing the dispatch.
    */
-  classifyFailure(events: readonly StreamEvent[], exitCode: number | null): Outcome;
+  parseLine(line: string, channel: "stdout" | "stderr"): StreamEvent | null;
 }
 
 export interface DispatchRecord {
@@ -75,6 +75,13 @@ export interface DispatchRecord {
 
 export interface KillConfirmRecord {
   requested: boolean;
+  /**
+   * True if the process group was still alive when the kill signal was sent —
+   * i.e. we genuinely interrupted running work, rather than racing a process
+   * that had already finished. This is what distinguishes a real cancel/kill
+   * from a late no-op (used to classify the dispatch outcome).
+   */
+  wasAliveAtSignal: boolean;
   /** True if SIGTERM alone did not stop the tree and SIGKILL was needed. */
   escalatedToSigkill: boolean;
   /** True once the whole process group is confirmed gone. */

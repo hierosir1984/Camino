@@ -1,4 +1,4 @@
-import type { AdapterContext, AdapterSpec, Outcome, SpawnPlan, StreamEvent } from "../types.js";
+import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "../types.js";
 import { classifyByQuotaSignal } from "../quota.js";
 
 /**
@@ -31,37 +31,57 @@ export function claudeAdapter(
     },
     parseLine(line: string): StreamEvent | null {
       const trimmed = line.trim();
-      if (!trimmed.startsWith("{")) return null;
+      const quota = classifyByQuotaSignal(trimmed);
+      const q = quota ? { quotaSignal: true as const } : {};
+      if (!trimmed.startsWith("{")) {
+        // Non-JSON (esp. stderr) is normally noise, but a quota signal here
+        // must NOT be lost (review finding #6).
+        if (quota) return { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true };
+        return null;
+      }
       let obj: Record<string, unknown>;
       try {
         obj = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
-        return null;
+        return quota ? { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true } : null;
       }
       const type = String(obj["type"] ?? "");
-      const quota = classifyByQuotaSignal(trimmed);
-      const q = quota ? { quotaSignal: true as const } : {};
       switch (type) {
         case "assistant": {
-          const msg = obj["message"] as
-            { content?: Array<{ type?: string; text?: string }> } | undefined;
-          const text = msg?.content?.find((c) => c.type === "text")?.text ?? "(assistant turn)";
-          return { kind: "assistant", text: text.slice(0, 400), ...q };
+          const message = obj["message"] as { content?: unknown } | undefined;
+          const content = message?.content;
+          // content may be a string, a non-array, or an array with null items —
+          // guard every shape (review finding #5).
+          if (Array.isArray(content)) {
+            const textPart = content.find(
+              (c): c is { type: string; text: string } =>
+                !!c && typeof c === "object" && (c as { type?: unknown }).type === "text",
+            );
+            const toolPart = content.find(
+              (c) => !!c && typeof c === "object" && (c as { type?: unknown }).type === "tool_use",
+            );
+            if (textPart)
+              return { kind: "assistant", text: String(textPart.text).slice(0, 400), ...q };
+            if (toolPart) return { kind: "tool", text: "tool_use", ...q };
+            return { kind: "other", text: "assistant", ...q };
+          }
+          if (typeof content === "string") {
+            return { kind: "assistant", text: content.slice(0, 400), ...q };
+          }
+          return { kind: "other", text: "assistant", ...q };
         }
         case "result": {
           const text = String(obj["result"] ?? obj["subtype"] ?? "result");
           const isError = obj["is_error"] === true || obj["subtype"] === "error_max_turns";
           return { kind: isError ? "error" : "result", text: text.slice(0, 400), ...q };
         }
+        case "user":
+          return { kind: "tool", text: "tool_result", ...q };
         case "system":
           return { kind: "other", text: `system:${String(obj["subtype"] ?? "")}`, ...q };
         default:
           return { kind: "other", text: type || "event", ...q };
       }
-    },
-    classifyFailure(events: readonly StreamEvent[], exitCode: number | null): Outcome {
-      if (events.some((e) => e.quotaSignal)) return "quota-blocked";
-      return exitCode === null ? "requirement-failed" : "requirement-failed";
     },
   };
 }

@@ -3,19 +3,20 @@
 // blaming the worker for the provider's throttle would poison the outcome
 // ledger and trigger spurious family switches.
 //
-// Patterns are deliberately broad and provider-agnostic; each real adapter can
-// add provider-specific markers. Registry item 13 tracks the actual quota
-// windows — this is only the failure-classification half.
+// Markers are deliberately SPECIFIC error signatures, not bare topic words:
+// bare "quota" / "capacity" / "overloaded" matched benign text ("needs
+// capacity planning", "not overloaded") — the WP-001 review's finding #2. Each
+// pattern below names an actual rate-limit condition as the providers emit it.
 const QUOTA_MARKERS = [
-  /\brate[_\s-]?limit/i,
   /\b429\b/,
-  /usage limit/i,
-  /quota/i,
+  /rate[_\s-]?limit(?:ed|_exceeded|\s+exceeded|\s+reached)/i,
   /too many requests/i,
-  /overloaded/i,
-  /retry[_\s-]?after/i,
+  /usage limit (?:reached|exceeded)/i,
+  /quota (?:exceeded|exhausted)/i,
   /insufficient[_\s-]?quota/i,
-  /capacity/i,
+  /overloaded_error/i, // Anthropic's specific overload error type
+  /retry[_\s-]?after/i,
+  /resource[_\s-]?exhausted/i,
 ];
 
 export function classifyByQuotaSignal(text: string): boolean {

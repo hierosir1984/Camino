@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import type { AdapterSpec, Outcome, SpawnPlan, StreamEvent } from "../types.js";
+import type { AdapterSpec, SpawnPlan, StreamEvent } from "../types.js";
 import { classifyByQuotaSignal } from "../quota.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -44,13 +44,6 @@ export function mockAdapter(mode?: string): AdapterSpec {
       } catch {
         return null;
       }
-    },
-    classifyFailure(events: readonly StreamEvent[], exitCode: number | null): Outcome {
-      return classifyByQuotaSignal(events.map((e) => e.text).join("\n"))
-        ? "quota-blocked"
-        : exitCode === null
-          ? "requirement-failed"
-          : "requirement-failed";
     },
   };
 }

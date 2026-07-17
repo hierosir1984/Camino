@@ -1,4 +1,4 @@
-import type { AdapterContext, AdapterSpec, Outcome, SpawnPlan, StreamEvent } from "../types.js";
+import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "../types.js";
 import { classifyByQuotaSignal } from "../quota.js";
 
 /**
@@ -68,10 +68,6 @@ export function grokAdapter(
         return { kind: "tool", text: type, ...q };
       }
       return { kind: "other", text: type || "event", ...q };
-    },
-    classifyFailure(events: readonly StreamEvent[], exitCode: number | null): Outcome {
-      if (events.some((e) => e.quotaSignal)) return "quota-blocked";
-      return exitCode === null ? "requirement-failed" : "requirement-failed";
     },
   };
 }

@@ -39,13 +39,13 @@ this spike's machinery promotes into them.
 ## Run it
 
 ```sh
-# Mechanics only, zero quota (this runs in CI):
-npx vitest run spikes/dispatch/lifecycle.test.ts spikes/dispatch/registry.test.ts
+# Mechanics only, zero quota (also runs inside `npm test` / CI):
+npm run spike:test
 
 # Real dispatches on live subscriptions (spends quota):
-npm run spike:dispatch            # one trivial issue per enabled adapter
-npm run spike:dispatch -- --cancel        # + a real mid-run cancel per adapter
-npm run spike:dispatch -- --only=codex    # restrict to named adapters
+npm run spike:dispatch                  # one trivial issue per enabled adapter
+npm run spike:dispatch -- --cancel      # + a real mid-run cancel per adapter
+npm run spike:dispatch -- --only=codex  # restrict to named adapters
 ```
 
 Real dispatches record `transcripts/REPORT.md` + `transcripts/summary.json`

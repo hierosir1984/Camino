@@ -26,9 +26,26 @@ export function headSha(workdir: string): string | null {
   }
 }
 
-/** Return the new commit SHA if the worker advanced HEAD, else null. */
+/** Is `ancestor` an ancestor of `descendant`? */
+function isAncestor(workdir: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync("git", ["-C", workdir, "merge-base", "--is-ancestor", ancestor, descendant], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Return the new commit SHA only if the worker genuinely ADVANCED HEAD — i.e.
+ * the new HEAD is a descendant of the base. A reset/rollback to an older commit
+ * is not a new worker commit (WP-001 review #10).
+ */
 export function committedSince(workdir: string, before: string | null): string | null {
   const after = headSha(workdir);
-  if (after && after !== before) return after;
-  return null;
+  if (!after || after === before) return null;
+  if (before && !isAncestor(workdir, before, after)) return null;
+  return after;
 }

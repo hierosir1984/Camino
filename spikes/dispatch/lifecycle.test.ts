@@ -33,19 +33,37 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("mid-run cancel executes kill-confirm and the whole process TREE is gone", async () => {
+  it("mid-run cancel executes kill-confirm and the whole process TREE is gone (leader ignores SIGTERM)", async () => {
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(
-        mockAdapter("hang"), // spawns a sleep grandchild, ignores SIGTERM
+        mockAdapter("hang"), // leader ignores SIGTERM, spawns a sleep grandchild
         { workdir: ws, prompt: "run forever" },
         { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL },
       );
       expect(rec.outcome).toBe("cancelled");
-      expect(rec.killConfirm?.requested).toBe(true);
+      expect(rec.killConfirm?.wasAliveAtSignal).toBe(true);
       expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // SIGTERM ignored → SIGKILL
       expect(rec.killConfirm?.treeGone).toBe(true); // group verified gone
-      // No orphaned `sleep 600` grandchild survived this dispatch's group.
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("orphan case: leader exits on SIGTERM but a descendant ignores it — SIGKILL still reaps the tree", async () => {
+    // WP-001 review #1: a leader-only wait would skip SIGKILL and orphan the
+    // SIGTERM-ignoring descendant. Correct kill-confirm SIGKILLs the whole group.
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(
+        mockAdapter("orphan"),
+        { workdir: ws, prompt: "spawn a stubborn descendant" },
+        { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL },
+      );
+      expect(rec.outcome).toBe("cancelled"); // interrupted a live group
+      expect(rec.killConfirm?.wasAliveAtSignal).toBe(true);
+      expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // descendant forced SIGKILL
+      expect(rec.killConfirm?.treeGone).toBe(true); // no orphan survives
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -67,6 +85,22 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("timeout is classified 'killed', distinct from a user cancel", async () => {
+    // WP-001 review #4: timeout must not masquerade as a user cancellation.
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(
+        mockAdapter("hang"),
+        { workdir: ws, prompt: "run forever" },
+        { timeoutMs: 150, killConfirm: FAST_KILL },
+      );
+      expect(rec.outcome).toBe("killed"); // not "cancelled"
+      expect(rec.killConfirm?.treeGone).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a rate limit is classified quota-blocked, never requirement-failed", async () => {
     const ws = makeWorkspace();
     try {
@@ -79,19 +113,21 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("worker env carries no GitHub credential and neutralizes git global config", () => {
-    // Even if the parent process has GitHub creds, the worker env must not.
-    const { env, posture } = composeWorkerEnv({
-      PATH: "/usr/bin",
-      HOME: "/Users/x",
-      GITHUB_TOKEN: "ghp_secret",
-      GH_TOKEN: "gho_secret",
-      GIT_ASKPASS: "/some/askpass",
-    });
+  it("worker env carries no GitHub credential even when an adapter tries to inject one", () => {
+    // Enforcement, not just detection (WP-001 review #3): creds supplied via the
+    // adapter's `extra` are stripped; git neutralization cannot be overridden.
+    const { env, posture } = composeWorkerEnv(
+      { PATH: "/usr/bin", HOME: "/Users/x", GITHUB_TOKEN: "ghp_from_parent" },
+      {
+        GITHUB_TOKEN: "adapter-injected",
+        GH_ENTERPRISE_TOKEN: "adapter-enterprise",
+        GIT_CONFIG_GLOBAL: "/tmp/attacker-gitconfig",
+      },
+    );
     expect(posture.githubCredentialKeys).toEqual([]); // CAM-SEC-06 / CAM-EXEC-02
     expect(env["GITHUB_TOKEN"]).toBeUndefined();
-    expect(env["GH_TOKEN"]).toBeUndefined();
-    expect(env["GIT_ASKPASS"]).toBeUndefined();
+    expect(env["GH_ENTERPRISE_TOKEN"]).toBeUndefined();
+    expect(env["GIT_CONFIG_GLOBAL"]).toBe("/dev/null"); // override rejected
     expect(posture.gitGlobalNeutralized).toBe(true);
     expect(env["HOME"]).toBe("/Users/x"); // provider auth path preserved (sanctioned)
   });
@@ -106,6 +142,24 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       const rec = await dispatch(missing, { workdir: ws, prompt: "x" });
       expect(rec.spawned).toBe(false);
       expect(rec.outcome).toBe("requirement-failed");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a parser that throws does not crash the dispatch", async () => {
+    // The harness must survive a buggy adapter parser (WP-001 review #5).
+    const ws = makeWorkspace();
+    try {
+      const throwing = {
+        ...mockAdapter(),
+        parseLine: () => {
+          throw new Error("boom");
+        },
+      };
+      const rec = await dispatch(throwing, { workdir: ws, prompt: "x" });
+      expect(rec.spawned).toBe(true);
+      expect(rec.outcome).toBe("succeeded"); // process still exited 0; parser errors swallowed
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }

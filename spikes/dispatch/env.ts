@@ -38,13 +38,20 @@ export function composeWorkerEnv(
     if (typeof v === "string") env[key] = v;
   }
 
-  // Neutralize git's global + system config for the worker: no user gitconfig,
-  // no credential helper, no stored token is visible to git in the workspace.
+  // Adapter-supplied extras go on FIRST, so the enforcement below cannot be
+  // overridden by them (WP-001 review finding #3): a malicious/buggy adapter
+  // must not be able to restore a GitHub credential or un-neutralize git.
+  for (const [k, v] of Object.entries(extra)) env[k] = v;
+
+  // ENFORCE, don't merely report: drop every GitHub-credential-shaped key…
+  for (const k of Object.keys(env)) {
+    if (GITHUB_CREDENTIAL_MARKERS.some((m) => k.toUpperCase().includes(m))) delete env[k];
+  }
+  // …and neutralize git's global + system config LAST so nothing can override
+  // it: no user gitconfig, no credential helper, no stored token is visible.
   env["GIT_CONFIG_GLOBAL"] = "/dev/null";
   env["GIT_CONFIG_SYSTEM"] = "/dev/null";
   env["GIT_TERMINAL_PROMPT"] = "0";
-
-  for (const [k, v] of Object.entries(extra)) env[k] = v;
 
   const keys = Object.keys(env).sort();
   const githubCredentialKeys = keys.filter((k) =>
@@ -55,7 +62,7 @@ export function composeWorkerEnv(
     env,
     posture: {
       keys,
-      githubCredentialKeys,
+      githubCredentialKeys, // now empty BY CONSTRUCTION, not by luck
       gitGlobalNeutralized:
         env["GIT_CONFIG_GLOBAL"] === "/dev/null" && env["GIT_CONFIG_SYSTEM"] === "/dev/null",
     },

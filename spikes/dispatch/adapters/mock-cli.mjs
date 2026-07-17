@@ -29,6 +29,20 @@ if (mode === "hang") {
   setInterval(() => emit("other", "still working"), 200);
   // Reference child so it isn't GC'd; it dies with the group on SIGKILL.
   void child;
+} else if (mode === "orphan") {
+  // The nastier case (WP-001 review #1): the LEADER exits cleanly on SIGTERM,
+  // but a descendant IGNORES SIGTERM. A leader-only wait would skip SIGKILL and
+  // orphan the descendant; correct kill-confirm must SIGKILL the whole group.
+  // The descendant uses a shell `trap` — installed synchronously at startup,
+  // unlike a node SIGTERM handler that races process boot.
+  spawn("sh", ["-c", 'trap "" TERM; while :; do sleep 1; done'], { stdio: "ignore" });
+  process.on("SIGTERM", () => process.exit(0)); // leader exits on TERM
+  // Give the descendant a beat to install its trap before work "starts", so a
+  // cancel arriving shortly after the first event hits a ready descendant.
+  setTimeout(() => {
+    emit("assistant", "spawned a SIGTERM-ignoring descendant");
+    setInterval(() => emit("other", "leader alive"), 200);
+  }, 150);
 } else if (mode === "graceful-cancel") {
   let stop = false;
   process.on("SIGTERM", () => {

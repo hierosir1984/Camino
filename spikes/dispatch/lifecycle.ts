@@ -1,11 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { composeWorkerEnv } from "./env.js";
+import { classifyByQuotaSignal } from "./quota.js";
 import type {
   AdapterContext,
   AdapterSpec,
   DispatchRecord,
   KillConfirmRecord,
+  Outcome,
   StreamEvent,
 } from "./types.js";
 
@@ -29,37 +31,49 @@ export interface DispatchOptions {
   onLine?: (channel: "stdout" | "stderr", line: string) => void;
 }
 
-/** Is any process in group `pgid` still alive? */
+/** Is ANY process in group `pgid` still alive? (leader OR any descendant) */
 function groupAlive(pgid: number): boolean {
   try {
     process.kill(-pgid, 0);
     return true;
   } catch (err) {
-    // ESRCH = gone; EPERM = exists but not ours (still alive).
+    // ESRCH = gone; EPERM = exists but not ours (still alive, conservative).
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
-function waitExit(child: ChildProcess, ms: number): Promise<boolean> {
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Wait up to `ms` for the whole group to disappear, polling. */
+async function waitGroupGone(pgid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (!groupAlive(pgid)) return true;
+    await sleep(20);
+  }
+  return !groupAlive(pgid);
+}
+
+/** Wait up to `ms` for the group leader to exit. */
+function waitLeaderExit(child: ChildProcess, ms: number): Promise<void> {
   return new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
-    let done = false;
-    const finish = (v: boolean) => {
-      if (done) return;
-      done = true;
+    if (child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(resolve, ms);
+    child.once("exit", () => {
       clearTimeout(timer);
-      resolve(v);
-    };
-    const timer = setTimeout(() => finish(false), ms);
-    child.once("exit", () => finish(true));
+      resolve();
+    });
   });
 }
 
 /**
  * Kill-confirm sequence (CAM-EXEC-06, registry item 4):
- * SIGTERM to the process GROUP → grace → SIGKILL → verify the whole tree is
- * gone. Targeting the group (negative pid) is what makes it a TREE kill: a CLI
- * that spawned children/grandchildren is taken down whole.
+ * SIGTERM to the process GROUP → grace → SIGKILL **iff any group member is
+ * still alive** → verify the whole tree is gone. Escalation is gated on the
+ * GROUP, not the leader: a leader that exits on SIGTERM while a descendant
+ * ignores it must still trigger SIGKILL, or that descendant orphans.
  */
 export async function killConfirm(
   child: ChildProcess,
@@ -68,37 +82,73 @@ export async function killConfirm(
   const started = Date.now();
   const pid = child.pid;
   if (pid == null) {
-    return { requested: true, escalatedToSigkill: false, treeGone: true, elapsedMs: 0 };
+    return {
+      requested: true,
+      wasAliveAtSignal: false,
+      escalatedToSigkill: false,
+      treeGone: true,
+      elapsedMs: 0,
+    };
+  }
+  const wasAliveAtSignal = groupAlive(pid);
+  if (!wasAliveAtSignal) {
+    // The process finished on its own before we signalled — not a real kill.
+    return {
+      requested: true,
+      wasAliveAtSignal: false,
+      escalatedToSigkill: false,
+      treeGone: true,
+      elapsedMs: Date.now() - started,
+    };
   }
   try {
     process.kill(-pid, "SIGTERM");
   } catch {
     /* group may already be gone */
   }
+  await waitLeaderExit(child, timings.graceMs);
   let escalated = false;
-  const exitedOnTerm = await waitExit(child, timings.graceMs);
-  if (!exitedOnTerm && groupAlive(pid)) {
+  if (groupAlive(pid)) {
+    // Any surviving member (leader or descendant) → SIGKILL the whole group.
     escalated = true;
     try {
       process.kill(-pid, "SIGKILL");
     } catch {
       /* ignore */
     }
-    await waitExit(child, timings.sigkillWaitMs);
+    await waitGroupGone(pid, timings.sigkillWaitMs);
   }
   return {
     requested: true,
+    wasAliveAtSignal,
     escalatedToSigkill: escalated,
     treeGone: !groupAlive(pid),
     elapsedMs: Date.now() - started,
   };
 }
 
+function assembleFinalText(events: readonly StreamEvent[]): string {
+  // Prefer a single complete result message (codex agent_message, claude
+  // result). Otherwise reassemble the trailing run of assistant/result
+  // fragments in order (token-streaming CLIs like grok).
+  const lastResult = [...events]
+    .reverse()
+    .find((e) => e.kind === "result" && e.text.trim().length > 0);
+  if (lastResult) return lastResult.text.slice(0, 400);
+  const trailing: string[] = [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.kind === "assistant" || e.kind === "result") trailing.push(e.text);
+    else if (trailing.length > 0) break;
+  }
+  return trailing.reverse().join("").slice(0, 400);
+}
+
 /**
  * Drive one headless dispatch through an adapter: compose a clean env, spawn
  * the CLI detached (own process group), parse both streams line-by-line into
- * normalized events, and either let it finish or cancel it mid-run with
- * kill-confirm.
+ * normalized events, and either let it finish or cancel/timeout it with
+ * kill-confirm. Outcome is classified centrally.
  */
 export async function dispatch(
   adapter: AdapterSpec,
@@ -118,10 +168,23 @@ export async function dispatch(
   });
 
   const events: StreamEvent[] = [];
+  const rawChunks: string[] = [];
+  let exited = false;
+  let killReason: "cancel" | "timeout" | null = null;
   let killRecord: KillConfirmRecord | undefined;
+  let killPromise: Promise<void> | null = null;
   let cancelTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
   let sawFirstEvent = false;
+
+  // Initiate a kill exactly once, only while the child is still running.
+  const requestKill = (reason: "cancel" | "timeout") => {
+    if (exited || killReason) return;
+    killReason = reason;
+    killPromise = killConfirm(child, timings).then((k) => {
+      killRecord = k;
+    });
+  };
 
   const spawnFailed = await new Promise<boolean>((resolve) => {
     let settled = false;
@@ -162,17 +225,20 @@ export async function dispatch(
     const rl = createInterface({ input: stream });
     rl.on("line", (line) => {
       opts.onLine?.(channel, line);
-      const ev = adapter.parseLine(line, channel);
+      rawChunks.push(line);
+      // A buggy parser must never crash the harness (bypassing cleanup).
+      let ev: StreamEvent | null = null;
+      try {
+        ev = adapter.parseLine(line, channel);
+      } catch {
+        ev = null;
+      }
       if (!ev) return;
       events.push(ev);
       if (!sawFirstEvent) {
         sawFirstEvent = true;
         if (opts.cancelAfterFirstEventMs != null) {
-          cancelTimer = setTimeout(() => {
-            void killConfirm(child, timings).then((k) => {
-              killRecord = k;
-            });
-          }, opts.cancelAfterFirstEventMs);
+          cancelTimer = setTimeout(() => requestKill("cancel"), opts.cancelAfterFirstEventMs);
         }
       }
     });
@@ -181,54 +247,43 @@ export async function dispatch(
   if (child.stderr) consume("stderr", child.stderr);
 
   if (opts.timeoutMs != null) {
-    timeoutTimer = setTimeout(() => {
-      void killConfirm(child, timings).then((k) => {
-        killRecord = killRecord ?? k;
-      });
-    }, opts.timeoutMs);
+    timeoutTimer = setTimeout(() => requestKill("timeout"), opts.timeoutMs);
   }
 
   const exitCode = await new Promise<number | null>((resolve) => {
-    child.once("exit", (code) => resolve(code));
+    child.once("exit", (code) => {
+      exited = true;
+      resolve(code);
+    });
   });
   if (cancelTimer) clearTimeout(cancelTimer);
   if (timeoutTimer) clearTimeout(timeoutTimer);
-  // Let any pending kill-confirm settle.
-  if (
-    killRecord === undefined &&
-    (opts.cancelAfterFirstEventMs != null || opts.timeoutMs != null)
-  ) {
-    await new Promise((r) => setTimeout(r, 50));
-  }
+  if (killPromise) await killPromise; // let an in-flight kill finish
 
-  // finalText: prefer a single complete result message (codex agent_message,
-  // claude result). If none carries text — token-streaming CLIs like grok emit
-  // the answer as many fragments — reassemble the trailing run of
-  // assistant/result fragments in order.
-  const lastResult = [...events]
-    .reverse()
-    .find((e) => e.kind === "result" && e.text.trim().length > 0);
-  let finalText: string;
-  if (lastResult) {
-    finalText = lastResult.text;
-  } else {
-    const trailing: string[] = [];
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i]!;
-      if (e.kind === "assistant" || e.kind === "result") trailing.push(e.text);
-      else if (trailing.length > 0) break;
-    }
-    finalText = trailing.reverse().join("");
-  }
-  finalText = finalText.slice(0, 400);
+  // Quota classification is centralized and evidence-wide: any parsed quota
+  // signal OR a quota marker in the RAW output (so a signal on a dropped /
+  // non-JSON / malformed line is not lost) — CAM-EXEC-06.
+  const quotaBlocked =
+    events.some((e) => e.quotaSignal) || classifyByQuotaSignal(rawChunks.join("\n"));
 
-  let outcome: DispatchRecord["outcome"];
-  if (killRecord) {
+  // A cancel/timeout counts only if we genuinely interrupted a LIVE process
+  // group (wasAliveAtSignal). A process that finished in the race window before
+  // our signal landed is a success/failure on its own terms, not a cancel —
+  // this is how a graceful-exit-on-SIGTERM worker is still "cancelled" while a
+  // just-completed worker is not (WP-001 review #4).
+  const reallyInterrupted = killRecord?.wasAliveAtSignal === true;
+
+  let outcome: Outcome;
+  if (killReason === "timeout" && reallyInterrupted) {
+    outcome = "killed";
+  } else if (killReason === "cancel" && reallyInterrupted) {
     outcome = "cancelled";
   } else if (exitCode === 0) {
     outcome = "succeeded";
+  } else if (quotaBlocked) {
+    outcome = "quota-blocked";
   } else {
-    outcome = adapter.classifyFailure(events, exitCode);
+    outcome = "requirement-failed";
   }
 
   return {
@@ -236,7 +291,7 @@ export async function dispatch(
     outcome,
     spawned: true,
     streamedEvents: events.length,
-    finalText,
+    finalText: assembleFinalText(events),
     committedSha: null, // filled by the harness after inspecting the workspace
     ...(killRecord ? { killConfirm: killRecord } : {}),
     envPosture: posture,
