@@ -85,6 +85,17 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     file: "__fence_trip__req.cjs",
     source: 'const fs = require("fs");\nmodule.exports = fs;\n',
   },
+  // The two vectors surfaced by the WP-000 post-merge audit:
+  {
+    name: "eval-based require (audit vector)",
+    file: "__fence_trip__eval.ts",
+    source: 'export const leak = eval("require")("node:fs");\n',
+  },
+  {
+    name: "computed globalThis[process][getBuiltinModule] (audit vector)",
+    file: "__fence_trip__computed.ts",
+    source: 'const g = globalThis["process"];\nexport const leak = g["getBuiltinModule"]("fs");\n',
+  },
 ];
 
 describe("packages/core import fence", () => {

@@ -39,14 +39,25 @@ const CORE_SYNTAX_BANS = [
     selector: "TSExternalModuleReference",
     message: "import-require syntax is banned in packages/core (purity fence, build plan §1.1).",
   },
+  // getBuiltinModule — dot and computed-string-literal forms both banned.
   {
     selector: "MemberExpression[property.name='getBuiltinModule']",
     message:
       "process.getBuiltinModule() is banned in packages/core (purity fence, build plan §1.1).",
   },
   {
+    selector: "MemberExpression[computed=true][property.value='getBuiltinModule']",
+    message:
+      "computed getBuiltinModule access is banned in packages/core (purity fence, build plan §1.1).",
+  },
+  // globalThis.process / globalThis["process"] — both forms banned.
+  {
     selector: "MemberExpression[object.name='globalThis'][property.name='process']",
     message: "globalThis.process is banned in packages/core (purity fence, build plan §1.1).",
+  },
+  {
+    selector: "MemberExpression[object.name='globalThis'][computed=true][property.value='process']",
+    message: 'globalThis["process"] is banned in packages/core (purity fence, build plan §1.1).',
   },
 ];
 
@@ -78,6 +89,10 @@ function coreFence({ files, allowRegex }) {
           message: "packages/core is pure — no process access (purity fence, build plan §1.1).",
         },
       ],
+      // eval / implied-eval are runtime-string escape hatches into anything;
+      // pure domain logic has no use for them (WP-000 audit follow-up).
+      "no-eval": "error",
+      "no-implied-eval": "error",
       "no-restricted-syntax": ["error", ...CORE_SYNTAX_BANS],
     },
   };

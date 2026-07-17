@@ -21,6 +21,24 @@ Key invariants: workers hold zero repository credentials; only Camino-authored
 commits are pushed; subscription credentials are never read, stored, or proxied;
 evidence binds to exact commit SHAs.
 
+## The `packages/core` purity fence (lint-grade, with a stated residual)
+
+The `core` package is pure by rule: an ESLint allowlist permits only
+core-relative imports and `@camino/shared`, and bans Node builtins (any
+spelling), other packages, dynamic `import()`/`require`/`createRequire`,
+`process`/`getBuiltinModule` (dot and computed-literal forms), and
+`eval`. A regression suite proves each bypass class trips.
+
+**Stated residual:** static lint cannot see fully dynamic access —
+a specifier assembled by string concatenation (`"no" + "de:fs"`) or
+reflection through a computed, non-literal key evades any AST rule. The
+fence raises the cost of an I/O leak in pure code and catches the honest
+mistakes and the obvious evasions; it is not a sandbox. Defense in depth
+against a _determined_ leak is the layer above it — quarantine scope
+checks on the worker diff, cross-family review, and (optionally, WP-101)
+runtime or dependency-graph enforcement. This matches the T3 honesty
+above: the fence is a pre-merge guardrail, not a containment guarantee.
+
 Reporting: this is a personal-use project (pre-release). Please open a GitHub
 issue for non-sensitive reports, or contact the repository owner directly for
 anything sensitive.
