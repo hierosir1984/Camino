@@ -1,5 +1,7 @@
 # xAI / Grok Build — sanctioned-path research (contractual half)
 
+> **Disposition: ACCEPTED by David, 2026-07-17** (in-session). Registry attributes take effect as recommended below: sanctioned-path = confirmed (source-linked, snapshot 2026-07-17), enablement = enabled for personal use, with the two caveats recorded and the listed re-check triggers. The WP-000 entry-gate item "xAI contractual sanctioned-path confirmation recorded" is satisfied by this memo + disposition.
+>
 > 2026-07-17. Research memo feeding the WP-000 Phase-0 entry gate item "xAI contractual sanctioned-path confirmation recorded" (BUILD.md prerequisite; CAM-EXEC-01 enablement gate). The *technical* headless path was already verified during PRD review; this memo covers the *contractual/policy* half. Registry posture per CAM-ROUTE-01: attributes are time-varying and source-linked — this is a snapshot, re-checked on schedule and on the triggers listed at the end.
 
 ## Question
