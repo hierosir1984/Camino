@@ -3,9 +3,9 @@
 // acceptance evidence. This spends real quota; the mechanics are already proven
 // quota-free in lifecycle.test.ts.
 //
-//   npm run spike:dispatch                 # solve dispatch per enabled adapter
-//   npm run spike:dispatch -- --cancel     # + a real mid-run cancel per adapter
-//   npm run spike:dispatch -- --only=codex # restrict to named adapters
+//   node --run spike:dispatch                 # solve dispatch per enabled adapter
+//   node --run spike:dispatch -- --cancel     # + a real mid-run cancel per adapter
+//   node --run spike:dispatch -- --only=codex # restrict to named adapters
 //
 // Transcripts land in spikes/dispatch/transcripts/: REPORT.md + summary.json
 // are the durable, portable evidence (relative paths, sampled parsed events);

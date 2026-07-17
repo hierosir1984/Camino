@@ -75,6 +75,18 @@ if (mode === "hang") {
   emit("assistant", "attempting");
   emit("error", "429 rate_limit_exceeded: usage limit reached, retry later");
   process.exit(3);
+} else if (mode === "quota-split") {
+  // A quota signal split across two adjacent RAW lines (not valid JSON, so the
+  // parser drops both) — must still be caught by the rolling window.
+  process.stdout.write("provider says: rate\n");
+  process.stdout.write("limit exceeded, retry later\n");
+  process.exit(4);
+} else if (mode === "flood") {
+  // Emit many events to exercise the bounded retention cap.
+  const n = Number(process.env.MOCK_FLOOD ?? "500");
+  for (let i = 0; i < n; i++) emit("other", `event ${i}`);
+  emit("result", "done flooding");
+  process.exit(0);
 } else {
   // solve
   emit("assistant", "I will create GREETING.txt");

@@ -130,6 +130,34 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("catches a quota signal split across adjacent raw lines", async () => {
+    // WP-001 review #1-r3: incremental scanning must still catch a signal the
+    // old aggregate scan caught when split across two lines.
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(mockAdapter("quota-split"), { workdir: ws, prompt: "x" });
+      expect(rec.exitCode).not.toBe(0);
+      expect(rec.outcome).toBe("quota-blocked");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds retained events but reports the true total count", async () => {
+    // WP-001 review #4: a flood of events must not grow retention without bound;
+    // the true count is still reported and the trailing result is preserved.
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(mockAdapter("flood"), { workdir: ws, prompt: "flood" });
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.streamedEvents).toBe(501); // 500 "other" + 1 "result"
+      expect(rec.events.length).toBeLessThanOrEqual(400); // head 200 + tail 200
+      expect(rec.finalText).toContain("done flooding"); // trailing result retained
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("worker env carries no GitHub credential even when an adapter tries to inject one", () => {
     // Enforcement, not just detection (WP-001 review #3): creds supplied via the
     // adapter's `extra` are stripped; git neutralization cannot be overridden.

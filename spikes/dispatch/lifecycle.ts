@@ -42,6 +42,23 @@ function groupAlive(pgid: number): boolean {
   }
 }
 
+/** Is process `pid` still alive, per the OS (not per an event-loop flag)? */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+// Bound how many parsed events are retained so a noisy/hostile worker cannot
+// grow harness memory (review #4): keep the first HEAD + last TAIL, plus a
+// total count. The head/tail window preserves both the opening context and the
+// trailing result run that finalText needs.
+const EVENT_HEAD_CAP = 200;
+const EVENT_TAIL_CAP = 200;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -137,11 +154,28 @@ export async function dispatch(
     stdio: [plan.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
   });
 
-  const events: StreamEvent[] = [];
-  // Incremental quota detection: a single flag, not an unbounded buffer, so a
-  // noisy/hostile worker cannot grow harness memory (review #4-new). Catches a
-  // quota signal even on a line the parser drops (non-JSON / malformed).
+  // Bounded event retention (head + tail ring) with a true total count.
+  const headEvents: StreamEvent[] = [];
+  const tailRing: StreamEvent[] = [];
+  let totalEvents = 0;
+  let anyEventQuota = false;
+  const recordEvent = (ev: StreamEvent) => {
+    totalEvents++;
+    if (ev.quotaSignal) anyEventQuota = true;
+    if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);
+    else {
+      tailRing.push(ev);
+      if (tailRing.length > EVENT_TAIL_CAP) tailRing.shift();
+    }
+  };
+  const retainedEvents = (): StreamEvent[] => [...headEvents, ...tailRing];
+
+  // Incremental quota detection: flags, not an unbounded buffer, so a
+  // noisy/hostile worker cannot grow harness memory. A one-line rolling window
+  // catches a signal split across two adjacent lines (which the old aggregate
+  // scan caught) without retaining the whole stream (review #4-new, #1-r3).
   let quotaSeenInRaw = false;
+  let prevLine = "";
   let exited = false;
   let killReason: "cancel" | "timeout" | null = null;
   let killRecord: KillConfirmRecord | undefined;
@@ -150,9 +184,14 @@ export async function dispatch(
   let timeoutTimer: NodeJS.Timeout | undefined;
   let sawFirstEvent = false;
 
-  // Initiate a kill exactly once, only while the child is still running.
+  // Initiate a kill exactly once, and only while the child is genuinely still
+  // running per the OS — `exited` lags behind actual exit (it is set by the
+  // exit event callback), so we also probe pidAlive to avoid labeling a process
+  // that has already died as cancelled/killed (review #3-r3 outcome race).
   const requestKill = (reason: "cancel" | "timeout") => {
     if (exited || killReason) return;
+    const pid = child.pid;
+    if (pid == null || !pidAlive(pid)) return; // OS says already gone → not a real kill
     killReason = reason;
     killPromise = killConfirm(child, timings).then((k) => {
       killRecord = k;
@@ -186,7 +225,7 @@ export async function dispatch(
       envPosture: posture,
       exitCode: null,
       durationMs: Date.now() - started,
-      events,
+      events: [],
     };
   }
 
@@ -198,7 +237,14 @@ export async function dispatch(
     const rl = createInterface({ input: stream });
     rl.on("line", (line) => {
       opts.onLine?.(channel, line);
-      if (!quotaSeenInRaw && classifyByQuotaSignal(line)) quotaSeenInRaw = true;
+      if (!quotaSeenInRaw) {
+        // Scan this line and the two-line window (this + previous), so a signal
+        // split across adjacent lines is still caught.
+        if (classifyByQuotaSignal(line) || classifyByQuotaSignal(`${prevLine}\n${line}`)) {
+          quotaSeenInRaw = true;
+        }
+      }
+      prevLine = line;
       // A buggy parser must never crash the harness (bypassing cleanup).
       let ev: StreamEvent | null = null;
       try {
@@ -207,7 +253,7 @@ export async function dispatch(
         ev = null;
       }
       if (!ev) return;
-      events.push(ev);
+      recordEvent(ev);
       if (!sawFirstEvent) {
         sawFirstEvent = true;
         if (opts.cancelAfterFirstEventMs != null) {
@@ -233,17 +279,17 @@ export async function dispatch(
   if (timeoutTimer) clearTimeout(timeoutTimer);
   if (killPromise) await killPromise; // let an in-flight kill finish
 
-  // Quota classification is centralized: any parsed quota signal OR a quota
-  // marker seen in the raw stream (so a signal on a dropped/malformed line is
-  // not lost) — CAM-EXEC-06.
-  const quotaBlocked = quotaSeenInRaw || events.some((e) => e.quotaSignal);
+  const events = retainedEvents();
 
-  // A cancel/timeout is authoritative from `killReason`, which is set ONLY by
-  // requestKill and ONLY while the child had not yet exited (its `exited`
-  // guard). So killReason set ⇒ we initiated the kill on a still-running
-  // process; a process that had already exited never gets a killReason and is
-  // classified on its exit code. This is race-free without the earlier
-  // liveness probe (which had a check-to-signal TOCTOU — review #2/#4-new).
+  // Quota classification is centralized: a quota signal on any parsed event OR
+  // in the raw stream (so a signal on a dropped/malformed line is not lost) —
+  // CAM-EXEC-06. anyEventQuota is tracked over ALL events, not just retained.
+  const quotaBlocked = quotaSeenInRaw || anyEventQuota;
+
+  // A cancel/timeout is authoritative from `killReason`, set ONLY by requestKill
+  // and ONLY while the child was genuinely still running (its exited + pidAlive
+  // guards). A process that had already exited never gets a killReason and is
+  // classified on its exit code — no natural completion is mislabeled.
   let outcome: Outcome;
   if (killReason === "timeout") {
     outcome = "killed";
@@ -261,7 +307,7 @@ export async function dispatch(
     adapter: adapter.name,
     outcome,
     spawned: true,
-    streamedEvents: events.length,
+    streamedEvents: totalEvents,
     finalText: assembleFinalText(events),
     committedSha: null, // filled by the harness after inspecting the workspace
     ...(killRecord ? { killConfirm: killRecord } : {}),

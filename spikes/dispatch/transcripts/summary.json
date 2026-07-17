@@ -7,8 +7,8 @@
       "outcome": "succeeded",
       "spawned": true,
       "streamedEvents": 11,
-      "finalText": "Done. Created `GREETING.txt` and committed it as `2ca28c8`.",
-      "committedSha": "2ca28c81ef6288ff815e7b71a7041159081f91d1",
+      "finalText": "Done. GREETING.txt created and committed as `0b46ea6`.",
+      "committedSha": "0b46ea6be01e9bffc4f43fe94b5d73dbc20f80e0",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -25,7 +25,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 17765,
+      "durationMs": 15425,
       "transcript": "spikes/dispatch/transcripts/claude-code.solve.jsonl",
       "sampleEvents": [
         {
@@ -46,11 +46,11 @@
         },
         {
           "kind": "assistant",
-          "text": "Done. Created `GREETING.txt` and committed it as `2ca28c8`."
+          "text": "Done. GREETING.txt created and committed as `0b46ea6`."
         },
         {
           "kind": "result",
-          "text": "Done. Created `GREETING.txt` and committed it as `2ca28c8`."
+          "text": "Done. GREETING.txt created and committed as `0b46ea6`."
         }
       ]
     },
@@ -60,10 +60,10 @@
         "requested": true,
         "escalatedToSigkill": false,
         "treeGone": true,
-        "elapsedMs": 596
+        "elapsedMs": 612
       },
       "streamedEvents": 3,
-      "durationMs": 3061
+      "durationMs": 3067
     }
   },
   {
@@ -73,9 +73,9 @@
       "adapter": "codex-cli",
       "outcome": "succeeded",
       "spawned": true,
-      "streamedEvents": 13,
-      "finalText": "Created, staged, and committed `GREETING.txt` as `d53feb6`.",
-      "committedSha": "d53feb6024bb6a87d7f28466f235eff3f44875b4",
+      "streamedEvents": 15,
+      "finalText": "Created and committed `GREETING.txt` as `a7abc40`.",
+      "committedSha": "a7abc40945ec1ff3cb9dde3aedaac0de19f1e2db",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -92,7 +92,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 28001,
+      "durationMs": 22967,
       "transcript": "spikes/dispatch/transcripts/codex-cli.solve.jsonl",
       "sampleEvents": [
         {
@@ -113,7 +113,7 @@
         },
         {
           "kind": "result",
-          "text": "Created, staged, and committed `GREETING.txt` as `d53feb6`."
+          "text": "Created and committed `GREETING.txt` as `a7abc40`."
         },
         {
           "kind": "other",
@@ -130,7 +130,7 @@
         "elapsedMs": 21
       },
       "streamedEvents": 6,
-      "durationMs": 1791
+      "durationMs": 1809
     }
   },
   {
@@ -140,9 +140,9 @@
       "adapter": "grok-build",
       "outcome": "succeeded",
       "spawned": true,
-      "streamedEvents": 68,
-      "finalText": "Done. `GREETING.txt` created and committed as `Add GREETING.txt`.",
-      "committedSha": "de45caf8a1669ebddeefd6ac36cdfc0b6ca3ab8d",
+      "streamedEvents": 63,
+      "finalText": "Created `GREETING.txt` and committed it as `Add GREETING.txt`.",
+      "committedSha": "e8f85eb6f6e37fded650b921766038781cfcdeb4",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -159,7 +159,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 10132,
+      "durationMs": 10346,
       "transcript": "spikes/dispatch/transcripts/grok-build.solve.jsonl",
       "sampleEvents": [
         {
@@ -194,10 +194,10 @@
         "requested": true,
         "escalatedToSigkill": false,
         "treeGone": true,
-        "elapsedMs": 21
+        "elapsedMs": 22
       },
-      "streamedEvents": 71,
-      "durationMs": 7950
+      "streamedEvents": 65,
+      "durationMs": 7125
     }
   }
 ]
