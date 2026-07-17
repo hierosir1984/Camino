@@ -56,6 +56,31 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     source: 'import { readFileSync } from "node:fs";\nexport const leak = readFileSync;\n',
   },
   {
+    name: "un-denylisted builtin (events) — allowlist catches it",
+    file: "__fence_trip__events.ts",
+    source: 'import { EventEmitter } from "events";\nexport const leak = EventEmitter;\n',
+  },
+  {
+    name: "arbitrary npm package name",
+    file: "__fence_trip__npm.ts",
+    source: 'import anything from "left-pad";\nexport const leak = anything;\n',
+  },
+  {
+    name: ".jsx file under core",
+    file: "__fence_trip__ext2.jsx",
+    source: 'import { readFileSync } from "node:fs";\nexport const leak = readFileSync;\n',
+  },
+  {
+    name: "process.getBuiltinModule without any import",
+    file: "__fence_trip__getbuiltin.ts",
+    source: 'export const leak = globalThis.process.getBuiltinModule("fs");\n',
+  },
+  {
+    name: "bare process global access",
+    file: "__fence_trip__process.ts",
+    source: "export const leak = process.env;\n",
+  },
+  {
     name: "require() call in .cjs under core",
     file: "__fence_trip__req.cjs",
     source: 'const fs = require("fs");\nmodule.exports = fs;\n',
