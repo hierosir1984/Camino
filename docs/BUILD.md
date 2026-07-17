@@ -22,7 +22,7 @@
 - [ ] Node 22, Docker Desktop, Playwright installed
 - [ ] Claude Code, Codex CLI, Grok Build CLI authenticated on David's subscriptions
 - [ ] Funded API fallback accounts confirmed (Anthropic + OpenAI Console) — CAM-ROUTE-08 prerequisite
-- [ ] xAI contractual sanctioned-path confirmation recorded at adapter onboarding (technical headless support already verified)
+- [x] xAI contractual sanctioned-path confirmation recorded — research memo [docs/plan/xai-sanctioned-path-research.md](plan/xai-sanctioned-path-research.md), disposition ACCEPTED by David 2026-07-17 (confirmed-permissive; two caveats + re-check triggers recorded)
 
 ## Phase 0 — Spikes (PRD §7, in order)
 
