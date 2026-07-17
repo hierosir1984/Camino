@@ -6,5 +6,8 @@
   "description": "Cross-package types and schemas: requirement IDs, event types, evidence-packet schema, API DTOs",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
   }
 }

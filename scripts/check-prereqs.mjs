@@ -3,9 +3,12 @@
 // "before Phase 0" prerequisites. Exit 0 only when every item is green;
 // WP-001..005 stay blocked until then.
 //
-// Machine-checkable items are probed directly; human items (funded fallback
+// Machine-checkable items are probed directly. Human items (funded fallback
 // accounts, xAI sanctioned-path disposition) are read from the committed
-// attestation file docs/plan/phase-0-prereq-attestations.json.
+// attestation file docs/plan/phase-0-prereq-attestations.json — the three
+// attestation checks are ALWAYS emitted: a missing, unparsable, null, or
+// wrongly-shaped file fails them rather than silently dropping them
+// (hardened per the WP-000 cross-provider review).
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -35,68 +38,104 @@ function fileExists(p, label) {
     : { ok: false, detail: `${label} missing` };
 }
 
+/** Auth probe that prefers a real CLI status command and falls back to the credential artifact. */
+function authProbe(statusCmd, statusArgs, artifactPath, artifactLabel) {
+  const status = probe(statusCmd, statusArgs);
+  if (status.ok) return { ok: true, detail: status.detail };
+  return fileExists(artifactPath, artifactLabel);
+}
+
 const checks = [];
 const add = (name, result, note = "") => checks.push({ name, ...result, note });
 
-// --- machine-checkable ---
-const nodeMajor = Number(process.versions.node.split(".")[0]);
-add("Node 22+", {
-  ok: nodeMajor >= 22,
-  detail: `node ${process.versions.node}`,
-});
+// --- machine-checkable (BUILD.md "before Phase 0") ---
+add(
+  "GitHub repository (origin remote)",
+  probe("git", ["-C", repoRoot, "remote", "get-url", "origin"]),
+);
 
-add("Docker Desktop", probe("docker", ["version", "--format", "{{.Client.Version}}"]));
+const nodeMajor = Number(process.versions.node.split(".")[0]);
+add("Node 22+", { ok: nodeMajor >= 22, detail: `node ${process.versions.node}` });
+
+add(
+  "Docker Desktop (daemon reachable)",
+  probe("docker", ["version", "--format", "{{.Server.Version}}"]),
+);
 add("Playwright", probe("npx", ["--no-install", "playwright", "--version"]), "no-install probe");
 
 add("Claude Code CLI", probe("claude", ["--version"]));
 add(
   "Claude Code auth",
   fileExists(join(homedir(), ".claude.json"), "~/.claude.json"),
-  "best-effort; verify with a real invocation on first dispatch",
+  "artifact check only — proven by a real invocation in the WP-001 dispatch spike",
 );
 add("Codex CLI", probe("codex", ["--version"]));
 add(
   "Codex auth",
-  fileExists(join(homedir(), ".codex", "auth.json"), "~/.codex/auth.json"),
-  "best-effort; verify with a real invocation on first dispatch",
+  authProbe(
+    "codex",
+    ["login", "status"],
+    join(homedir(), ".codex", "auth.json"),
+    "~/.codex/auth.json",
+  ),
+  "status command preferred, artifact fallback — proven in WP-001",
 );
 add("Grok Build CLI", probe("grok", ["--version"]), "disabled-with-reason path applies if absent");
 add(
   "Grok Build auth",
   fileExists(join(homedir(), ".grok"), "~/.grok"),
-  "best-effort; verify with a real invocation on first dispatch",
+  "artifact check only — proven by a real invocation in the WP-001 dispatch spike",
 );
 
-// --- human attestations (committed) ---
+// --- human attestations (committed; always emitted, never skipped) ---
 const attestationPath = join(repoRoot, "docs", "plan", "phase-0-prereq-attestations.json");
 let attestations = null;
+let attestationProblem = "";
 try {
-  attestations = JSON.parse(readFileSync(attestationPath, "utf8"));
-} catch {
-  add("Attestation file", { ok: false, detail: `${attestationPath} missing or unparsable` });
+  const parsed = JSON.parse(readFileSync(attestationPath, "utf8"));
+  if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    attestations = parsed;
+  } else {
+    attestationProblem = `attestation file is ${parsed === null ? "null" : "not an object"}`;
+  }
+} catch (error) {
+  attestationProblem = `attestation file missing/unparsable: ${String(error.message).slice(0, 80)}`;
 }
-if (attestations) {
-  const funded = attestations.fundedFallbackAccounts ?? {};
-  add(
-    "Funded API fallback — Anthropic (CAM-ROUTE-08)",
-    { ok: funded.anthropic === true, detail: String(funded.anthropic) },
-    "David attests in the attestation file",
-  );
-  add(
-    "Funded API fallback — OpenAI (CAM-ROUTE-08)",
-    { ok: funded.openai === true, detail: String(funded.openai) },
-    "David attests in the attestation file",
-  );
-  const xai = attestations.xaiSanctionedPath ?? {};
-  add(
-    "xAI sanctioned-path disposition recorded",
-    {
-      ok: xai.status === "accepted",
-      detail: xai.status ? `${xai.status} by ${xai.by} ${xai.date}` : "missing",
-    },
-    xai.memo ?? "",
-  );
-}
+
+const funded =
+  attestations && typeof attestations.fundedFallbackAccounts === "object"
+    ? (attestations.fundedFallbackAccounts ?? {})
+    : {};
+const xai =
+  attestations && typeof attestations.xaiSanctionedPath === "object"
+    ? (attestations.xaiSanctionedPath ?? {})
+    : {};
+
+add(
+  "Funded API fallback — Anthropic (CAM-ROUTE-08)",
+  {
+    ok: funded.anthropic === true,
+    detail: attestationProblem || String(funded.anthropic),
+  },
+  "David attests in docs/plan/phase-0-prereq-attestations.json",
+);
+add(
+  "Funded API fallback — OpenAI (CAM-ROUTE-08)",
+  {
+    ok: funded.openai === true,
+    detail: attestationProblem || String(funded.openai),
+  },
+  "David attests in docs/plan/phase-0-prereq-attestations.json",
+);
+add(
+  "xAI sanctioned-path disposition recorded",
+  {
+    ok: xai.status === "accepted",
+    detail:
+      attestationProblem || (xai.status ? `${xai.status} by ${xai.by} ${xai.date}` : "missing"),
+  },
+  typeof xai.memo === "string" ? xai.memo : "",
+);
 
 // --- report + record ---
 const pad = (s, n) => String(s).padEnd(n);

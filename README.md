@@ -17,9 +17,13 @@ cleared) lives in [docs/design/](docs/design/17-design-v5.md).
 
 ```sh
 npm install
-npm test          # one-command test: lint + typecheck + unit + fixture smoke
-npm run gate      # Phase-0 entry gate: verifies BUILD.md prerequisites
+npm test                       # one-command test: lint + typecheck + unit + fixture smoke
+node scripts/check-prereqs.mjs # Phase-0 entry gate: verifies BUILD.md prerequisites
 ```
+
+`npm test` is the single blessed script (it also cascades into each package's
+scoped tests via npm workspaces). For piecemeal runs use the tools directly:
+`npx eslint .`, `npx prettier --write .`, `npx tsc -b`, `npx vitest run`.
 
 Requires Node 22+. The repo follows the validatable-repo profile it will one day
 demand of the repositories it operates on: devcontainer, one-command test, seeded
