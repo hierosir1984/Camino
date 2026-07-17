@@ -1,0 +1,125 @@
+[
+  {
+    "adapter": "claude-code",
+    "enabled": true,
+    "solve": {
+      "adapter": "claude-code",
+      "outcome": "succeeded",
+      "spawned": true,
+      "streamedEvents": 11,
+      "finalText": "Done. Created `GREETING.txt` and committed it as `d244d44`.",
+      "committedSha": "d244d44fdc05c768f4880f776b8cec4eb1a01907",
+      "envPosture": {
+        "keys": [
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_SYSTEM",
+          "GIT_TERMINAL_PROMPT",
+          "HOME",
+          "LOGNAME",
+          "PATH",
+          "SHELL",
+          "TMPDIR",
+          "USER"
+        ],
+        "githubCredentialKeys": [],
+        "gitGlobalNeutralized": true
+      },
+      "exitCode": 0,
+      "durationMs": 17677,
+      "transcriptFile": "/Users/davidtoniolo/Projects/Camino/.claude/worktrees/sweet-hawking-334a29/spikes/dispatch/transcripts/claude-code.solve.jsonl"
+    },
+    "cancel": {
+      "outcome": "cancelled",
+      "killConfirm": {
+        "requested": true,
+        "escalatedToSigkill": false,
+        "treeGone": true,
+        "elapsedMs": 599
+      },
+      "streamedEvents": 3,
+      "durationMs": 3128
+    }
+  },
+  {
+    "adapter": "codex-cli",
+    "enabled": true,
+    "solve": {
+      "adapter": "codex-cli",
+      "outcome": "succeeded",
+      "spawned": true,
+      "streamedEvents": 15,
+      "finalText": "Created and committed `GREETING.txt` as `60e49e3`.",
+      "committedSha": "60e49e3cb3f4224a6e9860d7e851532c6f3685b4",
+      "envPosture": {
+        "keys": [
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_SYSTEM",
+          "GIT_TERMINAL_PROMPT",
+          "HOME",
+          "LOGNAME",
+          "PATH",
+          "SHELL",
+          "TMPDIR",
+          "USER"
+        ],
+        "githubCredentialKeys": [],
+        "gitGlobalNeutralized": true
+      },
+      "exitCode": 0,
+      "durationMs": 24625,
+      "transcriptFile": "/Users/davidtoniolo/Projects/Camino/.claude/worktrees/sweet-hawking-334a29/spikes/dispatch/transcripts/codex-cli.solve.jsonl"
+    },
+    "cancel": {
+      "outcome": "cancelled",
+      "killConfirm": {
+        "requested": true,
+        "escalatedToSigkill": false,
+        "treeGone": true,
+        "elapsedMs": 4
+      },
+      "streamedEvents": 5,
+      "durationMs": 2462
+    }
+  },
+  {
+    "adapter": "grok-build",
+    "enabled": true,
+    "solve": {
+      "adapter": "grok-build",
+      "outcome": "succeeded",
+      "spawned": true,
+      "streamedEvents": 61,
+      "finalText": "Created `GREETING.txt` and committed it (`Add GREETING.txt`).",
+      "committedSha": "2d0cf17ae442ee1be7e30f02192a7a1103981970",
+      "envPosture": {
+        "keys": [
+          "GIT_CONFIG_GLOBAL",
+          "GIT_CONFIG_SYSTEM",
+          "GIT_TERMINAL_PROMPT",
+          "HOME",
+          "LOGNAME",
+          "PATH",
+          "SHELL",
+          "TMPDIR",
+          "USER"
+        ],
+        "githubCredentialKeys": [],
+        "gitGlobalNeutralized": true
+      },
+      "exitCode": 0,
+      "durationMs": 9518,
+      "transcriptFile": "/Users/davidtoniolo/Projects/Camino/.claude/worktrees/sweet-hawking-334a29/spikes/dispatch/transcripts/grok-build.solve.jsonl"
+    },
+    "cancel": {
+      "outcome": "cancelled",
+      "killConfirm": {
+        "requested": true,
+        "escalatedToSigkill": false,
+        "treeGone": true,
+        "elapsedMs": 6
+      },
+      "streamedEvents": 59,
+      "durationMs": 6982
+    }
+  }
+]
