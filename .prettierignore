@@ -5,4 +5,5 @@ package-lock.json
 docs/
 fixtures/sample-repo-src/
 .camino/
+spikes/dispatch/transcripts/
 *.tsbuildinfo

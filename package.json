@@ -12,13 +12,16 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "eslint . && prettier --check . && tsc -b && vitest run"
+    "test": "eslint . && prettier --check . && tsc -b && vitest run",
+    "spike:test": "vitest run spikes/dispatch",
+    "spike:dispatch": "node --import tsx spikes/dispatch/run.ts"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
     "@types/node": "^22.10.0",
     "eslint": "^9.15.0",
     "prettier": "^3.3.3",
+    "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.15.0",
     "vitest": "^3.0.0"

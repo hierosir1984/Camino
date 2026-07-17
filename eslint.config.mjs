@@ -114,9 +114,17 @@ export default tseslint.config(
     allowRegex: CORE_TEST_ALLOWLIST_REGEX,
   }),
   {
-    files: ["scripts/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "spikes/**/*.mjs"],
     languageOptions: {
-      globals: { process: "readonly", console: "readonly", URL: "readonly" },
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        URL: "readonly",
+        setTimeout: "readonly",
+        setInterval: "readonly",
+        clearTimeout: "readonly",
+        clearInterval: "readonly",
+      },
     },
     rules: {
       "@typescript-eslint/no-require-imports": "off",

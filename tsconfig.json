@@ -5,6 +5,7 @@
     { "path": "packages/core" },
     { "path": "packages/daemon" },
     { "path": "packages/gui" },
-    { "path": "tests" }
+    { "path": "tests" },
+    { "path": "spikes" }
   ]
 }
