@@ -90,7 +90,8 @@ export function renderPacket(input: PacketInput): string {
     "",
     "`good` = a genuine ambiguity the PRD left open; asking was worth your attention.",
     "`obviously-fine` = the planner could safely have decided this itself.",
-    "The probe passes at **≥70% rated good** (PRD §7, Phase-0 item 2).",
+    "**≥70% rated good** is the question-quality bar (PRD §7, Phase-0 item 2); the full exit",
+    "also requires checklist usability confirmed and review time recorded.",
     "",
   );
   if (qs.length === 0) {
@@ -150,9 +151,20 @@ export function renderPacket(input: PacketInput): string {
   for (const row of nonReq) {
     push(`| ${row.segment} | ${row.note ?? "—"} |`);
   }
-  push("", "### C3. ⚠ Requirement segments not covered by any issue (empty = good)", "");
+  push(
+    "",
+    "### C3. ⚠ Requirement segments not covered by any issue",
+    "",
+    "_Computed from the planner's OWN isRequirement classification — it cannot see a segment the_",
+    "_planner misclassified as non-requirement; the adversarial review in section D adjudicates_",
+    "_the classification itself._",
+    "",
+  );
   if (uncovered.length === 0) {
-    push("None — every requirement row maps to at least one issue.", "");
+    push(
+      "None — every row the planner classified as a requirement maps to at least one issue.",
+      "",
+    );
   } else {
     for (const row of uncovered) {
       push(`- **${row.segment}** — ${row.note ?? "no note recorded"}`);

@@ -7,3 +7,5 @@ fixtures/sample-repo-src/
 .camino/
 spikes/dispatch/transcripts/
 *.tsbuildinfo
+spikes/plan-probe/transcripts/
+spikes/plan-probe/RATING-PACKET.md

@@ -4,6 +4,9 @@
 //   node --run spike:plan-probe -- --mock      # zero-quota pipeline dry-run (mock adapters)
 //   node --run spike:plan-probe -- --planner=claude-code --reviewer=grok-build
 //   node --run spike:plan-probe -- --fixture=path/to/other-prd.md   # reused by WP-004
+//   node --run spike:plan-probe -- --rerender  # regenerate packet/report from committed
+//                                              # artifacts, zero quota (refuses to clobber
+//                                              # a packet that already carries ratings)
 //
 // Stages: fixture PRD → family-A planner (writes plan.json) → validation →
 // family-B falsification reviewer (writes review.json) → validation → rating
@@ -88,7 +91,13 @@ export interface ProbeEvidence {
   } | null;
   review: { verdict: string; blocker: number; major: number; minor: number } | null;
   packet: string | null;
-  ok: boolean;
+  /**
+   * PIPELINE MECHANICS ONLY: both stages dispatched, both deliverables
+   * structurally valid, packet rendered. Says nothing about whether the plan
+   * is any good (that is the review verdict) or accepted (that is David's
+   * packet) — review r1 finding 2.
+   */
+  mechanicsOk: boolean;
 }
 
 interface StageRun {
@@ -169,7 +178,7 @@ export interface ProbeOptions {
  * The whole probe. Returns evidence and writes: <outDir>/{plan.json,
  * review.json, REPORT.md, summary.json, *.jsonl} and the rating packet.
  * Throws only on harness misuse (same-family pairing, unreadable fixture);
- * worker failures come back as evidence with ok=false.
+ * worker failures come back as evidence with mechanicsOk=false.
  */
 export async function runProbe(
   planner: AdapterSpec,
@@ -205,7 +214,7 @@ export async function runProbe(
     plan: null,
     review: null,
     packet: null,
-    ok: false,
+    mechanicsOk: false,
   };
 
   // --- stage 1: planner ---
@@ -290,7 +299,7 @@ export async function runProbe(
   });
   writeFileSync(packetPath, packet);
   evidence.packet = relative(REPO_ROOT, packetPath);
-  evidence.ok = true;
+  evidence.mechanicsOk = true;
 
   finish(outDir, evidence, packet);
   return evidence;
@@ -350,10 +359,10 @@ export function renderReport(evidence: ProbeEvidence, packet: string | null): st
       "",
       `- Issues: ${evidence.plan.issueCount}`,
       `- Clarifying questions: ${evidence.plan.questionCount} (${evidence.plan.blockingQuestions} blocking)`,
-      `- Non-requirement segments visibly flagged (CAM-PLAN-02): ` +
+      `- Segments the planner flagged non-requirement (CAM-PLAN-02): ` +
         `${evidence.plan.flaggedNonRequirements.join(", ") || "none"}`,
-      `- Requirement segments with NO implementing issue: ` +
-        `${evidence.plan.uncoveredRequirements.join(", ") || "none"}`,
+      `- Requirement segments with NO implementing issue (by the planner's OWN classification` +
+        ` — the review may dispute rows): ${evidence.plan.uncoveredRequirements.join(", ") || "none"}`,
       "",
     );
   }
@@ -367,6 +376,12 @@ export function renderReport(evidence: ProbeEvidence, packet: string | null): st
       "",
     );
   }
+  lines.push(
+    `Mechanics: ${evidence.mechanicsOk ? "OK" : "FAILED"} — pipeline mechanics only ` +
+      `(stages dispatched, deliverables structurally valid, packet rendered). The plan's ` +
+      `quality is the review verdict above; acceptance is David's completed packet.`,
+    "",
+  );
   if (packet && evidence.packet) {
     const check = checkPacket(packet);
     lines.push(
@@ -391,6 +406,94 @@ export function renderReport(evidence: ProbeEvidence, packet: string | null): st
   return lines.join("\n") + "\n";
 }
 
+/**
+ * Re-render packet/REPORT/summary from the ALREADY-COMMITTED artifacts (zero
+ * quota): stage evidence is carried over from the existing summary.json;
+ * plan.json/review.json are re-validated; derived fields are recomputed.
+ * Refuses to overwrite a rating packet that already carries ratings unless
+ * `force` — David's recorded ratings must never be silently clobbered.
+ */
+export function rerenderProbe(
+  opts: { outDir?: string; fixturePath?: string; packetPath?: string; force?: boolean } = {},
+): ProbeEvidence {
+  const outDir = opts.outDir ?? OUT;
+  const packetPath = opts.packetPath ?? DEFAULT_PACKET;
+  const fixtureAbs = resolve(opts.fixturePath ?? DEFAULT_FIXTURE);
+
+  const evidence = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8")) as ProbeEvidence;
+  const fixtureText = readFileSync(fixtureAbs, "utf8");
+  const segments = parseSegments(fixtureText);
+  evidence.segments = segments;
+
+  const planRaw = readFileSync(join(outDir, "plan.json"), "utf8");
+  const planParsed = parsePlan(planRaw, segments);
+  evidence.planner.validationErrors = planParsed.errors;
+  const reviewRaw = readFileSync(join(outDir, "review.json"), "utf8");
+  const reviewParsed = parseReview(reviewRaw);
+  if (evidence.reviewer) evidence.reviewer.validationErrors = reviewParsed.errors;
+
+  const plan = planParsed.plan;
+  const review = reviewParsed.review;
+  evidence.plan = plan
+    ? {
+        issueCount: plan.issues.length,
+        questionCount: plan.clarifyingQuestions.length,
+        blockingQuestions: plan.clarifyingQuestions.filter((q) => q.blocking).length,
+        uncoveredRequirements: uncoveredRequirements(plan).map((c) => c.segment),
+        flaggedNonRequirements: flaggedNonRequirements(plan).map((c) => c.segment),
+      }
+    : null;
+  evidence.review = review
+    ? {
+        verdict: review.verdict,
+        blocker: review.findings.filter((f) => f.severity === "blocker").length,
+        major: review.findings.filter((f) => f.severity === "major").length,
+        minor: review.findings.filter((f) => f.severity === "minor").length,
+      }
+    : null;
+
+  let packet: string | null = null;
+  if (plan && review && evidence.reviewer) {
+    let existing = "";
+    try {
+      existing = readFileSync(packetPath, "utf8");
+    } catch {
+      /* no packet yet */
+    }
+    if (existing) {
+      const prior = checkPacket(existing);
+      const anyFilled =
+        prior.good + prior.obviouslyFine > 0 ||
+        prior.unacked.length < prior.questionIds.length ||
+        prior.reviewMinutes !== null;
+      if (anyFilled && !opts.force) {
+        throw new Error(
+          `refusing to overwrite ${packetPath}: it already carries ratings ` +
+            `(rerun with --force only if that is intended)`,
+        );
+      }
+    }
+    packet = renderPacket({
+      plan,
+      review,
+      plannerName: evidence.planner.adapter,
+      plannerFamily: evidence.crossFamily.plannerFamily,
+      reviewerName: evidence.reviewer.adapter,
+      reviewerFamily: evidence.crossFamily.reviewerFamily,
+      fixtureRel: evidence.fixture,
+      generatedAt: new Date().toISOString(),
+    });
+    writeFileSync(packetPath, packet);
+    evidence.packet = relative(REPO_ROOT, packetPath);
+  } else {
+    evidence.packet = null;
+  }
+  evidence.mechanicsOk = packet !== null;
+
+  finish(outDir, evidence, packet);
+  return evidence;
+}
+
 function pickAdapter(name: string): AdapterSpec {
   if (name.startsWith("mock-")) {
     throw new Error("mock adapters are only available via --mock");
@@ -413,6 +516,20 @@ async function main() {
   };
   const mock = argv.includes("--mock");
   const fixture = flag("fixture") ?? DEFAULT_FIXTURE;
+
+  if (argv.includes("--rerender")) {
+    const evidence = rerenderProbe({
+      fixturePath: fixture,
+      force: argv.includes("--force"),
+    });
+    console.log(
+      evidence.mechanicsOk
+        ? `re-rendered: ${evidence.packet}`
+        : "re-render found invalid artifacts — see REPORT.md",
+    );
+    process.exitCode = evidence.mechanicsOk ? 0 : 1;
+    return;
+  }
 
   let planner: AdapterSpec;
   let reviewer: AdapterSpec;
@@ -443,8 +560,10 @@ async function main() {
         `valid=${evidence.reviewer.validationErrors.length === 0}`,
     );
   }
-  console.log(evidence.ok ? `packet: ${evidence.packet}` : "probe FAILED — see REPORT.md");
-  process.exitCode = evidence.ok ? 0 : 1;
+  console.log(
+    evidence.mechanicsOk ? `packet: ${evidence.packet}` : "probe mechanics FAILED — see REPORT.md",
+  );
+  process.exitCode = evidence.mechanicsOk ? 0 : 1;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

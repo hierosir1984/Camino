@@ -1,7 +1,7 @@
 # WP-002 rating packet — Evidence viewer v0 — render inspectable evidence packets for merge approval (CAM-CORE-07, Phase-1)
 
 Planner: **claude-code** (anthropic) · Reviewer: **codex-cli** (openai) · Fixture: `spikes/plan-probe/fixture/evidence-viewer-v0.md`
-Generated: 2026-07-17T10:46:25.271Z
+Generated: 2026-07-17T10:59:45.336Z
 
 > **How to rate this packet (the WP-002 / PRD §7 item 2 exit):**
 > 1. Note the time you start.
@@ -86,7 +86,8 @@ Mandate: S5 · Depends on: I2, I3, I4
 
 `good` = a genuine ambiguity the PRD left open; asking was worth your attention.
 `obviously-fine` = the planner could safely have decided this itself.
-The probe passes at **≥70% rated good** (PRD §7, Phase-0 item 2).
+**≥70% rated good** is the question-quality bar (PRD §7, Phase-0 item 2); the full exit
+also requires checklist usability confirmed and review time recorded.
 
 ### Q1 — Where does the GUI read evidence packets from — a daemon HTTP endpoint (Fastify) serving packet JSON from the SQLite event log, or directly from local fixture files for v0? `[blocking]`
 
@@ -164,9 +165,13 @@ everything else is visibly flagged as non-requirement text.
 | S15 | Escalation inbox (CAM-CORE-05) is a separate mission; listed for interface awareness only. |
 | S16 | Mission→main PR lifecycle (CAM-MERGE-13) is a separate mission; the viewer's packets are what such PRs link to, but the PR flow is out of scope here. |
 
-### C3. ⚠ Requirement segments not covered by any issue (empty = good)
+### C3. ⚠ Requirement segments not covered by any issue
 
-None — every requirement row maps to at least one issue.
+_Computed from the planner's OWN isRequirement classification — it cannot see a segment the_
+_planner misclassified as non-requirement; the adversarial review in section D adjudicates_
+_the classification itself._
+
+None — every row the planner classified as a requirement maps to at least one issue.
 
 Could you confirm mission intent from this table (accept/adjust ledger entries, spot the
 flagged text) without going back to the raw PRD?

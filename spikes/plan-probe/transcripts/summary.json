@@ -122,5 +122,6 @@
     "minor": 2
   },
   "packet": "spikes/plan-probe/RATING-PACKET.md",
-  "ok": true
+  "ok": true,
+  "mechanicsOk": true
 }

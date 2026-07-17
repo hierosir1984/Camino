@@ -2,7 +2,7 @@
 // segment parsing, plan/review validation (incl. the silent-coverage-gap
 // rejection), cross-family enforcement, packet rendering + the
 // acknowledge-before-approval gate, and the full pipeline end-to-end.
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import { extractJson, parsePlan, parseReview, validatePlan, validateReview } fro
 import { plannerPrompt, reviewerPrompt } from "./prompts.js";
 import { checkPacket, renderPacket } from "./packet.js";
 import { mockProbeAdapter } from "./mock.js";
-import { runProbe } from "./run.js";
+import { rerenderProbe, runProbe } from "./run.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(here, "fixture", "evidence-viewer-v0.md");
@@ -266,6 +266,10 @@ describe("rating packet", () => {
     }
     expect(md).toContain("REVIEW-MINUTES: ____");
     expect(md).toContain("CHECKLIST-USABLE: ____");
+    // Honesty framing from code-review r1: coverage lines are relative to the
+    // planner's own classification, and ≥70% is only one conjunct of the exit.
+    expect(md).toContain("planner's OWN isRequirement classification");
+    expect(md).toContain("the full exit");
     expect(md).toContain("Cross-family adversarial review");
     expect(md).toContain("F1");
     expect(md).toContain("Flagged as non-requirement text");
@@ -333,7 +337,7 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
       FIXTURE,
       { outDir, packetPath: join(outDir, "RATING-PACKET.md"), timeoutMs: 30_000 },
     );
-    expect(evidence.ok).toBe(true);
+    expect(evidence.mechanicsOk).toBe(true);
     expect(evidence.planner.outcome).toBe("succeeded");
     expect(evidence.planner.validationErrors).toEqual([]);
     expect(evidence.planner.streamedEvents).toBeGreaterThan(0);
@@ -358,7 +362,7 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
       FIXTURE,
       { outDir, packetPath: join(outDir, "RATING-PACKET.md"), timeoutMs: 30_000 },
     );
-    expect(evidence.ok).toBe(false);
+    expect(evidence.mechanicsOk).toBe(false);
     expect(evidence.planner.validationErrors.join("\n")).toContain("has no row");
     expect(evidence.reviewer).toBeNull(); // no quota wasted reviewing an invalid plan
     expect(evidence.packet).toBeNull();
@@ -374,7 +378,7 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
       FIXTURE,
       { outDir, packetPath: join(outDir, "RATING-PACKET.md"), timeoutMs: 30_000 },
     );
-    expect(evidence.ok).toBe(true);
+    expect(evidence.mechanicsOk).toBe(true);
     expect(evidence.planner.validationErrors).toEqual([]);
   });
 
@@ -386,8 +390,33 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
       FIXTURE,
       { outDir, packetPath: join(outDir, "RATING-PACKET.md"), timeoutMs: 30_000 },
     );
-    expect(evidence.ok).toBe(false);
+    expect(evidence.mechanicsOk).toBe(false);
     expect(evidence.planner.validationErrors).toEqual(["worker did not write plan.json"]);
+  });
+
+  it("rerender regenerates from committed artifacts but refuses to clobber ratings", async () => {
+    const outDir = tmp("probe-rerender-");
+    const packetPath = join(outDir, "RATING-PACKET.md");
+    await runProbe(
+      mockProbeAdapter("planner", "plan"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      { outDir, packetPath, timeoutMs: 30_000 },
+    );
+    // Unfilled packet → rerender is allowed and mechanics stay OK.
+    const re = rerenderProbe({ outDir, fixturePath: FIXTURE, packetPath });
+    expect(re.mechanicsOk).toBe(true);
+    expect(re.review?.verdict).toBe("approve-with-findings");
+    // Fill one rating → rerender must refuse without force.
+    const filled = readFileSync(packetPath, "utf8").replace("RATING-Q1: ____", "RATING-Q1: good");
+    writeFileSync(packetPath, filled);
+    expect(() => rerenderProbe({ outDir, fixturePath: FIXTURE, packetPath })).toThrow(
+      /refusing to overwrite/,
+    );
+    // force overrides deliberately.
+    expect(
+      rerenderProbe({ outDir, fixturePath: FIXTURE, packetPath, force: true }).mechanicsOk,
+    ).toBe(true);
   });
 
   it("an invalid review blocks the packet (no review attached → no approval surface)", async () => {
@@ -398,7 +427,7 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
       FIXTURE,
       { outDir, packetPath: join(outDir, "RATING-PACKET.md"), timeoutMs: 30_000 },
     );
-    expect(evidence.ok).toBe(false);
+    expect(evidence.mechanicsOk).toBe(false);
     expect(evidence.reviewer?.validationErrors.join("\n")).toContain("verdict");
     expect(evidence.packet).toBeNull();
   });

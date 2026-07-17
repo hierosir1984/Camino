@@ -14,13 +14,15 @@ Cross-family (CAM-PLAN-03): planner family **anthropic** ≠ reviewer family **o
 
 - Issues: 5
 - Clarifying questions: 5 (1 blocking)
-- Non-requirement segments visibly flagged (CAM-PLAN-02): S2, S3, S5, S6, S7, S8, S13, S15, S16
-- Requirement segments with NO implementing issue: none
+- Segments the planner flagged non-requirement (CAM-PLAN-02): S2, S3, S5, S6, S7, S8, S13, S15, S16
+- Requirement segments with NO implementing issue (by the planner's OWN classification — the review may dispute rows): none
 
 ## Attached adversarial review
 
 - Verdict: reject
 - Findings: 3 blocker / 6 major / 2 minor
+
+Mechanics: OK — pipeline mechanics only (stages dispatched, deliverables structurally valid, packet rendered). The plan's quality is the review verdict above; acceptance is David's completed packet.
 
 ## Rating packet
 
