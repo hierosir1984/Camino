@@ -12,11 +12,14 @@
 //   quota             — emit a rate-limit event and exit nonzero.
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 const mode = process.env.MOCK_MODE ?? "solve";
 const emit = (type, text) => process.stdout.write(JSON.stringify({ type, text }) + "\n");
+// Synchronous emit: blocks until the bytes are delivered, so a following
+// process.exit() cannot truncate them (process.exit does NOT drain stdout).
+const emitSync = (type, text) => writeSync(1, JSON.stringify({ type, text }) + "\n");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -81,10 +84,12 @@ if (mode === "hang") {
   process.stdout.write("provider error: 429 rate_limit_exceeded, retry later\n");
   process.exit(4);
 } else if (mode === "flood") {
-  // Emit many events to exercise the bounded retention cap.
+  // Emit many events to exercise the bounded retention cap. Synchronous writes
+  // so process.exit() below can't truncate the stream (deterministic count
+  // across platforms — CI caught the async-flush truncation).
   const n = Number(process.env.MOCK_FLOOD ?? "500");
-  for (let i = 0; i < n; i++) emit("other", `event ${i}`);
-  emit("result", "done flooding");
+  for (let i = 0; i < n; i++) emitSync("other", `event ${i}`);
+  emitSync("result", "done flooding");
   process.exit(0);
 } else {
   // solve
