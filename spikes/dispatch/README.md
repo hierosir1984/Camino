@@ -40,13 +40,17 @@ this spike's machinery promotes into them.
 
 ```sh
 # Mechanics only, zero quota (also runs inside `npm test` / CI):
-npm run spike:test
+node --run spike:test
 
 # Real dispatches on live subscriptions (spends quota):
-npm run spike:dispatch                  # one trivial issue per enabled adapter
-npm run spike:dispatch -- --cancel      # + a real mid-run cancel per adapter
-npm run spike:dispatch -- --only=codex  # restrict to named adapters
+node --run spike:dispatch                  # one trivial issue per enabled adapter
+node --run spike:dispatch -- --cancel      # + a real mid-run cancel per adapter
+node --run spike:dispatch -- --only=codex  # restrict to named adapters
 ```
+
+> Use `node --run` (Node 22 built-in), not `npm run`: this machine's global
+> npm config enables workspaces, so `npm run <script>` fans the script out to
+> every package. `node --run` executes the root script directly.
 
 Real dispatches record `transcripts/REPORT.md` + `transcripts/summary.json`
 (committed evidence); raw `*.jsonl` streams are gitignored.

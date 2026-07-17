@@ -43,6 +43,19 @@ if (mode === "hang") {
     emit("assistant", "spawned a SIGTERM-ignoring descendant");
     setInterval(() => emit("other", "leader alive"), 200);
   }, 150);
+} else if (mode === "grace-descendant") {
+  // Cooperative-but-slow descendant: the leader exits immediately on SIGTERM,
+  // but a descendant takes ~200ms to shut down. With enough grace, NO SIGKILL
+  // should fire — the descendant must get the full grace window, not be killed
+  // the instant the leader exits (WP-001 review #1-new).
+  spawn("sh", ["-c", 'trap "sleep 0.2; exit 0" TERM; while :; do sleep 1; done'], {
+    stdio: "ignore",
+  });
+  process.on("SIGTERM", () => process.exit(0));
+  setTimeout(() => {
+    emit("assistant", "spawned a cooperative-but-slow descendant");
+    setInterval(() => emit("other", "leader alive"), 200);
+  }, 150);
 } else if (mode === "graceful-cancel") {
   let stop = false;
   process.on("SIGTERM", () => {

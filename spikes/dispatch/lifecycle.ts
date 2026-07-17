@@ -56,24 +56,13 @@ async function waitGroupGone(pgid: number, ms: number): Promise<boolean> {
   return !groupAlive(pgid);
 }
 
-/** Wait up to `ms` for the group leader to exit. */
-function waitLeaderExit(child: ChildProcess, ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) return resolve();
-    const timer = setTimeout(resolve, ms);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-}
-
 /**
  * Kill-confirm sequence (CAM-EXEC-06, registry item 4):
- * SIGTERM to the process GROUP → grace → SIGKILL **iff any group member is
- * still alive** → verify the whole tree is gone. Escalation is gated on the
- * GROUP, not the leader: a leader that exits on SIGTERM while a descendant
- * ignores it must still trigger SIGKILL, or that descendant orphans.
+ * SIGTERM to the process GROUP → give the WHOLE GROUP up to `graceMs` to exit
+ * → SIGKILL iff any member is still alive → verify the tree is gone.
+ * Waiting on the GROUP (not just the leader) means a cooperative descendant
+ * gets the full grace window, while a stubborn one still forces SIGKILL — and
+ * a leader that exits on SIGTERM while a descendant ignores it cannot orphan.
  */
 export async function killConfirm(
   child: ChildProcess,
@@ -82,34 +71,16 @@ export async function killConfirm(
   const started = Date.now();
   const pid = child.pid;
   if (pid == null) {
-    return {
-      requested: true,
-      wasAliveAtSignal: false,
-      escalatedToSigkill: false,
-      treeGone: true,
-      elapsedMs: 0,
-    };
-  }
-  const wasAliveAtSignal = groupAlive(pid);
-  if (!wasAliveAtSignal) {
-    // The process finished on its own before we signalled — not a real kill.
-    return {
-      requested: true,
-      wasAliveAtSignal: false,
-      escalatedToSigkill: false,
-      treeGone: true,
-      elapsedMs: Date.now() - started,
-    };
+    return { requested: true, escalatedToSigkill: false, treeGone: true, elapsedMs: 0 };
   }
   try {
     process.kill(-pid, "SIGTERM");
   } catch {
     /* group may already be gone */
   }
-  await waitLeaderExit(child, timings.graceMs);
+  await waitGroupGone(pid, timings.graceMs); // full grace for the whole group
   let escalated = false;
   if (groupAlive(pid)) {
-    // Any surviving member (leader or descendant) → SIGKILL the whole group.
     escalated = true;
     try {
       process.kill(-pid, "SIGKILL");
@@ -120,7 +91,6 @@ export async function killConfirm(
   }
   return {
     requested: true,
-    wasAliveAtSignal,
     escalatedToSigkill: escalated,
     treeGone: !groupAlive(pid),
     elapsedMs: Date.now() - started,
@@ -168,7 +138,10 @@ export async function dispatch(
   });
 
   const events: StreamEvent[] = [];
-  const rawChunks: string[] = [];
+  // Incremental quota detection: a single flag, not an unbounded buffer, so a
+  // noisy/hostile worker cannot grow harness memory (review #4-new). Catches a
+  // quota signal even on a line the parser drops (non-JSON / malformed).
+  let quotaSeenInRaw = false;
   let exited = false;
   let killReason: "cancel" | "timeout" | null = null;
   let killRecord: KillConfirmRecord | undefined;
@@ -225,7 +198,7 @@ export async function dispatch(
     const rl = createInterface({ input: stream });
     rl.on("line", (line) => {
       opts.onLine?.(channel, line);
-      rawChunks.push(line);
+      if (!quotaSeenInRaw && classifyByQuotaSignal(line)) quotaSeenInRaw = true;
       // A buggy parser must never crash the harness (bypassing cleanup).
       let ev: StreamEvent | null = null;
       try {
@@ -260,23 +233,21 @@ export async function dispatch(
   if (timeoutTimer) clearTimeout(timeoutTimer);
   if (killPromise) await killPromise; // let an in-flight kill finish
 
-  // Quota classification is centralized and evidence-wide: any parsed quota
-  // signal OR a quota marker in the RAW output (so a signal on a dropped /
-  // non-JSON / malformed line is not lost) — CAM-EXEC-06.
-  const quotaBlocked =
-    events.some((e) => e.quotaSignal) || classifyByQuotaSignal(rawChunks.join("\n"));
+  // Quota classification is centralized: any parsed quota signal OR a quota
+  // marker seen in the raw stream (so a signal on a dropped/malformed line is
+  // not lost) — CAM-EXEC-06.
+  const quotaBlocked = quotaSeenInRaw || events.some((e) => e.quotaSignal);
 
-  // A cancel/timeout counts only if we genuinely interrupted a LIVE process
-  // group (wasAliveAtSignal). A process that finished in the race window before
-  // our signal landed is a success/failure on its own terms, not a cancel —
-  // this is how a graceful-exit-on-SIGTERM worker is still "cancelled" while a
-  // just-completed worker is not (WP-001 review #4).
-  const reallyInterrupted = killRecord?.wasAliveAtSignal === true;
-
+  // A cancel/timeout is authoritative from `killReason`, which is set ONLY by
+  // requestKill and ONLY while the child had not yet exited (its `exited`
+  // guard). So killReason set ⇒ we initiated the kill on a still-running
+  // process; a process that had already exited never gets a killReason and is
+  // classified on its exit code. This is race-free without the earlier
+  // liveness probe (which had a check-to-signal TOCTOU — review #2/#4-new).
   let outcome: Outcome;
-  if (killReason === "timeout" && reallyInterrupted) {
+  if (killReason === "timeout") {
     outcome = "killed";
-  } else if (killReason === "cancel" && reallyInterrupted) {
+  } else if (killReason === "cancel") {
     outcome = "cancelled";
   } else if (exitCode === 0) {
     outcome = "succeeded";

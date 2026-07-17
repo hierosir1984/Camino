@@ -75,13 +75,6 @@ export interface DispatchRecord {
 
 export interface KillConfirmRecord {
   requested: boolean;
-  /**
-   * True if the process group was still alive when the kill signal was sent —
-   * i.e. we genuinely interrupted running work, rather than racing a process
-   * that had already finished. This is what distinguishes a real cancel/kill
-   * from a late no-op (used to classify the dispatch outcome).
-   */
-  wasAliveAtSignal: boolean;
   /** True if SIGTERM alone did not stop the tree and SIGKILL was needed. */
   escalatedToSigkill: boolean;
   /** True once the whole process group is confirmed gone. */

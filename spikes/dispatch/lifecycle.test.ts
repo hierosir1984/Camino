@@ -42,7 +42,6 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
         { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL },
       );
       expect(rec.outcome).toBe("cancelled");
-      expect(rec.killConfirm?.wasAliveAtSignal).toBe(true);
       expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // SIGTERM ignored → SIGKILL
       expect(rec.killConfirm?.treeGone).toBe(true); // group verified gone
     } finally {
@@ -61,9 +60,27 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
         { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL },
       );
       expect(rec.outcome).toBe("cancelled"); // interrupted a live group
-      expect(rec.killConfirm?.wasAliveAtSignal).toBe(true);
       expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // descendant forced SIGKILL
       expect(rec.killConfirm?.treeGone).toBe(true); // no orphan survives
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a cooperative descendant gets the FULL grace window (no premature SIGKILL)", async () => {
+    // WP-001 review #1-new: escalation must wait for the whole GROUP through the
+    // grace period, not SIGKILL the instant the leader exits. A descendant that
+    // needs ~200ms to shut down, given a 1500ms grace, must not be SIGKILLed.
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(
+        mockAdapter("grace-descendant"),
+        { workdir: ws, prompt: "cooperative but slow" },
+        { cancelAfterFirstEventMs: 50, killConfirm: { graceMs: 1500, sigkillWaitMs: 2000 } },
+      );
+      expect(rec.outcome).toBe("cancelled");
+      expect(rec.killConfirm?.escalatedToSigkill).toBe(false); // exited within grace
+      expect(rec.killConfirm?.treeGone).toBe(true);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }

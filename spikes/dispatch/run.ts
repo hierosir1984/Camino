@@ -11,7 +11,8 @@
 // are the durable, portable evidence (relative paths, sampled parsed events);
 // raw .jsonl streams are gitignored.
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, relative } from "node:path";
 import { dispatch, type KillConfirmTimings } from "./lifecycle.js";
 import { buildRegistry } from "./registry.js";
@@ -43,10 +44,17 @@ export interface AdapterEvidence {
   cancel?: Pick<DispatchRecord, "outcome" | "killConfirm" | "streamedEvents" | "durationMs">;
 }
 
+// Redact the local home path from captured worker output so committed evidence
+// carries no absolute workstation path / local identity (review #6-new).
+const HOME = homedir();
+function scrub(text: string): string {
+  return HOME ? text.split(HOME).join("~") : text;
+}
+
 /** First + last few parsed events — portable proof of live parsing in summary.json. */
 function sampleEvents(events: StreamEvent[]): StreamEvent[] {
-  if (events.length <= 6) return events;
-  return [...events.slice(0, 3), ...events.slice(-3)];
+  const picked = events.length <= 6 ? events : [...events.slice(0, 3), ...events.slice(-3)];
+  return picked.map((e) => ({ ...e, text: scrub(e.text) }));
 }
 
 function summarizeSolve(
@@ -55,8 +63,10 @@ function summarizeSolve(
 ): NonNullable<AdapterEvidence["solve"]> {
   const rest: Omit<DispatchRecord, "events"> & { events?: unknown } = { ...rec };
   delete rest.events;
+  const summary = rest as Omit<DispatchRecord, "events">;
   return {
-    ...(rest as Omit<DispatchRecord, "events">),
+    ...summary,
+    finalText: scrub(summary.finalText),
     transcript: relative(REPO_ROOT, transcriptAbs), // repo-relative, portable
     sampleEvents: sampleEvents(rec.events),
   };
@@ -205,8 +215,9 @@ export function renderReport(evidence: AdapterEvidence[], didCancel: boolean): s
   return lines.join("\n") + "\n";
 }
 
-// Only run when invoked as a script (not when imported by a test).
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+// Only run when invoked as a script (not when imported by a test). Compare via
+// pathToFileURL so paths with spaces / '#' resolve correctly (review #5-new).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main()
     .then(() => process.exit(0))
     .catch((err) => {

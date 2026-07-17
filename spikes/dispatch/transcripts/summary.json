@@ -7,8 +7,8 @@
       "outcome": "succeeded",
       "spawned": true,
       "streamedEvents": 11,
-      "finalText": "Done. Created GREETING.txt and committed it as `ca52962`.",
-      "committedSha": "ca52962a29ca7daedeabc3395f23d1dea903b56c",
+      "finalText": "Done. Created `GREETING.txt` and committed it as `2ca28c8`.",
+      "committedSha": "2ca28c81ef6288ff815e7b71a7041159081f91d1",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -25,7 +25,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 11905,
+      "durationMs": 17765,
       "transcript": "spikes/dispatch/transcripts/claude-code.solve.jsonl",
       "sampleEvents": [
         {
@@ -46,11 +46,11 @@
         },
         {
           "kind": "assistant",
-          "text": "Done. Created GREETING.txt and committed it as `ca52962`."
+          "text": "Done. Created `GREETING.txt` and committed it as `2ca28c8`."
         },
         {
           "kind": "result",
-          "text": "Done. Created GREETING.txt and committed it as `ca52962`."
+          "text": "Done. Created `GREETING.txt` and committed it as `2ca28c8`."
         }
       ]
     },
@@ -58,13 +58,12 @@
       "outcome": "cancelled",
       "killConfirm": {
         "requested": true,
-        "wasAliveAtSignal": true,
         "escalatedToSigkill": false,
         "treeGone": true,
-        "elapsedMs": 578
+        "elapsedMs": 596
       },
       "streamedEvents": 3,
-      "durationMs": 3093
+      "durationMs": 3061
     }
   },
   {
@@ -74,9 +73,9 @@
       "adapter": "codex-cli",
       "outcome": "succeeded",
       "spawned": true,
-      "streamedEvents": 22,
-      "finalText": "Created and committed `GREETING.txt` as `cc070bd`.",
-      "committedSha": "cc070bd27e3272337cbd1e4fd5818c72f9170627",
+      "streamedEvents": 13,
+      "finalText": "Created, staged, and committed `GREETING.txt` as `d53feb6`.",
+      "committedSha": "d53feb6024bb6a87d7f28466f235eff3f44875b4",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -93,7 +92,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 37454,
+      "durationMs": 28001,
       "transcript": "spikes/dispatch/transcripts/codex-cli.solve.jsonl",
       "sampleEvents": [
         {
@@ -106,7 +105,7 @@
         },
         {
           "kind": "other",
-          "text": "Under-development features enabled: chronicle. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /Users/davidtoniolo/.codex/config.toml."
+          "text": "Under-development features enabled: chronicle. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in ~/.codex/config.toml."
         },
         {
           "kind": "tool",
@@ -114,7 +113,7 @@
         },
         {
           "kind": "result",
-          "text": "Created and committed `GREETING.txt` as `cc070bd`."
+          "text": "Created, staged, and committed `GREETING.txt` as `d53feb6`."
         },
         {
           "kind": "other",
@@ -126,13 +125,12 @@
       "outcome": "cancelled",
       "killConfirm": {
         "requested": true,
-        "wasAliveAtSignal": true,
         "escalatedToSigkill": false,
         "treeGone": true,
-        "elapsedMs": 6
+        "elapsedMs": 21
       },
-      "streamedEvents": 5,
-      "durationMs": 2504
+      "streamedEvents": 6,
+      "durationMs": 1791
     }
   },
   {
@@ -142,9 +140,9 @@
       "adapter": "grok-build",
       "outcome": "succeeded",
       "spawned": true,
-      "streamedEvents": 79,
-      "finalText": "Done. `GREETING.txt` is created and committed as `Add GREETING.txt`.",
-      "committedSha": "b5cac015083271f0ddc6d475c6e9ce7cd7b5e6e0",
+      "streamedEvents": 68,
+      "finalText": "Done. `GREETING.txt` created and committed as `Add GREETING.txt`.",
+      "committedSha": "de45caf8a1669ebddeefd6ac36cdfc0b6ca3ab8d",
       "envPosture": {
         "keys": [
           "GIT_CONFIG_GLOBAL",
@@ -161,7 +159,7 @@
         "gitGlobalNeutralized": true
       },
       "exitCode": 0,
-      "durationMs": 9370,
+      "durationMs": 10132,
       "transcript": "spikes/dispatch/transcripts/grok-build.solve.jsonl",
       "sampleEvents": [
         {
@@ -194,13 +192,12 @@
       "outcome": "cancelled",
       "killConfirm": {
         "requested": true,
-        "wasAliveAtSignal": true,
         "escalatedToSigkill": false,
         "treeGone": true,
-        "elapsedMs": 3
+        "elapsedMs": 21
       },
-      "streamedEvents": 63,
-      "durationMs": 7067
+      "streamedEvents": 71,
+      "durationMs": 7950
     }
   }
 ]
