@@ -1,0 +1,15 @@
+{
+  "$comment": "Human-attested Phase-0 prerequisites (BUILD.md). David edits this file; scripts/check-prereqs.mjs reads it. Machine-checkable items are probed directly by the script.",
+  "fundedFallbackAccounts": {
+    "anthropic": false,
+    "openai": false,
+    "$comment": "CAM-ROUTE-08 prerequisite — set true when the Console accounts are confirmed funded."
+  },
+  "xaiSanctionedPath": {
+    "status": "accepted",
+    "by": "David",
+    "date": "2026-07-17",
+    "memo": "docs/plan/xai-sanctioned-path-research.md",
+    "$comment": "Disposition ACCEPTED in-session 2026-07-17; memo lands on main with PR #1."
+  }
+}

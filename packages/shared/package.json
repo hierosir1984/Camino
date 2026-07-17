@@ -1,0 +1,13 @@
+{
+  "name": "@camino/shared",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-package types and schemas: requirement IDs, event types, evidence-packet schema, API DTOs",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules
+dist
+coverage
+package-lock.json
+docs/
+fixtures/sample-repo-src/
+.camino/
+*.tsbuildinfo
