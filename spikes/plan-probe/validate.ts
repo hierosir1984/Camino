@@ -38,6 +38,17 @@ function nonEmpty(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
 }
 
+/**
+ * The schemas are closed: a document carrying keys the prompt never showed is
+ * not "conforming with extras", it is nonconforming (review r1c finding 6 —
+ * unexpected keys are where smuggled/mistaken content hides).
+ */
+function unknownKeys(obj: Record<string, unknown>, allowed: string[], where: string): string[] {
+  return Object.keys(obj)
+    .filter((k) => !allowed.includes(k))
+    .map((k) => `${where}: unexpected key "${k}"`);
+}
+
 /** Parse + validate a plan document against the fixture's segment set. */
 export function parsePlan(
   raw: string,
@@ -56,6 +67,9 @@ export function parsePlan(
 export function validatePlan(obj: unknown, segments: string[]): string[] {
   const errors: string[] = [];
   if (!isRecord(obj)) return ["plan is not a JSON object"];
+  errors.push(
+    ...unknownKeys(obj, ["missionTitle", "issues", "clarifyingQuestions", "checklist"], "plan"),
+  );
 
   if (!nonEmpty(obj["missionTitle"])) errors.push("missionTitle missing/empty");
 
@@ -72,6 +86,13 @@ export function validatePlan(obj: unknown, segments: string[]): string[] {
         errors.push(`${where} is not an object`);
         return;
       }
+      errors.push(
+        ...unknownKeys(
+          it,
+          ["id", "title", "goal", "acceptanceCriteria", "mappedSegments", "dependsOn", "riskTier"],
+          where,
+        ),
+      );
       const issue = it as Partial<PlannedIssue>;
       if (!nonEmpty(issue.id)) errors.push(`${where}.id missing`);
       else if (issueIds.has(issue.id)) errors.push(`${where}.id "${issue.id}" duplicated`);
@@ -117,6 +138,21 @@ export function validatePlan(obj: unknown, segments: string[]): string[] {
         errors.push(`${where} is not an object`);
         return;
       }
+      errors.push(
+        ...unknownKeys(
+          q,
+          [
+            "id",
+            "question",
+            "whyItMatters",
+            "assumptionIfUnanswered",
+            "blocking",
+            "relatedSegments",
+            "relatedIssues",
+          ],
+          where,
+        ),
+      );
       const cq = q as Partial<ClarifyingQuestion>;
       if (!nonEmpty(cq.id)) errors.push(`${where}.id missing`);
       else if (qIds.has(cq.id)) errors.push(`${where}.id "${cq.id}" duplicated`);
@@ -132,6 +168,11 @@ export function validatePlan(obj: unknown, segments: string[]): string[] {
       if (typeof cq.blocking !== "boolean") errors.push(`${where}.blocking must be boolean`);
       if (!isStringArray(cq.relatedSegments))
         errors.push(`${where}.relatedSegments must be a string array`);
+      else
+        for (const s of cq.relatedSegments) {
+          if (!segments.includes(s))
+            errors.push(`${where}.relatedSegments: unknown segment "${s}"`);
+        }
       if (!isStringArray(cq.relatedIssues))
         errors.push(`${where}.relatedIssues must be a string array`);
       else
@@ -154,7 +195,17 @@ export function validatePlan(obj: unknown, segments: string[]): string[] {
         errors.push(`${where} is not an object`);
         return;
       }
+      errors.push(
+        ...unknownKeys(
+          row,
+          ["segment", "isRequirement", "proposedLedgerEntry", "mappedIssues", "note"],
+          where,
+        ),
+      );
       const entry = row as Partial<ChecklistEntry>;
+      if (entry.note !== undefined && typeof entry.note !== "string") {
+        errors.push(`${where}.note must be a string when present`);
+      }
       if (!nonEmpty(entry.segment)) {
         errors.push(`${where}.segment missing`);
         return;
@@ -167,6 +218,8 @@ export function validatePlan(obj: unknown, segments: string[]): string[] {
         errors.push(`${where}.isRequirement must be boolean`);
       }
       const led = entry.proposedLedgerEntry;
+      if (isRecord(led))
+        errors.push(...unknownKeys(led, ["id", "statement"], `${where}.proposedLedgerEntry`));
       if (entry.isRequirement === true) {
         if (!isRecord(led) || !nonEmpty(led["id"]) || !nonEmpty(led["statement"])) {
           errors.push(
@@ -245,6 +298,7 @@ const FINDING_CLASSES = [
 export function validateReview(obj: unknown): string[] {
   const errors: string[] = [];
   if (!isRecord(obj)) return ["review is not a JSON object"];
+  errors.push(...unknownKeys(obj, ["verdict", "summary", "findings"], "review"));
   const verdict = obj["verdict"];
   if (verdict !== "approve" && verdict !== "approve-with-findings" && verdict !== "reject") {
     errors.push("verdict must be approve|approve-with-findings|reject");
@@ -262,6 +316,9 @@ export function validateReview(obj: unknown): string[] {
       errors.push(`${where} is not an object`);
       return;
     }
+    errors.push(
+      ...unknownKeys(f, ["id", "severity", "class", "claim", "evidence", "suggestedFix"], where),
+    );
     const finding = f as Partial<ReviewFinding>;
     if (!nonEmpty(finding.id)) errors.push(`${where}.id missing`);
     else if (ids.has(finding.id)) errors.push(`${where}.id "${finding.id}" duplicated`);
@@ -278,6 +335,11 @@ export function validateReview(obj: unknown): string[] {
   });
   if (verdict === "approve" && findings.length > 0) {
     errors.push('verdict "approve" contradicts a non-empty findings list');
+  }
+  // The inverse contradictions too (review r1c finding 6): a verdict that
+  // promises findings must carry at least one.
+  if ((verdict === "approve-with-findings" || verdict === "reject") && findings.length === 0) {
+    errors.push(`verdict "${String(verdict)}" contradicts an empty findings list`);
   }
   return errors;
 }

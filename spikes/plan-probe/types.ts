@@ -139,19 +139,43 @@ export function assertCrossFamily(plannerName: string, reviewerName: string): vo
 }
 
 /**
- * Extract the ordered segment tags ([S1]…[Sn]) from a fixture PRD. Tags are
- * only recognized at line start, so bracketed text inside quoted schema blobs
- * never registers as a segment.
+ * Extract the ordered segment tags ([S1]…[Sn]) from a fixture PRD. Only the
+ * canonical form registers: line start, no indentation, no leading zeros —
+ * so bracketed text inside quoted schema blobs never becomes a segment.
+ *
+ * Anything tag-SHAPED that is not canonical (indented, blockquoted, [S01],
+ * or a duplicate) is REJECTED loudly instead of silently dropped: a dropped
+ * tag would quietly shrink the checklist-totality requirement while the
+ * planner still sees the text (review r1c finding 7).
  */
 export function parseSegments(fixtureText: string): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const match of fixtureText.matchAll(/^\[S(\d+)\]/gm)) {
-    const tag = `S${match[1]}`;
-    if (!seen.has(tag)) {
-      seen.add(tag);
-      out.push(tag);
+  const bad: string[] = [];
+  const lines = fixtureText.split(/\r?\n/);
+  lines.forEach((line, i) => {
+    const canonical = line.match(/^\[S([1-9]\d*)\]/);
+    if (canonical) {
+      const tag = `S${canonical[1]}`;
+      if (seen.has(tag)) bad.push(`line ${i + 1}: duplicate segment tag [${tag}]`);
+      else {
+        seen.add(tag);
+        out.push(tag);
+      }
+      return;
     }
+    if (/^\s*(?:>\s*)*\[S\d+\]/.test(line)) {
+      bad.push(
+        `line ${i + 1}: noncanonical segment tag (indented/quoted/leading-zero): ` +
+          `"${line.trim().slice(0, 40)}"`,
+      );
+    }
+  });
+  if (bad.length > 0) {
+    throw new Error(
+      "fixture segment tags must be canonical line-start [S<n>] and unique:\n" +
+        bad.map((b) => `  - ${b}`).join("\n"),
+    );
   }
   return out;
 }

@@ -24,9 +24,9 @@ export const ATTENTION_BUDGET_MINUTES = 45; // CAM-OBS-02: per mission plan
 
 const UNFILLED = "____";
 
+/** Empty, or nothing but underscores and whitespace ("__ __" included — r1c #8). */
 function isUnfilled(value: string): boolean {
-  const v = value.trim();
-  return v.length === 0 || /^_+$/.test(v);
+  return /^[_\s]*$/.test(value);
 }
 
 export function renderPacket(input: PacketInput): string {
@@ -222,6 +222,10 @@ export interface PacketCheck {
   invalidRatings: string[];
   unacked: string[];
   missingQuestions: string[];
+  /** Marker ids present in the packet text but NOT in the plan (review r1c #3). */
+  unexpectedQuestions: string[];
+  /** Marker names appearing more than once — ambiguous, never scored (r1c #3/#8). */
+  duplicateMarkers: string[];
   checklistUsable: "yes" | "no" | null;
   checklistNote: string | null;
   reviewMinutes: number | null;
@@ -229,35 +233,84 @@ export interface PacketCheck {
   withinBudget: boolean | null;
   approvable: boolean;
   meetsGoodBar: boolean;
+  /** The FULL PRD §7 item-2 exit: complete ∧ ≥70% good ∧ checklist usable=yes ∧ time recorded. */
+  phase0ExitPass: boolean;
 }
 
+/** Exact-match rating values; "good-ish" and friends are invalid (r1c #8). */
 function normalizeRating(value: string): "good" | "obviously-fine" | "invalid" {
   const v = value
     .trim()
     .toLowerCase()
-    .replace(/[.!]+$/, "");
-  if (/^obviously[\s-]?fine\b/.test(v)) return "obviously-fine";
-  if (/^good\b/.test(v)) return "good";
+    .replace(/[.!]+$/, "")
+    .replace(/\s+/g, " ");
+  if (v === "obviously-fine" || v === "obviously fine") return "obviously-fine";
+  if (v === "good") return "good";
   return "invalid";
+}
+
+/** Collect every marker occurrence so duplicates are visible, not last-wins. */
+function collectMarkers(markdown: string, name: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const re = new RegExp(`^${name}-(Q\\d+):[ \\t]*(.*)$`, "gm");
+  for (const m of markdown.matchAll(re)) {
+    const id = `Q${m[1]!.slice(1)}`;
+    const list = out.get(id) ?? [];
+    list.push(m[2] ?? "");
+    out.set(id, list);
+  }
+  return out;
+}
+
+function singleValue(markdown: string, marker: string): { raw: string; count: number } {
+  const matches = [...markdown.matchAll(new RegExp(`^${marker}:[ \\t]*(.*)$`, "gm"))];
+  return { raw: matches[matches.length - 1]?.[1] ?? "", count: matches.length };
+}
+
+/**
+ * Does the packet carry ANY human-entered value — a rating (valid or not), an
+ * acknowledgment, a checklist answer or note, or any timer field? Used by the
+ * overwrite guards: recorded human input is never silently clobbered, whether
+ * or not it parses (review r1c finding 5).
+ */
+export function packetCarriesInput(markdown: string): boolean {
+  for (const name of ["RATING", "ACK"]) {
+    for (const values of collectMarkers(markdown, name).values()) {
+      if (values.some((v) => !isUnfilled(v))) return true;
+    }
+  }
+  for (const marker of [
+    "CHECKLIST-USABLE",
+    "CHECKLIST-NOTE",
+    "REVIEW-START",
+    "REVIEW-END",
+    "REVIEW-MINUTES",
+  ]) {
+    if (!isUnfilled(singleValue(markdown, marker).raw)) return true;
+  }
+  return false;
 }
 
 /**
  * Parse a (possibly filled) packet and compute the probe's acceptance state.
- * `expectedQuestionIds` (from plan.json) guards against marker lines being
- * accidentally deleted while editing the packet.
+ * `expectedQuestionIds` (from plan.json) is the authoritative question set:
+ * markers for ids outside it are flagged, never scored — packet TEXT (e.g.
+ * quoted reviewer prose in section D) must not be able to mint questions or
+ * move the ≥70% figure (review r1c finding 3).
  */
 export function checkPacket(markdown: string, expectedQuestionIds?: string[]): PacketCheck {
-  const ratings = new Map<string, string>();
-  const acks = new Map<string, string>();
-  for (const m of markdown.matchAll(/^RATING-(Q\d+):[ \t]*(.*)$/gm)) {
-    ratings.set(`Q${m[1]!.slice(1)}`, m[2] ?? "");
-  }
-  for (const m of markdown.matchAll(/^ACK-(Q\d+):[ \t]*(.*)$/gm)) {
-    acks.set(`Q${m[1]!.slice(1)}`, m[2] ?? "");
-  }
+  const ratings = collectMarkers(markdown, "RATING");
+  const acks = collectMarkers(markdown, "ACK");
 
-  const questionIds = [...ratings.keys()];
-  const missingQuestions = (expectedQuestionIds ?? []).filter((q) => !ratings.has(q));
+  const found = [...new Set([...ratings.keys(), ...acks.keys()])];
+  const expected = expectedQuestionIds ?? [...ratings.keys()];
+  const questionIds = [...expected];
+  const missingQuestions = expected.filter((q) => !ratings.has(q));
+  const unexpectedQuestions = found.filter((q) => !expected.includes(q));
+
+  const duplicateMarkers: string[] = [];
+  for (const [id, values] of ratings) if (values.length > 1) duplicateMarkers.push(`RATING-${id}`);
+  for (const [id, values] of acks) if (values.length > 1) duplicateMarkers.push(`ACK-${id}`);
 
   let good = 0;
   let obviouslyFine = 0;
@@ -265,8 +318,12 @@ export function checkPacket(markdown: string, expectedQuestionIds?: string[]): P
   const invalidRatings: string[] = [];
   const unacked: string[] = [];
   for (const q of questionIds) {
-    const raw = ratings.get(q) ?? "";
-    if (isUnfilled(raw)) {
+    const ratingValues = ratings.get(q);
+    const raw = ratingValues?.length === 1 ? ratingValues[0]! : "";
+    if (ratingValues === undefined || isUnfilled(raw)) {
+      if (ratingValues !== undefined && ratingValues.length > 1) {
+        // duplicated marker: already flagged; never scored
+      }
       unrated.push(q);
     } else {
       const norm = normalizeRating(raw);
@@ -274,27 +331,27 @@ export function checkPacket(markdown: string, expectedQuestionIds?: string[]): P
       else if (norm === "obviously-fine") obviouslyFine++;
       else invalidRatings.push(q);
     }
-    const ack = acks.get(q) ?? "";
-    if (isUnfilled(ack)) unacked.push(q);
+    const ackValues = acks.get(q);
+    const ack = ackValues?.length === 1 ? ackValues[0]! : "";
+    if (ackValues === undefined || isUnfilled(ack)) unacked.push(q);
   }
 
-  const usableMatch = markdown.match(/^CHECKLIST-USABLE:[ \t]*(.*)$/m);
-  const usableRaw = usableMatch?.[1] ?? "";
+  const usableRaw = singleValue(markdown, "CHECKLIST-USABLE").raw;
   let checklistUsable: "yes" | "no" | null = null;
   if (!isUnfilled(usableRaw)) {
     if (/^yes\b/i.test(usableRaw.trim())) checklistUsable = "yes";
     else if (/^no\b/i.test(usableRaw.trim())) checklistUsable = "no";
   }
-  const noteMatch = markdown.match(/^CHECKLIST-NOTE:[ \t]*(.*)$/m);
-  const noteRaw = noteMatch?.[1] ?? "";
+  const noteRaw = singleValue(markdown, "CHECKLIST-NOTE").raw;
   const checklistNote = isUnfilled(noteRaw) ? null : noteRaw.trim();
 
-  const minutesMatch = markdown.match(/^REVIEW-MINUTES:[ \t]*(.*)$/m);
-  const minutesRaw = minutesMatch?.[1] ?? "";
+  // Integer minutes only (an optional "min"/"minutes" suffix is tolerated);
+  // "45.5" or prose is unparsed, not silently truncated (r1c #8).
+  const minutesRaw = singleValue(markdown, "REVIEW-MINUTES").raw;
   let reviewMinutes: number | null = null;
   if (!isUnfilled(minutesRaw)) {
-    const n = Number.parseInt(minutesRaw.trim(), 10);
-    if (Number.isFinite(n) && n >= 0) reviewMinutes = n;
+    const m = minutesRaw.trim().match(/^(\d+)\s*(?:min(?:ute)?s?)?$/i);
+    if (m) reviewMinutes = Number.parseInt(m[1]!, 10);
   }
 
   const total = questionIds.length;
@@ -305,8 +362,11 @@ export function checkPacket(markdown: string, expectedQuestionIds?: string[]): P
     invalidRatings.length === 0 &&
     unacked.length === 0 &&
     missingQuestions.length === 0 &&
+    unexpectedQuestions.length === 0 &&
+    duplicateMarkers.length === 0 &&
     checklistUsable !== null &&
     reviewMinutes !== null;
+  const meetsGoodBar = total > 0 && goodPct >= 70;
 
   return {
     questionIds,
@@ -317,13 +377,17 @@ export function checkPacket(markdown: string, expectedQuestionIds?: string[]): P
     invalidRatings,
     unacked,
     missingQuestions,
+    unexpectedQuestions,
+    duplicateMarkers,
     checklistUsable,
     checklistNote,
     reviewMinutes,
     budgetMinutes: ATTENTION_BUDGET_MINUTES,
     withinBudget: reviewMinutes === null ? null : reviewMinutes <= ATTENTION_BUDGET_MINUTES,
     approvable,
-    meetsGoodBar: total > 0 && goodPct >= 70,
+    meetsGoodBar,
+    // The conjunctive PRD §7 item-2 exit (r1c #4): completeness alone is not a pass.
+    phase0ExitPass: approvable && meetsGoodBar && checklistUsable === "yes",
   };
 }
 
@@ -345,8 +409,16 @@ export function describeCheck(check: PacketCheck): string {
         `  - invalid ratings (want good|obviously-fine): ${check.invalidRatings.join(", ")}`,
       );
     if (check.unacked.length > 0) lines.push(`  - unacknowledged: ${check.unacked.join(", ")}`);
+    if (check.unexpectedQuestions.length > 0)
+      lines.push(
+        `  - markers for questions NOT in the plan (ignored, must be removed): ` +
+          check.unexpectedQuestions.join(", "),
+      );
+    if (check.duplicateMarkers.length > 0)
+      lines.push(`  - duplicated markers (ambiguous): ${check.duplicateMarkers.join(", ")}`);
     if (check.checklistUsable === null) lines.push("  - CHECKLIST-USABLE not answered (yes|no)");
-    if (check.reviewMinutes === null) lines.push("  - REVIEW-MINUTES not recorded");
+    if (check.reviewMinutes === null)
+      lines.push("  - REVIEW-MINUTES not recorded (integer minutes)");
   }
   const rated = check.good + check.obviouslyFine;
   lines.push(
@@ -367,5 +439,9 @@ export function describeCheck(check: PacketCheck): string {
       `Checklist usability: ${check.checklistUsable}${check.checklistNote ? ` — ${check.checklistNote}` : ""}`,
     );
   }
+  lines.push(
+    `Phase-0 item-2 exit (conjunctive): ${check.phase0ExitPass ? "PASS" : "not passed"} — ` +
+      `needs complete packet ∧ ≥70% good ∧ checklist usable=yes ∧ time recorded.`,
+  );
   return lines.join("\n");
 }

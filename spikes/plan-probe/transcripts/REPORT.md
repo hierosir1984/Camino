@@ -33,8 +33,9 @@ Packet INCOMPLETE — approval cannot complete (CAM-PLAN-01):
   - unrated: Q1, Q2, Q3, Q4, Q5
   - unacknowledged: Q1, Q2, Q3, Q4, Q5
   - CHECKLIST-USABLE not answered (yes|no)
-  - REVIEW-MINUTES not recorded
+  - REVIEW-MINUTES not recorded (integer minutes)
 Ratings: 0 good / 0 obviously-fine of 5 (0% good) — below the ≥70% bar
   (5 not yet rated)
+Phase-0 item-2 exit (conjunctive): not passed — needs complete packet ∧ ≥70% good ∧ checklist usable=yes ∧ time recorded.
 ```
 

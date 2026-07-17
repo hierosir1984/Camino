@@ -2,7 +2,7 @@
 // segment parsing, plan/review validation (incl. the silent-coverage-gap
 // rejection), cross-family enforcement, packet rendering + the
 // acknowledge-before-approval gate, and the full pipeline end-to-end.
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,7 @@ import { adapterFamily, assertCrossFamily, parseSegments } from "./types.js";
 import type { PlanDocument, ReviewDocument } from "./types.js";
 import { extractJson, parsePlan, parseReview, validatePlan, validateReview } from "./validate.js";
 import { plannerPrompt, reviewerPrompt } from "./prompts.js";
-import { checkPacket, renderPacket } from "./packet.js";
+import { checkPacket, packetCarriesInput, renderPacket } from "./packet.js";
 import { mockProbeAdapter } from "./mock.js";
 import { rerenderProbe, runProbe } from "./run.js";
 
@@ -430,5 +430,194 @@ describe("pipeline end-to-end (mock adapters, zero quota)", () => {
     expect(evidence.mechanicsOk).toBe(false);
     expect(evidence.reviewer?.validationErrors.join("\n")).toContain("verdict");
     expect(evidence.packet).toBeNull();
+  });
+});
+
+describe("code-review r1c folds", () => {
+  const packetInput = () => ({
+    plan: validPlan(),
+    review: validReview(),
+    plannerName: "claude-code",
+    plannerFamily: "anthropic",
+    reviewerName: "codex-cli",
+    reviewerFamily: "openai",
+    fixtureRel: "spikes/plan-probe/fixture/evidence-viewer-v0.md",
+    generatedAt: "2026-07-17T00:00:00Z",
+  });
+  const filledPacket = () =>
+    renderPacket(packetInput())
+      .replace("RATING-Q1: ____", "RATING-Q1: good")
+      .replace("RATING-Q2: ____", "RATING-Q2: good")
+      .replace("RATING-Q3: ____", "RATING-Q3: obviously-fine")
+      .replace("ACK-Q1: ____", "ACK-Q1: daemon API")
+      .replace("ACK-Q2: ____", "ACK-Q2: confirm")
+      .replace("ACK-Q3: ____", "ACK-Q3: confirm")
+      .replace("REVIEW-MINUTES: ____", "REVIEW-MINUTES: 22")
+      .replace("CHECKLIST-USABLE: ____", "CHECKLIST-USABLE: yes");
+
+  it("parseSegments rejects noncanonical/duplicate tags instead of dropping them (#7)", () => {
+    expect(() => parseSegments("  [S1] indented")).toThrow(/noncanonical/);
+    expect(() => parseSegments("> [S1] quoted")).toThrow(/noncanonical/);
+    expect(() => parseSegments("[S01] leading zero")).toThrow(/noncanonical/);
+    expect(() => parseSegments("[S1] a\n[S1] again")).toThrow(/duplicate/);
+    expect(parseSegments("[S1] a\r\n[S2] b")).toEqual(["S1", "S2"]); // CRLF fine
+  });
+
+  it("validators reject unknown keys, bad note types, unknown relatedSegments (#6)", () => {
+    const plan = validPlan() as unknown as Record<string, unknown>;
+    plan["extraTopLevel"] = 1;
+    expect(validatePlan(plan, SEGS).join("\n")).toContain('unexpected key "extraTopLevel"');
+    const plan2 = validPlan();
+    (plan2.checklist[0] as unknown as Record<string, unknown>)["note"] = 42;
+    expect(validatePlan(plan2, SEGS).join("\n")).toContain("note must be a string");
+    const plan3 = validPlan();
+    plan3.clarifyingQuestions[0]!.relatedSegments = ["S999"];
+    expect(validatePlan(plan3, SEGS).join("\n")).toContain(
+      'relatedSegments: unknown segment "S999"',
+    );
+  });
+
+  it("review verdicts promising findings must carry findings (#6)", () => {
+    expect(validateReview({ ...validReview(), findings: [] }).join("\n")).toContain(
+      "contradicts an empty findings list",
+    );
+    expect(
+      validateReview({ verdict: "reject", summary: "bad plan", findings: [] }).join("\n"),
+    ).toContain("contradicts an empty findings list");
+  });
+
+  it("packet text cannot mint questions or inflate the score (#3)", () => {
+    const injected = filledPacket() + "\nRATING-Q9: good\nACK-Q9: confirm\n";
+    const check = checkPacket(injected, ["Q1", "Q2", "Q3"]);
+    expect(check.unexpectedQuestions).toEqual(["Q9"]);
+    expect(check.questionIds).toEqual(["Q1", "Q2", "Q3"]); // scored set = plan's set
+    expect(check.goodPct).toBeCloseTo(66.7, 1); // NOT inflated to 75
+    expect(check.approvable).toBe(false);
+  });
+
+  it("duplicated markers are ambiguous, never last-wins (#3/#8)", () => {
+    const dup = filledPacket() + "\nRATING-Q1: obviously-fine\n";
+    const check = checkPacket(dup, ["Q1", "Q2", "Q3"]);
+    expect(check.duplicateMarkers).toEqual(["RATING-Q1"]);
+    expect(check.approvable).toBe(false);
+  });
+
+  it("malformed entries do not pass: good-ish, underscore acks, fractional minutes (#8)", () => {
+    const md = filledPacket()
+      .replace("RATING-Q1: good", "RATING-Q1: good-ish")
+      .replace("ACK-Q2: confirm", "ACK-Q2: __ __")
+      .replace("REVIEW-MINUTES: 22", "REVIEW-MINUTES: 45.5");
+    const check = checkPacket(md, ["Q1", "Q2", "Q3"]);
+    expect(check.invalidRatings).toEqual(["Q1"]);
+    expect(check.unacked).toEqual(["Q2"]);
+    expect(check.reviewMinutes).toBeNull();
+    expect(check.approvable).toBe(false);
+  });
+
+  it("phase0ExitPass is conjunctive: complete ∧ ≥70% ∧ usable=yes ∧ time (#4)", () => {
+    const complete = checkPacket(filledPacket(), ["Q1", "Q2", "Q3"]);
+    expect(complete.approvable).toBe(true);
+    expect(complete.phase0ExitPass).toBe(false); // 66.7% < 70
+    const passing = checkPacket(
+      filledPacket().replace("RATING-Q3: obviously-fine", "RATING-Q3: good"),
+      ["Q1", "Q2", "Q3"],
+    );
+    expect(passing.phase0ExitPass).toBe(true);
+    const usableNo = checkPacket(
+      filledPacket()
+        .replace("RATING-Q3: obviously-fine", "RATING-Q3: good")
+        .replace("CHECKLIST-USABLE: yes", "CHECKLIST-USABLE: no"),
+      ["Q1", "Q2", "Q3"],
+    );
+    expect(usableNo.approvable).toBe(true); // recording "no" is valid data...
+    expect(usableNo.phase0ExitPass).toBe(false); // ...but the exit does not pass
+  });
+
+  it("packetCarriesInput sees every human field, parseable or not (#5)", () => {
+    const fresh = renderPacket(packetInput());
+    expect(packetCarriesInput(fresh)).toBe(false);
+    expect(packetCarriesInput(fresh.replace("RATING-Q1: ____", "RATING-Q1: good-ish"))).toBe(true);
+    expect(
+      packetCarriesInput(fresh.replace("CHECKLIST-USABLE: ____", "CHECKLIST-USABLE: no")),
+    ).toBe(true);
+    expect(packetCarriesInput(fresh.replace("REVIEW-START: ____", "REVIEW-START: 14:05"))).toBe(
+      true,
+    );
+  });
+
+  it("a failed rerun clears stale evidence instead of presenting run N-1's (#1)", async () => {
+    const outDir = tmp("probe-stale-");
+    const packetPath = join(outDir, "RATING-PACKET.md");
+    const opts = { outDir, packetPath, timeoutMs: 30_000 };
+    await runProbe(
+      mockProbeAdapter("planner", "plan"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      opts,
+    );
+    expect(existsSync(join(outDir, "plan.json"))).toBe(true);
+    const rerun = await runProbe(
+      mockProbeAdapter("planner", "plan-missing"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      opts,
+    );
+    expect(rerun.mechanicsOk).toBe(false);
+    expect(existsSync(join(outDir, "plan.json"))).toBe(false); // no stale N-1 artifact
+    expect(existsSync(join(outDir, "review.json"))).toBe(false);
+    expect(existsSync(packetPath)).toBe(false);
+  });
+
+  it("a real rerun refuses to discard a packet carrying input without force (#1/#5)", async () => {
+    const outDir = tmp("probe-guard-");
+    const packetPath = join(outDir, "RATING-PACKET.md");
+    const opts = { outDir, packetPath, timeoutMs: 30_000 };
+    await runProbe(
+      mockProbeAdapter("planner", "plan"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      opts,
+    );
+    writeFileSync(
+      packetPath,
+      readFileSync(packetPath, "utf8").replace("REVIEW-START: ____", "REVIEW-START: 09:00"),
+    );
+    await expect(
+      runProbe(
+        mockProbeAdapter("planner", "plan"),
+        mockProbeAdapter("reviewer", "review"),
+        FIXTURE,
+        opts,
+      ),
+    ).rejects.toThrow(/refusing to overwrite/);
+    const forced = await runProbe(
+      mockProbeAdapter("planner", "plan"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      { ...opts, force: true },
+    );
+    expect(forced.mechanicsOk).toBe(true);
+  });
+
+  it("rerender re-asserts cross-family from adapter names (#2)", async () => {
+    const outDir = tmp("probe-refam-");
+    const packetPath = join(outDir, "RATING-PACKET.md");
+    await runProbe(
+      mockProbeAdapter("planner", "plan"),
+      mockProbeAdapter("reviewer", "review"),
+      FIXTURE,
+      { outDir, packetPath, timeoutMs: 30_000 },
+    );
+    const summaryPath = join(outDir, "summary.json");
+    const summary = JSON.parse(readFileSync(summaryPath, "utf8")) as {
+      planner: { adapter: string };
+      reviewer: { adapter: string };
+    };
+    summary.planner.adapter = "codex-cli";
+    summary.reviewer.adapter = "codex-cli";
+    writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+    expect(() => rerenderProbe({ outDir, fixturePath: FIXTURE, packetPath })).toThrow(
+      /CAM-PLAN-03/,
+    );
   });
 });

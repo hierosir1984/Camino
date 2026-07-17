@@ -37,7 +37,7 @@ import {
   parseReview,
   uncoveredRequirements,
 } from "./validate.js";
-import { checkPacket, describeCheck, renderPacket } from "./packet.js";
+import { checkPacket, describeCheck, packetCarriesInput, renderPacket } from "./packet.js";
 import { mockProbeAdapter } from "./mock.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -172,6 +172,36 @@ export interface ProbeOptions {
   timeoutMs?: number;
   /** Timestamp injected for deterministic tests. */
   now?: () => string;
+  /** Discard an existing packet that carries David's input (deliberate only). */
+  force?: boolean;
+}
+
+/**
+ * A run owns its evidence directory: stale deliverables and transcripts from a
+ * previous run must never survive to masquerade as the new run's output
+ * (review r1c finding 1 — a failed rerun left run N-1's plan.json beside a
+ * REPORT saying the planner wrote nothing). The packet is guarded separately:
+ * one carrying David's input is never silently discarded (finding 5).
+ */
+function clearStaleEvidence(outDir: string, packetPath: string, force: boolean): void {
+  for (const f of readdirSync(outDir)) {
+    if (/^(plan\.json|review\.json|(planner|reviewer)\..*\.jsonl)$/.test(f)) {
+      rmSync(join(outDir, f), { force: true });
+    }
+  }
+  let existingPacket = "";
+  try {
+    existingPacket = readFileSync(packetPath, "utf8");
+  } catch {
+    return; // no packet yet
+  }
+  if (packetCarriesInput(existingPacket) && !force) {
+    throw new Error(
+      `refusing to overwrite ${packetPath}: it already carries recorded input ` +
+        `(rerun with --force only if discarding it is intended)`,
+    );
+  }
+  rmSync(packetPath, { force: true });
 }
 
 /**
@@ -194,6 +224,7 @@ export async function runProbe(
   const timeoutMs = opts.timeoutMs ?? REAL_TIMEOUT_MS;
   const now = opts.now ?? (() => new Date().toISOString());
   mkdirSync(outDir, { recursive: true });
+  clearStaleEvidence(outDir, packetPath, opts.force ?? false);
 
   const fixtureAbs = resolve(fixturePath);
   const fixtureText = readFileSync(fixtureAbs, "utf8");
@@ -425,6 +456,16 @@ export function rerenderProbe(
   const segments = parseSegments(fixtureText);
   evidence.segments = segments;
 
+  // Re-assert CAM-PLAN-03 from the recorded ADAPTER NAMES — a rerender must
+  // not trust summary.json's stored family strings (review r1c finding 2).
+  if (evidence.reviewer) {
+    assertCrossFamily(evidence.planner.adapter, evidence.reviewer.adapter);
+    evidence.crossFamily = {
+      plannerFamily: adapterFamily(evidence.planner.adapter),
+      reviewerFamily: adapterFamily(evidence.reviewer.adapter),
+    };
+  }
+
   const planRaw = readFileSync(join(outDir, "plan.json"), "utf8");
   const planParsed = parsePlan(planRaw, segments);
   evidence.planner.validationErrors = planParsed.errors;
@@ -460,18 +501,13 @@ export function rerenderProbe(
     } catch {
       /* no packet yet */
     }
-    if (existing) {
-      const prior = checkPacket(existing);
-      const anyFilled =
-        prior.good + prior.obviouslyFine > 0 ||
-        prior.unacked.length < prior.questionIds.length ||
-        prior.reviewMinutes !== null;
-      if (anyFilled && !opts.force) {
-        throw new Error(
-          `refusing to overwrite ${packetPath}: it already carries ratings ` +
-            `(rerun with --force only if that is intended)`,
-        );
-      }
+    // ANY recorded human value — valid or not, rating or timer or note —
+    // blocks the overwrite (review r1c finding 5).
+    if (existing && packetCarriesInput(existing) && !opts.force) {
+      throw new Error(
+        `refusing to overwrite ${packetPath}: it already carries recorded input ` +
+          `(rerun with --force only if discarding it is intended)`,
+      );
     }
     packet = renderPacket({
       plan,
@@ -543,6 +579,7 @@ async function main() {
   } else {
     planner = pickAdapter(flag("planner") ?? "claude-code");
     reviewer = pickAdapter(flag("reviewer") ?? "codex-cli");
+    opts = { force: argv.includes("--force") };
   }
 
   console.log(

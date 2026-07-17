@@ -1,7 +1,7 @@
 # WP-002 rating packet — Evidence viewer v0 — render inspectable evidence packets for merge approval (CAM-CORE-07, Phase-1)
 
 Planner: **claude-code** (anthropic) · Reviewer: **codex-cli** (openai) · Fixture: `spikes/plan-probe/fixture/evidence-viewer-v0.md`
-Generated: 2026-07-17T10:59:45.336Z
+Generated: 2026-07-17T11:27:08.030Z
 
 > **How to rate this packet (the WP-002 / PRD §7 item 2 exit):**
 > 1. Note the time you start.
