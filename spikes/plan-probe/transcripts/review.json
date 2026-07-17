@@ -1,0 +1,94 @@
+{
+  "verdict": "reject",
+  "summary": "The plan drops required rollup and evidence-classification semantics and does not establish that approval is bound to the exact packet for the candidate or enforced at the authoritative approval boundary. Its schema and rendering criteria omit required S11 fields, while several probes can pass with headings, inert controls, or unverified artifact actions. The checklist and defaults also hide these gaps by misclassifying S13, narrowing S10 to a demo screen, and adding an unowned daemon endpoint.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "class": "dropped-requirement",
+      "claim": "The S13 mission-rollup obligation is dropped entirely.",
+      "evidence": "S13 is inside the section titled 'Requirements (this mission)' and specifies mission_id, requirement_map, gate_record, and per_issue_delivered. The checklist nevertheless marks S13 isRequirement:false with no mapped issue, I1 types only the per-attempt packet, and Q4's default defers the rollup to an invented later surface. Even if Q4 legitimately resolves whether the rollup needs its own UI, no criterion delivers its schema or data model.",
+      "suggestedFix": "Mark S13 as a requirement and add an issue or criteria that type and validate every rollup field; make the rendering portion conditional on Q4 if necessary, but do not defer the schema without an explicit PRD scope change."
+    },
+    {
+      "id": "F2",
+      "severity": "blocker",
+      "class": "dropped-requirement",
+      "claim": "The plan represents advisory/gating as an unconstrained label and drops S12's classification invariant.",
+      "evidence": "S12 requires worker-head evidence to be advisory and permits gating only for Camino-authored candidates. I1 merely types class as the union 'advisory' | 'gating', I2 displays the supplied value, and I5 only checks that both labels appear. LED-6 also truncates the segment by omitting its worker-head/Camino-candidate rule, so a worker-head item labeled gating satisfies every listed criterion.",
+      "suggestedFix": "Faithfully restate the complete S12 rule and add validation or derivation criteria that relate each item's sha, base_sha, and class to worker_head_sha and the Camino-authored candidate identity, including negative fixtures for inverted classifications."
+    },
+    {
+      "id": "F3",
+      "severity": "major",
+      "class": "dropped-requirement",
+      "claim": "S10's requirement for every merge approval screen is narrowed to a single demonstration screen.",
+      "evidence": "S10 says 'every merge approval screen embeds the packet being approved.' I4 requires only 'A merge approval screen,' and Q5's fallback explicitly proposes a minimal host used merely to demonstrate gating while assigning the full workflow elsewhere. Those criteria can pass without integrating the viewer into the actual approval entry points that S10 quantifies over.",
+      "suggestedFix": "Identify the authoritative approval entry points and require packet embedding and gating on each. If none exists yet, record the missing approval surface as a prerequisite and make later integration an explicit owned criterion rather than treating a demo host as delivery."
+    },
+    {
+      "id": "F4",
+      "severity": "major",
+      "class": "dropped-requirement",
+      "claim": "I1 can satisfy its criteria with incomplete nested S11 types.",
+      "evidence": "I1 AC1 enumerates collection names such as commands[] and checks[] but not their member shapes; AC2 adds only sha, base_sha, and class; AC3 completes only artifact fields. The criteria never explicitly require commands.cmd, checks.name/result/duration, reviews.model/family/verdict/summary, exclusions.item/reason, or waivers.register_ref/reason/actor, all mandated by S11.",
+      "suggestedFix": "Enumerate every required nested field and its type, or require an exact compile-time/schema conformance fixture that fails when any S11 field is absent or optional contrary to the registry schema."
+    },
+    {
+      "id": "F5",
+      "severity": "major",
+      "class": "dropped-requirement",
+      "claim": "The acceptance criteria do not deliver functional rendering of the full S11 packet contents claimed by LED-5.",
+      "evidence": "I2 AC1 limits displayed metadata to verdict, failure_class, retries, and created_at, omitting attempt_id, issue_id, contract_hash, candidate_sha, base_sha, and worker_head_sha. No I2/I3 criterion requires rendering per-item sha/base_sha, command text, check details, review details, or artifact path. I5 asserts only section presence and class markers, and its fixture criterion does not require populated commands, checks, or reviews, so empty headings can pass despite S4, S9, and S11.",
+      "suggestedFix": "Specify the visible representation of every top-level and nested S11 field and add populated fixtures plus value-level assertions for all packet sections, including item identities."
+    },
+    {
+      "id": "F6",
+      "severity": "blocker",
+      "class": "criteria-defect",
+      "claim": "I4 and I5 do not prove an identity-bound or authoritative no-packet approval invariant and are passable by a permanently disabled or bypassable UI.",
+      "evidence": "S10 requires the packet being approved and says no v1 merge is approvable without it; S11 provides candidate_sha and base_sha for that binding. I4 only says a viewer shows a packet 'for' the candidate and that a control is disabled when none is present, while I5 tests only the no-packet disabled state. There is no observable equality check for candidate_sha/base_sha, no mismatched-packet case, no positive case in which a valid matching packet enables approval, and no handler/API/state-transition rejection test, so an unrelated packet, a forever-disabled button, or a direct bypass can pass.",
+      "suggestedFix": "Enforce the invariant at the authoritative approval decision boundary and probe positive matching-packet approval plus absent-packet, candidate-SHA mismatch, base-SHA mismatch, and direct-bypass rejection cases; keep the disabled control as secondary UX evidence."
+    },
+    {
+      "id": "F7",
+      "severity": "major",
+      "class": "criteria-defect",
+      "claim": "I3's artifact-preview criteria can pass with hard-coded or inert UI rather than inspectable artifacts.",
+      "evidence": "The trace criterion only requires exposing an 'open locally' action; it never requires activation to open the referenced trace. I5 does not click that action or verify any artifact bytes, and it does not assert that the displayed log text or screenshot corresponds to the fixture's path/content. A decorative button, hard-coded text, or broken image therefore satisfies the stated checks despite S9-S10 requiring previewable artifacts.",
+      "suggestedFix": "Use known fixture contents and require the probe to verify exact log text, a successfully loaded screenshot, and activation of the trace action opening the exact referenced artifact, with explicit failure behavior for missing or unreadable artifacts."
+    },
+    {
+      "id": "F8",
+      "severity": "minor",
+      "class": "mapping-defect",
+      "claim": "I5 is mapped only to contextual S5 even though it is the proposed verification for multiple requirements.",
+      "evidence": "I5's criteria exercise packet rendering, advisory/gating markers, artifact types, exclusion/waiver content, and no-packet gating from S9, S10, S12, and S14. Its mappedSegments contains only S5, which the checklist correctly labels non-requirement; the S10 checklist note even says I5 probes the rule while S10 mappedIssues omits I5.",
+      "suggestedFix": "Map I5 to every requirement it verifies, including S9, S10, S12, and S14 as applicable, and retain S5 only as the rationale for synthetic fixtures."
+    },
+    {
+      "id": "F9",
+      "severity": "major",
+      "class": "scope-creep",
+      "claim": "Q1's default adds a daemon HTTP endpoint backed by synthetic fixtures without a PRD mandate or an issue that delivers it.",
+      "evidence": "S2, S3, and S5 are explicitly repo facts or technology context, not mission obligations; none of S1 or S9-S14 selects a packet transport. Q1 nevertheless defaults to a Fastify endpoint and relates it to I2-I5, but no issue has acceptance criteria for the endpoint, its contract, or its behavior. Thus the default both expands scope and leaves the assumed dependency unowned.",
+      "suggestedFix": "Keep the component boundary transport-neutral unless the owner selects an endpoint. If an endpoint is selected, add a separately owned issue with an observable contract and tests; otherwise inject typed fixture data without claiming a new backend surface."
+    },
+    {
+      "id": "F10",
+      "severity": "major",
+      "class": "bad-premise",
+      "claim": "Q5 relies on the unsupported premise that the full merge-approval workflow belongs to a separate mission.",
+      "evidence": "No segment assigns merge approval to another mission. S10 is an explicit requirement of this mission; S15 separates only the escalation inbox, and S16 separates only the mission-to-main PR lifecycle. Q5's fallback uses the unsupported boundary to justify I4 as a minimal demonstration host rather than integration with an authoritative approval flow.",
+      "suggestedFix": "Remove the separate-mission assertion. Either include the required approval integration in this plan or surface a blocking ownership/prerequisite question whose resolution creates an explicit, traceable owner for S10."
+    },
+    {
+      "id": "F11",
+      "severity": "minor",
+      "class": "question-quality",
+      "claim": "Q2 is padding because the PRD already answers whether traces may open locally.",
+      "evidence": "Q2 asks whether traces must render inline or whether launching locally is acceptable. S10 explicitly permits logs, screenshots, and traces to 'render inline or open locally,' so local opening is already a compliant option; the question asks for an implementation preference, not missing requirement information.",
+      "suggestedFix": "Delete Q2 or record the chosen compliant presentation mode as a nonblocking implementation decision, while retaining an observable criterion that the trace is actually previewable."
+    }
+  ]
+}

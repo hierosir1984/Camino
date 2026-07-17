@@ -1,0 +1,255 @@
+{
+  "missionTitle": "Evidence viewer v0 — render inspectable evidence packets for merge approval (CAM-CORE-07, Phase-1)",
+  "issues": [
+    {
+      "id": "I1",
+      "title": "Evidence-packet schema types in packages/shared",
+      "goal": "Define the v1 evidence-packet TypeScript types in packages/shared so the GUI renders a real, typed structure rather than untyped JSON.",
+      "acceptanceCriteria": [
+        "packages/shared exports a packet type carrying every S11 field: attempt_id, issue_id, contract_hash, candidate_sha, base_sha, worker_head_sha, commands[], artifacts[], checks[], reviews[], exclusions[], waivers[], retries, failure_class, verdict, created_at.",
+        "Each nested item type (commands, artifacts, checks, reviews, exclusions, waivers) includes its own sha, base_sha, and a class field typed as 'advisory' | 'gating'.",
+        "artifacts items type includes path, type, sha256, and scrubbed.",
+        "tsc passes and packages/gui imports the type without violating the core/shared import fence."
+      ],
+      "mappedSegments": ["S11", "S12"],
+      "dependsOn": [],
+      "riskTier": "low"
+    },
+    {
+      "id": "I2",
+      "title": "Packet rendering component (sections + gating/advisory + exclusion/waiver lists)",
+      "goal": "Build the React component that renders a packet's contents — all sections plus metadata — with each item's advisory/gating class visible and the exclusion/waiver lists shown.",
+      "acceptanceCriteria": [
+        "Given a packet fixture, the component renders every top-level section: commands, artifacts, checks, reviews, exclusions, waivers, plus metadata (verdict, failure_class, retries, created_at).",
+        "Each rendered item shows its class with a visually distinct advisory-vs-gating marker.",
+        "exclusions render their item/reason and waivers render their register_ref/reason/actor.",
+        "Component renders without error when a list (e.g. exclusions or waivers) is empty."
+      ],
+      "mappedSegments": ["S1", "S4", "S9", "S11", "S12", "S14"],
+      "dependsOn": ["I1"],
+      "riskTier": "medium"
+    },
+    {
+      "id": "I3",
+      "title": "Artifact previews (logs inline, screenshots inline, traces open locally)",
+      "goal": "Render artifact previews so a reviewer can inspect logs, screenshots, and traces from within the packet view.",
+      "acceptanceCriteria": [
+        "A log-type artifact renders its text content inline.",
+        "A screenshot-type artifact renders as an inline image.",
+        "A trace-type artifact exposes an 'open locally' action rather than requiring inline rendering.",
+        "Each artifact displays its scrubbed status and sha256."
+      ],
+      "mappedSegments": ["S1", "S4", "S9", "S10"],
+      "dependsOn": ["I1"],
+      "riskTier": "medium"
+    },
+    {
+      "id": "I4",
+      "title": "Merge approval screen embeds packet and gates approval",
+      "goal": "Embed the evidence viewer in a merge approval screen so approval happens against the packet, and no merge is approvable without its packet.",
+      "acceptanceCriteria": [
+        "A merge approval screen embeds the evidence viewer showing the packet for the candidate being approved.",
+        "The approve control is blocked/disabled when no packet is present for the candidate.",
+        "The gating-vs-advisory distinction is visible on the approval screen."
+      ],
+      "mappedSegments": ["S1", "S10"],
+      "dependsOn": ["I2", "I3"],
+      "riskTier": "medium"
+    },
+    {
+      "id": "I5",
+      "title": "Synthetic packet fixtures and Playwright probe",
+      "goal": "Provide synthetic evidence-packet fixtures (no real packets exist yet) and a Playwright probe that verifies the viewer renders and gates correctly.",
+      "acceptanceCriteria": [
+        "Fixture packets exist covering both advisory and gating items, all three artifact types (log, screenshot, trace), and non-empty exclusions and waivers.",
+        "A Playwright probe loads the viewer against a fixture and asserts each packet section renders and both gating and advisory markers appear.",
+        "The probe asserts the approve control is not enabled when a candidate has no packet."
+      ],
+      "mappedSegments": ["S5"],
+      "dependsOn": ["I2", "I3", "I4"],
+      "riskTier": "low"
+    }
+  ],
+  "clarifyingQuestions": [
+    {
+      "id": "Q1",
+      "question": "Where does the GUI read evidence packets from — a daemon HTTP endpoint (Fastify) serving packet JSON from the SQLite event log, or directly from local fixture files for v0?",
+      "whyItMatters": "This sets the data-access architecture shared across the packet component, artifact previews, and the approval screen, and whether a daemon endpoint is part of this mission.",
+      "assumptionIfUnanswered": "The GUI reads packets through a daemon HTTP endpoint returning packet JSON; because no real packets exist yet (S5), v0 wires that endpoint to synthetic fixtures, and the components consume typed JSON without assuming direct filesystem/DB access.",
+      "blocking": true,
+      "relatedSegments": ["S2", "S3", "S5"],
+      "relatedIssues": ["I2", "I3", "I4", "I5"]
+    },
+    {
+      "id": "Q2",
+      "question": "What does 'render inline or open locally' mean concretely for each artifact type — specifically, must traces render inline (e.g. embedded Playwright trace viewer) or is launching them locally acceptable for v0?",
+      "whyItMatters": "It sets the scope of I3: inline trace rendering is substantially more work than an 'open locally' file action.",
+      "assumptionIfUnanswered": "Logs and screenshots render inline; traces are offered via an 'open locally' action (open the artifact file with the OS/existing viewer) rather than inline.",
+      "blocking": false,
+      "relatedSegments": ["S9", "S10"],
+      "relatedIssues": ["I3"]
+    },
+    {
+      "id": "Q3",
+      "question": "How does the viewer access artifact bytes and treat the 'scrubbed' flag — are artifact files at a local `path` the viewer can read, and does 'scrubbed' only affect a displayed badge or gate what content is shown?",
+      "whyItMatters": "It determines how I3 fetches artifact content and whether scrubbing is a display concern or a content-filtering obligation.",
+      "assumptionIfUnanswered": "Artifacts are addressable via their `path` (local filesystem or served by the daemon), the viewer previews the referenced content as-is, and `scrubbed` is surfaced as a badge without additional filtering by the viewer.",
+      "blocking": false,
+      "relatedSegments": ["S10", "S11"],
+      "relatedIssues": ["I3"]
+    },
+    {
+      "id": "Q4",
+      "question": "Does the v0 viewer render the mission rollup (mission_id, requirement_map, gate_record, per_issue_delivered), or only per-attempt packets?",
+      "whyItMatters": "Rendering the mission-level rollup adds a distinct UI surface and typing beyond the per-attempt packet the approval screen embeds.",
+      "assumptionIfUnanswered": "v0 renders per-attempt packets only; rendering the mission rollup is deferred to a later mission (registry/rollup surface), and no rollup UI is built here.",
+      "blocking": false,
+      "relatedSegments": ["S13"],
+      "relatedIssues": ["I2"]
+    },
+    {
+      "id": "Q5",
+      "question": "Does this mission build the merge approval screen itself (the GUI is an empty scaffold), or only the embeddable viewer that a separately-owned approval screen will host?",
+      "whyItMatters": "It sets whether I4 delivers a minimal host screen that demonstrably gates approval, or stops at an embeddable component with no gating surface to verify.",
+      "assumptionIfUnanswered": "This mission builds a minimal merge approval screen sufficient to embed the viewer and demonstrate that approval is blocked without a packet; the full merge-approval workflow remains a separate mission.",
+      "blocking": false,
+      "relatedSegments": ["S10"],
+      "relatedIssues": ["I4"]
+    }
+  ],
+  "checklist": [
+    {
+      "segment": "S1",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-1",
+        "statement": "Deliver a v0 evidence viewer in Camino's GUI that renders evidence packets so merge approval happens against inspectable evidence (CAM-CORE-07, Phase-1 scope)."
+      },
+      "mappedIssues": ["I2", "I3", "I4"],
+      "note": "Top-level mission mandate; realized by the rendering component, artifact previews, and approval-screen integration."
+    },
+    {
+      "segment": "S2",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Established repo-layout context; work lands in packages/gui (and packages/shared for types), but the layout itself is not an obligation of this mission."
+    },
+    {
+      "segment": "S3",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": ["I1", "I5"],
+      "note": "Technology defaults; constrains the stack (TypeScript/Node 22, React+Vite, Playwright) used by every issue but is a standing default, not a new obligation."
+    },
+    {
+      "segment": "S4",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-2",
+        "statement": "v0 scope is functional rendering (packet contents + artifact previews); presentation polish is out of scope and follows later."
+      },
+      "mappedIssues": ["I2", "I3"],
+      "note": "Scope boundary for the mission; bounds I2/I3 to functional rendering."
+    },
+    {
+      "segment": "S5",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": ["I5"],
+      "note": "Context: no real packets exist, so the mission must supply synthetic fixtures to build and verify against (drives I5 and Q1)."
+    },
+    {
+      "segment": "S6",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Design rationale for prioritizing CAM-CORE-07; motivation, not an obligation."
+    },
+    {
+      "segment": "S7",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Design rationale on (sha, base) identity and why only Camino-authored candidates are gating; informs I1/I2 typing but is context. The concrete obligation is captured in S12."
+    },
+    {
+      "segment": "S8",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Motivation-section restatement that the v0 GUI includes an evidence viewer; the concrete obligation is S1/S9, so no separate ledger entry to avoid duplication."
+    },
+    {
+      "segment": "S9",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-3",
+        "statement": "The evidence viewer renders evidence packets (v1 schema) with artifact previews for logs, screenshots, and traces."
+      },
+      "mappedIssues": ["I2", "I3"],
+      "note": "Core CAM-CORE-07 declaration."
+    },
+    {
+      "segment": "S10",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-4",
+        "statement": "Every merge approval screen embeds the packet being approved with artifacts previewable and the gating/advisory distinction visible; no v1 merge is approvable without its packet."
+      },
+      "mappedIssues": ["I3", "I4"],
+      "note": "Acceptance criteria for CAM-CORE-07; the gating-without-packet rule is verified in I4 and probed in I5."
+    },
+    {
+      "segment": "S11",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-5",
+        "statement": "Represent and render the full v1 evidence-packet schema (all per-attempt fields and nested command/artifact/check/review/exclusion/waiver lists)."
+      },
+      "mappedIssues": ["I1", "I2"],
+      "note": "Schema of record; typed in I1, rendered in I2."
+    },
+    {
+      "segment": "S12",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-6",
+        "statement": "Every packet item carries its own (sha, base_sha) identity and a class: advisory|gating marker, and the viewer surfaces that class per item."
+      },
+      "mappedIssues": ["I1", "I2"],
+      "note": "Advisory/gating classification typed in I1 and shown per item in I2."
+    },
+    {
+      "segment": "S13",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Mission-rollup schema (mission-level, registry-cited). Whether the v0 viewer renders it is underdetermined (see Q4); assumed deferred to a later mission, so no issue owns it here."
+    },
+    {
+      "segment": "S14",
+      "isRequirement": true,
+      "proposedLedgerEntry": {
+        "id": "LED-7",
+        "statement": "The viewer renders the advisory/gating distinction and the exclusion and waiver lists."
+      },
+      "mappedIssues": ["I2"],
+      "note": "Explicit rendering obligations, realized in I2."
+    },
+    {
+      "segment": "S15",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Escalation inbox (CAM-CORE-05) is a separate mission; listed for interface awareness only."
+    },
+    {
+      "segment": "S16",
+      "isRequirement": false,
+      "proposedLedgerEntry": null,
+      "mappedIssues": [],
+      "note": "Mission→main PR lifecycle (CAM-MERGE-13) is a separate mission; the viewer's packets are what such PRs link to, but the PR flow is out of scope here."
+    }
+  ]
+}
