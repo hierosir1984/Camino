@@ -1,0 +1,10 @@
+{
+  "name": "@camino/gui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "React + Vite GUI, served by the daemon: board, inbox, evidence viewer, gap register (app lands in WP-102/WP-122/WP-123/WP-124)",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

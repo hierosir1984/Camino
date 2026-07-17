@@ -1,0 +1,14 @@
+# dependencies / build
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# local gate record (the committed attestations live in docs/plan/)
+.camino/gate-record.json
+
+# transient fence-trip fixtures created by tests
+**/__fence_trip__*
+
+# OS noise
+.DS_Store

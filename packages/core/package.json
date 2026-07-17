@@ -1,0 +1,10 @@
+{
+  "name": "@camino/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pure domain logic, no I/O: Appendix A state machines (WP-101), projections, idempotency-key derivation. Import fence: only @camino/shared.",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

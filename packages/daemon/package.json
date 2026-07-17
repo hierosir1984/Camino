@@ -1,0 +1,10 @@
+{
+  "name": "@camino/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fastify server and all I/O: event store, intake, planner, scheduler, adapters, quarantine, validation runner, merge engine, vault",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

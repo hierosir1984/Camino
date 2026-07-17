@@ -1,0 +1,21 @@
+# One-command test in CI (validatable-repo profile, WP-000).
+# Attack/egress/chaos suites accumulate into this workflow as they land
+# (BUILD.md standing obligation: the Phase-0 suites persist as CI).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
