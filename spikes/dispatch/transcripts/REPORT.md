@@ -7,7 +7,7 @@ Per-parsed-event samples and repo-relative transcript paths are in `summary.json
 
 | Adapter | Enabled | Solve outcome | Stream events | Local commit | Env: GH creds | Cancel outcome | Kill-confirm |
 |---|---|---|---|---|---|---|---|
-| claude-code | yes | succeeded | 11 | 0b46ea6b | none ✓ | cancelled | treeGone=true |
-| codex-cli | yes | succeeded | 15 | a7abc409 | none ✓ | cancelled | treeGone=true |
-| grok-build | yes | succeeded | 63 | e8f85eb6 | none ✓ | cancelled | treeGone=true |
+| claude-code | yes | succeeded | 11 | 92a754c9 | none ✓ | cancelled | treeGone=true |
+| codex-cli | yes | succeeded | 14 | 1b997623 | none ✓ | cancelled | treeGone=true |
+| grok-build | yes | succeeded | 54 | ec10d3fe | none ✓ | cancelled | treeGone=true |
 

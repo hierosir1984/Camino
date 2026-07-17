@@ -75,11 +75,10 @@ if (mode === "hang") {
   emit("assistant", "attempting");
   emit("error", "429 rate_limit_exceeded: usage limit reached, retry later");
   process.exit(3);
-} else if (mode === "quota-split") {
-  // A quota signal split across two adjacent RAW lines (not valid JSON, so the
-  // parser drops both) — must still be caught by the rolling window.
-  process.stdout.write("provider says: rate\n");
-  process.stdout.write("limit exceeded, retry later\n");
+} else if (mode === "quota-raw") {
+  // A quota signal on a single NON-JSON line (parser drops it) — the raw scan
+  // must still catch it.
+  process.stdout.write("provider error: 429 rate_limit_exceeded, retry later\n");
   process.exit(4);
 } else if (mode === "flood") {
   // Emit many events to exercise the bounded retention cap.

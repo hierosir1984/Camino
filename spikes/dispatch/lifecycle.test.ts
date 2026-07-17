@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { dispatch } from "./lifecycle.js";
 import { mockAdapter } from "./adapters/mock.js";
 import { composeWorkerEnv } from "./env.js";
+import { classifyByQuotaSignal } from "./quota.js";
 import { makeWorkspace, headSha, committedSince } from "./workspace.js";
 
 // Every mechanic of the dispatch lifecycle proven against the fake CLI —
@@ -130,16 +131,25 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("catches a quota signal split across adjacent raw lines", async () => {
-    // WP-001 review #1-r3: incremental scanning must still catch a signal the
-    // old aggregate scan caught when split across two lines.
+  it("catches a quota signal on a dropped non-JSON raw line", async () => {
+    // The raw scan must catch a rate-limit signal even when the parser drops the
+    // line. (Cross-line joining is deliberately not done — it false-positives on
+    // benign text — so a real single-line signal is the contract; review #4-r4.)
     const ws = makeWorkspace();
     try {
-      const rec = await dispatch(mockAdapter("quota-split"), { workdir: ws, prompt: "x" });
+      const rec = await dispatch(mockAdapter("quota-raw"), { workdir: ws, prompt: "x" });
       expect(rec.exitCode).not.toBe(0);
       expect(rec.outcome).toBe("quota-blocked");
     } finally {
       rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT false-flag benign multi-line text as quota", () => {
+    // The removed rolling window matched "success rate\nLimited…"; per-line
+    // scanning must not (review #4-r4).
+    for (const benign of ["success rate", "Limited evidence remains", "capacity is fine"]) {
+      expect(classifyByQuotaSignal(benign), benign).toBe(false);
     }
   });
 

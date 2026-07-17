@@ -42,16 +42,6 @@ function groupAlive(pgid: number): boolean {
   }
 }
 
-/** Is process `pid` still alive, per the OS (not per an event-loop flag)? */
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 // Bound how many parsed events are retained so a noisy/hostile worker cannot
 // grow harness memory (review #4): keep the first HEAD + last TAIL, plus a
 // total count. The head/tail window preserves both the opening context and the
@@ -170,12 +160,13 @@ export async function dispatch(
   };
   const retainedEvents = (): StreamEvent[] => [...headEvents, ...tailRing];
 
-  // Incremental quota detection: flags, not an unbounded buffer, so a
-  // noisy/hostile worker cannot grow harness memory. A one-line rolling window
-  // catches a signal split across two adjacent lines (which the old aggregate
-  // scan caught) without retaining the whole stream (review #4-new, #1-r3).
+  // Incremental quota detection: a single flag, not an unbounded buffer, so a
+  // noisy/hostile worker cannot grow harness memory (review #4). Scanned
+  // per-line: providers emit a rate-limit signal atomically on one line (a 429
+  // status, a `rate_limit_exceeded` token). Joining adjacent lines to catch a
+  // signal "split" across them manufactures false positives from unrelated text
+  // ("success rate\nLimited…") and is deliberately not done (review #4-r4).
   let quotaSeenInRaw = false;
-  let prevLine = "";
   let exited = false;
   let killReason: "cancel" | "timeout" | null = null;
   let killRecord: KillConfirmRecord | undefined;
@@ -184,14 +175,22 @@ export async function dispatch(
   let timeoutTimer: NodeJS.Timeout | undefined;
   let sawFirstEvent = false;
 
-  // Initiate a kill exactly once, and only while the child is genuinely still
-  // running per the OS — `exited` lags behind actual exit (it is set by the
-  // exit event callback), so we also probe pidAlive to avoid labeling a process
-  // that has already died as cancelled/killed (review #3-r3 outcome race).
+  // Initiate a kill exactly once, only while the child has not yet exited (per
+  // the exit event, our authoritative exit signal).
+  //
+  // Accepted residual (review #3): the exit event is asynchronous, so a process
+  // that finishes at almost exactly the cancel/timeout instant may be labeled
+  // cancelled/killed rather than succeeded. There is no synchronous way to
+  // distinguish "still running" from "exited but not yet reaped" (a zombie
+  // answers kill(pid,0)), nor a natural exit-0 from a worker that caught SIGTERM
+  // and exited 0. The mislabel is (a) confined to a sub-millisecond race that
+  // never arises in real dispatches (cancel fires 1.5s into 30s+ of work) and
+  // (b) in the ledger-safe direction — a cancelled attempt is excluded from
+  // model scorecards, not falsely credited. The production attempt state
+  // machine (Appendix A, WP-101/105) records cancel-requested and exited as
+  // separate events and reconciles them, rather than forcing a synchronous label.
   const requestKill = (reason: "cancel" | "timeout") => {
     if (exited || killReason) return;
-    const pid = child.pid;
-    if (pid == null || !pidAlive(pid)) return; // OS says already gone → not a real kill
     killReason = reason;
     killPromise = killConfirm(child, timings).then((k) => {
       killRecord = k;
@@ -237,14 +236,7 @@ export async function dispatch(
     const rl = createInterface({ input: stream });
     rl.on("line", (line) => {
       opts.onLine?.(channel, line);
-      if (!quotaSeenInRaw) {
-        // Scan this line and the two-line window (this + previous), so a signal
-        // split across adjacent lines is still caught.
-        if (classifyByQuotaSignal(line) || classifyByQuotaSignal(`${prevLine}\n${line}`)) {
-          quotaSeenInRaw = true;
-        }
-      }
-      prevLine = line;
+      if (!quotaSeenInRaw && classifyByQuotaSignal(line)) quotaSeenInRaw = true;
       // A buggy parser must never crash the harness (bypassing cleanup).
       let ev: StreamEvent | null = null;
       try {
