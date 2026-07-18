@@ -32,10 +32,15 @@ const DENIED = `camino-val-${RUN_ID}-denied`;
 const ALLOWED_BODY = "camino-endpoint-allowed-ok";
 const DENIED_BODY = "camino-endpoint-denied-ok";
 const ENDPOINT_PORT = 8080;
+// The allowed endpoint ALSO listens here; this port is never allowlisted, so a
+// connection failure to it is attributable to the firewall (something IS
+// listening) — proving the allow rule is host+port, not host-wide.
+const WRONG_PORT = 8081;
 
 const SETUP_TIMEOUT = 300_000; // image build on a cold cache
 const TEST_TIMEOUT = 120_000;
 
+let allowedIp = "";
 let deniedIp = "";
 
 interface ProbeLine {
@@ -75,7 +80,41 @@ function probeOf(probes: Map<string, ProbeLine>, name: string): ProbeLine {
   return p;
 }
 
-async function startEndpoint(name: string, body: string): Promise<void> {
+/** Ordered `-A OUTPUT …` rule lines the entrypoint printed to stderr. */
+function outputRules(stderr: string): string[] {
+  return stderr
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("-A OUTPUT"));
+}
+
+/**
+ * Assert the deny-before-allow ordering that makes the profile sound: DNS
+ * closed before the loopback accept, the allowlist accept present, and the
+ * catch-all REJECT LAST — so no early exception can slip a packet past the
+ * allowlist. Catches a ruleset that appends an exception after the final
+ * reject, or opens loopback DNS before closing the resolver.
+ */
+function assertRuleOrder(stderr: string, allowedPort: number): void {
+  const rules = outputRules(stderr);
+  const idx = (pred: (r: string) => boolean): number => rules.findIndex(pred);
+  const dnsResolver = idx((r) => r.includes("127.0.0.11") && r.includes("REJECT"));
+  const loAccept = idx((r) => /-o lo -j ACCEPT$/.test(r));
+  const allowAccept = idx(
+    (r) => r.includes(`--dport ${String(allowedPort)}`) && r.includes("ACCEPT"),
+  );
+  const finalReject = rules.length - 1;
+  expect(dnsResolver, "resolver-address reject present").toBeGreaterThanOrEqual(0);
+  expect(loAccept, "loopback accept present").toBeGreaterThan(dnsResolver);
+  expect(allowAccept, "allowlist accept present").toBeGreaterThan(loAccept);
+  expect(rules[finalReject], "catch-all REJECT is the last OUTPUT rule").toContain("-j REJECT");
+  expect(allowAccept, "allow precedes the catch-all reject").toBeLessThan(finalReject);
+}
+
+async function startEndpoint(name: string, body: string, secondPort?: number): Promise<void> {
+  // Optionally serve a second port (busybox httpd daemonizes without -f); the
+  // foreground instance on ENDPOINT_PORT keeps the container alive.
+  const second = secondPort ? `httpd -p ${secondPort} -h /www && ` : "";
   await dockerOrThrow([
     "run",
     "-d",
@@ -87,7 +126,7 @@ async function startEndpoint(name: string, body: string): Promise<void> {
     "/bin/sh",
     IMAGE,
     "-c",
-    `mkdir -p /www && echo ${body} > /www/index.html && exec httpd -f -p ${ENDPOINT_PORT} -h /www`,
+    `mkdir -p /www && echo ${body} > /www/index.html && ${second}exec httpd -f -p ${ENDPOINT_PORT} -h /www`,
   ]);
 }
 
@@ -117,9 +156,11 @@ async function profiledProbeRun(allowlist: { host: string; port: number }[]) {
       env: {
         CAMINO_PROBE_ALLOWED_HOST: ALLOWED,
         CAMINO_PROBE_ALLOWED_PORT: String(ENDPOINT_PORT),
+        CAMINO_PROBE_ALLOWED_IP: allowedIp,
         CAMINO_PROBE_DENIED_HOST: DENIED,
         CAMINO_PROBE_DENIED_IP: deniedIp,
         CAMINO_PROBE_DENIED_PORT: String(ENDPOINT_PORT),
+        CAMINO_PROBE_WRONG_PORT: String(WRONG_PORT),
       },
       readonlyMounts: [{ hostPath: path.join(HERE, "probes.sh"), containerPath: "/probes.sh" }],
     },
@@ -132,19 +173,24 @@ beforeAll(async () => {
   await requireDockerDaemon();
   await dockerOrThrow(["build", "-t", IMAGE, path.join(HERE, "profile")]);
   await dockerOrThrow(["network", "create", NET]);
-  await startEndpoint(ALLOWED, ALLOWED_BODY);
+  await startEndpoint(ALLOWED, ALLOWED_BODY, WRONG_PORT);
   await startEndpoint(DENIED, DENIED_BODY);
-  deniedIp = (
-    await dockerOrThrow([
-      "inspect",
-      "-f",
-      "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-      DENIED,
-    ])
-  ).stdout.trim();
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(deniedIp)) {
-    throw new Error(`could not determine denied endpoint IPv4 (got '${deniedIp}')`);
-  }
+  const ipOf = async (name: string): Promise<string> => {
+    const ip = (
+      await dockerOrThrow([
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        name,
+      ])
+    ).stdout.trim();
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+      throw new Error(`could not determine ${name} endpoint IPv4 (got '${ip}')`);
+    }
+    return ip;
+  };
+  allowedIp = await ipOf(ALLOWED);
+  deniedIp = await ipOf(DENIED);
   // Readiness: wait until both endpoints serve.
   for (let attempt = 0; ; attempt++) {
     const [a, d] = await Promise.all([unrestrictedGet(ALLOWED), unrestrictedGet(DENIED)]);
@@ -181,16 +227,28 @@ describe("CAM-VAL-03 egress half — selective allow from inside the environment
       const r = await profiledProbeRun([{ host: ALLOWED, port: ENDPOINT_PORT }]);
       expect(r.code, `workload run failed: ${r.stderr}`).toBe(0);
 
-      // Setup evidence: the rules the workload ran under, incl. the deny backstop.
+      // Setup evidence: the rules the workload ran under, incl. the deny
+      // backstop and the exact deny-before-allow ordering.
       expect(r.stderr).toContain("egress-profile: rules installed");
       expect(r.stderr).toContain("-P OUTPUT DROP");
+      // INPUT default-deny: closes the established-egress bypass (an inbound
+      // connection from a non-allowlisted peer can never reach ESTABLISHED, so
+      // the OUTPUT established-accept only matches connections we initiated).
+      expect(r.stderr).toContain("-P INPUT DROP");
       expect(r.stderr).toContain(`--dport ${ENDPOINT_PORT} -j ACCEPT`);
+      assertRuleOrder(r.stderr, ENDPOINT_PORT);
 
       const probes = parseProbes(r.stdout);
       // The workload is unprivileged…
       expect(probeOf(probes, "uid").out).toBe("1000");
       // …and cannot alter the rules it runs under.
       expect(probeOf(probes, "rules-locked").exit).not.toBe(0);
+
+      // INSTRUMENTATION HEALTH: the nc positive control to the allowed endpoint
+      // (by IP) must SUCCEED. If nc were missing/broken, every denial probe
+      // would exit nonzero for the wrong reason and masquerade as denial — this
+      // assertion is what makes the nc-based denial probes below trustworthy.
+      expect(probeOf(probes, "allowed-endpoint-tcp").exit).toBe(0);
 
       // SELECTIVE ALLOW: full HTTP round trip, by name, to the allowlisted
       // endpoint. A total-network-denial implementation fails RIGHT HERE.
@@ -203,6 +261,11 @@ describe("CAM-VAL-03 egress half — selective allow from inside the environment
       // alive by the control — is rejected at the packet level (probed by IP,
       // independent of name resolution).
       expect(probeOf(probes, "non-allowlisted-sibling-tcp").exit).not.toBe(0);
+
+      // PORT SPECIFICITY: a non-allowlisted port ON the allowed host — where
+      // something IS listening (8081) — is blocked, so the accept is host+port,
+      // not host-wide.
+      expect(probeOf(probes, "allowed-host-wrong-port-tcp").exit).not.toBe(0);
 
       // Non-allowlisted names neither resolve nor is the resolver channel
       // open (the embedded resolver forwards upstream — it must be closed).
@@ -222,7 +285,10 @@ describe("CAM-VAL-03 egress half — selective allow from inside the environment
       expect(r.code, `workload run failed: ${r.stderr}`).toBe(0);
       const probes = parseProbes(r.stdout);
       expect(probeOf(probes, "uid").out).toBe("1000");
+      // By NAME (HTTP) and by IP (TCP): the by-IP leg proves the packet path is
+      // closed, so a DNS failure alone cannot satisfy the baseline.
       expect(probeOf(probes, "allowed-endpoint-http").exit).not.toBe(0);
+      expect(probeOf(probes, "allowed-endpoint-tcp").exit).not.toBe(0);
       expect(probeOf(probes, "non-allowlisted-sibling-tcp").exit).not.toBe(0);
       expect(probeOf(probes, "non-allowlisted-external-tcp").exit).not.toBe(0);
     },

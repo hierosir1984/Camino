@@ -6,11 +6,19 @@
 # + truncated output). The vitest harness decides pass/fail — the workload
 # only produces evidence, it never decides (WP-004 convention).
 #
+# Instrumentation health: the harness asserts the POSITIVE nc control
+# (`allowed-endpoint-tcp`) SUCCEEDS, so a missing/broken `nc` — which would
+# make every denial probe exit nonzero for the wrong reason — is caught instead
+# of being mistaken for egress denial.
+#
 # Expected env (set by the harness):
 #   CAMINO_PROBE_ALLOWED_HOST / CAMINO_PROBE_ALLOWED_PORT — allowlisted endpoint
+#   CAMINO_PROBE_ALLOWED_IP   — same endpoint by IP (nc positive control)
 #   CAMINO_PROBE_DENIED_HOST  — non-allowlisted sibling endpoint (name)
 #   CAMINO_PROBE_DENIED_IP / CAMINO_PROBE_DENIED_PORT — same endpoint by IP,
 #     so the packet-level denial is probed independently of name resolution.
+#   CAMINO_PROBE_WRONG_PORT   — a non-allowlisted port ON the allowed host IP,
+#     proving the allow rule is port-specific, not host-wide.
 set -u
 
 run_probe() {
@@ -30,10 +38,18 @@ run_probe uid id -u
 run_probe allowed-endpoint-http \
   wget -T 5 -q -O - "http://$CAMINO_PROBE_ALLOWED_HOST:$CAMINO_PROBE_ALLOWED_PORT/"
 run_probe allowed-name-resolution getent hosts "$CAMINO_PROBE_ALLOWED_HOST"
+# Positive nc control (by IP): proves the tool used for the DENY probes actually
+# works here. If this fails, the harness fails the run — a broken nc must never
+# masquerade as egress denial.
+run_probe allowed-endpoint-tcp nc -w 5 "$CAMINO_PROBE_ALLOWED_IP" "$CAMINO_PROBE_ALLOWED_PORT"
 
-# Selective DENY leg: the sibling endpoint on the SAME network, probed by IP
+# SELECTIVE DENY: the sibling endpoint on the SAME network, probed by IP
 # (the unrestricted control proves it is alive and serving).
 run_probe non-allowlisted-sibling-tcp nc -w 3 "$CAMINO_PROBE_DENIED_IP" "$CAMINO_PROBE_DENIED_PORT"
+
+# Port specificity: a NON-allowlisted port on the ALLOWED host IP must fail —
+# the allow rule is host+port, not host-wide.
+run_probe allowed-host-wrong-port-tcp nc -w 3 "$CAMINO_PROBE_ALLOWED_IP" "$CAMINO_PROBE_WRONG_PORT"
 
 # Non-allowlisted names neither resolve (DNS closed, no pin) …
 run_probe non-allowlisted-name-resolution getent hosts "$CAMINO_PROBE_DENIED_HOST"

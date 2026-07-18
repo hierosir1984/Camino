@@ -70,11 +70,75 @@ describe("renderEgressRunArgs", () => {
     ).toThrow(/network/);
   });
 
+  it("rejects shared/reserved networks whose namespace the root bootstrap would rewrite", () => {
+    for (const network of [
+      "host",
+      "none",
+      "bridge",
+      "default",
+      "host-gateway",
+      "container:abc123",
+    ]) {
+      expect(
+        () => renderEgressRunArgs({ image: "i", network, allowlist: [] }, ["/bin/sh"]),
+        network,
+      ).toThrow(/network|rejected/);
+    }
+  });
+
   it("rejects malformed env keys", () => {
     expect(() =>
       renderEgressRunArgs({ image: "i", network: "n", allowlist: [], env: { "BAD KEY": "v" } }, [
         "/bin/sh",
       ]),
     ).toThrow(/env key/);
+  });
+
+  it("reserves CAMINO_EGRESS_* env keys so a caller entry cannot shadow the composed allowlist", () => {
+    expect(() =>
+      renderEgressRunArgs(
+        { image: "i", network: "n", allowlist: [], env: { CAMINO_EGRESS_ALLOWLIST: "evil:1" } },
+        ["/bin/sh"],
+      ),
+    ).toThrow(/reserved/);
+  });
+
+  it("rejects mounts that would cover a bootstrap path (entrypoint/tools)", () => {
+    for (const containerPath of [
+      "/usr/local/bin/egress-profile-entrypoint",
+      "/sbin",
+      "/sbin/iptables",
+      "/usr/bin",
+      "/",
+      "/etc/hosts",
+      "relative/path",
+    ]) {
+      expect(
+        () =>
+          renderEgressRunArgs(
+            {
+              image: "i",
+              network: "n",
+              allowlist: [],
+              readonlyMounts: [{ hostPath: "/h/x", containerPath }],
+            },
+            ["/bin/sh"],
+          ),
+        containerPath,
+      ).toThrow(/mount target/);
+    }
+  });
+
+  it("accepts a workload mount at a non-bootstrap path", () => {
+    const args = renderEgressRunArgs(
+      {
+        image: "i",
+        network: "n",
+        allowlist: [],
+        readonlyMounts: [{ hostPath: "/h/probes.sh", containerPath: "/probes.sh" }],
+      },
+      ["/bin/sh"],
+    );
+    expect(args).toContain("/h/probes.sh:/probes.sh:ro");
   });
 });

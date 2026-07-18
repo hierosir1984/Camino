@@ -237,12 +237,71 @@ describe("encoding variants", () => {
     expect(a.occurrences.some((o) => o.secretId === "alpha-sub")).toBe(false);
   });
 
-  it("variantsFor: url variant only when it differs; base64 cores above the floor", () => {
+  it("base64url (JWT-segment alphabet) is redacted, not only standard base64", async () => {
+    // A value whose base64 uses + and / — so its url-safe form uses - and _.
+    const JWTISH = "SYNTHETIC-wp005-jwt->>>???-payload";
+    const { src, retained } = await freshDirs("b64url");
+    const std = b64(JWTISH);
+    const url = Buffer.from(JWTISH).toString("base64url");
+    expect(url).not.toBe(std); // the alphabets differ for this value
+    await write(src, "token.log", `authz: Bearer x.${url}.sig\nstd: ${std}\n`);
+    const report = await scrubRetained({
+      sourceDir: src,
+      retainedDir: retained,
+      secrets: [{ id: "jwt", value: JWTISH }],
+    });
+    const out = await fs.readFile(path.join(retained, "token.log"), "utf8");
+    expect(out).not.toContain(url);
+    expect(out).not.toContain(std);
+    const a = artifactOf(report, "token.log");
+    expect(a.occurrences.some((o) => o.encoding === "base64url")).toBe(true);
+  });
+
+  it("form-encoding dialects (space-as-+, lowercase hex) are redacted", async () => {
+    const { src, retained } = await freshDirs("formenc");
+    const canonical = encodeURIComponent(CHARLIE); // %20, uppercase hex
+    const form = canonical.replace(/%20/gu, "+").replace(/%[0-9A-F]{2}/gu, (m) => m.toLowerCase());
+    expect(form).not.toBe(canonical);
+    await write(src, "form.log", `body: field=${form}\n`);
+    const report = await scrubRetained({
+      sourceDir: src,
+      retainedDir: retained,
+      secrets: [{ id: "charlie", value: CHARLIE }],
+    });
+    const out = await fs.readFile(path.join(retained, "form.log"), "utf8");
+    expect(out).not.toContain(form);
+    expect(
+      artifactOf(report, "form.log").occurrences.some((o) => o.encoding === "urlencoded"),
+    ).toBe(true);
+  });
+
+  it("variantsFor: url variant only when it differs; base64 + base64url cores above the floor", () => {
     const plain = variantsFor({ id: "p", value: "SYNTHETIC-plain-value" });
     expect(plain.some((v) => v.encoding === "urlencoded")).toBe(false);
     expect(plain.some((v) => v.encoding === "base64")).toBe(true);
     const special = variantsFor({ id: "s", value: CHARLIE });
     expect(special.some((v) => v.encoding === "urlencoded")).toBe(true);
+  });
+});
+
+describe("report never encodes a secret (finding 3)", () => {
+  it("refuses a secret id that equals another secret's base64 (marker would leak it)", async () => {
+    const { src, retained } = await freshDirs("markerleak");
+    await write(src, "a.log", "x\n");
+    const victim = "abcdefghij";
+    const b64victim = b64(victim); // e.g. YWJjZGVmZ2hpag==→ core all-alnum
+    await expect(
+      scrubRetained({
+        sourceDir: src,
+        retainedDir: retained,
+        // The second id equals the victim's base64 core, so a marker
+        // `SCRUBBED-<id>` would reproduce that base64 — must be refused.
+        secrets: [
+          { id: "victim", value: victim },
+          { id: b64victim.replace(/=+$/u, ""), value: "QRSTUVWXYZ" },
+        ],
+      }),
+    ).rejects.toThrow(/marker|reproduce/);
   });
 });
 
@@ -317,5 +376,68 @@ describe("fail-closed guards", () => {
     await expect(
       scrubRetained({ sourceDir: src, retainedDir: retained, secrets: [] }),
     ).rejects.toThrow(/at least one/);
+  });
+
+  it("maxFileBytes that is NaN/Infinity/≤0 is refused (a silent uncapped read is fail-open)", async () => {
+    const { src, retained } = await freshDirs("badcap");
+    await write(src, "a.log", "x\n");
+    for (const maxFileBytes of [Number.NaN, Infinity, 0, -1, 1.5]) {
+      await expect(
+        scrubRetained({ sourceDir: src, retainedDir: retained, secrets: SECRETS, maxFileBytes }),
+        String(maxFileBytes),
+      ).rejects.toThrow(/maxFileBytes/);
+    }
+  });
+
+  it("two source names redacting to the same retained name are disambiguated, not dropped or collided", async () => {
+    const { src, retained } = await freshDirs("namecollision");
+    // A literal file named exactly like the other's redacted form.
+    await write(src, "SCRUBBED-alpha", "literal name\n");
+    await write(src, ALPHA, "secret-named file\n");
+    const report = await scrubRetained({ sourceDir: src, retainedDir: retained, secrets: SECRETS });
+    const names = (await walkFiles(retained)).sort();
+    expect(names).toContain("SCRUBBED-alpha");
+    expect(names.some((n) => n.startsWith("SCRUBBED-alpha~"))).toBe(true);
+    expect(report.artifacts).toHaveLength(2);
+    // Neither retained name carries the secret.
+    for (const n of names) expect(n).not.toContain(ALPHA);
+  });
+
+  it("scrubbing an artifact with very many occurrences terminates promptly (no quadratic blowup)", async () => {
+    const { src, retained } = await freshDirs("manyhits");
+    // ~200k occurrences of an 8-byte secret in one file: the old
+    // per-occurrence whole-buffer concat would be ~200k full copies.
+    const secret = "SECRET-8x";
+    const body = `${secret} `.repeat(200_000);
+    await write(src, "spam.log", body);
+    const started = process.hrtime.bigint();
+    const report = await scrubRetained({
+      sourceDir: src,
+      retainedDir: retained,
+      secrets: [{ id: "s", value: secret }],
+    });
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    const out = await fs.readFile(path.join(retained, "spam.log"), "utf8");
+    expect(out).not.toContain(secret);
+    expect(artifactOf(report, "spam.log").occurrences).toContainEqual({
+      secretId: "s",
+      encoding: "raw",
+      count: 200_000,
+    });
+    expect(elapsedMs, `took ${elapsedMs.toFixed(0)}ms`).toBeLessThan(10_000);
+  });
+
+  it("post-verification walks the whole retained tree, not just expected paths", async () => {
+    // A benign clean file plus a secret-bearing one; the walk covers both and
+    // the report's verifiedClean reflects the actual on-disk bytes.
+    const { src, retained } = await freshDirs("treewalk");
+    await write(src, "nested/deep/clean.txt", "nothing here\n");
+    await write(src, "nested/secret.txt", `has ${ALPHA}\n`);
+    const report = await scrubRetained({ sourceDir: src, retainedDir: retained, secrets: SECRETS });
+    expect(report.verifiedClean).toBe(true);
+    for (const rel of await walkFiles(retained)) {
+      const bytes = await fs.readFile(path.join(retained, rel), "utf8");
+      expect(bytes).not.toContain(ALPHA);
+    }
   });
 });

@@ -36,6 +36,55 @@ export interface EgressProfileRun {
 // shell metacharacters — is rejected outright.
 const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// A user-defined network NAME only (Docker network names are
+// [A-Za-z0-9][A-Za-z0-9_.-]*). This deliberately excludes the reserved
+// networks whose namespace is NOT the container's own: `host` and
+// `container:<id>` share another namespace, so the root bootstrap's
+// `iptables -F/-P DROP` would rewrite the HOST (or a sibling's) firewall;
+// `none`/`bridge`/`host-gateway` are likewise not owned isolated bridges.
+const NETWORK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const RESERVED_NETWORKS = new Set(["host", "none", "bridge", "default", "host-gateway"]);
+// The root entrypoint and its tools live here; a caller-supplied mount must not
+// cover them, and CAMINO_EGRESS_* is composed, never caller-supplied.
+const RESERVED_ENV_PREFIX = "CAMINO_EGRESS_";
+const PROTECTED_MOUNT_TARGETS = [
+  "/",
+  "/usr/local/bin",
+  "/sbin",
+  "/usr/sbin",
+  "/bin",
+  "/usr/bin",
+  "/etc",
+  "/lib",
+];
+
+function assertSafeNetwork(network: string): void {
+  if (!network) throw new Error("egress profile requires a user-defined network");
+  if (network.includes(":") || !NETWORK_NAME_RE.test(network) || RESERVED_NETWORKS.has(network)) {
+    throw new Error(
+      `egress profile network ${JSON.stringify(network)} rejected — requires an owned, isolated ` +
+        "user-defined bridge (not host/none/bridge/container:<id>, which share another namespace " +
+        "the root bootstrap would rewrite; fail-closed)",
+    );
+  }
+}
+
+function assertSafeMountTarget(containerPath: string): void {
+  if (!containerPath.startsWith("/") || containerPath.includes(":")) {
+    throw new Error(
+      `egress profile mount target ${JSON.stringify(containerPath)} rejected (want an absolute path)`,
+    );
+  }
+  const norm = containerPath.replace(/\/+$/u, "") || "/";
+  const covers = (p: string): boolean =>
+    p === "/" ? norm === "/" : norm === p || norm.startsWith(`${p}/`);
+  if (PROTECTED_MOUNT_TARGETS.some(covers)) {
+    throw new Error(
+      `egress profile mount target ${JSON.stringify(containerPath)} would cover a bootstrap path ` +
+        "(entrypoint/tools) — rejected (fail-closed)",
+    );
+  }
+}
 
 /** Render the CAMINO_EGRESS_ALLOWLIST value; fail-closed on malformed entries. */
 export function renderAllowlistEnv(allowlist: EgressAllowlistEntry[]): string {
@@ -55,18 +104,37 @@ export function renderAllowlistEnv(allowlist: EgressAllowlistEntry[]): string {
     .join(" ");
 }
 
-/** Full `docker run` argument vector (execFile-style, never a shell string). */
+/**
+ * Full `docker run` argument vector (execFile-style, never a shell string).
+ *
+ * The container parameters (network, mounts, env keys) are Camino-composed, not
+ * worker-supplied — the untrusted workload is the *code* that runs unprivileged
+ * AFTER the rules install. Even so, this composer refuses to build a run whose
+ * parameters could subvert the root bootstrap: an unsafe/shared network, a
+ * mount over a bootstrap path, or a caller env key that shadows the composed
+ * allowlist. (Full privilege separation — a setup sidecar or cap-drop init so
+ * the bootstrap shares nothing with the workload's env/mounts at all — is the
+ * WP-107 productization; here we fail closed on the reachable cases.)
+ */
 export function renderEgressRunArgs(run: EgressProfileRun, cmd: string[]): string[] {
-  if (!run.network) throw new Error("egress profile requires a user-defined network");
+  assertSafeNetwork(run.network);
   const args = ["run", "--rm", "--cap-add", "NET_ADMIN", "--network", run.network];
   if (run.name) args.push("--name", run.name);
+  // Composed FIRST and its key reserved below, so no caller entry can override
+  // it (Docker honours the last -e for a key).
   args.push("-e", `CAMINO_EGRESS_ALLOWLIST=${renderAllowlistEnv(run.allowlist)}`);
   for (const [k, v] of Object.entries(run.env ?? {})) {
     if (!ENV_KEY_RE.test(k))
       throw new Error(`egress profile env key ${JSON.stringify(k)} rejected`);
+    if (k.startsWith(RESERVED_ENV_PREFIX)) {
+      throw new Error(
+        `egress profile env key ${JSON.stringify(k)} is reserved (composed, not caller-set)`,
+      );
+    }
     args.push("-e", `${k}=${v}`);
   }
   for (const m of run.readonlyMounts ?? []) {
+    assertSafeMountTarget(m.containerPath);
     args.push("-v", `${m.hostPath}:${m.containerPath}:ro`);
   }
   args.push(run.image, ...cmd);
