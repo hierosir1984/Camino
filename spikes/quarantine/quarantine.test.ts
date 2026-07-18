@@ -165,6 +165,22 @@ const REJECTION_CASES: Case[] = [
     fixture: attacks.nulSymlinkTarget,
     expect: "symlink-escape",
   },
+  // review r3 folds:
+  {
+    name: "r3#1 — HFS-ignorable .git equivalent (git fsck gate)",
+    fixture: attacks.hfsDotGit,
+    expect: "fsck-violation",
+  },
+  {
+    name: "r3#7 — oversized symlink target (rejected on size, no crash)",
+    fixture: attacks.oversizeSymlink,
+    expect: "symlink-escape",
+  },
+  {
+    name: "r3#8 — ancestor-component collision (A ⇄ a/)",
+    fixture: attacks.ancestorComponentCollision,
+    expect: "path-collision-case",
+  },
 ];
 
 describe("attacks 2–12 — each is rejected with the expected reason and produces no candidate", () => {
@@ -348,7 +364,7 @@ jobs:
 `;
     const f = analyzeWorkflow(".github/workflows/ns.yml", wf, CANDIDATE_REFS);
     expect(f).not.toBeNull();
-    expect(f!.fires.join(" ")).toMatch(/Camino-managed namespace/);
+    expect(f!.fires.length).toBeGreaterThan(0); // an unseen sub-namespace still fires
   });
 
   it("r2#5 — secrets: inherit into a reusable workflow is flagged", () => {
@@ -365,6 +381,61 @@ jobs:
     const f = analyzeWorkflow(".github/workflows/reuse.yml", wf, CANDIDATE_REFS);
     expect(f).not.toBeNull();
     expect(f!.privileged.join(" ")).toMatch(/secrets: inherit/);
+  });
+
+  it("r3#2 — privileged workflow_run on a candidate namespace is flagged", () => {
+    const wf = `name: wr
+on:
+  workflow_run:
+    workflows: [ci]
+    branches: ['camino/**']
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    const f = analyzeWorkflow(".github/workflows/wr.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.fires.join(" ")).toMatch(/workflow_run/);
+  });
+
+  it("r3#3 — scalar `on: pull_request` with secrets is flagged", () => {
+    const wf = `name: pr2
+on: pull_request
+permissions: read-all
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{ run: use, env: { K: "\${{ secrets.DEPLOY_KEY }}" } }]
+`;
+    const f = analyzeWorkflow(".github/workflows/pr2.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.fires.join(" ")).toMatch(/pull_request/);
+  });
+
+  it("r3#5 — whole-object toJSON(secrets) is flagged", () => {
+    const wf = `name: dump
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{ run: use, env: { ALL: "\${{ toJSON(secrets) }}" } }]
+`;
+    const f = analyzeWorkflow(".github/workflows/dump.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.privileged.join(" ")).toMatch(/whole `secrets` object/);
+  });
+
+  it("r3#11 — a fully-excluded candidate namespace is NOT flagged", () => {
+    const wf = `name: exc
+on:
+  push:
+    branches: ['camino/**', '!camino/**', main]
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    // camino/** re-excluded by !camino/**, only main remains ⇒ no candidate fires.
+    expect(analyzeWorkflow(".github/workflows/exc.yml", wf, CANDIDATE_REFS)).toBeNull();
   });
 });
 

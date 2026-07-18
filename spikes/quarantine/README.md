@@ -65,10 +65,41 @@ npm test                     # full gate; the attack suite runs here on every PR
 There are no generated evidence artifacts to commit — the executable suite **is** the deliverable,
 and it persists as Camino's own CI.
 
+## Adversarial review — 3 rounds, and what they taught (Codex Sol, cross-family)
+
+The 13 enumerated attacks passed from round 0. Three falsification rounds then hardened the intake
+well beyond the enumerated list: **8 findings (r1) → 12 (r2) → 11 (r3), all folded, each now a
+regression case.** The count did not fall to zero, and the reason is the load-bearing lesson, not
+a reason to keep going:
+
+- **Two findings each round were things git's own `fsck` already catches** (literal/HFS `.git`
+  equivalents, mode/type mismatches). The fix was not more hand-rolled regexes but to **delegate
+  the malformed-object/path class to `git fsck`** (`intake.ts`), which is far more complete than
+  anything hand-rolled. Our own checks now cover only the cross-platform aliases git _permits_
+  (`GIT~1`, case-spelled protected paths, trailing-dot names).
+- **The rest cluster in two inherently-unbounded surfaces**: full Unicode case-folding (an ICU
+  table — we do NFKC + a few residual folds) and complete GitHub-Actions trigger/secret semantics
+  (many event types and expression forms). A hand-rolled analyzer will always trail these; a
+  finder will always find the next gap. That is the signal to **stop folding and name the
+  boundary**, exactly as the PRD design phase did when its prose rounds hovered.
+
+### Known limitations (accepted for the spike; product-grade in WP-108 / CAM-SEC-03 onboarding)
+
+- **Unicode folding** is NFKC + `ß`/`ς` residuals, not a full ICU case-fold — exotic
+  cross-script confusables may not collapse. (Over-rejects where it does fire; a miss is a missed
+  collision, not an accept of something worse.)
+- **Workflow posture** analysis is heuristic: privileged-by-nature events (`push`,
+  `pull_request(_target)`, `workflow_run`), ordered branch filters over a probe set (not symbolic
+  glob∩namespace intersection), and secret/permission detection (named, bracket, whole-object,
+  `secrets: inherit`, per-job). A truly complete analyzer is the CAM-SEC-03 onboarding check.
+- **Non-UTF-8 paths** are rejected wholesale (a genuinely U+FFFD-named file is a false reject —
+  the safe direction).
+
 ## What promotes to Phase 1 (WP-108)
 
 The policy checks (`policy.ts`), the shallow-fetch-into-pristine intake (`intake.ts`), and the
 workflow posture analyzer (`workflow.ts`) are prototype-grade. WP-108 rebuilds the intake at
 product grade against the issue's frozen contract (WP-110) within registry-item-11 budgets and
 emits the quarantined diff for classification (WP-111) and evidence (WP-116). **This exact attack
-corpus is the acceptance gate for that module.**
+corpus is the acceptance gate for that module** — plus the r1–r3 lessons above: keep the `git
+fsck` delegation, and build the full ICU fold + symbolic workflow analysis it defers.

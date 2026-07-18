@@ -10,7 +10,16 @@
 //
 // This is a PROTOTYPE. WP-108 is the product module; this suite's attack corpus
 // is meant to run against it unchanged.
-import { buildTree, cleanupRepos, commitTree, git, gitBuf, initRepo, objectExists } from "./git.js";
+import {
+  buildTree,
+  cleanupRepos,
+  commitTree,
+  fsckTree,
+  git,
+  gitBuf,
+  initRepo,
+  objectExists,
+} from "./git.js";
 import {
   checkBudgets,
   checkDotGitPaths,
@@ -19,6 +28,7 @@ import {
   checkScopeAndProtected,
   checkSubmodules,
   checkSymlinks,
+  SYMLINK_TARGET_MAX_BYTES,
 } from "./policy.js";
 import {
   DEFAULT_BUDGETS,
@@ -79,10 +89,13 @@ function changedPaths(dir: string, base: string, head: string): string[] {
 function symlinkTargets(dir: string, entries: readonly TreeEntry[]): Map<string, string> {
   const targets = new Map<string, string>();
   for (const e of entries) {
+    // Never read an oversized "symlink" blob — checkSymlinks rejects it on size
+    // alone, and reading it would blow the subprocess buffer (review r3 #7).
+    if (e.mode !== "120000") continue;
+    if (e.size != null && e.size > SYMLINK_TARGET_MAX_BYTES) continue;
     // latin1: preserve the exact target bytes (incl. any NUL / control) so the
     // escape check sees what the OS would (review r2 #11).
-    if (e.mode === "120000")
-      targets.set(e.path, gitBuf(dir, "cat-file", "blob", e.sha).toString("latin1"));
+    targets.set(e.path, gitBuf(dir, "cat-file", "blob", e.sha).toString("latin1"));
   }
   return targets;
 }
@@ -145,6 +158,17 @@ export function runIntake(
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, contract.base, workerHead);
   const changedSet = new Set(changed);
+
+  // Delegate the malformed-object/path class to git's own hardened fsck first
+  // (review r3 #1/#6); our hand-rolled checks then add the cross-platform
+  // aliases git PERMITS (GIT~1, case-spelled protected paths, etc.).
+  const fsckErr = fsckTree(pristineDir, treeSha);
+  if (fsckErr) {
+    rejections.push({
+      code: "fsck-violation",
+      detail: `git fsck rejected the worker tree: ${fsckErr}`,
+    });
+  }
 
   rejections.push(
     ...checkScopeAndProtected(changed, contract.allowedPaths),

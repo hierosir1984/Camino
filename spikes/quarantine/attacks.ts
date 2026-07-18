@@ -380,6 +380,39 @@ export function unchangedGitlinkAllowed(): WorkerFixture {
   return { repo, head, contract: contract(base, ["src/**", "README.md", "vendor/**"]) };
 }
 
+// --- review r3 folds ---
+
+/** `.git<U+200C>/config` — HFS-ignorable char makes it `.git` on HFS+; git fsck catches it. */
+export function hfsDotGit(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const cfg = hashBlob(repo, "[core]\n\thooksPath = .\n");
+  const head = headWith(repo, base, entries, [{ mode: "100644", sha: cfg, path: ".git‌/config" }]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
+/** A "symlink" whose target blob is far larger than PATH_MAX — reject on size. */
+export function oversizeSymlink(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const target = hashBlob(repo, "x".repeat(64 * 1024)); // 64 KiB > 4 KiB PATH_MAX
+  const head = headWith(repo, base, entries, [{ mode: "120000", sha: target, path: "src/fat" }]);
+  return { repo, head, contract: contract(base) };
+}
+
+/** Root file `A` collides with directory component `a/` on a case-insensitive FS. */
+export function ancestorComponentCollision(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const a = hashBlob(repo, "file A\n");
+  const b = hashBlob(repo, "under a\n");
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: a, path: "A" },
+    { mode: "100644", sha: b, path: "a/file" },
+  ]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
 // --- 12. size bomb ---
 
 export function sizeBomb(): WorkerFixture {

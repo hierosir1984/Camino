@@ -61,6 +61,7 @@ export type RejectionCode =
   | "symlink-escape"
   | "dotgit-path"
   | "windows-alias"
+  | "fsck-violation"
   | "blob-size-budget"
   | "tree-size-budget"
   | "entry-budget";

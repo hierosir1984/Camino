@@ -13,7 +13,10 @@ import type { Budgets, Rejection, TreeEntry } from "./types.js";
  * false collision is safe while a missed one is not (review r1 #8 / r2 #6).
  */
 function foldExpand(s: string): string {
-  return s.replace(/ß/g, "ss");
+  // ß→ss (no NFKC decomposition) and Greek final sigma ς→σ (equal under full
+  // case-folding but not NFKC — review r3 #9). Still not a complete Unicode fold;
+  // WP-108 uses ICU.
+  return s.replace(/ß/g, "ss").replace(/ς/g, "σ");
 }
 
 /**
@@ -40,16 +43,25 @@ function fullyCanonical(path: string): string {
  * whether the paths differ only by case or by Unicode composition.
  */
 export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] {
-  const byCanonical = new Map<string, string[]>();
+  // Key EVERY path prefix (ancestor directory components + the full path), not
+  // just leaves: a root symlink `A` and a directory `a/file` collide on a
+  // case-insensitive filesystem through the `A` ⇄ `a` component even though
+  // their full leaf paths differ (review r3 #8).
+  const byCanonical = new Map<string, Set<string>>();
   for (const e of entries) {
-    const key = fullyCanonical(e.path);
-    const list = byCanonical.get(key) ?? [];
-    if (!list.includes(e.path)) list.push(e.path);
-    byCanonical.set(key, list);
+    const segs = e.path.split("/");
+    for (let i = 1; i <= segs.length; i++) {
+      const prefix = segs.slice(0, i).join("/");
+      const key = fullyCanonical(prefix);
+      const set = byCanonical.get(key) ?? new Set<string>();
+      set.add(prefix);
+      byCanonical.set(key, set);
+    }
   }
   const out: Rejection[] = [];
-  for (const paths of byCanonical.values()) {
-    if (paths.length < 2) continue;
+  for (const set of byCanonical.values()) {
+    if (set.size < 2) continue;
+    const paths = [...set];
     // Case-only iff lowercasing ALONE (no normalization) already collapses them;
     // if NFC was needed to make them collide, the difference is Unicode
     // composition (e.g. composed "é" vs "e"+combining-accent).
@@ -219,6 +231,14 @@ export function symlinkTargetDanger(linkPath: string, target: string): "escape" 
   return null;
 }
 
+/**
+ * A real symlink target is a single path, bounded by PATH_MAX (~4 KiB). Anything
+ * larger is not a symlink the OS could materialize — and reading it would blow
+ * the subprocess buffer before any budget runs (review r3 #7), so the intake
+ * does not read oversized targets and we reject on size alone here.
+ */
+export const SYMLINK_TARGET_MAX_BYTES = 4096;
+
 /** `targets` maps each symlink entry path → its stored target string. */
 export function checkSymlinks(
   entries: readonly TreeEntry[],
@@ -227,6 +247,14 @@ export function checkSymlinks(
   const out: Rejection[] = [];
   for (const e of entries) {
     if (e.mode !== "120000") continue;
+    if (e.size != null && e.size > SYMLINK_TARGET_MAX_BYTES) {
+      out.push({
+        code: "symlink-escape",
+        path: e.path,
+        detail: `symlink "${e.path}" target is ${e.size} bytes (> ${SYMLINK_TARGET_MAX_BYTES}) — not a real symlink`,
+      });
+      continue;
+    }
     const target = targets.get(e.path) ?? "";
     const danger = symlinkTargetDanger(e.path, target);
     if (danger === "escape") {

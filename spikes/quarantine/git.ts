@@ -114,6 +114,32 @@ export function buildTree(dir: string, entries: CacheEntry[]): string {
   }
 }
 
+/**
+ * Run git's own hardened object/path checker over `treeSha`. Returns the first
+ * error line, or null if clean. This delegates the whole malformed-object class
+ * — `.git` path equivalents (incl. HFS-ignorable characters), mode/type
+ * mismatches, broken links — to git's fsck, which is far more complete than any
+ * hand-rolled path parser (review r3 #1/#6). We fsck the TREE (not the commit)
+ * to avoid the shallow-fetch parent boundary.
+ */
+export function fsckTree(dir: string, treeSha: string): string | null {
+  try {
+    execFileSync("git", ["-C", dir, "fsck", "--strict", "--no-dangling", treeSha], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return null;
+  } catch (e) {
+    const err = e as { stderr?: Buffer; stdout?: Buffer };
+    const lines = ((err.stderr?.toString() ?? "") + (err.stdout?.toString() ?? ""))
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    return (
+      lines.find((l) => /error|fatal|missing|broken|corrupt/i.test(l)) ?? lines[0] ?? "fsck failed"
+    );
+  }
+}
+
 /** Author a commit object over `tree` with the given parents; returns its sha. */
 export function commitTree(
   dir: string,

@@ -80,30 +80,31 @@ function toStringList(v: unknown): string[] {
 /** Which push-family triggers would fire on a candidate ref, and why. */
 function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
   const reasons: string[] = [];
-  // Shorthand `on: push` / `on: [push, …]` ⇒ every branch (incl. candidate refs).
+  // Events that run with the base repo's secrets/write token regardless of the
+  // ref they key on — presence alone is the "fires" reason (review r1 #2, r2 #3,
+  // r3 #2/#3): pull_request(_target) on same-repo candidate branches, and
+  // workflow_run (chained off another workflow, privileged).
+  const PRIVILEGED_EVENTS = ["pull_request_target", "pull_request", "workflow_run"];
+  // A richer probe set than the three concrete samples, so ordered evaluation
+  // catches exact sub-namespace patterns the samples miss (review r2 #4). Full
+  // symbolic glob∩namespace analysis is WP-108/CAM-SEC-03 onboarding.
+  const probes = [...candidateRefs, ...NAMESPACE_PROBES];
+
   const shorthand = typeof on === "string" ? [on] : Array.isArray(on) ? on : null;
   if (shorthand) {
     if (shorthand.includes("push")) {
       reasons.push(`on: push (all branches) fires on ${candidateRefs.join(", ")}`);
     }
-    if (shorthand.includes("pull_request_target")) {
-      reasons.push("on: pull_request_target runs in privileged base context on pull requests");
+    for (const ev of PRIVILEGED_EVENTS) {
+      if (shorthand.includes(ev)) reasons.push(`on: ${ev} runs with base-repo secrets`);
     }
     return reasons;
   }
   const onObj = asRecord(on);
   if (!onObj) return reasons;
 
-  // `pull_request_target` (and, for SAME-REPO candidate refs, ordinary
-  // `pull_request`) run with the base repo's secrets — the fork no-secret rule
-  // does not apply because candidate refs are same-repo branches (review r1 #2,
-  // r2 #3). Branch filters on these match the PR's BASE, not the candidate ref,
-  // so presence alone is the "fires" reason; it becomes a finding only if the
-  // workflow is also privileged.
-  for (const ev of ["pull_request_target", "pull_request"]) {
-    if (ev in onObj) {
-      reasons.push(`${ev} runs with base-repo secrets on same-repo pull requests`);
-    }
+  for (const ev of PRIVILEGED_EVENTS) {
+    if (ev in onObj) reasons.push(`${ev} runs with base-repo secrets / privileged context`);
   }
 
   // `push` DOES key on the pushed ref, so candidate-ref matching applies.
@@ -128,18 +129,14 @@ function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
             `push: (no branches filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`,
           );
         } else if (branches.length > 0) {
-          for (const h of firesOnBranches(branches, candidateRefs)) {
-            reasons.push(`push.branches ${JSON.stringify(branches)} matches ${h}`);
-          }
-          // Sample refs cannot represent a whole namespace, so also flag a
-          // positive pattern that TARGETS a candidate namespace prefix even if
-          // no sample ref matched it exactly (review r2 #4).
-          for (const b of branchesTargetingNamespace(branches)) {
-            reasons.push(`push.branches "${b}" targets a Camino-managed namespace`);
+          // Ordered last-match-wins over the probe set — respects `!` re-exclusion
+          // (review r3 #11) and covers sub-namespaces the samples miss (r2 #4).
+          for (const h of firesOnBranches(branches, probes)) {
+            reasons.push(`push.branches ${JSON.stringify(branches)} fires on ${h}`);
           }
         } else if (ignore.length > 0) {
-          const ignored = new Set(firesOnBranches(ignore, candidateRefs));
-          for (const ref of candidateRefs) {
+          const ignored = new Set(firesOnBranches(ignore, probes));
+          for (const ref of probes) {
             if (!ignored.has(ref)) {
               reasons.push(`push.branches-ignore ${JSON.stringify(ignore)} still fires on ${ref}`);
             }
@@ -151,25 +148,13 @@ function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
   return reasons;
 }
 
-/** Camino-managed ref namespaces a candidate can live under (design §5.5). */
-const CANDIDATE_NAMESPACE_PREFIXES = ["camino/", "mission/"];
-
-/**
- * Positive branch patterns whose literal prefix lands inside (or a wildcard can
- * reach into) a Camino-managed namespace — a whole-namespace generalization of
- * the concrete-sample match, so an exact sub-namespace pattern the samples miss
- * is still flagged (review r2 #4).
- */
-function branchesTargetingNamespace(patterns: string[]): string[] {
-  return patterns.filter((p) => {
-    if (p.startsWith("!")) return false;
-    if (/^[*?[]/.test(p)) return true; // leading wildcard can reach anywhere
-    const literal = p.split(/[*?[]/)[0] ?? p;
-    return CANDIDATE_NAMESPACE_PREFIXES.some(
-      (np) => literal.startsWith(np) || np.startsWith(literal),
-    );
-  });
-}
+/** Extra probe refs spanning candidate-namespace shapes (review r2 #4 / r3 #4). */
+const NAMESPACE_PROBES = [
+  "camino/candidate/issue-99/1",
+  "camino/candidate/issue-99/deep/nested/x",
+  "camino/tmp/validate/zzz",
+  "mission/99",
+];
 
 /** Write scopes declared by a `permissions:` value (top-level or per-job). */
 function writeScopes(perms: unknown): string[] {
@@ -194,6 +179,11 @@ function analyzePrivilege(doc: Record<string, unknown>, rawText: string): string
     if (name && name !== "GITHUB_TOKEN") secretRefs.add(name);
   }
   if (secretRefs.size > 0) reasons.push(`references secrets: ${[...secretRefs].join(", ")}`);
+  // The whole `secrets` object used as a value — `toJSON(secrets)` or a bare
+  // `${{ secrets }}` — exposes EVERY secret at once and names none (review r3 #5).
+  if (/\$\{\{[^}]*\bsecrets\b(?!\s*[.[])[^}]*\}\}/.test(rawText)) {
+    reasons.push("references the whole `secrets` object (e.g. toJSON(secrets)) — all secrets");
+  }
 
   // Token permissions: explicit all-read is safe; write (or absent) is not —
   // checked at the top level AND per-job (`jobs.<id>.permissions`, review r1 #3).
