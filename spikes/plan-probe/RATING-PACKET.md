@@ -16,9 +16,9 @@ Generated: 2026-07-17T11:27:08.030Z
 
 ## Review timer
 
-REVIEW-START: ____
-REVIEW-END: ____
-REVIEW-MINUTES: ____
+REVIEW-START: 09:19
+REVIEW-END: 09:34
+REVIEW-MINUTES: 15
 
 _Budget: 45 minutes per mission plan (CAM-OBS-02); this recording is the baseline data point._
 
@@ -95,8 +95,8 @@ also requires checklist usability confirmed and review time recorded.
 - Assumption if unanswered: The GUI reads packets through a daemon HTTP endpoint returning packet JSON; because no real packets exist yet (S5), v0 wires that endpoint to synthetic fixtures, and the components consume typed JSON without assuming direct filesystem/DB access.
 - Related: S2, S3, S5 → I2, I3, I4, I5
 
-RATING-Q1: ____
-ACK-Q1: ____
+RATING-Q1: Obviously-fine. 
+ACK-Q1: confirm
 
 ### Q2 — What does 'render inline or open locally' mean concretely for each artifact type — specifically, must traces render inline (e.g. embedded Playwright trace viewer) or is launching them locally acceptable for v0?
 
@@ -104,8 +104,8 @@ ACK-Q1: ____
 - Assumption if unanswered: Logs and screenshots render inline; traces are offered via an 'open locally' action (open the artifact file with the OS/existing viewer) rather than inline.
 - Related: S9, S10 → I3
 
-RATING-Q2: ____
-ACK-Q2: ____
+RATING-Q2: good
+ACK-Q2: confirm
 
 ### Q3 — How does the viewer access artifact bytes and treat the 'scrubbed' flag — are artifact files at a local `path` the viewer can read, and does 'scrubbed' only affect a displayed badge or gate what content is shown?
 
@@ -113,8 +113,8 @@ ACK-Q2: ____
 - Assumption if unanswered: Artifacts are addressable via their `path` (local filesystem or served by the daemon), the viewer previews the referenced content as-is, and `scrubbed` is surfaced as a badge without additional filtering by the viewer.
 - Related: S10, S11 → I3
 
-RATING-Q3: ____
-ACK-Q3: ____
+RATING-Q3: good
+ACK-Q3: confirm
 
 ### Q4 — Does the v0 viewer render the mission rollup (mission_id, requirement_map, gate_record, per_issue_delivered), or only per-attempt packets?
 
@@ -122,8 +122,8 @@ ACK-Q3: ____
 - Assumption if unanswered: v0 renders per-attempt packets only; rendering the mission rollup is deferred to a later mission (registry/rollup surface), and no rollup UI is built here.
 - Related: S13 → I2
 
-RATING-Q4: ____
-ACK-Q4: ____
+RATING-Q4: good
+ACK-Q4: confirm
 
 ### Q5 — Does this mission build the merge approval screen itself (the GUI is an empty scaffold), or only the embeddable viewer that a separately-owned approval screen will host?
 
@@ -131,8 +131,8 @@ ACK-Q4: ____
 - Assumption if unanswered: This mission builds a minimal merge approval screen sufficient to embed the viewer and demonstrate that approval is blocked without a packet; the full merge-approval workflow remains a separate mission.
 - Related: S10 → I4
 
-RATING-Q5: ____
-ACK-Q5: ____
+RATING-Q5: good
+ACK-Q5: confirm
 
 ## C. Requirement checklist diff (CAM-PLAN-02)
 
@@ -176,8 +176,8 @@ None — every row the planner classified as a requirement maps to at least one 
 Could you confirm mission intent from this table (accept/adjust ledger entries, spot the
 flagged text) without going back to the raw PRD?
 
-CHECKLIST-USABLE: ____
-CHECKLIST-NOTE: ____
+CHECKLIST-USABLE: yes
+CHECKLIST-NOTE: good checklist, very suitable. I will state clearly though. 1. In Markdown format this table format gets difficult, so depending on our decisions later, such a display would be best in a GUI or with a widget... Reading tables in markdown particularly when there are 3+ columns gets messy for humans.
 
 ## D. Cross-family adversarial review (attached — CAM-PLAN-03)
 
