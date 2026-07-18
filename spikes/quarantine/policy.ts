@@ -5,11 +5,34 @@ import type { Budgets, Rejection, TreeEntry } from "./types.js";
 
 // --- path canonicalization (case-fold + Unicode collisions) ---
 
-/** Fully canonical key: NFC-normalized then case-folded, per segment. */
+/**
+ * A handful of FULL case-fold expansions that `toLowerCase()` does not perform
+ * but common case-insensitive filesystems / callers may (review r1 #8, e.g.
+ * `ß` ⇄ `SS`). Not exhaustive — the product check (WP-108) uses an ICU-backed
+ * full fold; this covers the well-known Latin multi-char folds and errs toward
+ * collapsing (a false collision is safe; a missed one is not).
+ */
+function foldExpand(s: string): string {
+  return s
+    .replace(/ß/g, "ss")
+    .replace(/ﬀ/g, "ff")
+    .replace(/ﬁ/g, "fi")
+    .replace(/ﬂ/g, "fl")
+    .replace(/ﬃ/g, "ffi")
+    .replace(/ﬄ/g, "ffl")
+    .replace(/ﬅ/g, "st")
+    .replace(/ﬆ/g, "st");
+}
+
+/**
+ * Canonical collision key: NFC-normalize, apply the known full-fold expansions,
+ * then lowercase — per segment. Two stored paths sharing this key would resolve
+ * to one file on a case-insensitive / normalizing filesystem.
+ */
 function fullyCanonical(path: string): string {
   return path
     .split("/")
-    .map((s) => s.normalize("NFC").toLowerCase())
+    .map((s) => foldExpand(s.normalize("NFC")).toLowerCase())
     .join("/");
 }
 
@@ -45,7 +68,9 @@ export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] 
 
 // --- reserved names & trailing-dot/space aliases ---
 
-const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+// COM/LPT digits include the superscript forms ¹²³ (U+00B9/B2/B3), which
+// Windows also reserves — COM² etc. (review r1 #7).
+const RESERVED = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
 /**
  * Windows reserved device names (CON, NUL, COM1…, LPT1…) — matched on the stem,
@@ -128,7 +153,9 @@ export function checkSubmodules(entries: readonly TreeEntry[]): Rejection[] {
 export function symlinkEscapes(linkPath: string, target: string): boolean {
   if (target.length === 0) return true;
   if (target.startsWith("/")) return true; // POSIX absolute
-  if (/^[a-zA-Z]:[\\/]/.test(target)) return true; // Windows drive-absolute
+  // Any `X:` prefix is a Windows drive path — absolute (`C:\x`) OR drive-relative
+  // (`C:x`, resolved against drive C's cwd, outside our lexical root) (review r1 #6).
+  if (/^[a-zA-Z]:/.test(target)) return true;
   if (target.startsWith("\\")) return true; // UNC / drive-relative
   // Resolve relative to the link's own directory, counting depth from root.
   const dir = linkPath.includes("/") ? linkPath.slice(0, linkPath.lastIndexOf("/")) : "";
@@ -181,12 +208,22 @@ export function checkSymlinks(
 
 // --- size / count budgets ---
 
-export function checkBudgets(entries: readonly TreeEntry[], budgets: Budgets): Rejection[] {
+/**
+ * `objectCount` is the count of ALL objects in the final tree — every subtree
+ * plus every leaf — not just the flattened leaves: a pathologically deep tree
+ * has one leaf but arbitrarily many tree objects, which is the resource bomb the
+ * budget must catch (review r1 #5). The intake supplies it from `ls-tree -r -t`.
+ */
+export function checkBudgets(
+  entries: readonly TreeEntry[],
+  budgets: Budgets,
+  objectCount: number,
+): Rejection[] {
   const out: Rejection[] = [];
-  if (entries.length > budgets.maxEntries) {
+  if (objectCount > budgets.maxEntries) {
     out.push({
       code: "entry-budget",
-      detail: `final tree has ${entries.length} entries (budget ${budgets.maxEntries})`,
+      detail: `final tree has ${objectCount} objects, trees + leaves (budget ${budgets.maxEntries})`,
     });
   }
   let total = 0;
@@ -251,10 +288,14 @@ export function matchesAnyGlob(path: string, globs: readonly string[]): boolean 
  * for the directory sets.
  */
 export function isProtectedPath(path: string): boolean {
-  const base = path.slice(path.lastIndexOf("/") + 1);
+  // Case-insensitive: a case-insensitive host (macOS/Windows) resolves
+  // `.GITATTRIBUTES` / `.GitHub/Workflows` / `.Camino` to the protected path,
+  // and git even applies a `.GITATTRIBUTES` on such a host (review r1 #1).
+  const p = path.toLowerCase();
+  const base = p.slice(p.lastIndexOf("/") + 1);
   if (base === ".gitattributes") return true;
-  if (path === ".github/workflows" || path.startsWith(".github/workflows/")) return true;
-  if (path === ".camino" || path.startsWith(".camino/")) return true;
+  if (p === ".github/workflows" || p.startsWith(".github/workflows/")) return true;
+  if (p === ".camino" || p.startsWith(".camino/")) return true;
   return false;
 }
 

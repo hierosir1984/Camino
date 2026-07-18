@@ -21,9 +21,9 @@ export interface WorkflowFinding {
 
 /**
  * Translate a GitHub branch **filter pattern** to a RegExp (a leading `!` is
- * stripped — the caller partitions positive vs negated patterns). Precise for
- * the security-relevant forms (`**`, `*`, `/`, literals); the exotic quantifiers
- * (`?`, `+`, `[]`) are approximated permissively (toward matching).
+ * stripped — the caller evaluates patterns in order, last match wins). Precise
+ * for the security-relevant forms (`**`, `*`, `/`, literals); the exotic
+ * quantifiers (`?`, `+`, `[]`) are approximated permissively (toward matching).
  */
 function filterPatternToRegExp(pattern: string): RegExp {
   const p = pattern.startsWith("!") ? pattern.slice(1) : pattern;
@@ -52,13 +52,15 @@ function filterPatternToRegExp(pattern: string): RegExp {
 
 /** Does any candidate ref match the branch filter list (GitHub semantics)? */
 function firesOnBranches(patterns: string[], candidateRefs: string[]): string[] {
+  // GitHub applies patterns IN ORDER, last match wins — a later positive can
+  // re-include what an earlier `!` excluded (review r1 #4). Partitioning loses
+  // that and under-flags, so evaluate sequentially per ref.
+  const compiled = patterns.map((p) => ({ neg: p.startsWith("!"), rx: filterPatternToRegExp(p) }));
   const reasons: string[] = [];
-  const positives = patterns.filter((p) => !p.startsWith("!")).map(filterPatternToRegExp);
-  const negatives = patterns.filter((p) => p.startsWith("!")).map(filterPatternToRegExp);
   for (const ref of candidateRefs) {
-    const included = positives.some((rx) => rx.test(ref));
-    const excluded = negatives.some((rx) => rx.test(ref));
-    if (included && !excluded) reasons.push(ref);
+    let matched = false;
+    for (const { neg, rx } of compiled) if (rx.test(ref)) matched = !neg;
+    if (matched) reasons.push(ref);
   }
   return reasons;
 }
@@ -78,78 +80,105 @@ function toStringList(v: unknown): string[] {
 /** Which push-family triggers would fire on a candidate ref, and why. */
 function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
   const reasons: string[] = [];
-  // `on: push`  or  `on: [push, ...]`  ⇒ fires on ALL branches.
-  if (typeof on === "string") {
-    if (on === "push") reasons.push(`on: push (all branches) fires on ${candidateRefs.join(", ")}`);
-    return reasons;
-  }
-  if (Array.isArray(on)) {
-    if (on.includes("push"))
-      reasons.push(`on: [push] (all branches) fires on ${candidateRefs.join(", ")}`);
+  // Shorthand `on: push` / `on: [push, …]` ⇒ every branch (incl. candidate refs).
+  const shorthand = typeof on === "string" ? [on] : Array.isArray(on) ? on : null;
+  if (shorthand) {
+    if (shorthand.includes("push")) {
+      reasons.push(`on: push (all branches) fires on ${candidateRefs.join(", ")}`);
+    }
+    if (shorthand.includes("pull_request_target")) {
+      reasons.push("on: pull_request_target runs in privileged base context on pull requests");
+    }
     return reasons;
   }
   const onObj = asRecord(on);
   if (!onObj) return reasons;
-  for (const event of ["push", "pull_request_target"]) {
-    if (!(event in onObj)) continue;
-    const spec = onObj[event];
-    // `push:` with null/empty value ⇒ no branch filter ⇒ all branches.
+
+  // `pull_request_target` is privileged BY NATURE: it runs in the base-repo
+  // context (with secrets/write) on pull requests, and its branch filters match
+  // the PR's BASE branch, not any candidate head ref (review r1 #2). So it is
+  // not analysed via candidate-ref matching — its mere presence is a "fires"
+  // reason, which only becomes a finding when the workflow is also privileged.
+  if ("pull_request_target" in onObj) {
+    reasons.push(
+      "pull_request_target runs in privileged base context on pull requests " +
+        "(branch filters match the base branch, not the candidate ref)",
+    );
+  }
+
+  // `push` DOES key on the pushed ref, so candidate-ref matching applies.
+  if ("push" in onObj) {
+    const spec = onObj["push"];
     if (spec === null || spec === undefined) {
-      reasons.push(
-        `${event}: (no branch filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`,
-      );
-      continue;
-    }
-    const specObj = asRecord(spec);
-    if (!specObj) continue;
-    const branches = toStringList(specObj["branches"]);
-    const ignore = toStringList(specObj["branches-ignore"]);
-    if (branches.length === 0 && ignore.length === 0) {
-      reasons.push(
-        `${event}: (no branches filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`,
-      );
-    } else if (branches.length > 0) {
-      const hits = firesOnBranches(branches, candidateRefs);
-      for (const h of hits)
-        reasons.push(`${event}.branches ${JSON.stringify(branches)} matches ${h}`);
-    } else if (ignore.length > 0) {
-      // branches-ignore ⇒ fires on everything NOT ignored.
-      const ignored = new Set(firesOnBranches(ignore, candidateRefs));
-      for (const ref of candidateRefs) {
-        if (!ignored.has(ref))
-          reasons.push(`${event}.branches-ignore ${JSON.stringify(ignore)} still fires on ${ref}`);
+      reasons.push(`push: (no branch filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`);
+    } else {
+      const specObj = asRecord(spec);
+      if (specObj) {
+        const branches = toStringList(specObj["branches"]);
+        const ignore = toStringList(specObj["branches-ignore"]);
+        if (branches.length === 0 && ignore.length === 0) {
+          reasons.push(
+            `push: (no branches filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`,
+          );
+        } else if (branches.length > 0) {
+          for (const h of firesOnBranches(branches, candidateRefs)) {
+            reasons.push(`push.branches ${JSON.stringify(branches)} matches ${h}`);
+          }
+        } else if (ignore.length > 0) {
+          const ignored = new Set(firesOnBranches(ignore, candidateRefs));
+          for (const ref of candidateRefs) {
+            if (!ignored.has(ref)) {
+              reasons.push(`push.branches-ignore ${JSON.stringify(ignore)} still fires on ${ref}`);
+            }
+          }
+        }
       }
     }
   }
   return reasons;
 }
 
+/** Write scopes declared by a `permissions:` value (top-level or per-job). */
+function writeScopes(perms: unknown): string[] {
+  if (perms === "write-all") return ["write-all"];
+  if (perms === "read-all" || perms === "read") return [];
+  const obj = asRecord(perms);
+  if (!obj) return [];
+  return Object.entries(obj)
+    .filter(([, v]) => v === "write")
+    .map(([k]) => k);
+}
+
 /** Reasons the workflow wields a real secret or a write token. */
 function analyzePrivilege(doc: Record<string, unknown>, rawText: string): string[] {
   const reasons: string[] = [];
-  // Non-GITHUB_TOKEN secret references are unconditionally sensitive.
+  // Non-GITHUB_TOKEN secret references, in BOTH the `secrets.NAME` and the
+  // index form `secrets['NAME']` / `secrets["NAME"]` (review r1 #3).
   const secretRefs = new Set<string>();
-  for (const m of rawText.matchAll(/\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}/g)) {
-    const name = m[1]!;
-    if (name !== "GITHUB_TOKEN") secretRefs.add(name);
+  const secretRe = /\$\{\{\s*secrets(?:\.([A-Za-z0-9_]+)|\[\s*['"]([^'"]+)['"]\s*\])/g;
+  for (const m of rawText.matchAll(secretRe)) {
+    const name = m[1] ?? m[2] ?? "";
+    if (name && name !== "GITHUB_TOKEN") secretRefs.add(name);
   }
   if (secretRefs.size > 0) reasons.push(`references secrets: ${[...secretRefs].join(", ")}`);
 
-  // Token permissions: explicit all-read is safe; write (or absent) is not.
+  // Token permissions: explicit all-read is safe; write (or absent) is not —
+  // checked at the top level AND per-job (`jobs.<id>.permissions`, review r1 #3).
   const perms = doc["permissions"];
   if (perms === undefined) {
     reasons.push("no explicit permissions block (default token may be write-capable)");
-  } else if (perms === "write-all") {
-    reasons.push("permissions: write-all");
-  } else if (perms === "read-all" || perms === "read") {
-    /* safe */
   } else {
-    const permObj = asRecord(perms);
-    if (permObj) {
-      const writes = Object.entries(permObj)
-        .filter(([, v]) => v === "write")
-        .map(([k]) => k);
-      if (writes.length > 0) reasons.push(`permissions grant write: ${writes.join(", ")}`);
+    const w = writeScopes(perms);
+    if (w.length > 0) reasons.push(`permissions grant write: ${w.join(", ")}`);
+  }
+  const jobs = asRecord(doc["jobs"]);
+  if (jobs) {
+    for (const [jobId, job] of Object.entries(jobs)) {
+      const jobObj = asRecord(job);
+      if (jobObj && "permissions" in jobObj) {
+        const w = writeScopes(jobObj["permissions"]);
+        if (w.length > 0) reasons.push(`job "${jobId}" permissions grant write: ${w.join(", ")}`);
+      }
     }
   }
   return reasons;

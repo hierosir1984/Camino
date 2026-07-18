@@ -250,6 +250,59 @@ export function symlinkIntoDotGit(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
+// --- review r1 folds: case-spelled protected path, deep-nesting bomb,
+//     drive-relative symlink, superscript device name, full-fold collision ---
+
+export function protectedPathCaseVariant(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const blob = hashBlob(repo, "* -diff\n");
+  // `.GITATTRIBUTES` resolves to `.gitattributes` on a case-insensitive host.
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: blob, path: ".GITATTRIBUTES" },
+  ]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
+export function deepNestingBomb(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const blob = hashBlob(repo, "x\n");
+  // One leaf, but ~26 intermediate tree objects — invisible to a leaf-only count.
+  const deepPath = "src/" + Array(25).fill("d").join("/") + "/leaf.txt";
+  const head = headWith(repo, base, entries, [{ mode: "100644", sha: blob, path: deepPath }]);
+  return { repo, head, contract: { base, allowedPaths: ["**"], budgets: { maxEntries: 10 } } };
+}
+
+export function symlinkDriveRelative(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const target = hashBlob(repo, "C:Windows/System32/config/SAM"); // drive-relative
+  const head = headWith(repo, base, entries, [{ mode: "120000", sha: target, path: "src/dr" }]);
+  return { repo, head, contract: contract(base) };
+}
+
+export function reservedSuperscript(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const blob = hashBlob(repo, "device\n");
+  const head = headWith(repo, base, entries, [{ mode: "100644", sha: blob, path: "src/COM².txt" }]);
+  return { repo, head, contract: contract(base) };
+}
+
+export function unicodeFoldCollision(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const a = hashBlob(repo, "sharp-s\n");
+  const b = hashBlob(repo, "double-s\n");
+  // "straße" and "STRASSE" collide under full Unicode case-folding (ß ⇄ SS).
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: a, path: "src/straße.txt" },
+    { mode: "100644", sha: b, path: "src/STRASSE.txt" },
+  ]);
+  return { repo, head, contract: contract(base) };
+}
+
 // --- 12. size bomb ---
 
 export function sizeBomb(): WorkerFixture {

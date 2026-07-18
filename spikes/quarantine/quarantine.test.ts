@@ -109,6 +109,32 @@ const REJECTION_CASES: Case[] = [
   },
   { name: "11c — symlink into .git", fixture: attacks.symlinkIntoDotGit, expect: "symlink-escape" },
   { name: "12 — size bomb", fixture: attacks.sizeBomb, expect: "blob-size-budget" },
+  // review r1 folds:
+  {
+    name: "r1#1 — case-spelled protected path (.GITATTRIBUTES)",
+    fixture: attacks.protectedPathCaseVariant,
+    expect: "protected-path",
+  },
+  {
+    name: "r1#5 — deep-nesting object-count bomb",
+    fixture: attacks.deepNestingBomb,
+    expect: "entry-budget",
+  },
+  {
+    name: "r1#6 — drive-relative symlink target (C:foo)",
+    fixture: attacks.symlinkDriveRelative,
+    expect: "symlink-escape",
+  },
+  {
+    name: "r1#7 — superscript device alias (COM²)",
+    fixture: attacks.reservedSuperscript,
+    expect: "reserved-name",
+  },
+  {
+    name: "r1#8 — full-fold path collision (straße ⇄ STRASSE)",
+    fixture: attacks.unicodeFoldCollision,
+    expect: "path-collision-unicode",
+  },
 ];
 
 describe("attacks 2–12 — each is rejected with the expected reason and produces no candidate", () => {
@@ -195,6 +221,64 @@ jobs:
     );
     expect(findings.map((f) => f.file)).toEqual([".github/workflows/deploy.yml"]);
   });
+
+  // --- review r1 folds ---
+
+  it("r1#4 — ordered branch re-inclusion fires (last matching pattern wins)", () => {
+    const wf = `name: x
+on:
+  push:
+    branches: ['camino/**', '!camino/**', 'camino/candidate/**']
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    const finding = analyzeWorkflow(".github/workflows/x.yml", wf, CANDIDATE_REFS);
+    expect(finding).not.toBeNull();
+    expect(finding!.fires.join(" ")).toContain("camino/candidate/issue-42/1");
+  });
+
+  it("r1#2 — pull_request_target with write-all is flagged (privileged base context)", () => {
+    const wf = `name: prt
+on:
+  pull_request_target:
+    branches: [main]
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    const finding = analyzeWorkflow(".github/workflows/prt.yml", wf, CANDIDATE_REFS);
+    expect(finding).not.toBeNull();
+    expect(finding!.fires.join(" ")).toMatch(/pull_request_target/);
+  });
+
+  it("r1#3 — bracket-index secret and job-level write permissions are seen", () => {
+    const bracket = `name: b
+on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{ run: "use", env: { K: "\${{ secrets['DEPLOY_KEY'] }}" } }]
+`;
+    const bf = analyzeWorkflow(".github/workflows/b.yml", bracket, CANDIDATE_REFS);
+    expect(bf).not.toBeNull();
+    expect(bf!.privileged.join(" ")).toMatch(/DEPLOY_KEY/);
+
+    const jobWrite = `name: j
+on: push
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps: [{ run: echo }]
+`;
+    const jf = analyzeWorkflow(".github/workflows/j.yml", jobWrite, CANDIDATE_REFS);
+    expect(jf).not.toBeNull();
+    expect(jf!.privileged.join(" ")).toMatch(/job "a" permissions grant write/);
+  });
 });
 
 describe("policy units — the security-relevant edge cases", () => {
@@ -205,6 +289,8 @@ describe("policy units — the security-relevant edge cases", () => {
     expect(symlinkEscapes("a/b/link", "../../..")).toBe(true); // escapes above root
     expect(symlinkEscapes("a/b/link", "../c")).toBe(false); // resolves to a/c — in tree
     expect(symlinkEscapes("src/link", "./sibling")).toBe(false);
+    expect(symlinkEscapes("src/link", "C:foo")).toBe(true); // drive-relative (r1#6)
+    expect(symlinkEscapes("src/link", "\\\\host\\share")).toBe(true); // UNC
   });
 
   it("matchesAnyGlob: ** spans '/', * does not", () => {
@@ -222,6 +308,10 @@ describe("policy units — the security-relevant edge cases", () => {
     expect(isProtectedPath(".camino/config.yml")).toBe(true);
     expect(isProtectedPath("src/app.js")).toBe(false);
     expect(isProtectedPath(".github/CODEOWNERS")).toBe(false); // not a CI definition
+    // Case-insensitive: a case-insensitive host resolves these to protected (r1#1).
+    expect(isProtectedPath(".GITATTRIBUTES")).toBe(true);
+    expect(isProtectedPath(".GitHub/Workflows/ci.yml")).toBe(true);
+    expect(isProtectedPath(".Camino/config.yml")).toBe(true);
   });
 
   it("checkNameAliases: reserved stems match, real words do not", () => {

@@ -125,9 +125,15 @@ export function runIntake(
   }
 
   const treeSha = git(pristineDir, "rev-parse", `${workerHead}^{tree}`);
+  // Leaves (blobs, symlinks, gitlinks) for the path/content checks…
   const entries = parseTree(
     gitBuf(pristineDir, "ls-tree", "-r", "-l", "-z", treeSha).toString("utf8"),
   );
+  // …and ALL objects (subtrees + leaves) for the object-count budget: `-t`
+  // includes every intermediate tree, so a deep-nesting bomb is counted.
+  const objectCount = parseTree(
+    gitBuf(pristineDir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8"),
+  ).length;
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, contract.base, workerHead);
 
@@ -138,7 +144,7 @@ export function runIntake(
     ...checkDotGitPaths(entries),
     ...checkSubmodules(entries),
     ...checkSymlinks(entries, targets),
-    ...checkBudgets(entries, budgets),
+    ...checkBudgets(entries, budgets, objectCount),
   );
 
   const accepted = rejections.length === 0;
