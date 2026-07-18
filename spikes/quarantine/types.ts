@@ -59,6 +59,7 @@ export type RejectionCode =
   | "trailing-dot-or-space"
   | "submodule-gitlink"
   | "symlink-escape"
+  | "dotgit-path"
   | "blob-size-budget"
   | "tree-size-budget"
   | "entry-budget";

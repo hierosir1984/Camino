@@ -77,6 +77,38 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   return out;
 }
 
+// --- `.git` directory smuggling ---
+
+/** A path segment that resolves to a `.git` directory on some platform. */
+function isDotGitSegment(seg: string): boolean {
+  // `.git` with optional trailing dots/spaces (Windows trims them), or the 8.3
+  // short-name alias `git~1`. Case-insensitive (HFS/NTFS fold case).
+  return /^\.git[ .]*$/i.test(seg) || /^git~[0-9]+$/i.test(seg);
+}
+
+/**
+ * A `.git` entry anywhere in the tree lets a worker rewrite repo internals when
+ * the candidate is checked out (hooks, config, alternates). Reject any tree path
+ * containing a `.git` segment or a short-name/trailing-alias of it. (`.gitignore`
+ * / `.gitattributes` / `.gitmodules` are NOT `.git` and are handled elsewhere.)
+ */
+export function checkDotGitPaths(entries: readonly TreeEntry[]): Rejection[] {
+  const out: Rejection[] = [];
+  for (const e of entries) {
+    for (const seg of e.path.split("/")) {
+      if (isDotGitSegment(seg)) {
+        out.push({
+          code: "dotgit-path",
+          path: e.path,
+          detail: `path contains a .git segment ("${seg}") — repo-internals smuggling`,
+        });
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 // --- submodule / gitlink ---
 
 /** A gitlink (mode 160000) pulls in out-of-tree history the intake never vetted. */
@@ -113,6 +145,13 @@ export function symlinkEscapes(linkPath: string, target: string): boolean {
   return false;
 }
 
+/** A symlink target is dangerous if it escapes the root OR dives into `.git`. */
+export function symlinkTargetDanger(linkPath: string, target: string): "escape" | "dotgit" | null {
+  if (target.split(/[/\\]/).some((seg) => isDotGitSegment(seg))) return "dotgit";
+  if (symlinkEscapes(linkPath, target)) return "escape";
+  return null;
+}
+
 /** `targets` maps each symlink entry path → its stored target string. */
 export function checkSymlinks(
   entries: readonly TreeEntry[],
@@ -122,11 +161,18 @@ export function checkSymlinks(
   for (const e of entries) {
     if (e.mode !== "120000") continue;
     const target = targets.get(e.path) ?? "";
-    if (symlinkEscapes(e.path, target)) {
+    const danger = symlinkTargetDanger(e.path, target);
+    if (danger === "escape") {
       out.push({
         code: "symlink-escape",
         path: e.path,
         detail: `symlink "${e.path}" targets "${target}", which escapes the repo root`,
+      });
+    } else if (danger === "dotgit") {
+      out.push({
+        code: "symlink-escape",
+        path: e.path,
+        detail: `symlink "${e.path}" targets "${target}", which points into a .git directory`,
       });
     }
   }

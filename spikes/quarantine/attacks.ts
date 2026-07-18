@@ -222,6 +222,34 @@ export function submoduleGitlink(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
+// --- 11b/c. `.git` directory smuggling via aliases + symlink into .git ---
+//
+// A LITERAL `.git` tree entry is refused by git's own object layer at both write
+// (hash-object) and transfer (index-pack, per CVE-2019-1349), so it cannot be
+// constructed with git tooling — git already blocks that case, and a policy unit
+// test proves checkDotGitPaths would also reject it. The cases git PERMITS are
+// the Windows 8.3 short-name alias (`GIT~1`, which resolves to `.git` on Windows)
+// and a symlink whose TARGET dives into `.git`; those are what our check adds.
+
+export function dotGitAlias(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const cfg = hashBlob(repo, "[core]\n\thooksPath = .\n");
+  // 8.3 short-name alias of ".git" that Windows resolves to the real dir.
+  const head = headWith(repo, base, entries, [{ mode: "100644", sha: cfg, path: "GIT~1/config" }]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
+export function symlinkIntoDotGit(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const target = hashBlob(repo, ".git/hooks"); // in-root by depth, but dives into .git
+  const head = headWith(repo, base, entries, [
+    { mode: "120000", sha: target, path: "src/hooklink" },
+  ]);
+  return { repo, head, contract: contract(base) };
+}
+
 // --- 12. size bomb ---
 
 export function sizeBomb(): WorkerFixture {

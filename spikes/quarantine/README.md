@@ -40,6 +40,13 @@ to the intake — the layer that must reject them — rather than being silently
 | 12  | size bomb (2 MB blob in the final tree)                                              | rejected `blob-size-budget`                                                             |
 | 13  | candidate-ref workflow-trigger (a hostile workflow firing on `camino/**`)            | flagged by the static posture analyzer, workflow named                                  |
 
+**Beyond the enumerated 13 (proactive hardening):** a `.git` directory smuggled into the tree
+would let a worker rewrite repo internals on checkout. A _literal_ `.git` tree entry is already
+refused by git's own object layer at write and transfer (CVE-2019-1349), so the residual cases
+are the Windows 8.3 alias `GIT~1` (which git permits but resolves to `.git`) and symlinks whose
+target dives into `.git` — both caught here (`dotgit-path` / `symlink-escape`), with a unit test
+proving the check also covers the literal form git blocks.
+
 A **positive control** proves a clean in-scope change is accepted and re-authored onto the base
 (single assigned parent, worker-attribution trailer, worker's final tree bit-for-bit).
 

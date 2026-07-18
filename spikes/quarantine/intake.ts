@@ -13,6 +13,7 @@
 import { buildTree, cleanupRepos, commitTree, git, gitBuf, initRepo, objectExists } from "./git.js";
 import {
   checkBudgets,
+  checkDotGitPaths,
   checkNameAliases,
   checkPathCollisions,
   checkScopeAndProtected,
@@ -134,6 +135,7 @@ export function runIntake(
     ...checkScopeAndProtected(changed, contract.allowedPaths),
     ...checkPathCollisions(entries),
     ...checkNameAliases(entries),
+    ...checkDotGitPaths(entries),
     ...checkSubmodules(entries),
     ...checkSymlinks(entries, targets),
     ...checkBudgets(entries, budgets),

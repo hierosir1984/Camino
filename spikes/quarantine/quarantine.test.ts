@@ -15,6 +15,7 @@ import {
   symlinkEscapes,
   checkPathCollisions,
   checkNameAliases,
+  checkDotGitPaths,
 } from "./policy.js";
 import { analyzeWorkflow, CANDIDATE_REFS, scanWorkflowPosture } from "./workflow.js";
 import * as attacks from "./attacks.js";
@@ -101,6 +102,12 @@ const REJECTION_CASES: Case[] = [
     fixture: attacks.submoduleGitlink,
     expect: "submodule-gitlink",
   },
+  {
+    name: "11b — .git 8.3 alias (GIT~1) smuggling",
+    fixture: attacks.dotGitAlias,
+    expect: "dotgit-path",
+  },
+  { name: "11c — symlink into .git", fixture: attacks.symlinkIntoDotGit, expect: "symlink-escape" },
   { name: "12 — size bomb", fixture: attacks.sizeBomb, expect: "blob-size-budget" },
 ];
 
@@ -226,6 +233,23 @@ describe("policy units — the security-relevant edge cases", () => {
     expect(checkNameAliases(mk("src/console.txt"))).toEqual([]); // "console" ≠ "con"
     expect(checkNameAliases(mk("src/data.")).map((r) => r.code)).toContain("trailing-dot-or-space");
     expect(checkNameAliases(mk("src/note "))[0]?.code).toBe("trailing-dot-or-space");
+  });
+
+  it("checkDotGitPaths: literal .git (git itself blocks this), aliases, trailing forms", () => {
+    const e = (path: string) => [
+      { mode: "100644", type: "blob" as const, sha: "x", size: 1, path },
+    ];
+    // The literal `.git` object cannot be built via git tooling (git refuses it
+    // at write + transfer), so this unit test is how we prove our own check
+    // would catch it independently.
+    expect(checkDotGitPaths(e(".git/config")).map((r) => r.code)).toEqual(["dotgit-path"]);
+    expect(checkDotGitPaths(e("a/.GIT/x")).map((r) => r.code)).toEqual(["dotgit-path"]);
+    expect(checkDotGitPaths(e("GIT~1/config")).map((r) => r.code)).toEqual(["dotgit-path"]);
+    expect(checkDotGitPaths(e("a/.git./x")).map((r) => r.code)).toEqual(["dotgit-path"]);
+    // Real dotfiles that are NOT the .git directory are left alone.
+    expect(checkDotGitPaths(e(".gitignore"))).toEqual([]);
+    expect(checkDotGitPaths(e(".gitmodules"))).toEqual([]);
+    expect(checkDotGitPaths(e("src/app.js"))).toEqual([]);
   });
 
   it("checkPathCollisions labels case vs Unicode correctly", () => {
