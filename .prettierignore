@@ -9,3 +9,5 @@ spikes/dispatch/transcripts/
 *.tsbuildinfo
 spikes/plan-probe/transcripts/
 spikes/plan-probe/RATING-PACKET.md
+spikes/untrusted-content/transcripts/
+spikes/untrusted-content/FINDINGS.md

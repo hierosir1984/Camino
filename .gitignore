@@ -13,6 +13,9 @@ coverage/
 # raw spike transcript streams (disposable; REPORT.md + summary.json are committed)
 spikes/dispatch/transcripts/*.jsonl
 spikes/plan-probe/transcripts/*.jsonl
+spikes/untrusted-content/transcripts/*.jsonl
+# raw agent evidence may contain whatever a worker read — never commit it (review r1 blocker 2)
+spikes/untrusted-content/transcripts/raw-evidence.json
 
 # OS noise
 .DS_Store
