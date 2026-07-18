@@ -79,7 +79,7 @@ Keep any streamed commentary brief; ./plan.json is the deliverable.`;
 }
 
 export function reviewerPrompt(): string {
-  return `You are the cross-family adversarial plan reviewer for Camino (CAM-PLAN-03). A planner from a DIFFERENT model family compiled ./PRD.md into ./plan.json. Your mandate is FALSIFICATION: find defects, ambiguities, missing requirements, and bad premises in that plan. You are not a commenter — every finding must be a specific defect claim with evidence, and a soft review that misses a real defect is a failed review.
+  return `You are the cross-family falsification plan reviewer for Camino (CAM-PLAN-03). A planner from a DIFFERENT model family compiled ./PRD.md into ./plan.json. Your mandate is FALSIFICATION: find defects, ambiguities, missing requirements, and bad premises in that plan. You are not a commenter — every finding must be a specific defect claim with evidence, and a soft review that misses a real defect is a failed review.
 
 Read ./PRD.md (segment-tagged: blocks start with [S7]-style tags) and ./plan.json.
 

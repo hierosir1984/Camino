@@ -4,11 +4,11 @@
 // repo and pulls ONLY the worker's final head into it via a shallow fetch
 // (--depth=1). Worker history — intermediate commits and any objects reachable
 // only through them — never enters the pristine store, so reachable-history
-// smuggling is defeated structurally, not by after-the-fact filtering. Policy
+// carry-in is excluded structurally, not filtered after the fact. Policy
 // checks then run on the final tree; a clean tree is re-authored as a fresh
 // Camino commit onto the assigned base, with a worker-attribution trailer.
 //
-// This is a PROTOTYPE. WP-108 is the product module; this suite's attack corpus
+// This is a PROTOTYPE. WP-108 is the product module; this suite's rejection corpus
 // is meant to run against it unchanged.
 import {
   buildTree,
@@ -151,7 +151,7 @@ export function runIntake(
   );
   // …and ALL objects (subtrees + leaves + the root tree itself) for the
   // object-count budget: `-t` includes every intermediate tree, and +1 counts
-  // the queried root that ls-tree omits (deep-nesting bomb — review r2 #12).
+  // the queried root that ls-tree omits (deep-nesting breach — review r2 #12).
   const objectCount =
     parseTree(gitBuf(pristineDir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8"))
       .length + 1;

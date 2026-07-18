@@ -39,7 +39,7 @@ export function composeWorkerEnv(
   }
 
   // Adapter-supplied extras go on FIRST, so the enforcement below cannot be
-  // overridden by them (WP-001 review finding #3): a malicious/buggy adapter
+  // overridden by them (WP-001 review finding #3): an untrusted or buggy adapter
   // must not be able to restore a GitHub credential or un-neutralize git.
   for (const [k, v] of Object.entries(extra)) env[k] = v;
 

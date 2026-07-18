@@ -10,7 +10,7 @@ observed, never declared.
 **Status: Phase 0 (spikes).** The walking skeleton is being built work package by
 work package — see the [build plan](docs/plan/phase-0-1-work-packages.md), the
 [work-package issues](https://github.com/hierosir1984/Camino/issues), and the
-[PRD](docs/PRD.md) (v1.4, build-ready). The design record (5 adversarial rounds,
+[PRD](docs/PRD.md) (v1.4, build-ready). The design record (5 falsification rounds,
 cleared) lives in [docs/design/](docs/design/17-design-v5.md).
 
 ## Quickstart (development)
@@ -37,7 +37,7 @@ fixtures.
 | `packages/core`   | Pure domain logic — no I/O, enforced by a CI lint fence             |
 | `packages/daemon` | The control plane: server, adapters, quarantine, validation, merges |
 | `packages/gui`    | React + Vite board, inbox, evidence viewer (served by the daemon)   |
-| `fixtures/`       | Seeded fixtures (sample repo, attack corpora as they land)          |
+| `fixtures/`       | Seeded fixtures (sample repo, robustness corpora as they land)      |
 | `docs/`           | PRD, design record, build plan, runbooks                            |
 
 ## How this repo is built

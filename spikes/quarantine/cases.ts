@@ -1,5 +1,5 @@
-// WP-003 attack fixtures. Each builds an untrusted "worker repo" with a base
-// and a final head via git PLUMBING, so the adversarial tree exists regardless
+// WP-003 rejection-case fixtures. Each builds an untrusted "worker repo" with a base
+// and a final head via git PLUMBING, so the exact tree under test exists regardless
 // of the host filesystem (case-insensitive/Unicode-normalizing macOS cannot
 // hold most of these as real files). Every builder isolates ONE violation so
 // the suite can assert the exact rejection code.
@@ -63,17 +63,17 @@ export function legitChange(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
-// --- 1. reachable-history smuggling ---
+// --- 1. reachable-history carry-in ---
 
 /** base → C1 (adds a 2 MB secret blob) → C2 (deletes it; clean in-scope head). */
-export function reachableHistorySmuggling(): WorkerFixture & { smuggledSha: string } {
+export function reachableHistoryCarryIn(): WorkerFixture & { carriedSha: string } {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
   const secret = "SECRET-KEY=" + "A".repeat(2 * 1024 * 1024); // 2 MB, > maxBlobBytes
-  const smuggledSha = hashBlob(repo, secret);
+  const carriedSha = hashBlob(repo, secret);
   const c1Tree = buildTree(repo, [
     ...entries,
-    { mode: "100644", sha: smuggledSha, path: "src/leak.bin" },
+    { mode: "100644", sha: carriedSha, path: "src/leak.bin" },
   ]);
   const c1 = commitTree(repo, c1Tree, [base], "add secret (intermediate)");
   const app = hashBlob(repo, "console.log('clean');\n");
@@ -82,7 +82,7 @@ export function reachableHistorySmuggling(): WorkerFixture & { smuggledSha: stri
     ...entries.filter((e) => e.path !== "src/app.js"),
   ]);
   const c2 = commitTree(repo, c2Tree, [c1], "clean up");
-  return { repo, head: c2, contract: contract(base), smuggledSha };
+  return { repo, head: c2, contract: contract(base), carriedSha };
 }
 
 // --- 2 & 3. path collisions ---
@@ -149,9 +149,9 @@ export function symlinkAbsolute(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
-// --- 7. .gitattributes tampering ---
+// --- 7. .gitattributes edit ---
 
-export function gitattributesTamper(): WorkerFixture {
+export function gitattributesEdit(): WorkerFixture {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
   const blob = hashBlob(repo, "* -diff\n*.js binary\n");
@@ -168,7 +168,7 @@ export function ciDefinitionEdit(): WorkerFixture {
   const { base, entries } = makeBase(repo);
   const blob = hashBlob(repo, "on: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n");
   const head = headWith(repo, base, entries, [
-    { mode: "100644", sha: blob, path: ".github/workflows/evil.yml" },
+    { mode: "100644", sha: blob, path: ".github/workflows/added.yml" },
   ]);
   // Widen scope so ONLY the protected-path rule (not out-of-scope) fires.
   return { repo, head, contract: contract(base, ["**"]) };
@@ -222,7 +222,7 @@ export function submoduleGitlink(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
-// --- 11b/c. `.git` directory smuggling via aliases + symlink into .git ---
+// --- 11b/c. `.git` directory entry via aliases + symlink into .git ---
 //
 // A LITERAL `.git` tree entry is refused by git's own object layer at both write
 // (hash-object) and transfer (index-pack, per CVE-2019-1349), so it cannot be
@@ -250,7 +250,7 @@ export function symlinkIntoDotGit(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
-// --- review r1 folds: case-spelled protected path, deep-nesting bomb,
+// --- review r1 folds: case-spelled protected path, deep-nesting budget breach,
 //     drive-relative symlink, superscript device name, full-fold collision ---
 
 export function protectedPathCaseVariant(): WorkerFixture {
@@ -264,7 +264,7 @@ export function protectedPathCaseVariant(): WorkerFixture {
   return { repo, head, contract: contract(base, ["**"]) };
 }
 
-export function deepNestingBomb(): WorkerFixture {
+export function deepNestingBudgetBreach(): WorkerFixture {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
   const blob = hashBlob(repo, "x\n");
@@ -413,9 +413,9 @@ export function ancestorComponentCollision(): WorkerFixture {
   return { repo, head, contract: contract(base, ["**"]) };
 }
 
-// --- 12. size bomb ---
+// --- 12. size-budget breach ---
 
-export function sizeBomb(): WorkerFixture {
+export function oversizeBlob(): WorkerFixture {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
   const big = hashBlob(repo, "X".repeat(2 * 1024 * 1024)); // 2 MB > maxBlobBytes (1 MB)

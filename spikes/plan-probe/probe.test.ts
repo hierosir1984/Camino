@@ -270,7 +270,7 @@ describe("rating packet", () => {
     // planner's own classification, and ≥70% is only one conjunct of the exit.
     expect(md).toContain("planner's OWN isRequirement classification");
     expect(md).toContain("the full exit");
-    expect(md).toContain("Cross-family adversarial review");
+    expect(md).toContain("Cross-family falsification review");
     expect(md).toContain("F1");
     expect(md).toContain("Flagged as non-requirement text");
   });

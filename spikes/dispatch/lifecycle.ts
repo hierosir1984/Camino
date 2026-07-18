@@ -42,7 +42,7 @@ function groupAlive(pgid: number): boolean {
   }
 }
 
-// Bound how many parsed events are retained so a noisy/hostile worker cannot
+// Bound how many parsed events are retained so a noisy/misbehaving worker cannot
 // grow harness memory (review #4): keep the first HEAD + last TAIL, plus a
 // total count. The head/tail window preserves both the opening context and the
 // trailing result run that finalText needs.
@@ -161,7 +161,7 @@ export async function dispatch(
   const retainedEvents = (): StreamEvent[] => [...headEvents, ...tailRing];
 
   // Incremental quota detection: a single flag, not an unbounded buffer, so a
-  // noisy/hostile worker cannot grow harness memory (review #4). Scanned
+  // noisy/misbehaving worker cannot grow harness memory (review #4). Scanned
   // per-line: providers emit a rate-limit signal atomically on one line (a 429
   // status, a `rate_limit_exceeded` token). Joining adjacent lines to catch a
   // signal "split" across them manufactures false positives from unrelated text

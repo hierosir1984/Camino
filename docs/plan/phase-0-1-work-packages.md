@@ -4,7 +4,7 @@
 >
 > Derived from [PRD v1.4](../PRD.md) (build-ready) and [design v5](../design/17-design-v5.md) (cleared). Build method: proto-Camino — each work package (WP) becomes a GitHub Issue carrying acceptance criteria mapped to PRD requirement IDs; an agent implements it on a branch; a reviewer from a different provider critiques the PR; David merges. Nothing is implemented until David approves this plan.
 >
-> **Revision history:** v1 → falsification round 1 (Codex gpt-5.6-sol xhigh): "safe to build on: **no**", 19 findings, all folded. v2 → round 2: "safe to build on: **no**", 13 findings (r1 regressions: 13 resolved, 6 partial, 0 unresolved; P1 inventory, scaffold, and exit confirmed exact), all folded. v3 → round 3 (verify-only): "safe to build on: **with corrections**" — 4 exact corrections, all folded into this v4 (§7). Raw reviews: [round 1](reviews/adversarial-review-round1.md), [round 2](reviews/adversarial-review-round2.md), [round 3](reviews/adversarial-review-round3.md).
+> **Revision history:** v1 → falsification round 1 (Codex gpt-5.6-sol xhigh): "safe to build on: **no**", 19 findings, all folded. v2 → round 2: "safe to build on: **no**", 13 findings (r1 regressions: 13 resolved, 6 partial, 0 unresolved; P1 inventory, scaffold, and exit confirmed exact), all folded. v3 → round 3 (verify-only): "safe to build on: **with corrections**" — 4 exact corrections, all folded into this v4 (§7). Raw reviews: [round 1](reviews/falsification-review-round1.md), [round 2](reviews/falsification-review-round2.md), [round 3](reviews/falsification-review-round3.md).
 
 ---
 
@@ -18,11 +18,11 @@ A single repository holding four packages that install and test together (npm wo
 Camino/
 ├── .devcontainer/                # Node 22 + Docker-capable dev environment
 ├── .github/
-│   ├── workflows/ci.yml          # lint + typecheck + one-command test; attack suites accumulate here
+│   ├── workflows/ci.yml          # lint + typecheck + one-command test; robustness suites accumulate here
 │   └── ISSUE_TEMPLATE/work-package.md
 ├── docs/                         # existing PRD + design record (unchanged)
 │   ├── plan/                     # this plan + phase checklists + review records land here on approval
-│   └── runbooks/                 # API-key fallback runbook (CAM-ROUTE-08), threat model (CAM-SEC-05)
+│   └── runbooks/                 # API-key fallback runbook (CAM-ROUTE-08), risk model (CAM-SEC-05)
 ├── packages/
 │   ├── shared/                   # cross-package types + schemas: requirement IDs, event types,
 │   │                             #   evidence-packet schema (registry item 8), contract schema,
@@ -33,12 +33,12 @@ Camino/
 │   │                             #   intake, planner, scheduler, adapters, quarantine, validation
 │   │                             #   runner, merge engine, GitHub (Octokit), vault
 │   └── gui/                      # React + Vite: board, inbox, evidence viewer, gap register
-├── fixtures/                     # seeded fixtures: sample target repo, ambiguous PRDs, attack repos,
-│                                 #   hostile workflows, injection corpus, chaos kill-point configs
+├── fixtures/                     # seeded fixtures: sample target repo, ambiguous PRDs, rejection-case repos,
+│                                 #   untrusted workflows, untrusted-content corpus, chaos kill-point configs
 ├── spikes/                       # Phase-0 spike harnesses (disposable); durable tests promote into packages
 ├── scripts/                      # bootstrap, one-command test entry, prerequisite checker
 ├── LICENSE                       # Apache-2.0 (recommendation — David to confirm; see §1.3)
-├── SECURITY.md                   # three-tier threat model summary (T1/T2/T3, per design §5.3)
+├── SECURITY.md                   # three-tier risk model summary (T1/T2/T3, per design §5.3)
 └── docs/release-checklist.md     # CAM-SEC-09: the four PRD items with owner/status, from day one
 ```
 
@@ -77,8 +77,8 @@ Daemon runtime state lives outside the repo in `~/.camino/` (SQLite DB, auth tok
 ### 1.4 Process conventions (proto-Camino method, written down)
 
 - One GitHub Issue per WP, from a template with: phase, track, mapped requirement IDs, acceptance criteria (checklist), dependencies (as issue links). The PRD *Accept:* text goes into the issue verbatim.
-- Branch `wp/NNN-short-slug`; PR cites the issue; every PR carries an adversarial review by a model **from a different provider than the implementing agent** (`reviewer.provider ≠ implementer.provider`); David merges. Merges are David's alone until Camino itself earns tiers.
-- Attack/egress/chaos suites persist as CI from the moment they exist (BUILD.md standing obligation).
+- Branch `wp/NNN-short-slug`; PR cites the issue; every PR carries a falsification review by a model **from a different provider than the implementing agent** (`reviewer.provider ≠ implementer.provider`); David merges. Merges are David's alone until Camino itself earns tiers.
+- Rejection/egress/chaos suites persist as CI from the moment they exist (BUILD.md standing obligation).
 - **PRD change control, in full:** *any* material PRD change — conflict-driven or not — requires David's approval before adoption; architectural changes additionally get a falsification pass before being built on. WPs never silently deviate; they open a `prd-change` issue and block on it if the change gates their acceptance criteria.
 - Two GitHub milestones: `Phase 0 — Spikes`, `Phase 1 — Walking skeleton`. Labels: `phase:0|1`, `track:A..E`, `wp`.
 
@@ -93,7 +93,7 @@ Scaffold per §1: workspaces, TS strict, lint/format + core fence, Vitest, devco
 **Accept:**
 - Fresh clone → `npm install && npm test` green locally and in CI (one-command test), and the run **exercises at least one seeded fixture** — a committed `fixtures/sample-repo` (script-materialized git repo) with a smoke test that clones and inspects it — so the validatable-repo profile (devcontainer, one-command test, seeded fixtures) is genuinely established. Maps: PRD §6 / BUILD.md standing obligation.
 - Devcontainer boots to a working toolchain (Node 22 + Docker available).
-- `docs/release-checklist.md` committed containing the four CAM-SEC-09 items — permissive license, no secrets in repo, compliance pass on provider policies, threat-model re-pricing for distribution — each with owner and status fields — **CAM-SEC-09**.
+- `docs/release-checklist.md` committed containing the four CAM-SEC-09 items — permissive license, no secrets in repo, compliance pass on provider policies, risk-model re-pricing for distribution — each with owner and status fields — **CAM-SEC-09**.
 - **Phase-0 entry gate** — `scripts/check-prereqs` verifies and records every BUILD.md "before Phase 0" item: Node 22, Docker Desktop, Playwright; Claude Code, Codex CLI, Grok Build CLI authenticated; funded API fallback accounts attested by David (**CAM-ROUTE-08** prerequisite half); **the xAI contractual confirmation recorded — the gate does not go green without it unless David has first approved a BUILD.md amendment relaxing it** (§1.3 item 6; Grok Build then enters disabled-with-reason). WP-001 is blocked until the gate records green.
 - Issue template renders the WP fields; milestones + labels exist.
 
@@ -106,20 +106,20 @@ Minimal adapter interface (spawn / stream / cancel / cleanup / quota-classify) d
 - Disabled-adapter path exercised if any adapter is disabled (per the WP-000 gate record) — **CAM-EXEC-01** negative case.
 
 ### WP-002 · PRD-to-plan probe (item 2)
-Prototype planner: PRD text → issues with acceptance criteria + clarifying questions + requirement checklist diff, plus one cross-provider adversarial review attached. David reviews a real PRD through it.
+Prototype planner: PRD text → issues with acceptance criteria + clarifying questions + requirement checklist diff, plus one cross-provider falsification review attached. David reviews a real PRD through it.
 **Accept (PRD §7 exit):**
 - David rates each clarifying question; **≥70% rated "good"**; ratings recorded.
 - Checklist usability confirmed by David; review time recorded against the 45-min plan budget (CAM-OBS-02 baseline data point).
 - Prototype evidence toward **CAM-PLAN-01/-02/-03** (product-grade acceptance lands in Phase 1).
 
-### WP-003 · Quarantine attack suite (item 3)
-Executable attack fixtures + a minimal squash-and-rebuild quarantine intake that rejects all of them. The suite persists as CI for Camino itself.
+### WP-003 · Quarantine rejection suite (item 3)
+Executable rejection fixtures + a minimal squash-and-rebuild quarantine intake that rejects all of them. The suite persists as CI for Camino itself.
 **Accept:**
-- Each enumerated attack is a fixture and is rejected: reachable-history smuggling; path collision (case-fold + Unicode normalization); reserved-name and trailing-dot aliases; symlink-target escapes; `.gitattributes` tampering; CI-definition edits; out-of-scope diffs; worker merge commits; submodule/gitlink introduction; size bombs; candidate-ref workflow-trigger (a hostile workflow must not fire on `camino/**`) — **CAM-EXEC-04** (Phase-0 suite), PRD §7 item 3 exit.
+- Each enumerated case is a fixture and is rejected: reachable-history carry-in; path collision (case-fold + Unicode normalization); reserved-name and trailing-dot aliases; symlink-target escapes; `.gitattributes` edits; CI-definition edits; out-of-scope diffs; worker merge commits; submodule/gitlink introduction; size-budget breaches; candidate-ref workflow-trigger (an untrusted workflow must not fire on `camino/**`) — **CAM-EXEC-04** (Phase-0 suite), PRD §7 item 3 exit.
 - Suite runs in Camino's CI on every PR from this WP forward.
 
-### WP-004 · Injection red-team baseline (item 4)
-Hostile corpus (issue text, README, web content) run against the WP-002 planner and one WP-001 worker. Findings catalogued; David dispositions each.
+### WP-004 · Untrusted-content robustness baseline (item 4)
+Untrusted-content corpus with planted instructions (issue text, README, web content) run against the WP-002 planner and one WP-001 worker. Findings catalogued; David dispositions each.
 **Accept (PRD §7 exit):**
 - Every finding catalogued with a recorded disposition — hardened or accepted-risk with reason — **CAM-EXEC-09** baseline (the P2 orchestrator-channel extension is CAM-SEC-07).
 - Corpus + harness persist in `fixtures/` for re-runs.
@@ -136,7 +136,7 @@ Container profile for validation: default-deny egress with an allowlist; literal
 
 ## 3. Phase 1 — Walking skeleton (26 work packages)
 
-Phase-1 exit (PRD §7): one real feature mission (3–6 issues) delivered end-to-end on a real repository — plan approved with its adversarial review attached, issues implemented by ≥2 adapter families, validated in clean environments, merged via merge-by-push through the integration branch to main with David approving against rendered evidence packets **in the viewer**, fold rendered, gap register populated; chaos suite (CAM-STATE-06) passing; economics instrumentation live — all under the walking-skeleton posture: **one repo, PAT, polling, training mode**.
+Phase-1 exit (PRD §7): one real feature mission (3–6 issues) delivered end-to-end on a real repository — plan approved with its falsification review attached, issues implemented by ≥2 adapter families, validated in clean environments, merged via merge-by-push through the integration branch to main with David approving against rendered evidence packets **in the viewer**, fold rendered, gap register populated; chaos suite (CAM-STATE-06) passing; economics instrumentation live — all under the walking-skeleton posture: **one repo, PAT, polling, training mode**.
 
 Scheduling rule: a WP starts when its listed dependencies (§5) are merged.
 
@@ -192,11 +192,11 @@ Workers in containers with isolated full clones (never linked worktrees), zero G
 - Registry item 11 verbatim: workspace ≤ 2 GB; archive ≤ 500 MB compressed per attempt, retained 90 days or last 10 attempts per issue, **whichever is more**; archive written before cleanup in the single A.4 archival step — **CAM-EXEC-05**.
 
 #### WP-108 · Quarantine module, product grade
-Squash-and-rebuild intake per CAM-EXEC-04, replacing the WP-003 prototype; checks run against the issue's frozen contract (from WP-110); the Phase-0 attack suite runs against it unchanged.
+Squash-and-rebuild intake per CAM-EXEC-04, replacing the WP-003 prototype; checks run against the issue's frozen contract (from WP-110); the Phase-0 rejection suite runs against it unchanged.
 **Accept:**
 - Shallow-fetch of the worker's final head only within registry item 11 budgets (≤ 5,000 objects / 500 MB per fetch); full policy-check list (scope vs contract, protected paths incl. `.gitattributes`/CI/`.camino/`, canonical path identity — case-fold + Unicode-normalization collisions rejected — reserved-name/trailing-dot aliases, symlink targets, submodule/gitlink block, tree size budget); fresh Camino-authored commit onto the assigned base with worker attribution trailer; worker merge commits rejected — **CAM-EXEC-04**.
 - All quarantine git operations run in the pristine, hooks-disabled clone; credentialed git never executes in worker-touched directories.
-- Entire WP-003 attack suite green against the product module in CI.
+- Entire WP-003 rejection suite green against the product module in CI.
 - Emits the **quarantined final diff** with candidate identity (sha, base_sha) — the input consumed by classification re-triggers (WP-111) and evidence (WP-116).
 
 ### Track C — Planning & intent
@@ -230,13 +230,13 @@ Falsification-mandate review by a different provider than the planner before eve
 Issue edit → contract v(n+1); compatible in-flight work completes and revalidates; else cancel-with-summary + replan; semantic impact assessment over dependents (conservative default: revalidate).
 **Accept (CAM-PLAN-05):** an edit mid-attempt never mutates a contract in place; fixtures exercise all three paths (compatible-complete-revalidate, cancel-replan, dependent invalidation) with expected downstream state changes; dependent readiness re-checked before re-dispatch (**CAM-PLAN-12** tie-in).
 
-#### WP-113 · Context packs + knowledge lifecycle + injection posture
+#### WP-113 · Context packs + knowledge lifecycle + untrusted-content posture
 Control-plane-assembled context packs (canon excerpts with ledger status for the worker's branch context, the issue contract, approved knowledge, provenance tags per content class); `.camino/knowledge.md` candidate→approved lifecycle; untrusted text treated as data.
 **Accept:**
 - Packs contain only control-plane-assembled content; workers never wander the docs folder; provenance tags per content class — **CAM-EXEC-07**.
 - Candidates immediate with provenance + commit/base validity; promotion via human batch or the two deterministic rule-classes (commands succeeding ≥3 times across ≥2 missions; quarantine-confirmed flaky-test annotations); scope + expiry fields; invalidation on revert of validity base; candidate-contradicts-approved escalates to curation — **CAM-CANON-09**, registry item 6.
 - **Pack-visibility boundaries** (r2 finding 8): a fixture proves **only approved entries enter another mission's packs** (a candidate from mission A never appears in mission B's pack), and **candidates are visible to same-issue repair attempts, provenance-marked** — **CAM-CANON-09** (visibility clauses).
-- Injection corpus (WP-004) re-run against pack assembly: hostile content lands as data, not instructions; findings dispositioned — **CAM-EXEC-09** (gate for any unattended run).
+- Untrusted-content corpus (WP-004) re-run against pack assembly: untrusted content lands as data, not instructions; findings dispositioned — **CAM-EXEC-09** (gate for any unattended run).
 
 #### WP-114 · Scheduler: readiness, leases, quota-aware dispatch, failure handoff
 Dependency-ordered sequential dispatch per mission (consuming WP-110 contracts/dependency edges); attempt leases with fencing (lease/environment interface in `shared`); quota-aware pausing; structured failure handoff. Dispatch selects (harness, model, tier) from the WP-106 policy table.
@@ -249,13 +249,13 @@ Dependency-ordered sequential dispatch per mission (consuming WP-110 contracts/d
 
 ### Track D — Validation & merge
 
-#### WP-115 · Validation runner: environments, vault, scrubbing, threat model
-Clean-environment validation from the per-repo test-environment profile (boot recipe, seed/reset scripts, reset-before-use); environment operations present lease generations (WP-114 interface); OS-keychain vault; egress/scrubbing productized from WP-005; infra-blocked classification; validation-config diff review; threat model documented.
+#### WP-115 · Validation runner: environments, vault, scrubbing, risk model
+Clean-environment validation from the per-repo test-environment profile (boot recipe, seed/reset scripts, reset-before-use); environment operations present lease generations (WP-114 interface); OS-keychain vault; egress/scrubbing productized from WP-005; infra-blocked classification; validation-config diff review; risk model documented.
 **Accept:**
 - Validation runs in a clean environment from the profile; reset-before-use is the hygiene primary; **post-crash resume assertion: environments reset-before-use on next acquisition** (chaos-matrix entry) — **CAM-VAL-01**, **CAM-STATE-06** (environment clause).
 - Worker env dumps contain no vault material; secrets reach only the runner — **CAM-VAL-02**.
-- CAM-SEC-04, complete: OS-keychain-backed storage for test-scoped credentials and (when used) API keys; injection into the validation runner only; per-repo tenant isolation; scheduled rotation; per-mission rotation for sensitive tenants — each behavior fixture-tested — **CAM-SEC-04**.
-- Phase-0 egress + scrubbing tests green against the product runner (allowlist-positive case included); **the three-tier threat model documented in-product, with T3 residual risk AND post-merge supply-chain residual risk stated, and surfaced in onboarding material** (rendered into what WP-118's onboarding shows David) (r2 finding 5) — **CAM-VAL-03**, **CAM-SEC-05**; scrub-before-store + retention quotas — **CAM-SEC-08**.
+- CAM-SEC-04, complete: OS-keychain-backed storage for test-scoped credentials and (when used) API keys; delivery into the validation runner only; per-repo tenant isolation; scheduled rotation; per-mission rotation for sensitive tenants — each behavior fixture-tested — **CAM-SEC-04**.
+- Phase-0 egress + scrubbing tests green against the product runner (allowlist-positive case included); **the three-tier risk model documented in-product, with T3 residual risk AND post-merge supply-chain residual risk stated, and surfaced in onboarding material** (rendered into what WP-118's onboarding shows David) (r2 finding 5) — **CAM-VAL-03**, **CAM-SEC-05**; scrub-before-store + retention quotas — **CAM-SEC-08**.
 - Worker changes to boot/validation config or dependency manifests → reclassification + human review of the config diff while any autonomy is active — **CAM-VAL-04**.
 - Missing test resources at validation → `infra-blocked`, never requirement-failed — **CAM-VAL-11**.
 - Registers its §4.4 kill-point integration fixtures (external test-service class) into the WP-104 chaos matrix — **CAM-STATE-06** tie.
@@ -273,10 +273,10 @@ Plan-time mission-level executable check suite (planner/reviewer-authored, worke
 - Every mission→main candidate gets a different-provider semantic review before the merge gate; three-way verdicts (pass / fail / escalate-with-question) recorded in the evidence packet with (sha, base_sha, class) — **CAM-VAL-06a**.
 
 #### WP-118 · Repo onboarding: protection, CI posture, credential custody
-Onboarding checks for the target repo: main protection (required checks incl. `camino/validation`, required-up-to-date, non-bypass); CI posture per CAM-SEC-03 (incl. the registry-17 private-repo clause: where environment required-reviewers are unavailable on the user's plan — warn, require secret relocation, or record accepted risk); sole fine-grained PAT custody in the control plane; onboarding material surfaces the WP-115 threat-model statement.
+Onboarding checks for the target repo: main protection (required checks incl. `camino/validation`, required-up-to-date, non-bypass); CI posture per CAM-SEC-03 (incl. the registry-17 private-repo clause: where environment required-reviewers are unavailable on the user's plan — warn, require secret relocation, or record accepted risk); sole fine-grained PAT custody in the control plane; onboarding material surfaces the WP-115 risk-model statement.
 **Accept:**
 - Onboarding fails with instructions when protection requirements are unmet — **CAM-MERGE-08**.
-- Fixture repo with a hostile `on: push branches: ['**']` secret-bearing workflow fails onboarding with the workflow named; default token read-only; Actions on `mission/*`, issue branches, and `camino/**` (incl. candidate refs) disabled or restricted to no-secret read-only; static trigger verification; privileged main workflows inventoried with the specified handling (environment protection with required reviewers where supported, else warn/relocate/record-accepted-risk); persistent self-hosted runners unsupported — **CAM-SEC-03**.
+- Fixture repo with a secret-bearing `on: push branches: ['**']` workflow fails onboarding with the workflow named; default token read-only; Actions on `mission/*`, issue branches, and `camino/**` (incl. candidate refs) disabled or restricted to no-secret read-only; static trigger verification; privileged main workflows inventoried with the specified handling (environment protection with required reviewers where supported, else warn/relocate/record-accepted-risk); persistent self-hosted runners unsupported — **CAM-SEC-03**.
 - The control plane holds the sole GitHub credential; workers hold zero GitHub credentials — **CAM-SEC-01** (custody half; pre-push policy checks are WP-119).
 - Onboarding material states T3 + post-merge supply-chain residual risk — **CAM-SEC-05** (surface half).
 
@@ -344,7 +344,7 @@ Per-attempt outcome ledger; mission economics; attention accounting with the ove
 Run the PRD §7 Phase-1 exit on a real repository, clause by clause.
 **Accept:**
 - Posture verified: one repo, PAT identity, polling, training mode throughout.
-- One real feature mission (3–6 issues): plan approved with its adversarial review attached; issues implemented by ≥2 adapter families; validated in clean environments; merged via merge-by-push through the integration branch to main; David approves against rendered evidence packets **in the viewer**; fold rendered; gap register populated.
+- One real feature mission (3–6 issues): plan approved with its falsification review attached; issues implemented by ≥2 adapter families; validated in clean environments; merged via merge-by-push through the integration branch to main; David approves against rendered evidence packets **in the viewer**; fold rendered; gap register populated.
 - Mission gate green at the exact landed candidate SHA — **CAM-VAL-13** Phase-1 clause.
 - Chaos suite full matrix green: **every §4.4 operation class against its real backend**, including lease-inspection and environment-reset resume assertions — **CAM-STATE-06** final.
 - CAM-CORE-04 full action-fixture matrix green.
@@ -446,7 +446,7 @@ Explicit graph — a WP starts when its dependencies are merged; issue links enc
 | 115 | 005, **104** (chaos-matrix registration), 107, **114** (lease interface) |
 | 116 | 101, **108** (candidate identity) |
 | 117 | **108** (worker-immutability), 110, 111, 115, **116** (verdicts into packets) |
-| 118 | 103, **115** (threat-model statement in onboarding material) |
+| 118 | 103, **115** (risk-model statement in onboarding material) |
 | 119 | 104, 108, 116, 117, 118 |
 | 120 | **104** (chaos-matrix registration), 109, 111, 119 |
 | 121 | 109, 118 |
@@ -467,7 +467,7 @@ Waves (parallel projection; no WP shares a wave with any dependency; r3 correcti
 7. **W7:** 119, 124, 125
 8. **W8:** 120, 121* → then **126**
 
-\* 121's dependencies (109, 118) clear at the end of W6, so its earliest slot is W7; it is placed in W8 to keep David's per-wave review load flat. 118 sits in W6 because it consumes WP-115's threat-model statement in its onboarding material; 123 follows 116 because the inbox renders packet artifacts; 124/125 follow 123.
+\* 121's dependencies (109, 118) clear at the end of W6, so its earliest slot is W7; it is placed in W8 to keep David's per-wave review load flat. 118 sits in W6 because it consumes WP-115's risk-model statement in its onboarding material; 123 follows 116 because the inbox renders packet artifacts; 124/125 follow 123.
 
 ## 6. What happens on approval
 
@@ -475,7 +475,7 @@ Waves (parallel projection; no WP shares a wave with any dependency; r3 correcti
 2. Create the two milestones, labels, and one GitHub Issue per WP (000–005, 101–126) with mapped IDs + verbatim PRD Accept text + dependency issue-links (including the Phase-0 chain).
 3. Start WP-000 on a branch per the method: agent implements, cross-provider review attached, David merges.
 
-## 7. Adversarial review record
+## 7. Falsification review record
 
 - **Round 1** (Codex gpt-5.6-sol xhigh, 2026-07-16): "safe to build on: **no**" — 19 findings; all accepted and folded into v2 (two with recorded nuances: urgent-lane P1 structure vs CAM-PLAN-10 [P2] workflow; xAI recording semantics).
 - **Round 2** (same reviewer, 2026-07-16): "safe to build on: **no**" — 13 findings; regression table on round 1: 13 resolved, 6 partial, 0 unresolved; P1 ID inventory, scaffold-vs-§6, and Phase-1 exit fidelity independently CONFIRMED. All 13 findings folded into v3, including: the artifact-level dependency edges (packet schema, contract, quarantined diff, lease interface) with re-cut waves; §4.4 full-table idempotency + workflow-dispatch at-most-once clause with satisfiable WP-104 timing; the xAI item moved into the WP-000 entry gate; CAM-SEC-05's onboarding clause; CAM-AUTON-01's post-revocation reset; CAM-MERGE-13's checklist; CAM-CANON-09's visibility boundaries; enumerated registry globs + all three risk tiers + register filters; registry items 14/17 re-homed; CAM-ROUTE-08 dual ownership (000 gate + 105 runbook); the CI-enforced core import fence; the WP-125 single-package rescope; and allowlist-positive egress + read-only provider-auth fixtures.

@@ -1,8 +1,8 @@
-// WP-003 quarantine attack suite — CAM-EXEC-04 (Phase-0), PRD §7 item 3.
+// WP-003 quarantine rejection suite — CAM-EXEC-04 (Phase-0), PRD §7 item 3.
 //
-// Every enumerated attack is a fixture that the squash-and-rebuild intake must
-// defeat: rejected outright, or (for reachable-history) structurally neutralized
-// so the smuggled object never enters the pristine store. A positive control
+// Every enumerated case is a fixture that the squash-and-rebuild intake must
+// reject outright, or (for reachable-history) exclude structurally
+// so the carried object never enters the pristine store. A positive control
 // proves a clean in-scope change is accepted and correctly re-authored. This
 // file rides the standard vitest CI glob, so it runs on every PR from here on.
 import { afterAll, describe, expect, it } from "vitest";
@@ -18,7 +18,7 @@ import {
   checkDotGitPaths,
 } from "./policy.js";
 import { analyzeWorkflow, CANDIDATE_REFS, scanWorkflowPosture } from "./workflow.js";
-import * as attacks from "./attacks.js";
+import * as cases from "./cases.js";
 
 afterAll(() => cleanupRepos());
 
@@ -26,7 +26,7 @@ const codes = (r: QuarantineResult): RejectionCode[] => r.rejections.map((x) => 
 
 describe("positive control — a clean in-scope change is accepted and re-authored", () => {
   it("accepts, rebuilds onto base with a single parent and a worker-attribution trailer", () => {
-    const fx = attacks.legitChange();
+    const fx = cases.legitChange();
     const r = runIntake(fx.repo, fx.head, fx.contract);
     expect(r.accepted).toBe(true);
     expect(r.rejections).toEqual([]);
@@ -43,149 +43,149 @@ describe("positive control — a clean in-scope change is accepted and re-author
 
 describe("false-reject controls — legitimate trees are accepted", () => {
   it("r2#9 — a gitlink already present + unchanged in the base is NOT rejected", () => {
-    const fx = attacks.unchangedGitlinkAllowed();
+    const fx = cases.unchangedGitlinkAllowed();
     const r = runIntake(fx.repo, fx.head, fx.contract);
     expect(r.rejections.map((x) => x.code)).not.toContain("submodule-gitlink");
     expect(r.accepted).toBe(true);
   });
 });
 
-describe("attack 1 — reachable-history smuggling is neutralized structurally", () => {
-  it("accepts the clean head but the smuggled object never entered the pristine store", () => {
-    const fx = attacks.reachableHistorySmuggling();
+describe("case 1 — reachable-history carry-in is excluded structurally", () => {
+  it("accepts the clean head but the carried object never entered the pristine store", () => {
+    const fx = cases.reachableHistoryCarryIn();
     const r = runIntake(fx.repo, fx.head, fx.contract);
     // The final tree is clean and in scope, so the head itself is accepted…
     expect(r.accepted).toBe(true);
     // …and crucially the 2 MB secret from the intermediate commit is ABSENT:
-    // the shallow fetch never pulled it, so it cannot be smuggled onto main.
-    expect(objectExists(r.pristineDir, fx.smuggledSha)).toBe(false);
+    // the shallow fetch never pulled it, so it can never reach main.
+    expect(objectExists(r.pristineDir, fx.carriedSha)).toBe(false);
     // The rebuilt candidate descends only from the assigned base.
     expect(r.rebuilt!.parents).toEqual([fx.contract.base]);
-    expect(objectExists(fx.repo, fx.smuggledSha)).toBe(true); // it did exist in worker history
+    expect(objectExists(fx.repo, fx.carriedSha)).toBe(true); // it did exist in worker history
   });
 });
 
 interface Case {
   name: string;
-  fixture: () => attacks.WorkerFixture;
+  fixture: () => cases.WorkerFixture;
   expect: RejectionCode;
 }
 
 const REJECTION_CASES: Case[] = [
   {
     name: "2 — path collision (case-fold)",
-    fixture: attacks.caseCollision,
+    fixture: cases.caseCollision,
     expect: "path-collision-case",
   },
   {
     name: "3 — path collision (Unicode normalization)",
-    fixture: attacks.unicodeCollision,
+    fixture: cases.unicodeCollision,
     expect: "path-collision-unicode",
   },
-  { name: "4 — reserved device name", fixture: attacks.reservedName, expect: "reserved-name" },
-  { name: "5 — trailing-dot alias", fixture: attacks.trailingDot, expect: "trailing-dot-or-space" },
+  { name: "4 — reserved device name", fixture: cases.reservedName, expect: "reserved-name" },
+  { name: "5 — trailing-dot alias", fixture: cases.trailingDot, expect: "trailing-dot-or-space" },
   {
     name: "6 — symlink target escape (../)",
-    fixture: attacks.symlinkEscape,
+    fixture: cases.symlinkEscape,
     expect: "symlink-escape",
   },
   {
     name: "6b — symlink target escape (absolute)",
-    fixture: attacks.symlinkAbsolute,
+    fixture: cases.symlinkAbsolute,
     expect: "symlink-escape",
   },
   {
-    name: "7 — .gitattributes tampering",
-    fixture: attacks.gitattributesTamper,
+    name: "7 — .gitattributes edit",
+    fixture: cases.gitattributesEdit,
     expect: "protected-path",
   },
-  { name: "8 — CI-definition edit", fixture: attacks.ciDefinitionEdit, expect: "protected-path" },
-  { name: "9 — out-of-scope diff", fixture: attacks.outOfScope, expect: "out-of-scope" },
+  { name: "8 — CI-definition edit", fixture: cases.ciDefinitionEdit, expect: "protected-path" },
+  { name: "9 — out-of-scope diff", fixture: cases.outOfScope, expect: "out-of-scope" },
   {
     name: "10 — worker merge commit",
-    fixture: attacks.workerMergeCommit,
+    fixture: cases.workerMergeCommit,
     expect: "worker-merge-commit",
   },
   {
     name: "11 — submodule/gitlink introduction",
-    fixture: attacks.submoduleGitlink,
+    fixture: cases.submoduleGitlink,
     expect: "submodule-gitlink",
   },
   {
-    name: "11b — .git 8.3 alias (GIT~1) smuggling",
-    fixture: attacks.dotGitAlias,
+    name: "11b — .git 8.3 alias (GIT~1)",
+    fixture: cases.dotGitAlias,
     expect: "dotgit-path",
   },
-  { name: "11c — symlink into .git", fixture: attacks.symlinkIntoDotGit, expect: "symlink-escape" },
-  { name: "12 — size bomb", fixture: attacks.sizeBomb, expect: "blob-size-budget" },
+  { name: "11c — symlink into .git", fixture: cases.symlinkIntoDotGit, expect: "symlink-escape" },
+  { name: "12 — size-budget breach", fixture: cases.oversizeBlob, expect: "blob-size-budget" },
   // review r1 folds:
   {
     name: "r1#1 — case-spelled protected path (.GITATTRIBUTES)",
-    fixture: attacks.protectedPathCaseVariant,
+    fixture: cases.protectedPathCaseVariant,
     expect: "protected-path",
   },
   {
-    name: "r1#5 — deep-nesting object-count bomb",
-    fixture: attacks.deepNestingBomb,
+    name: "r1#5 — deep-nesting object-count breach",
+    fixture: cases.deepNestingBudgetBreach,
     expect: "entry-budget",
   },
   {
     name: "r1#6 — drive-relative symlink target (C:foo)",
-    fixture: attacks.symlinkDriveRelative,
+    fixture: cases.symlinkDriveRelative,
     expect: "symlink-escape",
   },
   {
     name: "r1#7 — superscript device alias (COM²)",
-    fixture: attacks.reservedSuperscript,
+    fixture: cases.reservedSuperscript,
     expect: "reserved-name",
   },
   {
     name: "r1#8 — full-fold path collision (straße ⇄ STRASSE)",
-    fixture: attacks.unicodeFoldCollision,
+    fixture: cases.unicodeFoldCollision,
     expect: "path-collision-unicode",
   },
   // review r2 folds:
   {
     name: "r2#1 — rename hides a protected-path source deletion",
-    fixture: attacks.renameHidesProtected,
+    fixture: cases.renameHidesProtected,
     expect: "protected-path",
   },
   {
     name: "r2#2 — NTFS .git ADS alias (.git::$INDEX_ALLOCATION)",
-    fixture: attacks.ntfsDotGitAds,
+    fixture: cases.ntfsDotGitAds,
     expect: "dotgit-path",
   },
   {
     name: "r2#7 — backslash-separator collision (docs\\note)",
-    fixture: attacks.backslashCollision,
+    fixture: cases.backslashCollision,
     expect: "windows-alias",
   },
   {
     name: "r2#11 — NUL-bearing symlink target",
-    fixture: attacks.nulSymlinkTarget,
+    fixture: cases.nulSymlinkTarget,
     expect: "symlink-escape",
   },
   // review r3 folds:
   {
     name: "r3#1 — HFS-ignorable .git equivalent (git fsck gate)",
-    fixture: attacks.hfsDotGit,
+    fixture: cases.hfsDotGit,
     expect: "fsck-violation",
   },
   {
     name: "r3#7 — oversized symlink target (rejected on size, no crash)",
-    fixture: attacks.oversizeSymlink,
+    fixture: cases.oversizeSymlink,
     expect: "symlink-escape",
   },
   {
     name: "r3#8 — ancestor-component collision (A ⇄ a/)",
-    fixture: attacks.ancestorComponentCollision,
+    fixture: cases.ancestorComponentCollision,
     expect: "path-collision-case",
   },
 ];
 
-describe("attacks 2–12 — each is rejected with the expected reason and produces no candidate", () => {
+describe("cases 2–12 — each is rejected with the expected reason and produces no candidate", () => {
   for (const c of REJECTION_CASES) {
-    it(`attack ${c.name}`, () => {
+    it(`case ${c.name}`, () => {
       const fx = c.fixture();
       const r = runIntake(fx.repo, fx.head, fx.contract);
       expect(r.accepted).toBe(false);
@@ -195,8 +195,8 @@ describe("attacks 2–12 — each is rejected with the expected reason and produ
   }
 });
 
-describe("attack 13 — hostile workflow firing on candidate refs is flagged", () => {
-  const HOSTILE = `name: deploy
+describe("case 13 — privileged workflow firing on candidate refs is flagged", () => {
+  const PRIVILEGED = `name: deploy
 on:
   push:
     branches: ['**']
@@ -208,7 +208,7 @@ jobs:
         env:
           KEY: \${{ secrets.DEPLOY_KEY }}
 `;
-  const HOSTILE_WRITE = `name: release
+  const PRIVILEGED_WRITE = `name: release
 on: push
 permissions: write-all
 jobs:
@@ -234,7 +234,7 @@ jobs:
 `;
 
   it("flags a secret-bearing workflow with on: push branches ['**'], naming the file", () => {
-    const finding = analyzeWorkflow(".github/workflows/deploy.yml", HOSTILE, CANDIDATE_REFS);
+    const finding = analyzeWorkflow(".github/workflows/deploy.yml", PRIVILEGED, CANDIDATE_REFS);
     expect(finding).not.toBeNull();
     expect(finding!.file).toBe(".github/workflows/deploy.yml");
     expect(finding!.fires.length).toBeGreaterThan(0);
@@ -242,7 +242,11 @@ jobs:
   });
 
   it("flags on: push (no filter) with write-all permissions", () => {
-    const finding = analyzeWorkflow(".github/workflows/release.yml", HOSTILE_WRITE, CANDIDATE_REFS);
+    const finding = analyzeWorkflow(
+      ".github/workflows/release.yml",
+      PRIVILEGED_WRITE,
+      CANDIDATE_REFS,
+    );
     expect(finding).not.toBeNull();
     expect(finding!.privileged.join(" ")).toMatch(/write-all/);
   });
@@ -251,16 +255,16 @@ jobs:
     expect(analyzeWorkflow(".github/workflows/ci.yml", SAFE_NARROW, CANDIDATE_REFS)).toBeNull();
   });
 
-  it("does NOT flag a broad trigger that is read-only and secret-free (fires ≠ hostile)", () => {
+  it("does NOT flag a broad trigger that is read-only and secret-free (fires ≠ privileged)", () => {
     expect(
       analyzeWorkflow(".github/workflows/lint.yml", BROAD_BUT_HARMLESS, CANDIDATE_REFS),
     ).toBeNull();
   });
 
-  it("scan returns one finding per hostile workflow", () => {
+  it("scan returns one finding per privileged-on-candidate workflow", () => {
     const findings = scanWorkflowPosture(
       [
-        { path: ".github/workflows/deploy.yml", content: HOSTILE },
+        { path: ".github/workflows/deploy.yml", content: PRIVILEGED },
         { path: ".github/workflows/ci.yml", content: SAFE_NARROW },
       ],
       CANDIDATE_REFS,

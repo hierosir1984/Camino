@@ -22,5 +22,5 @@ labels: wp
 ## Definition of done
 
 - [ ] Every acceptance bullet in the Work package section demonstrably passes (fixtures/tests in CI where specified)
-- [ ] PR carries a cross-provider adversarial review (`reviewer.provider != implementer.provider`)
+- [ ] PR carries a cross-provider falsification review (`reviewer.provider != implementer.provider`)
 - [ ] David merges
