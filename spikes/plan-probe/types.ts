@@ -2,7 +2,7 @@
 //
 // This is a SPIKE: it de-risks the intake mechanics (PRD text → issues +
 // clarifying questions + requirement-checklist diff, with a cross-family
-// adversarial review attached) and produces the rating packet David scores.
+// falsification review attached) and produces the rating packet David scores.
 // The durable planner lands in Phase 1 (WP-117/118); the schemas here are the
 // prototype's, not the product's.
 

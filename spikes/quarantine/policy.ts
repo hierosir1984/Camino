@@ -37,8 +37,8 @@ function fullyCanonical(path: string): string {
 }
 
 /**
- * Two distinct stored paths that map to the same OS file are a smuggling/overwrite
- * vector: on a case-insensitive or Unicode-normalizing filesystem one silently
+ * Two distinct stored paths that map to the same OS file are an aliasing/overwrite
+ * hazard: on a case-insensitive or Unicode-normalizing filesystem one silently
  * shadows the other. Reject any such collision in the final tree, labelling
  * whether the paths differ only by case or by Unicode composition.
  */
@@ -108,7 +108,7 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
       });
     }
     for (const seg of e.path.split("/")) {
-      // A `\` segment is a Windows path separator smuggled past our `/` split,
+      // A `\` segment is a Windows path separator slipped past our `/` split,
       // and a `:` is an NTFS ADS marker / invalid POSIX-portable char; either
       // makes the path mean different things across platforms (review r2 #7, #2).
       if (seg.includes("\\") || seg.includes(":")) {
@@ -139,7 +139,7 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   return out;
 }
 
-// --- `.git` directory smuggling ---
+// --- `.git` directory aliases ---
 
 /** A path segment that resolves to a `.git` directory on some platform. */
 function isDotGitSegment(seg: string): boolean {
@@ -163,7 +163,7 @@ export function checkDotGitPaths(entries: readonly TreeEntry[]): Rejection[] {
         out.push({
           code: "dotgit-path",
           path: e.path,
-          detail: `path contains a .git segment ("${seg}") — repo-internals smuggling`,
+          detail: `path contains a .git segment ("${seg}") — repo-internals overwrite risk`,
         });
         break;
       }
@@ -279,7 +279,7 @@ export function checkSymlinks(
 /**
  * `objectCount` is the count of ALL objects in the final tree — every subtree
  * plus every leaf — not just the flattened leaves: a pathologically deep tree
- * has one leaf but arbitrarily many tree objects, which is the resource bomb the
+ * has one leaf but arbitrarily many tree objects, which is the resource blow-up the
  * budget must catch (review r1 #5). The intake supplies it from `ls-tree -r -t`.
  */
 export function checkBudgets(

@@ -1,5 +1,5 @@
 // Structural validation of worker-written JSON deliverables. Hand-rolled and
-// total (never throws on hostile input): every defect is returned as a
+// total (never throws on malformed input): every defect is returned as a
 // human-readable error string, so the run report can show the worker's output
 // AND exactly why it was rejected.
 import type {
@@ -41,7 +41,7 @@ function nonEmpty(v: unknown): v is string {
 /**
  * The schemas are closed: a document carrying keys the prompt never showed is
  * not "conforming with extras", it is nonconforming (review r1c finding 6 —
- * unexpected keys are where smuggled/mistaken content hides).
+ * unexpected keys are where stray/mistaken content hides).
  */
 function unknownKeys(obj: Record<string, unknown>, allowed: string[], where: string): string[] {
   return Object.keys(obj)

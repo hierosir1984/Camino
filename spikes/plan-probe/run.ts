@@ -399,7 +399,7 @@ export function renderReport(evidence: ProbeEvidence, packet: string | null): st
   }
   if (evidence.review) {
     lines.push(
-      "## Attached adversarial review",
+      "## Attached falsification review",
       "",
       `- Verdict: ${evidence.review.verdict}`,
       `- Findings: ${evidence.review.blocker} blocker / ${evidence.review.major} major / ` +

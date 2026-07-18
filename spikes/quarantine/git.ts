@@ -1,10 +1,10 @@
 // Git plumbing helpers for the WP-003 quarantine spike.
 //
-// Every attack fixture is constructed with PLUMBING (hash-object / a temp-index
+// Every case fixture is constructed with PLUMBING (hash-object / a temp-index
 // write-tree / commit-tree), never by writing working-tree files: the host is a
 // case-insensitive, Unicode-normalizing macOS filesystem, so `File.txt` +
 // `file.txt`, trailing-dot aliases, symlinks, and gitlinks simply cannot exist
-// as committed files here. Plumbing builds the exact adversarial trees anyway.
+// as committed files here. Plumbing builds the exact trees under test anyway.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -52,7 +52,7 @@ export function initRepo(prefix = "camino-quarantine-"): string {
   // Let the intake fetch a bare commit sha (fixtures hand out shas, not refs).
   git(dir, "config", "uploadpack.allowAnySHA1InWant", "true");
   git(dir, "config", "uploadpack.allowReachableSHA1InWant", "true");
-  // Keep adversarial paths intact so the POLICY layer catches them, not git's
+  // Keep the raw path bytes intact so the POLICY layer catches them, not git's
   // host-specific munging: macOS would otherwise precompose NFD names (hiding
   // the Unicode-collision fixture) and HFS/NTFS guards could pre-reject the
   // trailing-dot / reserved-name fixtures. The real repos we operate on could
