@@ -303,6 +303,83 @@ export function unicodeFoldCollision(): WorkerFixture {
   return { repo, head, contract: contract(base) };
 }
 
+// --- review r2 folds ---
+
+/** Rename `.gitattributes` → `src/attrs.txt`: the SOURCE deletion is protected. */
+export function renameHidesProtected(): WorkerFixture {
+  const repo = initRepo();
+  const app = hashBlob(repo, "console.log('app');\n");
+  const attrs = hashBlob(repo, "* text\n");
+  const baseTree = buildTree(repo, [
+    { mode: "100644", sha: app, path: "src/app.js" },
+    { mode: "100644", sha: attrs, path: ".gitattributes" },
+  ]);
+  const base = commitTree(repo, baseTree, [], "base");
+  const headTree = buildTree(repo, [
+    { mode: "100644", sha: app, path: "src/app.js" },
+    { mode: "100644", sha: attrs, path: "src/attrs.txt" }, // moved out of root
+  ]);
+  const head = commitTree(repo, headTree, [base], "rename .gitattributes");
+  return { repo, head, contract: contract(base, ["src/**"]) };
+}
+
+/** `.git::$INDEX_ALLOCATION/config` — NTFS alternate-stream spelling of `.git`. */
+export function ntfsDotGitAds(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const cfg = hashBlob(repo, "[core]\n\thooksPath = .\n");
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: cfg, path: ".git::$INDEX_ALLOCATION/config" },
+  ]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
+/** `docs\note` (backslash segment) collides with `docs/note` on Windows. */
+export function backslashCollision(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const a = hashBlob(repo, "fwd\n");
+  const b = hashBlob(repo, "bwd\n");
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: a, path: "docs/note" },
+    { mode: "100644", sha: b, path: "docs\\note" },
+  ]);
+  return { repo, head, contract: contract(base, ["**"]) };
+}
+
+/** A symlink whose target carries a NUL byte cannot materialize faithfully. */
+export function nulSymlinkTarget(): WorkerFixture {
+  const repo = initRepo();
+  const { base, entries } = makeBase(repo);
+  const target = hashBlob(repo, "safe\0../../../../etc/passwd");
+  const head = headWith(repo, base, entries, [{ mode: "120000", sha: target, path: "src/nul" }]);
+  return { repo, head, contract: contract(base) };
+}
+
+/** A gitlink already present + unchanged in the base must NOT be rejected. */
+export function unchangedGitlinkAllowed(): WorkerFixture {
+  const repo = initRepo();
+  const app = hashBlob(repo, "console.log('app');\n");
+  const readme = hashBlob(repo, "# sample\n");
+  // A real commit sha to point the gitlink at.
+  const pointer = commitTree(
+    repo,
+    buildTree(repo, [{ mode: "100644", sha: app, path: "x" }]),
+    [],
+    "ptr",
+  );
+  const baseEntries: CacheEntry[] = [
+    { mode: "100644", sha: app, path: "src/app.js" },
+    { mode: "100644", sha: readme, path: "README.md" },
+    { mode: "160000", sha: pointer, path: "vendor/lib" },
+  ];
+  const base = commitTree(repo, buildTree(repo, baseEntries), [], "base with submodule");
+  const app2 = hashBlob(repo, "console.log('v2');\n");
+  const headEntries = baseEntries.map((e) => (e.path === "src/app.js" ? { ...e, sha: app2 } : e));
+  const head = commitTree(repo, buildTree(repo, headEntries), [base], "change app only");
+  return { repo, head, contract: contract(base, ["src/**", "README.md", "vendor/**"]) };
+}
+
 // --- 12. size bomb ---
 
 export function sizeBomb(): WorkerFixture {

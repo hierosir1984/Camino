@@ -60,6 +60,7 @@ export type RejectionCode =
   | "submodule-gitlink"
   | "symlink-escape"
   | "dotgit-path"
+  | "windows-alias"
   | "blob-size-budget"
   | "tree-size-budget"
   | "entry-budget";

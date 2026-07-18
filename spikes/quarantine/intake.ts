@@ -69,15 +69,20 @@ function parentShas(dir: string, commit: string): string[] {
 }
 
 function changedPaths(dir: string, base: string, head: string): string[] {
-  const raw = gitBuf(dir, "diff", "--name-only", "-z", base, head).toString("utf8");
+  // `--no-renames`: rename detection collapses a move to just the destination,
+  // hiding the SOURCE deletion — which would let a rename of `.gitattributes` or
+  // an out-of-scope file slip past the protected/scope checks (review r2 #1).
+  const raw = gitBuf(dir, "diff", "--name-only", "--no-renames", "-z", base, head).toString("utf8");
   return raw.split("\0").filter((s) => s.length > 0);
 }
 
 function symlinkTargets(dir: string, entries: readonly TreeEntry[]): Map<string, string> {
   const targets = new Map<string, string>();
   for (const e of entries) {
+    // latin1: preserve the exact target bytes (incl. any NUL / control) so the
+    // escape check sees what the OS would (review r2 #11).
     if (e.mode === "120000")
-      targets.set(e.path, gitBuf(dir, "cat-file", "blob", e.sha).toString("utf8"));
+      targets.set(e.path, gitBuf(dir, "cat-file", "blob", e.sha).toString("latin1"));
   }
   return targets;
 }
@@ -125,24 +130,28 @@ export function runIntake(
   }
 
   const treeSha = git(pristineDir, "rev-parse", `${workerHead}^{tree}`);
-  // Leaves (blobs, symlinks, gitlinks) for the path/content checks…
+  // Leaves (blobs, symlinks, gitlinks) for the path/content checks. Paths that
+  // are not valid UTF-8 decode to U+FFFD and are rejected outright by
+  // checkNameAliases, so they cannot be silently deduped/collapsed (review r2 #8).
   const entries = parseTree(
     gitBuf(pristineDir, "ls-tree", "-r", "-l", "-z", treeSha).toString("utf8"),
   );
-  // …and ALL objects (subtrees + leaves) for the object-count budget: `-t`
-  // includes every intermediate tree, so a deep-nesting bomb is counted.
-  const objectCount = parseTree(
-    gitBuf(pristineDir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8"),
-  ).length;
+  // …and ALL objects (subtrees + leaves + the root tree itself) for the
+  // object-count budget: `-t` includes every intermediate tree, and +1 counts
+  // the queried root that ls-tree omits (deep-nesting bomb — review r2 #12).
+  const objectCount =
+    parseTree(gitBuf(pristineDir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8"))
+      .length + 1;
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, contract.base, workerHead);
+  const changedSet = new Set(changed);
 
   rejections.push(
     ...checkScopeAndProtected(changed, contract.allowedPaths),
     ...checkPathCollisions(entries),
     ...checkNameAliases(entries),
     ...checkDotGitPaths(entries),
-    ...checkSubmodules(entries),
+    ...checkSubmodules(entries, changedSet),
     ...checkSymlinks(entries, targets),
     ...checkBudgets(entries, budgets, objectCount),
   );

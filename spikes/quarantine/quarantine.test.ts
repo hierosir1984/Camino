@@ -41,6 +41,15 @@ describe("positive control — a clean in-scope change is accepted and re-author
   });
 });
 
+describe("false-reject controls — legitimate trees are accepted", () => {
+  it("r2#9 — a gitlink already present + unchanged in the base is NOT rejected", () => {
+    const fx = attacks.unchangedGitlinkAllowed();
+    const r = runIntake(fx.repo, fx.head, fx.contract);
+    expect(r.rejections.map((x) => x.code)).not.toContain("submodule-gitlink");
+    expect(r.accepted).toBe(true);
+  });
+});
+
 describe("attack 1 — reachable-history smuggling is neutralized structurally", () => {
   it("accepts the clean head but the smuggled object never entered the pristine store", () => {
     const fx = attacks.reachableHistorySmuggling();
@@ -134,6 +143,27 @@ const REJECTION_CASES: Case[] = [
     name: "r1#8 — full-fold path collision (straße ⇄ STRASSE)",
     fixture: attacks.unicodeFoldCollision,
     expect: "path-collision-unicode",
+  },
+  // review r2 folds:
+  {
+    name: "r2#1 — rename hides a protected-path source deletion",
+    fixture: attacks.renameHidesProtected,
+    expect: "protected-path",
+  },
+  {
+    name: "r2#2 — NTFS .git ADS alias (.git::$INDEX_ALLOCATION)",
+    fixture: attacks.ntfsDotGitAds,
+    expect: "dotgit-path",
+  },
+  {
+    name: "r2#7 — backslash-separator collision (docs\\note)",
+    fixture: attacks.backslashCollision,
+    expect: "windows-alias",
+  },
+  {
+    name: "r2#11 — NUL-bearing symlink target",
+    fixture: attacks.nulSymlinkTarget,
+    expect: "symlink-escape",
   },
 ];
 
@@ -279,6 +309,63 @@ jobs:
     expect(jf).not.toBeNull();
     expect(jf!.privileged.join(" ")).toMatch(/job "a" permissions grant write/);
   });
+
+  it("r2#3 — ordinary pull_request with secrets is flagged (same-repo candidate refs)", () => {
+    const wf = `name: pr
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps: [{ run: use, env: { K: "\${{ secrets.DEPLOY_KEY }}" } }]
+`;
+    const f = analyzeWorkflow(".github/workflows/pr.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.fires.join(" ")).toMatch(/pull_request/);
+  });
+
+  it("r2#10 — a tags-only push workflow does NOT fire on candidate branch refs", () => {
+    const wf = `name: tag
+on:
+  push:
+    tags: ['v*']
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    expect(analyzeWorkflow(".github/workflows/tag.yml", wf, CANDIDATE_REFS)).toBeNull();
+  });
+
+  it("r2#4 — an exact sub-namespace branch pattern not in the samples is still flagged", () => {
+    const wf = `name: ns
+on:
+  push:
+    branches: ['camino/candidate/issue-99/**']
+permissions: write-all
+jobs:
+  a: { runs-on: ubuntu-latest, steps: [{ run: echo }] }
+`;
+    const f = analyzeWorkflow(".github/workflows/ns.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.fires.join(" ")).toMatch(/Camino-managed namespace/);
+  });
+
+  it("r2#5 — secrets: inherit into a reusable workflow is flagged", () => {
+    const wf = `name: reuse
+on:
+  push:
+    branches: ['camino/**']
+permissions: read-all
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+`;
+    const f = analyzeWorkflow(".github/workflows/reuse.yml", wf, CANDIDATE_REFS);
+    expect(f).not.toBeNull();
+    expect(f!.privileged.join(" ")).toMatch(/secrets: inherit/);
+  });
 });
 
 describe("policy units — the security-relevant edge cases", () => {
@@ -357,5 +444,8 @@ describe("policy units — the security-relevant edge cases", () => {
       "path-collision-unicode",
     ]);
     expect(checkPathCollisions([e("a"), e("b")])).toEqual([]);
+    // ß ⇄ SS full-fold (r1#8/r2#6) and long-s ſ via NFKC (r2#6) both collide.
+    expect(checkPathCollisions([e("straße"), e("STRASSE")]).length).toBe(1);
+    expect(checkPathCollisions([e("ſafe"), e("safe")]).length).toBe(1);
   });
 });

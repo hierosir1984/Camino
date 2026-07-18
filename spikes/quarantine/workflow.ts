@@ -94,16 +94,16 @@ function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
   const onObj = asRecord(on);
   if (!onObj) return reasons;
 
-  // `pull_request_target` is privileged BY NATURE: it runs in the base-repo
-  // context (with secrets/write) on pull requests, and its branch filters match
-  // the PR's BASE branch, not any candidate head ref (review r1 #2). So it is
-  // not analysed via candidate-ref matching — its mere presence is a "fires"
-  // reason, which only becomes a finding when the workflow is also privileged.
-  if ("pull_request_target" in onObj) {
-    reasons.push(
-      "pull_request_target runs in privileged base context on pull requests " +
-        "(branch filters match the base branch, not the candidate ref)",
-    );
+  // `pull_request_target` (and, for SAME-REPO candidate refs, ordinary
+  // `pull_request`) run with the base repo's secrets — the fork no-secret rule
+  // does not apply because candidate refs are same-repo branches (review r1 #2,
+  // r2 #3). Branch filters on these match the PR's BASE, not the candidate ref,
+  // so presence alone is the "fires" reason; it becomes a finding only if the
+  // workflow is also privileged.
+  for (const ev of ["pull_request_target", "pull_request"]) {
+    if (ev in onObj) {
+      reasons.push(`${ev} runs with base-repo secrets on same-repo pull requests`);
+    }
   }
 
   // `push` DOES key on the pushed ref, so candidate-ref matching applies.
@@ -116,13 +116,26 @@ function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
       if (specObj) {
         const branches = toStringList(specObj["branches"]);
         const ignore = toStringList(specObj["branches-ignore"]);
-        if (branches.length === 0 && ignore.length === 0) {
+        const tagsOnly =
+          branches.length === 0 &&
+          ignore.length === 0 &&
+          (specObj["tags"] !== undefined || specObj["tags-ignore"] !== undefined);
+        if (tagsOnly) {
+          // A push filter with ONLY tags does not run on branch events, so it
+          // never fires on a candidate branch ref (review r2 #10).
+        } else if (branches.length === 0 && ignore.length === 0) {
           reasons.push(
             `push: (no branches filter ⇒ all branches) fires on ${candidateRefs.join(", ")}`,
           );
         } else if (branches.length > 0) {
           for (const h of firesOnBranches(branches, candidateRefs)) {
             reasons.push(`push.branches ${JSON.stringify(branches)} matches ${h}`);
+          }
+          // Sample refs cannot represent a whole namespace, so also flag a
+          // positive pattern that TARGETS a candidate namespace prefix even if
+          // no sample ref matched it exactly (review r2 #4).
+          for (const b of branchesTargetingNamespace(branches)) {
+            reasons.push(`push.branches "${b}" targets a Camino-managed namespace`);
           }
         } else if (ignore.length > 0) {
           const ignored = new Set(firesOnBranches(ignore, candidateRefs));
@@ -136,6 +149,26 @@ function analyzeTriggers(on: unknown, candidateRefs: string[]): string[] {
     }
   }
   return reasons;
+}
+
+/** Camino-managed ref namespaces a candidate can live under (design §5.5). */
+const CANDIDATE_NAMESPACE_PREFIXES = ["camino/", "mission/"];
+
+/**
+ * Positive branch patterns whose literal prefix lands inside (or a wildcard can
+ * reach into) a Camino-managed namespace — a whole-namespace generalization of
+ * the concrete-sample match, so an exact sub-namespace pattern the samples miss
+ * is still flagged (review r2 #4).
+ */
+function branchesTargetingNamespace(patterns: string[]): string[] {
+  return patterns.filter((p) => {
+    if (p.startsWith("!")) return false;
+    if (/^[*?[]/.test(p)) return true; // leading wildcard can reach anywhere
+    const literal = p.split(/[*?[]/)[0] ?? p;
+    return CANDIDATE_NAMESPACE_PREFIXES.some(
+      (np) => literal.startsWith(np) || np.startsWith(literal),
+    );
+  });
 }
 
 /** Write scopes declared by a `permissions:` value (top-level or per-job). */
@@ -175,9 +208,19 @@ function analyzePrivilege(doc: Record<string, unknown>, rawText: string): string
   if (jobs) {
     for (const [jobId, job] of Object.entries(jobs)) {
       const jobObj = asRecord(job);
-      if (jobObj && "permissions" in jobObj) {
+      if (!jobObj) continue;
+      if ("permissions" in jobObj) {
         const w = writeScopes(jobObj["permissions"]);
         if (w.length > 0) reasons.push(`job "${jobId}" permissions grant write: ${w.join(", ")}`);
+      }
+      // A reusable-workflow call with `secrets: inherit` passes ALL of the
+      // caller's secrets to the called workflow — invisible to a literal
+      // `secrets.X` scan (review r2 #5).
+      const secrets = jobObj["secrets"];
+      if (secrets === "inherit") {
+        reasons.push(`job "${jobId}" passes secrets: inherit to a reusable workflow`);
+      } else if (asRecord(secrets)) {
+        reasons.push(`job "${jobId}" forwards named secrets to a reusable workflow`);
       }
     }
   }

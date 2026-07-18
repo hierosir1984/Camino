@@ -6,33 +6,30 @@ import type { Budgets, Rejection, TreeEntry } from "./types.js";
 // --- path canonicalization (case-fold + Unicode collisions) ---
 
 /**
- * A handful of FULL case-fold expansions that `toLowerCase()` does not perform
- * but common case-insensitive filesystems / callers may (review r1 #8, e.g.
- * `ß` ⇄ `SS`). Not exhaustive — the product check (WP-108) uses an ICU-backed
- * full fold; this covers the well-known Latin multi-char folds and errs toward
- * collapsing (a false collision is safe; a missed one is not).
+ * Full case-fold expansions NFKC does not perform. NFKC already folds the Latin
+ * ligatures (ﬁ→fi …), the long s (ſ→s), and superscripts, so only `ß`⇄`SS`
+ * remains (it has no compatibility decomposition). Not a complete Unicode fold —
+ * the product check (WP-108) uses ICU — but it errs toward collapsing, and a
+ * false collision is safe while a missed one is not (review r1 #8 / r2 #6).
  */
 function foldExpand(s: string): string {
-  return s
-    .replace(/ß/g, "ss")
-    .replace(/ﬀ/g, "ff")
-    .replace(/ﬁ/g, "fi")
-    .replace(/ﬂ/g, "fl")
-    .replace(/ﬃ/g, "ffi")
-    .replace(/ﬄ/g, "ffl")
-    .replace(/ﬅ/g, "st")
-    .replace(/ﬆ/g, "st");
+  return s.replace(/ß/g, "ss");
 }
 
 /**
- * Canonical collision key: NFC-normalize, apply the known full-fold expansions,
- * then lowercase — per segment. Two stored paths sharing this key would resolve
- * to one file on a case-insensitive / normalizing filesystem.
+ * Canonical collision key for one path. Steps, per segment:
+ *  - treat `\` as `/` (Windows separator equivalence — review r2 #7);
+ *  - NFKC-normalize, apply the residual full-folds, then lowercase.
+ * Two stored paths sharing this key would resolve to one file on a
+ * case-insensitive / normalizing filesystem. (Paths that are not valid UTF-8
+ * are rejected upstream by checkNameAliases, so they never reach here as an
+ * ambiguous replacement-char string — review r2 #8.)
  */
 function fullyCanonical(path: string): string {
   return path
+    .replace(/\\/g, "/")
     .split("/")
-    .map((s) => foldExpand(s.normalize("NFC")).toLowerCase())
+    .map((s) => foldExpand(s.normalize("NFKC")).toLowerCase())
     .join("/");
 }
 
@@ -66,28 +63,56 @@ export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] 
   return out;
 }
 
-// --- reserved names & trailing-dot/space aliases ---
+// --- reserved names & trailing-dot/space / Windows-alias segments ---
 
 // COM/LPT digits include the superscript forms ¹²³ (U+00B9/B2/B3), which
 // Windows also reserves — COM² etc. (review r1 #7).
 const RESERVED = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
 /**
- * Windows reserved device names (CON, NUL, COM1…, LPT1…) — matched on the stem,
- * so `con.txt` is reserved but `console.txt` is not — resolve to a device rather
- * than a file, and trailing-dot / trailing-space segments are silently trimmed by
- * Windows, aliasing to a different path. Either lets a tree mean two things across
- * platforms. Reject.
+ * Strip the aliases Windows applies before it resolves a name: an NTFS alternate
+ * data stream suffix (`name::$DATA`, `.git::$INDEX_ALLOCATION`) and any trailing
+ * dots/spaces. `foo.txt::$DATA` and `foo.txt` are the same file; `.git::$INDEX_
+ * ALLOCATION` reaches the `.git` dir (review r2 #2).
  */
+function stripWindowsAlias(seg: string): string {
+  const colon = seg.indexOf(":");
+  const base = colon >= 0 ? seg.slice(0, colon) : seg;
+  return base.replace(/[ .]+$/, "");
+}
+
 export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   const out: Rejection[] = [];
   for (const e of entries) {
+    // A path git handed us that did not round-trip as UTF-8 decodes to U+FFFD:
+    // its real bytes are non-portable and its identity is ambiguous (distinct
+    // byte paths would collapse to one string). Reject rather than guess
+    // (review r2 #8).
+    if (e.path.includes("�")) {
+      out.push({
+        code: "windows-alias",
+        path: e.path,
+        detail: `path "${e.path}" is not valid UTF-8 (non-portable, ambiguous identity)`,
+      });
+    }
     for (const seg of e.path.split("/")) {
-      if (RESERVED.test(seg)) {
+      // A `\` segment is a Windows path separator smuggled past our `/` split,
+      // and a `:` is an NTFS ADS marker / invalid POSIX-portable char; either
+      // makes the path mean different things across platforms (review r2 #7, #2).
+      if (seg.includes("\\") || seg.includes(":")) {
+        out.push({
+          code: "windows-alias",
+          path: e.path,
+          detail: `path segment "${seg}" contains a backslash or colon (Windows separator / ADS)`,
+        });
+      }
+      // Reserved device name — matched on the ADS/trailing-stripped stem, so
+      // `con.txt`, `CON `, and `NUL::$DATA` all resolve.
+      if (RESERVED.test(stripWindowsAlias(seg))) {
         out.push({
           code: "reserved-name",
           path: e.path,
-          detail: `path segment "${seg}" is a reserved device name`,
+          detail: `path segment "${seg}" resolves to a reserved device name`,
         });
       }
       if (/[ .]$/.test(seg)) {
@@ -106,9 +131,10 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
 
 /** A path segment that resolves to a `.git` directory on some platform. */
 function isDotGitSegment(seg: string): boolean {
-  // `.git` with optional trailing dots/spaces (Windows trims them), or the 8.3
-  // short-name alias `git~1`. Case-insensitive (HFS/NTFS fold case).
-  return /^\.git[ .]*$/i.test(seg) || /^git~[0-9]+$/i.test(seg);
+  // Strip NTFS ADS + trailing dots/spaces first, then match `.git` (any case) or
+  // the 8.3 short-name alias `git~N` (review r1 + r2 #2).
+  const s = stripWindowsAlias(seg);
+  return /^\.git$/i.test(s) || /^git~[0-9]+$/i.test(s);
 }
 
 /**
@@ -136,10 +162,19 @@ export function checkDotGitPaths(entries: readonly TreeEntry[]): Rejection[] {
 
 // --- submodule / gitlink ---
 
-/** A gitlink (mode 160000) pulls in out-of-tree history the intake never vetted. */
-export function checkSubmodules(entries: readonly TreeEntry[]): Rejection[] {
+/**
+ * A gitlink (mode 160000) pulls in out-of-tree history the intake never vetted.
+ * Only a gitlink the worker INTRODUCED or moved is rejected — one already
+ * present and unchanged in the assigned base is not the worker's doing
+ * (CAM-EXEC-04 says block *introductions*; review r2 #9). `changed` is the
+ * base↔head path set.
+ */
+export function checkSubmodules(
+  entries: readonly TreeEntry[],
+  changed: ReadonlySet<string>,
+): Rejection[] {
   return entries
-    .filter((e) => e.mode === "160000" || e.type === "commit")
+    .filter((e) => (e.mode === "160000" || e.type === "commit") && changed.has(e.path))
     .map((e) => ({
       code: "submodule-gitlink" as const,
       path: e.path,
@@ -152,6 +187,11 @@ export function checkSubmodules(entries: readonly TreeEntry[]): Rejection[] {
 /** Does a symlink at `linkPath` with `target` resolve outside the repo root? */
 export function symlinkEscapes(linkPath: string, target: string): boolean {
   if (target.length === 0) return true;
+  // A NUL or control byte cannot be a real symlink target (the OS truncates at
+  // NUL), so the stored candidate would not materialize faithfully — reject
+  // (review r2 #11).
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f]/.test(target)) return true;
   if (target.startsWith("/")) return true; // POSIX absolute
   // Any `X:` prefix is a Windows drive path — absolute (`C:\x`) OR drive-relative
   // (`C:x`, resolved against drive C's cwd, outside our lexical root) (review r1 #6).
