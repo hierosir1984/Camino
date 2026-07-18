@@ -10,8 +10,9 @@ coverage/
 # transient fence-trip fixtures created by tests
 **/__fence_trip__*
 
-# raw dispatch-spike transcript streams (disposable; REPORT.md + summary.json are committed)
+# raw spike transcript streams (disposable; REPORT.md + summary.json are committed)
 spikes/dispatch/transcripts/*.jsonl
+spikes/plan-probe/transcripts/*.jsonl
 
 # OS noise
 .DS_Store

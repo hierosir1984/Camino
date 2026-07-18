@@ -1,0 +1,127 @@
+{
+  "fixture": "spikes/plan-probe/fixture/evidence-viewer-v0.md",
+  "segments": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "S8",
+    "S9",
+    "S10",
+    "S11",
+    "S12",
+    "S13",
+    "S14",
+    "S15",
+    "S16"
+  ],
+  "crossFamily": {
+    "plannerFamily": "anthropic",
+    "reviewerFamily": "openai"
+  },
+  "planner": {
+    "role": "planner",
+    "adapter": "claude-code",
+    "family": "anthropic",
+    "outcome": "succeeded",
+    "exitCode": 0,
+    "streamedEvents": 62,
+    "durationMs": 152044,
+    "unexpectedFiles": [],
+    "validationErrors": [],
+    "artifact": "spikes/plan-probe/transcripts/plan.json",
+    "sampleEvents": [
+      {
+        "kind": "other",
+        "text": "system:hook_started"
+      },
+      {
+        "kind": "other",
+        "text": "system:hook_response"
+      },
+      {
+        "kind": "other",
+        "text": "system:init"
+      },
+      {
+        "kind": "other",
+        "text": "assistant"
+      },
+      {
+        "kind": "assistant",
+        "text": "Compiled `./plan.json`. Summary:\n\n**Mission:** Evidence viewer v0 (CAM-CORE-07, Phase-1).\n\n**5 issues:**\n- **I1** (low) — packet schema types in `packages/shared` (foundation)\n- **I2** (medium) — packet rendering component: all sections + advisory/gating markers + exclusion/waiver lists\n- **I3** (medium) — artifact previews (logs/screenshots inline, traces open locally)\n- **I4** (medium) — merge a"
+      },
+      {
+        "kind": "result",
+        "text": "Compiled `./plan.json`. Summary:\n\n**Mission:** Evidence viewer v0 (CAM-CORE-07, Phase-1).\n\n**5 issues:**\n- **I1** (low) — packet schema types in `packages/shared` (foundation)\n- **I2** (medium) — packet rendering component: all sections + advisory/gating markers + exclusion/waiver lists\n- **I3** (medium) — artifact previews (logs/screenshots inline, traces open locally)\n- **I4** (medium) — merge a"
+      }
+    ]
+  },
+  "reviewer": {
+    "role": "reviewer",
+    "adapter": "codex-cli",
+    "family": "openai",
+    "outcome": "succeeded",
+    "exitCode": 0,
+    "streamedEvents": 64,
+    "durationMs": 391743,
+    "unexpectedFiles": [],
+    "validationErrors": [],
+    "artifact": "spikes/plan-probe/transcripts/review.json",
+    "sampleEvents": [
+      {
+        "kind": "other",
+        "text": "Reading additional input from stdin..."
+      },
+      {
+        "kind": "other",
+        "text": "thread.started"
+      },
+      {
+        "kind": "other",
+        "text": "Under-development features enabled: chronicle. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in ~/.codex/config.toml."
+      },
+      {
+        "kind": "other",
+        "text": "reasoning"
+      },
+      {
+        "kind": "result",
+        "text": "Created and validated [review.json](/var/folders/6z/x43rmn3n167213gz1ygf44640000gn/T/camino-plan-probe-dE0q8A/review.json). Verdict: `reject`, with 11 findings, including 3 blockers. No other files were modified.\n\n"
+      },
+      {
+        "kind": "other",
+        "text": "turn.completed"
+      }
+    ]
+  },
+  "plan": {
+    "issueCount": 5,
+    "questionCount": 5,
+    "blockingQuestions": 1,
+    "uncoveredRequirements": [],
+    "flaggedNonRequirements": [
+      "S2",
+      "S3",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S13",
+      "S15",
+      "S16"
+    ]
+  },
+  "review": {
+    "verdict": "reject",
+    "blocker": 3,
+    "major": 6,
+    "minor": 2
+  },
+  "packet": "spikes/plan-probe/RATING-PACKET.md",
+  "ok": true,
+  "mechanicsOk": true
+}
