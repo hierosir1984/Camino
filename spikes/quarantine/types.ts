@@ -1,7 +1,7 @@
 // WP-003 quarantine spike — shared types.
 //
 // Prototype evidence toward CAM-EXEC-04 (design §5.1 "quarantine v2:
-// squash-and-rebuild"). The product-grade module is WP-108; this suite's attack
+// squash-and-rebuild"). The product-grade module is WP-108; this suite's rejection
 // corpus is designed to run against that module unchanged.
 
 /** A parsed `git ls-tree -r -l` record from the worker's final tree. */
@@ -20,7 +20,7 @@ export interface TreeEntry {
 export interface Budgets {
   /** Max total bytes across all blobs in the final tree. */
   maxTreeBytes: number;
-  /** Max bytes for any single blob (single-file size bomb). */
+  /** Max bytes for any single blob (single-file size budget). */
   maxBlobBytes: number;
   /** Max number of tree entries (object-count proxy). */
   maxEntries: number;
@@ -94,8 +94,8 @@ export interface QuarantineResult {
   fetchedObjectCount: number;
   /**
    * The pristine, hooks-disabled repo the shallow-fetch landed in. Exposed so a
-   * test can prove a smuggled object is absent from it (reachable-history
-   * neutralization is structural: the object was never fetched, not merely
+   * test can prove a carried-in object is absent from it (reachable-history
+   * exclusion is structural: the object was never fetched, not merely
    * unreferenced by the rebuilt commit).
    */
   pristineDir: string;

@@ -176,7 +176,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       {
         GITHUB_TOKEN: "adapter-injected",
         GH_ENTERPRISE_TOKEN: "adapter-enterprise",
-        GIT_CONFIG_GLOBAL: "/tmp/attacker-gitconfig",
+        GIT_CONFIG_GLOBAL: "/tmp/external-gitconfig",
       },
     );
     expect(posture.githubCredentialKeys).toEqual([]); // CAM-SEC-06 / CAM-EXEC-02

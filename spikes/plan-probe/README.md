@@ -14,7 +14,7 @@ One real, bounded PRD goes through the prototype intake pipeline:
    intent-ledger entry or visibly flagged as non-requirement text (CAM-PLAN-02).
 2. The harness **validates** the plan structurally (checklist totality is enforced: a silently
    dropped segment fails the run).
-3. **Cross-family adversarial reviewer (family B, default `codex-cli`)** gets PRD + plan and a
+3. **Cross-family falsification reviewer (family B, default `codex-cli`)** gets PRD + plan and a
    falsification mandate — find dropped requirements, unstated assumptions, stub-passable
    criteria, mis-mappings, scope creep, padding questions — and writes `review.json`
    (CAM-PLAN-03). The pairing is asserted cross-provider **before** any quota is spent.

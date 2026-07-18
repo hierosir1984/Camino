@@ -1,13 +1,13 @@
-// WP-003 attack #13 — candidate-ref workflow-trigger posture (CAM-SEC-03).
+// WP-003 case #13 — candidate-ref workflow-trigger posture (CAM-SEC-03).
 //
-// This is the one attack that is NOT about the worker's tree: it is a repo CI
+// This is the one case that is NOT about the worker's tree: it is a repo CI
 // posture check. A workflow already in the repo that fires on a Camino-managed
 // namespace (camino/**, mission/*, issue branches) while carrying secrets or
 // write permissions would hand a privileged token to worker-derived refs. The
 // analyzer statically flags such workflows, naming the file (CAM-SEC-03 accept).
 //
 // Safety bias: when a branch pattern's exact semantics are ambiguous, the
-// matcher errs toward "fires" — a false flag is harmless, a missed hostile
+// matcher errs toward "fires" — a false flag is harmless, a missed privileged
 // workflow is not.
 import yaml from "js-yaml";
 
@@ -217,7 +217,7 @@ function analyzePrivilege(doc: Record<string, unknown>, rawText: string): string
   return reasons;
 }
 
-/** Analyze one workflow file. Returns a finding iff it is hostile-on-candidate. */
+/** Analyze one workflow file. Returns a finding iff it is privileged-on-candidate. */
 export function analyzeWorkflow(
   file: string,
   content: string,
@@ -227,7 +227,7 @@ export function analyzeWorkflow(
   try {
     doc = asRecord(yaml.load(content));
   } catch {
-    // An unparseable workflow is treated as hostile (fail-closed): we cannot
+    // An unparseable workflow is treated as privileged (fail-closed): we cannot
     // prove it safe.
     return {
       file,
@@ -245,7 +245,7 @@ export function analyzeWorkflow(
   return { file, fires, privileged };
 }
 
-/** Scan a set of workflow files; return one finding per hostile workflow. */
+/** Scan a set of workflow files; return one finding per privileged-on-candidate workflow. */
 export function scanWorkflowPosture(
   files: ReadonlyArray<{ path: string; content: string }>,
   candidateRefs: string[],

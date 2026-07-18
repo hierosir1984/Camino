@@ -156,7 +156,7 @@ export function renderPacket(input: PacketInput): string {
     "### C3. ⚠ Requirement segments not covered by any issue",
     "",
     "_Computed from the planner's OWN isRequirement classification — it cannot see a segment the_",
-    "_planner misclassified as non-requirement; the adversarial review in section D adjudicates_",
+    "_planner misclassified as non-requirement; the falsification review in section D adjudicates_",
     "_the classification itself._",
     "",
   );
@@ -180,9 +180,9 @@ export function renderPacket(input: PacketInput): string {
     "",
   );
 
-  // --- D. adversarial review ---
+  // --- D. falsification review ---
   push(
-    "## D. Cross-family adversarial review (attached — CAM-PLAN-03)",
+    "## D. Cross-family falsification review (attached — CAM-PLAN-03)",
     "",
     `Reviewer: **${input.reviewerName}** (${input.reviewerFamily}, planner family: ${input.plannerFamily}) · Verdict: **${review.verdict}**`,
     "",

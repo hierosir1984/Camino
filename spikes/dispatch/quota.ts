@@ -1,6 +1,6 @@
 // Shared quota / rate-limit signal detection. A dispatch that hits a provider
 // rate limit is `quota-blocked`, NEVER `requirement-failed` (CAM-EXEC-06):
-// blaming the worker for the provider's throttle would poison the outcome
+// blaming the worker for the provider's throttle would corrupt the outcome
 // ledger and trigger spurious family switches.
 //
 // Markers are deliberately SPECIFIC error signatures, not bare topic words:
