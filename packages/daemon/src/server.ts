@@ -51,6 +51,21 @@
  * attacker-controlled or reflected content, so the absent CSP protects nothing
  * that exists; the headers are guaranteed on every response the application
  * itself produces.
+ *
+ * KNOWN LIMITATION — loopback-origin service-worker squatting (round 5, finding
+ * 1): the daemon's origin (http://127.0.0.1:<port>) is not exclusively owned by
+ * the daemon across restarts. A malicious LOCAL process can bind the port while
+ * the daemon is stopped and, if the user's browser loads that origin, register a
+ * persistent service worker that survives the port returning to the real daemon
+ * and can then read the GUI token and drive the API. This needs no filesystem
+ * write, so it is outside the token/GUI directory boundaries. Partial mitigation
+ * here: `worker-src 'none'` (the legitimate GUI never uses a worker; the token
+ * is per-launch). It does NOT evict a worker already registered by a squatter.
+ * The complete fix is an origin a squatter cannot pre-seed — an ephemeral
+ * per-launch port, or a per-launch path/subdomain nonce — which changes the
+ * daemon⇄GUI addressing contract and belongs with the real GUI/launch work
+ * (WP-122+). Flagged for David as a parked decision; the placeholder GUI here
+ * uses no service worker.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
@@ -58,7 +73,7 @@ import { join, resolve, sep } from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
-import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { BIND_HOST } from "./config.js";
 import { generateToken } from "./token.js";
@@ -353,12 +368,31 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     reply.header("cross-origin-opener-policy", "same-origin");
     reply.header(
       "content-security-policy",
-      "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      // worker-src 'none' (round 5, finding 1): the legitimate GUI never uses a
+      // service or web worker, so the security model does not depend on one —
+      // and a GUI XSS cannot register a persistent worker. (This does NOT evict
+      // a worker a port-squatter registered on this origin while the daemon was
+      // stopped; see the loopback-origin residual in the module notes.)
+      "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; worker-src 'none'",
     );
     // Nothing the shell serves benefits from caching yet, and the API must
     // never be cached; revisit selectively when the real GUI bundle lands.
     reply.header("cache-control", "no-store");
     return payload;
+  });
+
+  // Never surface a raw OS error (message or absolute path) to a client — e.g.
+  // @fastify/static's open() error on an unreadable file (round 5, finding 2).
+  // The detail is logged server-side; the client gets a generic error. Send a
+  // pre-serialized string so the payload passes cleanly through the onSend hook.
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    request.log.error(error);
+    const raw = error.statusCode;
+    const status = typeof raw === "number" && raw >= 400 && raw < 600 ? raw : 500;
+    void reply
+      .code(status)
+      .type("application/json")
+      .send(JSON.stringify({ error: "internal-error" }));
   });
 
   app.get("/api/health", async () => ({ status: "ok" }));

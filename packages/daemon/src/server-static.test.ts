@@ -6,6 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -60,11 +61,35 @@ describe("GUI serving", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
     expect(await response.text()).toContain("Camino fixture shell");
-    expect(response.headers.get("content-security-policy")).toContain("default-src 'self'");
+    const csp = response.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("worker-src 'none'"); // round 5, finding 1
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(response.headers.get("x-frame-options")).toBe("DENY");
     expect(response.headers.get("referrer-policy")).toBe("no-referrer");
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("finding 2: an unreadable static file yields a path-free generic error, not the OS message", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "camino-static-err-"));
+    const errGui = join(scratch, "dist");
+    mkdirSync(errGui);
+    writeFileSync(join(errGui, "index.html"), "<title>shell</title>");
+    const denied = join(errGui, "denied.txt");
+    writeFileSync(denied, "unreadable-secret");
+    chmodSync(denied, 0o000);
+    const errDaemon = await startDaemonServer({ token: TOKEN, guiRoot: errGui, port: 0 });
+    try {
+      const response = await fetch(`${errDaemon.url}/denied.txt`);
+      const body = await response.text();
+      expect(response.status).toBe(500);
+      expect(body).not.toContain(errGui); // no absolute path
+      expect(body).not.toMatch(/permission denied|EACCES: /); // no raw OS prose
+      expect(body).toContain("internal-error");
+    } finally {
+      chmodSync(denied, 0o600); // restore so cleanup can remove it
+      await errDaemon.app.close();
+    }
   });
 
   it("serves assets and applies the same headers", async () => {

@@ -394,7 +394,14 @@ function createTokenAtomically(path: string): LoadedToken {
   return { token, path, created: true };
 }
 
-/** Surface only the errno code, never a raw message that could echo a secret path. */
+/**
+ * Reduce an OS error to its errno code, dropping the raw Node message prose
+ * (which can quote an internal path from deep in the call). The daemon's OWN
+ * known paths (the state directory, the token temp file) are still included in
+ * the surrounding TokenError messages ON PURPOSE — they tell the user which
+ * path to fix — and are not secrets; only the OS-prose is stripped here (round
+ * 4 finding 5 / round 5 finding 3: this strips the message, not the path).
+ */
 function redactErrno(error: unknown): string {
   const code = (error as NodeJS.ErrnoException).code;
   return code ?? "I/O error";
