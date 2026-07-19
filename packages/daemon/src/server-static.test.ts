@@ -70,6 +70,19 @@ describe("GUI serving", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
+  it("finding r6-1: a 416 unsatisfiable range keeps its Content-Range header (error headers preserved)", async () => {
+    // The sanitizing error handler must replace only the BODY, not drop the
+    // framework's semantic error headers (@fastify/send sets Content-Range).
+    const response = await fetch(`${daemon.url}/app.js`, {
+      headers: { range: "bytes=99999-100000" },
+    });
+    expect(response.status).toBe(416);
+    expect(response.headers.get("content-range")).toMatch(/^bytes \*\/\d+$/);
+    // Still sanitized + still carries the security headers.
+    expect(await response.text()).toContain("internal-error");
+    expect(response.headers.get("content-security-policy")).toContain("default-src 'self'");
+  });
+
   it("finding 2: an unreadable static file yields a path-free generic error, not the OS message", async () => {
     const scratch = mkdtempSync(join(tmpdir(), "camino-static-err-"));
     const errGui = join(scratch, "dist");

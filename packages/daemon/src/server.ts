@@ -385,8 +385,19 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   // @fastify/static's open() error on an unreadable file (round 5, finding 2).
   // The detail is logged server-side; the client gets a generic error. Send a
   // pre-serialized string so the payload passes cleanly through the onSend hook.
+  // Framework error HEADERS are preserved (round 6, finding 1): @fastify/send
+  // attaches semantically-required headers to some errors — e.g. `Content-Range`
+  // on a 416 unsatisfiable range — and dropping them is an HTTP regression. Only
+  // the error BODY is replaced, never the protocol headers.
   app.setErrorHandler((error: FastifyError, request, reply) => {
     request.log.error(error);
+    const errorHeaders = (error as { headers?: Record<string, number | string | string[]> })
+      .headers;
+    if (errorHeaders && typeof errorHeaders === "object") {
+      for (const [name, value] of Object.entries(errorHeaders)) {
+        reply.header(name, value);
+      }
+    }
     const raw = error.statusCode;
     const status = typeof raw === "number" && raw >= 400 && raw < 600 ? raw : 500;
     void reply
