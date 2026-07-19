@@ -134,7 +134,10 @@ export class MissionIntake {
     const { repoId, title, content, actor } = request;
     const common = this.validateCommon(repoId, title, actor);
     if (common) return common;
-    if (typeof content !== "string" || content.length === 0) {
+    if (typeof content !== "string") {
+      return reject("invalid-request", "PRD text must be a string.");
+    }
+    if (content.length === 0) {
       return reject("empty-content", "PRD text is empty — there is nothing to retain.");
     }
     if (!content.isWellFormed()) {
@@ -268,7 +271,10 @@ export class MissionIntake {
     if (typeof urgent !== "boolean") {
       return reject("invalid-request", "urgent must be true or false.");
     }
-    if (typeof description !== "string" || description.length === 0) {
+    if (typeof description !== "string") {
+      return reject("invalid-request", "quick-task description must be a string.");
+    }
+    if (description.length === 0) {
       return reject(
         "empty-content",
         "quick-task description is empty — there is nothing to retain.",
@@ -346,11 +352,13 @@ export class MissionIntake {
    * - `routeConflicts`: domain route vs recorded creation route;
    * - `creationConflicts`: the retained record's SEVEN bound fields
    *   (content hash, repo binding, title, urgent flag, source kind,
-   *   content format, filename — intake stamps all of them into every
-   *   creation payload it authors) vs what the creation event recorded —
-   *   the persistent signature of an id collision or a foreign creation,
-   *   even when routes agree and content matches (r3 f2, r4 f2; wording
-   *   per r6 finding 5);
+   *   content format, filename) vs what the creation event recorded.
+   *   Intake stamps the first six into every creation payload it authors;
+   *   `filename` is stamped exactly when the mission has one — absence is
+   *   represented by OMISSION, and the comparison treats both-absent as
+   *   agreement (r6 f5, precision per r7 f5). The persistent signature of
+   *   an id collision or a foreign creation, even when routes agree and
+   *   content matches (r3 f2, r4 f2);
    * - `hierarchyGaps`: missions without a repo row, repos without a project
    *   row (foreign writers with foreign keys off).
    * Empty across the board in healthy operation; WP-104's recovery contract

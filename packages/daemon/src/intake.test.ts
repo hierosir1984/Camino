@@ -122,6 +122,28 @@ describe("MissionIntake — pasted PRD text", () => {
     expectNothingStored(h);
   });
 
+  it("classifies wrong-type content as invalid-request, not empty-content (r7 finding 2)", () => {
+    const h = newHarness();
+    const pasted = h.intake.createFromText({
+      repoId: h.repoId,
+      title: "t",
+      content: 42 as unknown as string,
+      actor: "david",
+    });
+    expect(pasted).toMatchObject({ ok: false, code: "invalid-request" });
+    if (pasted.ok) return;
+    expect(pasted.reason).toContain("must be a string");
+    const quick = h.intake.createQuickTask({
+      repoId: h.repoId,
+      title: "t",
+      description: { text: "not a string" } as unknown as string,
+      urgent: false,
+      actor: "david",
+    });
+    expect(quick).toMatchObject({ ok: false, code: "invalid-request" });
+    expectNothingStored(h);
+  });
+
   it("rejects an unknown repo before storing anything", () => {
     const h = newHarness();
     const result = h.intake.createFromText({

@@ -39,9 +39,10 @@
  * any other encoding (r5 finding 4). What a privileged raw writer can
  * still do: issue DDL, supply explicit rowids, store a forged-but-valid-
  * hex hash, store TEXT that is not valid UTF-8 (encoding validation is not
- * expressible in SQLite SQL), or disable constraint enforcement wholesale
- * on its own connection (`PRAGMA ignore_check_constraints` — r5 finding 3)
- * — stated, not defended. The API path re-derives hashes, validates every
+ * expressible in SQLite SQL), or disable CHECK-constraint enforcement on
+ * its own connection (`PRAGMA ignore_check_constraints` — r5 f3; NOT NULL
+ * and foreign-key enforcement are separate and unaffected, r7 f4) —
+ * stated, not defended. The API path re-derives hashes, validates every
  * string it persists (generated ids AND caller-supplied foreign ids
  * included — r3 f4, r4 f3), and assigns rowids monotonically. Opening a
  * database whose user_version claims this schema but whose tables or

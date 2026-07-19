@@ -291,6 +291,60 @@ describe("CAM-CORE-08 — a second mission on the same repo waits visibly in `qu
     ).toThrow(/plain boolean/);
   });
 
+  it("an inherited Object.prototype.toJSON installed mid-read cannot silently double-book (r7 finding 1)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "First");
+    const m2 = intakePrdMission(h, "Second");
+    apply(h, m1, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+    apply(h, m2, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+
+    // The r7 vector: a facts GETTER pollutes Object.prototype with a
+    // one-shot toJSON before the slot check. The null-prototype payload
+    // keeps the hook out of the recorder's canonicalization (the window
+    // where reentrancy silently double-booked: both approvals applied);
+    // the recorder's own canonical copy re-acquires Object.prototype, so
+    // the hook can still fire inside the STORE's append — where WP-101's
+    // compare-and-swap detects the interleaving and REFUSES LOUDLY. Either
+    // way: no silent double-booking. (Boundary stated in the module doc: a
+    // prototype-polluting caller is outside any in-process guarantee — this
+    // pins the demonstrated vector's outcome, not the class.)
+    let hookRan = false;
+    const proto = Object.prototype as unknown as Record<string, unknown>;
+    const facts = {
+      dagAcyclic: true,
+      get checklistApproved(): boolean {
+        Object.defineProperty(proto, "toJSON", {
+          configurable: true,
+          value: function pollutedToJson(this: unknown) {
+            hookRan = true;
+            delete proto["toJSON"];
+            h.scheduler.approvePlan(m2, "david", {
+              checklistApproved: true,
+              dagAcyclic: true,
+            });
+            return this;
+          },
+        });
+        return true;
+      },
+    };
+    try {
+      // The reentrant append advances the store past the outer call's known
+      // seq; the outer append hits the CAS and throws the single-writer
+      // error instead of applying a stale approval.
+      expect(() => h.scheduler.approvePlan(m1, "david", facts)).toThrow(/single-writer/);
+    } finally {
+      delete proto["toJSON"]; // never leave the pollution behind
+    }
+    expect(hookRan).toBe(true);
+    // The inner (hostile-initiated but honestly-fact-ed) approval landed;
+    // the outer stale approval did NOT — no double-occupancy exists.
+    expect(h.recorder.currentState("mission", m2)).toBe("approved");
+    expect(h.recorder.currentState("mission", m1)).toBe("planned");
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+    expect(h.recorder.verify()).toEqual([]);
+  });
+
   it("intake and planning proceed concurrently while the slot is held", () => {
     const h = newHarness();
     const m1 = intakePrdMission(h, "Executing mission");

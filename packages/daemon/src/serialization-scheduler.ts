@@ -216,10 +216,20 @@ export class SerializationScheduler {
     // 1): spreading the caller's object into the payload would carry any
     // enumerable toJSON/getter into the recorder's canonicalization, which
     // runs AFTER the slot check — an exotic facts object could re-enter
-    // this method there and double-book the slot. Reading named fields into
-    // locals here means any getter side effect runs BEFORE the slot check
-    // below, and nothing exotic ever reaches the recorder.
-    const payload: Record<string, boolean> = {};
+    // this method there and SILENTLY double-book the slot. Reading named
+    // fields into locals here means any getter side effect runs BEFORE the
+    // slot check below, and nothing caller-controlled reaches the
+    // recorder. The payload has a NULL prototype so the recorder's
+    // canonicalization inherits no ambient toJSON either (r7 finding 1: a
+    // getter can pollute Object.prototype during the read). A hook that
+    // still fires deeper — the store re-serializes the recorder's own
+    // canonical copy, which has a normal prototype — lands AFTER the
+    // decision, where the store's compare-and-swap append detects the
+    // interleaving and refuses loudly (tested). Net contract: no silent
+    // double-booking on any demonstrated vector. Boundary stated plainly:
+    // a caller that mutates global prototypes can rewrite this module's
+    // own methods — no in-process API guarantee survives that actor.
+    const payload: Record<string, boolean> = Object.create(null) as Record<string, boolean>;
     const requiredFields =
       mission.route === "integration"
         ? (["checklistApproved", "dagAcyclic"] as const)
