@@ -908,6 +908,12 @@ export const MISSION_QUICK_ILLEGAL: readonly IllegalVector<MissionState, Mission
     event: { type: "gate-violation-detected", workSummaryCarried: true, pausedFrom: "executing" },
     expect: "guard-rejected",
   },
+  {
+    name: "re-route from paused-manual with NO recorded paused-from rejects even with the branch attested (fail-closed; scoped verify pass)",
+    from: "paused-manual",
+    event: { type: "gate-violation-detected", workSummaryCarried: true, branchCarried: true },
+    expect: "guard-rejected",
+  },
 ];
 
 // ------------------------------------------------------------------ issue A.2
@@ -1265,6 +1271,12 @@ export const ISSUE_ILLEGAL: readonly IllegalVector<IssueState, IssueEvent>[] = [
     name: "replan without the contract-v(n+1) attestation (review r3 finding 2)",
     from: "replanning",
     event: { type: "replan-complete", contractVersionAdvanced: false, unmetDependencies: 0 },
+    expect: "guard-rejected",
+  },
+  {
+    name: "validation-failure escalation still requires the repair-policy guard (AMEND-4; scoped verify pass)",
+    from: "validating",
+    event: { type: "validation-failed", repairPolicyAllows: false, failureCount: 4 },
     expect: "guard-rejected",
   },
   {

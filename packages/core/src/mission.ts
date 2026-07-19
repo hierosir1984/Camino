@@ -814,11 +814,13 @@ const quickTaskRows: readonly MissionRow[] = [
       name: "work-summary-and-branch-if-paused-from-execution",
       check: (e) =>
         attested(e.workSummaryCarried) &&
-        (["queued", "draft", "planned", "approved"].includes(e.pausedFrom as string) ||
+        typeof e.pausedFrom === "string" &&
+        MISSION_ACTIVE_STATES.includes(e.pausedFrom as (typeof MISSION_ACTIVE_STATES)[number]) &&
+        (["queued", "draft", "planned", "approved"].includes(e.pausedFrom) ||
           attested(e.branchCarried)),
     },
     to: "re-routed",
-    note: "paused-manual resolves by the RECORDED paused-from state (enriched): a task paused before execution needs no branch; otherwise the branch attestation is required (absent recorded context fails closed).",
+    note: "paused-manual resolves by the RECORDED paused-from state (enriched): a task paused before execution needs no branch; otherwise the branch attestation is required. Absent or unrecognized recorded context REJECTS outright — an honest log always carries pausedFrom in paused-manual (scoped verify pass, finding 1).",
   }),
   abandoned, // A.1b←A.1#24 (inherited)
 ];

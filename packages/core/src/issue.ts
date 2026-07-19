@@ -346,11 +346,14 @@ const issueRows: readonly IssueRow[] = [
     from: ["validating"],
     event: "validation-failed",
     guard: {
-      name: "validation-failure-count-exhausted",
-      check: (e) => Number.isInteger(e.failureCount) && (e.failureCount as number) >= 4,
+      name: "repair-policy-and-failure-count-exhausted",
+      check: (e) =>
+        attested(e.repairPolicyAllows) &&
+        Number.isInteger(e.failureCount) &&
+        (e.failureCount as number) >= 4,
     },
     to: "escalated",
-    note: "AMEND-4 (approved 2026-07-19): the 4th failure escalates from validating too, on the same recorded counter.",
+    note: "AMEND-4 (approved 2026-07-19): the 4th failure escalates from validating on the same recorded counter. The row's standing 'repair policy' guard applies to BOTH splits (scoped verify pass, finding 2).",
   }),
   // A.2#15 — validating | infra-blocked | — | blocked
   row({
