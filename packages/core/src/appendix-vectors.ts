@@ -74,7 +74,12 @@ export const MISSION_INTEGRATION_LEGAL: readonly LegalVector<MissionState, Missi
   {
     ref: "A.1#6",
     from: "approved",
-    event: { type: "integration-branch-created", onboardingChecksGreen: true },
+    event: {
+      type: "integration-branch-created",
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    },
     to: "executing",
   },
   {
@@ -216,6 +221,7 @@ export const MISSION_INTEGRATION_LEGAL: readonly LegalVector<MissionState, Missi
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "cand-1",
       approvedCandidateSha: "cand-1",
       descopedRequirements: [],
@@ -227,6 +233,7 @@ export const MISSION_INTEGRATION_LEGAL: readonly LegalVector<MissionState, Missi
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "cand-1",
       approvedCandidateSha: "cand-1",
       descopedRequirements: ["CAM-GUI-04"],
@@ -257,7 +264,12 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
   {
     name: "skip approval: integration branch from draft",
     from: "draft",
-    event: { type: "integration-branch-created", onboardingChecksGreen: true },
+    event: {
+      type: "integration-branch-created",
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    },
     expect: "illegal-transition",
   },
   {
@@ -277,6 +289,7 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     from: "executing",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "cand-1",
       approvedCandidateSha: "cand-1",
       descopedRequirements: [],
@@ -355,6 +368,7 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "other-sha",
       approvedCandidateSha: "cand-1",
       descopedRequirements: [],
@@ -364,7 +378,12 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
   {
     name: "push confirmation with no recorded approval binding",
     from: "merging",
-    event: { type: "push-confirmed", pushedSha: "cand-1", descopedRequirements: [] },
+    event: {
+      type: "push-confirmed",
+      landedOnMain: true,
+      pushedSha: "cand-1",
+      descopedRequirements: [],
+    },
     expect: "guard-rejected",
   },
   {
@@ -407,6 +426,7 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "cand-1",
       approvedCandidateSha: "cand-1",
       descopedRequirements: "not-an-array",
@@ -418,6 +438,7 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "cand-1",
       approvedCandidateSha: "cand-1",
     } as unknown as MissionEvent,
@@ -468,6 +489,18 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     name: "manual pause while a running attempt is unsettled",
     from: "executing",
     event: { type: "mission-paused", actor: "david", attemptSettled: false },
+    expect: "guard-rejected",
+  },
+  {
+    name: "push confirmation without the landed-on-main attestation (review r3 finding 1)",
+    from: "merging",
+    event: {
+      type: "push-confirmed",
+      landedOnMain: false,
+      pushedSha: "cand-1",
+      approvedCandidateSha: "cand-1",
+      descopedRequirements: [],
+    },
     expect: "guard-rejected",
   },
   {
@@ -532,7 +565,11 @@ export const MISSION_QUICK_LEGAL: readonly LegalVector<MissionState, MissionEven
   {
     ref: "A.1b#4",
     from: "approved",
-    event: { type: "quick-task-execution-started" },
+    event: {
+      type: "quick-task-execution-started",
+      targetIsMainCandidate: true,
+      noIntegrationBranchNoFold: true,
+    },
     to: "executing",
   },
   {
@@ -617,6 +654,7 @@ export const MISSION_QUICK_LEGAL: readonly LegalVector<MissionState, MissionEven
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "qcand-1",
       approvedCandidateSha: "qcand-1",
       descopedRequirements: [],
@@ -738,6 +776,7 @@ export const MISSION_QUICK_ILLEGAL: readonly IllegalVector<MissionState, Mission
     from: "merging",
     event: {
       type: "push-confirmed",
+      landedOnMain: true,
       pushedSha: "qcand-1",
       approvedCandidateSha: "qcand-1",
       descopedRequirements: ["CAM-GUI-04"],
@@ -761,7 +800,11 @@ export const MISSION_QUICK_ILLEGAL: readonly IllegalVector<MissionState, Mission
   {
     name: "re-routed is terminal: nothing follows it",
     from: "re-routed",
-    event: { type: "quick-task-execution-started" },
+    event: {
+      type: "quick-task-execution-started",
+      targetIsMainCandidate: true,
+      noIntegrationBranchNoFold: true,
+    },
     expect: "illegal-transition",
   },
   {
@@ -933,13 +976,13 @@ export const ISSUE_LEGAL: readonly LegalVector<IssueState, IssueEvent>[] = [
   {
     ref: "A.2#20a",
     from: "replanning",
-    event: { type: "replan-complete", unmetDependencies: 0 },
+    event: { type: "replan-complete", contractVersionAdvanced: true, unmetDependencies: 0 },
     to: "ready",
   },
   {
     ref: "A.2#20b",
     from: "replanning",
-    event: { type: "replan-complete", unmetDependencies: 1 },
+    event: { type: "replan-complete", contractVersionAdvanced: true, unmetDependencies: 1 },
     to: "waiting-deps",
   },
   {
@@ -1100,7 +1143,17 @@ export const ISSUE_ILLEGAL: readonly IllegalVector<IssueState, IssueEvent>[] = [
   {
     name: "replan dependency count smuggled as an array (coercion; review r2 finding 7)",
     from: "replanning",
-    event: { type: "replan-complete", unmetDependencies: [1] } as unknown as IssueEvent,
+    event: {
+      type: "replan-complete",
+      contractVersionAdvanced: true,
+      unmetDependencies: [1],
+    } as unknown as IssueEvent,
+    expect: "guard-rejected",
+  },
+  {
+    name: "replan without the contract-v(n+1) attestation (review r3 finding 2)",
+    from: "replanning",
+    event: { type: "replan-complete", contractVersionAdvanced: false, unmetDependencies: 0 },
     expect: "guard-rejected",
   },
 ];
@@ -1168,13 +1221,18 @@ export const ATTEMPT_LEGAL: readonly LegalVector<AttemptState, AttemptEvent>[] =
   {
     ref: "A.3#7a",
     from: "submitted",
-    event: { type: "verdict-recorded", verdict: "pass" },
+    event: { type: "verdict-recorded", quarantineAndValidationComplete: true, verdict: "pass" },
     to: "succeeded",
   },
   {
     ref: "A.3#7b",
     from: "submitted",
-    event: { type: "verdict-recorded", verdict: "fail", failureClass: "wiring-gap" },
+    event: {
+      type: "verdict-recorded",
+      quarantineAndValidationComplete: true,
+      verdict: "fail",
+      failureClass: "wiring-gap",
+    },
     to: "failed",
   },
   { ref: "A.3#8", from: "succeeded", event: ARCHIVAL_EVENT, to: "archived" },
@@ -1186,7 +1244,7 @@ export const ATTEMPT_ILLEGAL: readonly IllegalVector<AttemptState, AttemptEvent>
   {
     name: "verdict before submission",
     from: "running",
-    event: { type: "verdict-recorded", verdict: "pass" },
+    event: { type: "verdict-recorded", quarantineAndValidationComplete: true, verdict: "pass" },
     expect: "illegal-transition",
   },
   {
@@ -1303,7 +1361,13 @@ export const ATTEMPT_ILLEGAL: readonly IllegalVector<AttemptState, AttemptEvent>
   {
     name: "failure verdict without a taxonomy class",
     from: "submitted",
-    event: { type: "verdict-recorded", verdict: "fail" },
+    event: { type: "verdict-recorded", quarantineAndValidationComplete: true, verdict: "fail" },
+    expect: "guard-rejected",
+  },
+  {
+    name: "verdict without the quarantine+validation completeness attestation (review r3 finding 2)",
+    from: "submitted",
+    event: { type: "verdict-recorded", quarantineAndValidationComplete: false, verdict: "pass" },
     expect: "guard-rejected",
   },
   {

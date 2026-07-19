@@ -56,7 +56,12 @@ export type AttemptEvent =
   // A.3#6 — provider rate limit
   | { type: "rate-limited" }
   // A.3#7 — quarantine + validation verdict
-  | { type: "verdict-recorded"; verdict: "pass" | "fail"; failureClass?: string }
+  | {
+      type: "verdict-recorded";
+      quarantineAndValidationComplete: boolean;
+      verdict: "pass" | "fail";
+      failureClass?: string;
+    }
   // A.4#5 — single archival step: archive written → ledger row → workspace destroyed
   | {
       type: "archival-completed";
@@ -165,7 +170,10 @@ const attemptRows: readonly AttemptRow[] = [
     ref: "A.3#7a",
     from: ["submitted"],
     event: "verdict-recorded",
-    guard: { name: "verdict-pass", check: (e) => e.verdict === "pass" },
+    guard: {
+      name: "verdict-pass",
+      check: (e) => attested(e.quarantineAndValidationComplete) && e.verdict === "pass",
+    },
     to: "succeeded",
   }),
   row({
@@ -174,7 +182,10 @@ const attemptRows: readonly AttemptRow[] = [
     event: "verdict-recorded",
     guard: {
       name: "verdict-fail-classified",
-      check: (e) => e.verdict === "fail" && nonEmptyString(e.failureClass),
+      check: (e) =>
+        attested(e.quarantineAndValidationComplete) &&
+        e.verdict === "fail" &&
+        nonEmptyString(e.failureClass),
     },
     to: "failed",
     note: "One appendix row, guard-split on the verdict; failures are classified per the done-problem taxonomy (CAM-OBS-04).",

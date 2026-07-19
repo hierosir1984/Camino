@@ -168,7 +168,7 @@ describe("foldView", () => {
         event: "mission-created",
         payload: { source: "prd-intake" },
         fromState: null,
-        toState: "draft",
+        toState: "executing",
       }),
     );
     apply(
@@ -208,7 +208,7 @@ describe("foldView", () => {
         event: "mission-created",
         payload: { source: "prd-intake" },
         fromState: null,
-        toState: "draft",
+        toState: "awaiting-merge-approval",
       }),
     );
     applyRecord(
@@ -277,6 +277,42 @@ describe("foldView", () => {
     step("final-head-submitted", { quarantinePassed: true }, "implementing", "validating");
     step("validation-failed", { repairPolicyAllows: true, failureCount: 2 }, "validating", "ready");
     expect(view.issues.get("i1")?.failureCount).toBe(2);
+  });
+
+  it("rejects rows whose recorded fromState disagrees with the fold, and unknown states", () => {
+    const creation = record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "mission-created",
+      payload: { source: "prd-intake" },
+      fromState: null,
+      toState: "draft",
+    });
+    expect(() =>
+      foldView([
+        creation,
+        record({
+          entityKind: "mission",
+          entityId: "m1",
+          event: "mission-paused",
+          payload: { attemptSettled: true },
+          fromState: "executing",
+          toState: "paused-manual",
+        }),
+      ]),
+    ).toThrow(/disagrees with the folded state/);
+    expect(() =>
+      foldView([
+        record({
+          entityKind: "mission",
+          entityId: "m2",
+          event: "mission-created",
+          payload: { source: "prd-intake" },
+          fromState: null,
+          toState: "not-a-state",
+        }),
+      ]),
+    ).toThrow(/unknown mission state/);
   });
 
   it("fails loud on a log that could not have been recorded", () => {

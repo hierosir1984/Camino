@@ -18,10 +18,11 @@
  * caller-supplied values for those fields — and for the reserved fields
  * "type"/"actor" — never reach a guard.
  *
- * Single-writer: one recorder owns a store at a time. Before every append
- * the recorder checks the store has not advanced beyond its view and throws
- * if it has — detection, not prevention; the durable cross-process recovery
- * lock is WP-104 (CAM-STATE-03).
+ * Single-writer: one recorder owns a store at a time. Every append is a
+ * compare-and-swap against the recorder's known last seq, atomic with the
+ * insert inside the store's transaction; a second writer's interleaving
+ * refuses rather than corrupts. The durable cross-process recovery lock is
+ * WP-104 (CAM-STATE-03).
  */
 import type { EntityKind, EventRecord, EventStore, RejectionCode } from "@camino/shared";
 import {
@@ -53,8 +54,12 @@ export class TransitionRecorder {
 
   constructor(store: EventStore) {
     this.store = store;
-    // Recovery is replay: the view exists only as a fold over the log.
+    // Recovery is replay, and it is fail-closed: a log the decision path
+    // disagrees with (forged rows, states no machine knows, source-state
+    // mismatches) is refused rather than silently adopted. Forensics on a
+    // refused log go through core's foldView/verifyReplay directly.
     const records = store.read();
+    assertLogVerifies(records);
     this.view = foldView(records);
     this.lastSeq = records.at(-1)?.seq ?? 0;
   }
@@ -123,9 +128,10 @@ export class TransitionRecorder {
     return { ok: false, code: decision.code, record };
   }
 
-  /** Rebuild the view from the log alone and adopt it (recovery path). */
+  /** Rebuild the view from the log alone and adopt it (recovery path, fail-closed). */
   rebuild(): StateView {
     const records = this.store.read();
+    assertLogVerifies(records);
     this.view = foldView(records);
     this.lastSeq = records.at(-1)?.seq ?? 0;
     return structuredClone(this.view);
@@ -137,12 +143,27 @@ export class TransitionRecorder {
   }
 }
 
+/** Recovery refuses logs the decision path disagrees with (CAM-STATE-05). */
+function assertLogVerifies(records: Parameters<typeof verifyReplay>[0]): void {
+  const divergences = verifyReplay(records);
+  if (divergences.length > 0) {
+    const detail = divergences
+      .slice(0, 5)
+      .map((d) => `seq ${d.seq}: ${d.problem}`)
+      .join("; ");
+    throw new Error(
+      `event log fails replay verification (${divergences.length} divergence(s)) — refusing to adopt it: ${detail}`,
+    );
+  }
+}
+
 /**
  * A stand-in payload for requests whose payload JSON cannot hold as a plain
  * object at all (BigInt values, toJSON returning a non-object, non-object
- * inputs). It deliberately carries a reserved key so the decision path —
- * today and on every future replay of the record — lands on the same
- * `malformed-payload` refusal (replay-stable by construction).
+ * inputs, property traps that throw). It deliberately carries a reserved
+ * key so the decision path — today and on every future replay of the
+ * record — lands on the same `malformed-payload` refusal (replay-stable by
+ * construction).
  */
 const UNREPRESENTABLE_PAYLOAD: Readonly<Record<string, unknown>> = {
   type: null,
@@ -158,27 +179,31 @@ const UNREPRESENTABLE_PAYLOAD: Readonly<Record<string, unknown>> = {
  * UNREPRESENTABLE_PAYLOAD, which the decision path refuses and logs.
  */
 function canonicalize(payload: Readonly<Record<string, unknown>>): Record<string, unknown> {
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    return { ...UNREPRESENTABLE_PAYLOAD };
-  }
-  let json: string | undefined;
+  // Every interaction with the caller's object can hit a trap (accessors
+  // that delete themselves, Proxy handlers that throw): capture reserved-key
+  // presence FIRST, and treat any exception anywhere as an unrepresentable
+  // payload — refused and logged, never thrown past.
   try {
-    json = JSON.stringify(payload);
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      return { ...UNREPRESENTABLE_PAYLOAD };
+    }
+    const reservedPresent = RESERVED_PAYLOAD_FIELDS.filter((key) =>
+      Object.prototype.hasOwnProperty.call(payload, key),
+    );
+    const json = JSON.stringify(payload);
+    if (json === undefined) {
+      return { ...UNREPRESENTABLE_PAYLOAD };
+    }
+    const parsed: unknown = JSON.parse(json);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ...UNREPRESENTABLE_PAYLOAD };
+    }
+    const canonical = parsed as Record<string, unknown>;
+    for (const reserved of reservedPresent) {
+      canonical[reserved] = canonical[reserved] ?? null;
+    }
+    return canonical;
   } catch {
     return { ...UNREPRESENTABLE_PAYLOAD };
   }
-  if (json === undefined) {
-    return { ...UNREPRESENTABLE_PAYLOAD };
-  }
-  const parsed: unknown = JSON.parse(json);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return { ...UNREPRESENTABLE_PAYLOAD };
-  }
-  const canonical = parsed as Record<string, unknown>;
-  for (const reserved of RESERVED_PAYLOAD_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(payload, reserved)) {
-      canonical[reserved] = canonical[reserved] ?? null;
-    }
-  }
-  return canonical;
 }

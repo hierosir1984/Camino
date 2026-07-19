@@ -137,6 +137,28 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     file: "__fence_trip__updir.ts",
     source: 'import { anything } from "../vitest.config.js";\nexport const leak = anything;\n',
   },
+  {
+    name: "dot-prefixed parent traversal (./../ spelling)",
+    file: "__fence_trip__dotupdir.ts",
+    source: 'import { anything } from "./../vitest.config.js";\nexport const leak = anything;\n',
+  },
+  // Round-3 vectors: aliasing the global object defeats member-expression
+  // selectors, so the identifier itself is banned.
+  {
+    name: "globalThis alias then property I/O",
+    file: "__fence_trip__galias.ts",
+    source: 'const g = globalThis;\nexport const leak = g.fetch("https://example.invalid");\n',
+  },
+  {
+    name: "destructuring fetch out of globalThis",
+    file: "__fence_trip__gdestructure.ts",
+    source: 'const { fetch: f } = globalThis;\nexport const leak = f("https://example.invalid");\n',
+  },
+  {
+    name: "globalThis.globalThis chain",
+    file: "__fence_trip__gchain.ts",
+    source: 'export const leak = globalThis.globalThis.fetch("https://example.invalid");\n',
+  },
 ];
 
 describe("packages/core import fence", () => {

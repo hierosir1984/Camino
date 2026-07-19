@@ -1,6 +1,6 @@
 # 26 · Appendix A consistency audit (WP-101)
 
-> **Status: recorded, four amendment proposals pending David.** This is the BUILD.md standing
+> **Status: recorded, five amendment proposals pending David.** This is the BUILD.md standing
 > obligation: Phase 1 implements the Appendix A state machines as typed code with exhaustive
 > transition tests, then walks a recorded code-vs-appendix diff. Every difference below is resolved
 > by (a) the code encoding the appendix faithfully, with the encoding noted, or (b) a **proposed
@@ -92,7 +92,7 @@ probes.
 | #3 approve → approved / queued | `A.1#3a`/`3b` | Guard split; a cyclic DAG matches neither split → refused (WP-110 rejects pre-approval). |
 | #4 reject/edit → draft | `A.1#4` | Shared verbatim with A.1b (same row object). |
 | #5 queued → approved (FIFO) | `A.1#5` | `fifoHead` attested; FIFO ordering itself is the WP-103 scheduler's. |
-| #6 branch+PR → executing | `A.1#6` | Onboarding checks attested. |
+| #6 branch+PR → executing | `A.1#6` | Branch created + mission PR created + onboarding checks all attested. |
 | #7 gates green → awaiting | `A.1#7` | All four event-column conjuncts + A.4#2 fold-first + A.4#3 rollup + freshness attested; the candidate (SHA, packet hash) pair is recorded here. |
 | #8/#9 gate red | `A.1#8`/`#9` | Split on repair-fits-scope; repair issues are created via issue row `A.2#1c`. |
 | #10 approval → merging | `A.1#10` | Authority ∈ {david (actor-bound), tier-2}; binds the recorded (candidate SHA, packet hash) pair; a stale SHA or non-candidate packet hash refuses (A.4#4). |
@@ -106,7 +106,7 @@ probes.
 | #19 blocker → blocked | `A.1#19` | — |
 | #20 pause resolved → executing | `A.1#20` | One row for both real-world variants, as in the appendix. |
 | #21 answered/cleared → executing | `A.1#21a`/`21b` | Disjunctive event column split onto its two sources (as A.2#21 vs #23): an escalation is answered BY DAVID (actor-bound); a blocker clears by the obstacle going away, any observer. |
-| #22 push confirmed → complete(/with-residue) | `A.1#22a`/`22b` | Split on the descoped list (validated as a string array); pushed SHA must equal the **recorded** approved SHA. |
+| #22 push confirmed → complete(/with-residue) | `A.1#22a`/`22b` | Landed-ON-MAIN attested; split on the descoped list (validated as a string array); pushed SHA must equal the **recorded** approved SHA. |
 | #23 rebuilds exhausted → escalated | `A.1#23` | Bound = 2 (registry item 1). |
 | #24 abandon → abandoned | `A.1#24` | "Intent ledger untouched" is structural in core (no ledger surface); CAM-CANON-01 enforcement is WP-109. |
 
@@ -119,13 +119,13 @@ a quick task can hit an infra blocker too (interpretation, finding F6).
 
 Own rows: `A.1b#1` intake; `#2` contract + mini review (observability adjudicated attested); `#3a/b`
 David-actor approval with the CAM-MERGE-01 gates (risk low ∧ neutral concurred ∧ single issue)
-required for *either* split; `#4` single-issue execution starts; `#5` validation green at the main
+required for *either* split; `#4` single-issue execution starts (target-is-main-candidate + no-branch/no-fold attested); `#5` validation green at the main
 candidate — packet populated + A.4#3 rollup + the preamble's validation scope (full contract checks
 ∧ repo fast suite) + freshness-vs-main attested, with the candidate (SHA, packet hash) pair
 recorded; `#6a/b` validation red → executing until the 4th failure escalates (recorded counter);
 `#7` approval by David (actor-bound) or tier-3 only, bound to the recorded (SHA, packet hash) pair;
 `#8` reject → executing; `#9` rebuild green → awaiting with the new pair (new approval); `#10`
-rebuilds exhausted (2) → escalated; `#11` push confirmed → `complete`, refusing any descoped
+rebuilds exhausted (2) → escalated; `#11` push confirmed → `complete` with the landed-on-main attestation, refusing any descoped
 residue (fail-closed, F15); `#12` any active + CAM-MERGE-01 gate violated → `re-routed` (terminal),
 work summary + branch carry-over attested, successor mission created via `A.1#1`.
 
@@ -153,7 +153,7 @@ AMEND-1; David-authority approvals are actor-bound and tier-1 is the only other 
 `#17` branch advanced → ready; `#18`
 mission-level fast-subset failure → encoded as `#1c` creation (the "further merges block until
 green" clause is WP-119 scheduler policy); `#19` incompatible contract edit (any active) →
-replanning; `#20a/20b` replan complete → ready / waiting-deps; `#21a/21b` escalation answered →
+replanning; `#20a/20b` replan complete under contract v(n+1) (attested) → ready / waiting-deps; `#21a/21b` escalation answered →
 ready / cancelled; `#22` David cancels (any active) → cancelled; `#23` block resolved → ready;
 `#24` cleanup failure (any active) → blocked, cause rides the envelope.
 
@@ -164,7 +164,7 @@ lease store, registry item 5); `#2` heartbeat lapse + kill-confirm → expired; 
 + final head fetched → submitted; `#4` cancel — only the four listed reasons are legal at runtime,
 a David-reason cancel is actor-bound — settled by checkpoint or kill-confirm, summary written →
 cancelled; `#5` budget breach + kill-confirm → killed-budget; `#6` rate limit → quota-blocked;
-`#7a/7b` verdict → succeeded / failed (failure class required); `#8` (= A.4#5) each of the six
+`#7a/7b` quarantine+validation verdict (completeness attested) → succeeded / failed (failure class required); `#8` (= A.4#5) each of the six
 terminals + the single archival step → `archived`, guard enforcing quotas, the ledger row
 referencing the written archive, and the strict sub-step order archive-written < ledger-row <
 workspace-destroyed.
@@ -235,6 +235,14 @@ does not inherit #13, so a quick-task rebuild that comes back red with fewer tha
 transition; the mission would sit in `merging` until the exhaustion event. Code is literal (no
 row). **Proposal:** add "`merging` | rebuilt candidate red | — | `executing` (repair attempt)" to
 A.1b, mirroring #13.
+
+**AMEND-5 (found by review round 3) · A.1b#12 demands branch carry-over from states that have no
+branch.** The re-route row applies from "any active" with the guard "work summary + branch carried
+over", but the preamble's own rationale says intake/planning states (draft/planned/queued) touch no
+workspace — there is no branch to carry from them. The attestation is unsatisfiable-or-vacuous in
+those source states. Code stays literal (the attestation is required from every active state).
+**Proposal:** amend the A.1b#12 guard to "work summary carried over; branch carried over where the
+task had entered execution".
 
 **AMEND-4 · Validation failures have no escalation bound on the issue machine.** A.2#14 sends every
 validation failure back to `ready` with no counter clause, while A.1b#6 says quick-task validation
@@ -315,14 +323,45 @@ Round 2 (same reviewer; raw review + dispositions on PR #44) returned "safe to b
 11. **Audit overstatements corrected:** A.1#1's cause claim narrowed to convention; the verdict
     below scopes the A.4 statement by §2's own deferrals.
 
+### Round 3 (verify + fresh hunt)
+
+Round 3 (same reviewer; raw review + dispositions on PR #44) returned "safe to build on: no" with
+10 findings — four round-2 folds incomplete plus fresh defects; all confirmed and folded:
+
+1. **Missing landed-on-main attestation (high):** A.1#22/A.1b#11 completion now requires the
+   attested fact that the push landed on main, alongside the SHA binding.
+2. **Other unattested event-column facts (high):** mission-PR creation (A.1#6), the quick issue's
+   main-candidate/no-branch/no-fold clause (A.1b#4), contract v(n+1) on replan (A.2#20), and
+   quarantine+validation completeness on the verdict (A.3#7) are now attested payload facts.
+3. **Recovery adopted forged durable state:** `applyRecord` validates state membership and
+   recorded-fromState agreement with the fold; recorder construction and rebuild run full replay
+   verification and REFUSE divergent logs (fail-closed recovery).
+4. **`verifyReplay` could throw:** the fold step is wrapped — rows the fold rejects are reported
+   as divergences and skipped; verification is total.
+5. **CAS option re-read + enclosing-transaction desync:** `expectedLastSeq` snapshotted once;
+   append refuses to run inside an enclosing transaction (a rollback would undo a row callers
+   already treated as durable).
+6. **Reserved-key self-deletion + throwing property traps:** reserved-key presence is captured
+   before serialization, and any exception while touching the caller's object becomes the logged
+   unrepresentable-payload refusal.
+7. **Store input accessors:** `append` snapshots every envelope field exactly once and builds the
+   returned record from the snapshot.
+8. **`globalThis` aliasing past the fence:** the global-object identifiers themselves
+   (globalThis/global/window/self) are banned in core — every alias, destructuring, or chain
+   escape starts with one reference; probes added.
+9. **Manifest substring/false-positive matching:** From-cell comparison is exact backtick-token
+   set equality; escaped pipes handled. Which SPLIT of a multi-source row owns which source is
+   pinned by the per-split vectors (not derivable from the table text) — stated in the test.
+10. **AMEND set incomplete:** the A.1b#12 branch-carry-over inconsistency is recorded as AMEND-5.
+
 ## 5. Verdict
 
 With the conventions of §1, the three machines and the A.1b overlay are encoded row-for-row, and
 the A.4 guarantees are encoded to the extent §2 records — items 2/3/5 and the binding half of
 item 4 mechanized here; item 1, packet-content immutability (item 4), and environment ownership
 explicitly deferred to WP-114/115/116 with their notes. Every row is exercised by the mechanical
-coverage harness and anchored structurally and semantically to the PRD's own tables, and the four
-genuine spec defects found by the walk are recorded above as amendment proposals. **Appendix A
-remains authoritative**; on David's disposition of AMEND-1..4 this audit is updated, the approved
-amendments land in the PRD appendix, and the corresponding rows/tests are added in the same
-change.
+coverage harness and anchored structurally and semantically to the PRD's own tables, and the five
+genuine spec defects found by the walk and the review rounds are recorded above as amendment
+proposals. **Appendix A remains authoritative**; on David's disposition of AMEND-1..5 this audit
+is updated, the approved amendments land in the PRD appendix, and the corresponding rows/tests are
+added in the same change.

@@ -164,7 +164,18 @@ export function verifyReplay(records: readonly EventRecord[]): ReplayDivergence[
           });
         }
       }
-      applyRecord(view, record);
+      // The fold itself validates structural integrity and throws on rows
+      // the recorder could not have produced; verification must REPORT such
+      // rows, not throw past the caller — the row is skipped and later rows
+      // for the entity are judged against the unpolluted view.
+      try {
+        applyRecord(view, record);
+      } catch (error) {
+        divergences.push({
+          seq: record.seq,
+          problem: `fold rejects the record: ${(error as Error).message}`,
+        });
+      }
     } else if (decision.ok) {
       divergences.push({
         seq: record.seq,

@@ -89,6 +89,8 @@ describe("TransitionRecorder", () => {
       ),
     ).toBe("approved");
     apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
       onboardingChecksGreen: true,
     });
 
@@ -107,7 +109,10 @@ describe("TransitionRecorder", () => {
     ).toBe("running");
     apply(recorder, "attempt", "a1", "worker-completed", { finalHeadFetched: true });
     apply(recorder, "issue", "i1", "final-head-submitted", { quarantinePassed: true });
-    apply(recorder, "attempt", "a1", "verdict-recorded", { verdict: "pass" });
+    apply(recorder, "attempt", "a1", "verdict-recorded", {
+      quarantineAndValidationComplete: true,
+      verdict: "pass",
+    });
     apply(recorder, "attempt", "a1", "archival-completed", {
       quotasEnforced: true,
       ledgerRowReferencesArchive: true,
@@ -159,6 +164,7 @@ describe("TransitionRecorder", () => {
     ).toBe("merging");
     expect(
       apply(recorder, "mission", "m1", "push-confirmed", {
+        landedOnMain: true,
         pushedSha: "cand-1",
         descopedRequirements: [],
       }),
@@ -184,7 +190,7 @@ describe("TransitionRecorder", () => {
       event: "integration-branch-created",
       actor: "camino:test",
       cause: "skip approval",
-      payload: { onboardingChecksGreen: true },
+      payload: { branchCreated: true, missionPrCreated: true, onboardingChecksGreen: true },
     });
     expect(illegal).toMatchObject({ ok: false, code: "illegal-transition" });
 
@@ -255,7 +261,10 @@ describe("TransitionRecorder", () => {
       },
       "david",
     );
-    apply(recorder, "mission", "q1", "quick-task-execution-started", {});
+    apply(recorder, "mission", "q1", "quick-task-execution-started", {
+      targetIsMainCandidate: true,
+      noIntegrationBranchNoFold: true,
+    });
     apply(recorder, "mission", "q1", "mission-paused", { attemptSettled: true }, "david", "pause");
 
     // The caller lies about the resume target; the recorder records the truth.
@@ -304,7 +313,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "mission", "m1", "mission-gate-green", {
       allIssuesTerminal: true,
       noStrandedRequirement: true,
@@ -366,11 +379,12 @@ describe("TransitionRecorder", () => {
       event: "push-confirmed",
       actor: "camino:merge",
       cause: "push of an unapproved sha",
-      payload: { pushedSha: "cand-1", descopedRequirements: [] },
+      payload: { landedOnMain: true, pushedSha: "cand-1", descopedRequirements: [] },
     });
     expect(wrongPush).toMatchObject({ ok: false, code: "guard-rejected" });
     expect(
       apply(recorder, "mission", "m1", "push-confirmed", {
+        landedOnMain: true,
         pushedSha: "cand-2",
         descopedRequirements: [],
       }),
@@ -497,7 +511,10 @@ describe("TransitionRecorder", () => {
       },
       "david",
     );
-    apply(recorder, "mission", "q1", "quick-task-execution-started", {});
+    apply(recorder, "mission", "q1", "quick-task-execution-started", {
+      targetIsMainCandidate: true,
+      noIntegrationBranchNoFold: true,
+    });
     expect(
       apply(recorder, "mission", "q1", "gate-violation-detected", {
         workSummaryCarried: true,
@@ -523,7 +540,7 @@ describe("TransitionRecorder", () => {
       event: "quick-task-execution-started",
       actor: "camino:test",
       cause: "post-terminal",
-      payload: {},
+      payload: { targetIsMainCandidate: true, noIntegrationBranchNoFold: true },
     });
     expect(afterTerminal).toMatchObject({ ok: false, code: "illegal-transition" });
   });
@@ -543,7 +560,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "issue", "i1", "issue-created", {
       origin: "plan-approval",
       unmetDependencies: 0,
@@ -583,6 +604,7 @@ describe("TransitionRecorder", () => {
     });
     apply(recorder, "attempt", "a1", "worker-completed", { finalHeadFetched: true });
     apply(recorder, "attempt", "a1", "verdict-recorded", {
+      quarantineAndValidationComplete: true,
       verdict: "fail",
       failureClass: "stub-completion",
     });
@@ -648,7 +670,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "mission", "m1", "mission-paused", { attemptSettled: true }, "david", "pause");
     apply(recorder, "mission", "m1", "mission-resumed", {}, "david", "resume");
     apply(recorder, "issue", "i1", "issue-created", {
@@ -669,7 +695,7 @@ describe("TransitionRecorder", () => {
       event: "push-confirmed",
       actor: "camino:merge",
       cause: "premature push",
-      payload: { pushedSha: "x", descopedRequirements: [] },
+      payload: { landedOnMain: true, pushedSha: "x", descopedRequirements: [] },
     });
     apply(recorder, "mission", "q1", "quick-task-intake", {}, "david");
     apply(recorder, "mission", "q1", "contract-attached", {
@@ -855,7 +881,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "mission", "m1", "mission-gate-green", {
       allIssuesTerminal: true,
       noStrandedRequirement: true,
@@ -878,9 +908,9 @@ describe("TransitionRecorder", () => {
     const before = store.read().length;
     // descopedRequirements omitted and mistyped: refused, logged, state kept.
     for (const payload of [
-      { pushedSha: "cand-1" },
-      { pushedSha: "cand-1", descopedRequirements: "not-an-array" },
-      { pushedSha: "cand-1", descopedRequirements: [1, 2] },
+      { landedOnMain: true, pushedSha: "cand-1" },
+      { landedOnMain: true, pushedSha: "cand-1", descopedRequirements: "not-an-array" },
+      { landedOnMain: true, pushedSha: "cand-1", descopedRequirements: [1, 2] },
     ]) {
       const outcome = recorder.record({
         entityKind: "mission",
@@ -912,7 +942,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "mission", "m1", "mission-gate-green", {
       allIssuesTerminal: true,
       noStrandedRequirement: true,
@@ -1053,7 +1087,11 @@ describe("TransitionRecorder", () => {
       { dagAcyclic: true, executionSlotFree: true },
       "david",
     );
-    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "integration-branch-created", {
+      branchCreated: true,
+      missionPrCreated: true,
+      onboardingChecksGreen: true,
+    });
     apply(recorder, "mission", "m1", "escalation-raised", {});
     const nonDavid = recorder.record({
       entityKind: "mission",
@@ -1086,5 +1124,147 @@ describe("TransitionRecorder", () => {
         "camino:poller",
       ),
     ).toBe("executing");
+  });
+  it("recovery is fail-closed: a forged log is refused at construction and rebuild (review r3 finding 3)", () => {
+    const path = tempDbPath();
+    const store = new SqliteEventStore(path);
+    cleanups.push(() => store.close());
+    // A structurally valid row no machine would produce: created straight
+    // into a terminal state.
+    store.append({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "mission-created",
+      actor: "camino:forger",
+      cause: "impossible durable state",
+      payload: { source: "prd-intake" },
+      fromState: null,
+      toState: "complete",
+      outcome: "applied",
+    });
+    expect(() => new TransitionRecorder(store)).toThrow(/fails replay verification/);
+  });
+
+  it("verify() reports rather than throws on rows the fold rejects (review r3 finding 4)", () => {
+    const { store, recorder } = newRecorder();
+    // Applied row for an entity that was never created: decide rejects it,
+    // the fold cannot apply it, and verification must return divergences.
+    store.append({
+      entityKind: "mission",
+      entityId: "ghost",
+      event: "plan-constructed",
+      actor: "camino:forger",
+      cause: "applied row for unknown entity",
+      payload: { reviewAttached: true, checklistRendered: true },
+      fromState: "draft",
+      toState: "planned",
+      outcome: "applied",
+    });
+    const problems = recorder.verify();
+    expect(problems.length).toBeGreaterThanOrEqual(2);
+    expect(problems.some((d) => /fold rejects the record/.test(d.problem))).toBe(true);
+  });
+
+  it("canonicalization contains property traps as logged refusals (review r3 finding 6)", () => {
+    const { store, recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    // A reserved key whose getter deletes itself during serialization: the
+    // pre-serialization capture still refuses it.
+    const selfDeleting: Record<string, unknown> = { dagAcyclic: true, executionSlotFree: true };
+    Object.defineProperty(selfDeleting, "type", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        delete selfDeleting["type"];
+        return "plan-rejected";
+      },
+    });
+    const dodged = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-approved",
+      actor: "david",
+      cause: "self-deleting reserved key",
+      payload: selfDeleting,
+    });
+    expect(dodged).toMatchObject({ ok: false, code: "malformed-payload" });
+    // A Proxy whose property enumeration throws: refused and logged, not thrown.
+    const trapped = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("descriptor trap");
+        },
+      },
+    ) as Record<string, unknown>;
+    const trappedOutcome = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-approved",
+      actor: "david",
+      cause: "throwing property trap",
+      payload: trapped,
+    });
+    expect(trappedOutcome).toMatchObject({ ok: false, code: "malformed-payload" });
+    const rejected = store.read().filter((r) => r.rejectionCode === "malformed-payload");
+    expect(rejected).toHaveLength(2);
+    expect(recorder.currentState("mission", "m1")).toBe("planned");
+    expect(recorder.verify()).toEqual([]);
+  });
+
+  it("store append snapshots its input and CAS option exactly once (review r3 findings 5, 7)", () => {
+    const { store } = newRecorder();
+    let idReads = 0;
+    let seqReads = 0;
+    const input = {
+      entityKind: "mission" as const,
+      get entityId() {
+        idReads += 1;
+        return `m${idReads}`;
+      },
+      event: "mission-created",
+      actor: "david",
+      cause: "accessor input",
+      payload: { source: "prd-intake" },
+      fromState: null,
+      toState: "draft",
+      outcome: "applied" as const,
+    };
+    const options = {
+      get expectedLastSeq() {
+        seqReads += 1;
+        return 0;
+      },
+    };
+    const returned = store.append(input, options);
+    expect(idReads).toBe(1);
+    expect(seqReads).toBe(1);
+    // The returned record and the persisted row carry the same single read.
+    expect(returned.entityId).toBe("m1");
+    expect(store.read()[0]?.entityId).toBe("m1");
+  });
+
+  it("store append refuses to run inside an enclosing transaction (review r3 finding 5)", () => {
+    const { store } = newRecorder();
+    const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+    const wrapped = db.transaction(() => {
+      store.append({
+        entityKind: "mission",
+        entityId: "m1",
+        event: "mission-created",
+        actor: "david",
+        cause: "append inside enclosing transaction",
+        payload: { source: "prd-intake" },
+        fromState: null,
+        toState: "draft",
+        outcome: "applied",
+      });
+    });
+    expect(() => wrapped()).toThrow(/enclosing transaction/);
+    expect(store.read()).toEqual([]);
   });
 });

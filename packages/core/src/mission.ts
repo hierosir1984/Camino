@@ -103,9 +103,18 @@ export type MissionEvent =
   // A.1#5 — execution slot frees
   | { type: "execution-slot-freed"; fifoHead: boolean }
   // A.1#6 — integration branch + mission PR created
-  | { type: "integration-branch-created"; onboardingChecksGreen: boolean }
-  // A.1b#4 — the single issue executes per A.2 with target = main candidate
-  | { type: "quick-task-execution-started" }
+  | {
+      type: "integration-branch-created";
+      branchCreated: boolean;
+      missionPrCreated: boolean;
+      onboardingChecksGreen: boolean;
+    }
+  // A.1b#4 — the single issue executes per A.2 with target = main candidate; no branch, no fold
+  | {
+      type: "quick-task-execution-started";
+      targetIsMainCandidate: boolean;
+      noIntegrationBranchNoFold: boolean;
+    }
   // A.1#7 — all issues terminal ∧ no stranded requirement ∧ gate green ∧ review pass
   | {
       type: "mission-gate-green";
@@ -164,9 +173,10 @@ export type MissionEvent =
   | { type: "interruption-resolved"; affectedIssuesHandled: boolean }
   // A.1#21 — David answers / obstacle cleared
   | { type: "obstacle-cleared"; actor?: string; affectedIssuesTransitioned: boolean }
-  // A.1#22 / A.1b#11 — merge-by-push lands, push confirmed
+  // A.1#22 / A.1b#11 — merge-by-push lands ON MAIN, push confirmed
   | {
       type: "push-confirmed";
+      landedOnMain: boolean;
       pushedSha: string;
       descopedRequirements: readonly string[];
       approvedCandidateSha?: string; // recorded context (the bound approval)
@@ -384,7 +394,13 @@ const integrationRows: readonly MissionRow[] = [
     ref: "A.1#6",
     from: ["approved"],
     event: "integration-branch-created",
-    guard: { name: "onboarding-checks-green", check: (e) => attested(e.onboardingChecksGreen) },
+    guard: {
+      name: "branch-and-pr-created-onboarding-green",
+      check: (e) =>
+        attested(e.branchCreated) &&
+        attested(e.missionPrCreated) &&
+        attested(e.onboardingChecksGreen),
+    },
     to: "executing",
   }),
   // A.1#7 — executing | all issues terminal ∧ … ∧ review pass | A.4 ordering; freshness | awaiting-merge-approval
@@ -519,6 +535,7 @@ const integrationRows: readonly MissionRow[] = [
     guard: {
       name: "sha-bound-no-residue",
       check: (e) =>
+        attested(e.landedOnMain) &&
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
         stringArray(e.descopedRequirements) &&
@@ -533,6 +550,7 @@ const integrationRows: readonly MissionRow[] = [
     guard: {
       name: "sha-bound-with-residue",
       check: (e) =>
+        attested(e.landedOnMain) &&
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
         stringArray(e.descopedRequirements) &&
@@ -616,6 +634,10 @@ const quickTaskRows: readonly MissionRow[] = [
     ref: "A.1b#4",
     from: ["approved"],
     event: "quick-task-execution-started",
+    guard: {
+      name: "main-candidate-target-no-branch-no-fold",
+      check: (e) => attested(e.targetIsMainCandidate) && attested(e.noIntegrationBranchNoFold),
+    },
     to: "executing",
   }),
   // A.1b#5 — executing | quick-task validation green at main candidate ∧ packet populated | freshness vs main | awaiting-merge-approval
@@ -721,6 +743,7 @@ const quickTaskRows: readonly MissionRow[] = [
     guard: {
       name: "sha-bound-quick-complete",
       check: (e) =>
+        attested(e.landedOnMain) &&
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
         stringArray(e.descopedRequirements) &&

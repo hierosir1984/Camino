@@ -38,6 +38,16 @@ const CAMINO_PACKAGE_ESCAPES = [
 // network and scheduling primitives have no place in pure domain logic.
 const CORE_RESTRICTED_GLOBALS = [
   { name: "process", message: "packages/core is pure — no process access (purity fence)." },
+  // globalThis itself (and its aliases) is banned outright: pure domain
+  // logic has no use for the global object, and every alias/destructuring
+  // escape starts with one reference to it (WP-101 review round 3).
+  {
+    name: "globalThis",
+    message: "packages/core is pure — no global-object access (purity fence).",
+  },
+  { name: "global", message: "packages/core is pure — no global-object access (purity fence)." },
+  { name: "window", message: "packages/core is pure — no global-object access (purity fence)." },
+  { name: "self", message: "packages/core is pure — no global-object access (purity fence)." },
   { name: "fetch", message: "packages/core is pure — no network I/O (purity fence)." },
   { name: "WebSocket", message: "packages/core is pure — no network I/O (purity fence)." },
   { name: "XMLHttpRequest", message: "packages/core is pure — no network I/O (purity fence)." },

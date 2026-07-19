@@ -12,9 +12,11 @@
  */
 import type { EventRecord } from "@camino/shared";
 import type { MissionRoute, MissionState } from "./mission.js";
-import { MISSION_CREATION_EVENTS } from "./mission.js";
+import { MISSION_CREATION_EVENTS, MISSION_STATES } from "./mission.js";
 import type { IssueState } from "./issue.js";
+import { ISSUE_STATES } from "./issue.js";
 import type { AttemptState } from "./attempt.js";
+import { ATTEMPT_STATES } from "./attempt.js";
 
 export interface MissionSnapshot {
   state: MissionState;
@@ -74,6 +76,20 @@ export function applyRecord(view: StateView, record: EventRecord): void {
   if (record.outcome !== "applied") return;
   if (record.toState === null) throw malformed(record, "applied record without toState");
 
+  // Structural integrity of the durable row itself: the target must be a
+  // known state of the entity's machine, and a transition's recorded source
+  // must agree with the folded snapshot — a log violating either could not
+  // have been produced by the recorder (fail loud, never silently adopt).
+  const knownStates: readonly string[] =
+    record.entityKind === "mission"
+      ? MISSION_STATES
+      : record.entityKind === "issue"
+        ? ISSUE_STATES
+        : ATTEMPT_STATES;
+  if (!knownStates.includes(record.toState)) {
+    throw malformed(record, `unknown ${record.entityKind} state ${JSON.stringify(record.toState)}`);
+  }
+
   switch (record.entityKind) {
     case "mission": {
       const toState = record.toState as MissionState;
@@ -87,6 +103,12 @@ export function applyRecord(view: StateView, record: EventRecord): void {
         return;
       }
       if (!snapshot) throw malformed(record, `event for unknown mission ${record.entityId}`);
+      if (record.fromState !== snapshot.state) {
+        throw malformed(
+          record,
+          `recorded fromState ${JSON.stringify(record.fromState)} disagrees with the folded state ${JSON.stringify(snapshot.state)}`,
+        );
+      }
       const fromState = record.fromState as MissionState;
       snapshot.state = toState;
       // Manual pause bookkeeping: first pause wins; cleared on leaving.
@@ -137,6 +159,12 @@ export function applyRecord(view: StateView, record: EventRecord): void {
         return;
       }
       if (!snapshot) throw malformed(record, `event for unknown issue ${record.entityId}`);
+      if (record.fromState !== snapshot.state) {
+        throw malformed(
+          record,
+          `recorded fromState ${JSON.stringify(record.fromState)} disagrees with the folded state ${JSON.stringify(snapshot.state)}`,
+        );
+      }
       snapshot.state = toState;
       if (record.event === "attempt-failed" || record.event === "validation-failed") {
         const recorded = payloadNumber(record, "failureCount");
@@ -154,6 +182,12 @@ export function applyRecord(view: StateView, record: EventRecord): void {
         return;
       }
       if (!snapshot) throw malformed(record, `event for unknown attempt ${record.entityId}`);
+      if (record.fromState !== snapshot.state) {
+        throw malformed(
+          record,
+          `recorded fromState ${JSON.stringify(record.fromState)} disagrees with the folded state ${JSON.stringify(snapshot.state)}`,
+        );
+      }
       snapshot.state = toState;
       return;
     }

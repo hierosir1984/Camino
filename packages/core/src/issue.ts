@@ -87,7 +87,7 @@ export type IssueEvent =
   // A.2#19 — contract edited, incompatible
   | { type: "contract-edited-incompatible" }
   // A.2#20 — replan complete under contract v(n+1)
-  | { type: "replan-complete"; unmetDependencies: number }
+  | { type: "replan-complete"; contractVersionAdvanced: boolean; unmetDependencies: number }
   // A.2#21 — David answers an escalation
   | { type: "escalation-answered"; actor?: string; resolution: "retry" | "cancel" }
   // A.2#22 — David cancels
@@ -373,8 +373,11 @@ const issueRows: readonly IssueRow[] = [
     from: ["replanning"],
     event: "replan-complete",
     guard: {
-      name: "replan-no-unmet-deps",
-      check: (e) => Number.isInteger(e.unmetDependencies) && e.unmetDependencies === 0,
+      name: "replan-under-next-contract-no-unmet-deps",
+      check: (e) =>
+        attested(e.contractVersionAdvanced) &&
+        Number.isInteger(e.unmetDependencies) &&
+        e.unmetDependencies === 0,
     },
     to: "ready",
   }),
@@ -383,8 +386,11 @@ const issueRows: readonly IssueRow[] = [
     from: ["replanning"],
     event: "replan-complete",
     guard: {
-      name: "replan-unmet-deps",
-      check: (e) => Number.isInteger(e.unmetDependencies) && e.unmetDependencies > 0,
+      name: "replan-under-next-contract-unmet-deps",
+      check: (e) =>
+        attested(e.contractVersionAdvanced) &&
+        Number.isInteger(e.unmetDependencies) &&
+        e.unmetDependencies > 0,
     },
     to: "waiting-deps",
     note: "One appendix row, guard-split on re-checked dependency readiness.",

@@ -162,10 +162,32 @@ export class SqliteEventStore implements EventStore {
   }
 
   append(input: EventInput, options: AppendOptions = {}): EventRecord {
-    validateInput(input);
+    // Snapshot every field exactly once: exotic caller objects with accessor
+    // properties must not let validation, insertion, and the returned record
+    // read different values (WP-101 review round 3).
+    const snapshot: EventInput = {
+      entityKind: input.entityKind,
+      entityId: input.entityId,
+      event: input.event,
+      actor: input.actor,
+      cause: input.cause,
+      payload: input.payload,
+      fromState: input.fromState,
+      toState: input.toState,
+      outcome: input.outcome,
+      ...(input.rejectionCode === undefined ? {} : { rejectionCode: input.rejectionCode }),
+    };
+    const expectedLastSeq = options.expectedLastSeq;
+    if (this.db.inTransaction) {
+      throw new Error(
+        "append must not run inside an enclosing transaction: a rollback would undo the row " +
+          "while callers already treated it as durable",
+      );
+    }
+    validateInput(snapshot);
     let payloadJson: string;
     try {
-      payloadJson = JSON.stringify(input.payload);
+      payloadJson = JSON.stringify(snapshot.payload);
     } catch (error) {
       throw new TypeError(`Event payload must be JSON-serializable: ${(error as Error).message}`);
     }
@@ -184,35 +206,35 @@ export class SqliteEventStore implements EventStore {
     // atomic unit against every other connection (compare-and-swap on the
     // store's highest seq).
     const runAppend = this.db.transaction((): number => {
-      if (options.expectedLastSeq !== undefined) {
+      if (expectedLastSeq !== undefined) {
         const lastSeq = this.db
           .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM events")
           .get() as { last: number };
-        if (lastSeq.last !== options.expectedLastSeq) {
+        if (lastSeq.last !== expectedLastSeq) {
           throw new Error(
-            `event store advanced beyond the writer's view (seq ${lastSeq.last} > ${options.expectedLastSeq}): ` +
+            `event store advanced beyond the writer's view (seq ${lastSeq.last} > ${expectedLastSeq}): ` +
               "a second writer violated the single-writer contract (CAM-STATE-03; the durable recovery lock lands with WP-104)",
           );
         }
       }
       const result = this.insert.run({
-        entityKind: input.entityKind,
-        entityId: input.entityId,
-        event: input.event,
-        actor: input.actor,
-        cause: input.cause,
+        entityKind: snapshot.entityKind,
+        entityId: snapshot.entityId,
+        event: snapshot.event,
+        actor: snapshot.actor,
+        cause: snapshot.cause,
         payload: payloadJson,
-        fromState: input.fromState,
-        toState: input.toState,
-        outcome: input.outcome,
-        rejectionCode: input.rejectionCode ?? null,
+        fromState: snapshot.fromState,
+        toState: snapshot.toState,
+        outcome: snapshot.outcome,
+        rejectionCode: snapshot.rejectionCode ?? null,
         recordedAt,
       });
       return Number(result.lastInsertRowid);
     });
     const seq = runAppend.immediate();
     return {
-      ...input,
+      ...snapshot,
       payload: roundTrip as EventRecord["payload"],
       seq,
       recordedAt,

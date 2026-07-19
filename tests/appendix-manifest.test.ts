@@ -56,13 +56,15 @@ function parseAppendixTable(sectionStart: string, sectionEnd: string): ParsedRow
   const lines = PRD.slice(start, end).split("\n");
 
   const columnsOf = (line: string): string[] => {
-    const cells = line.split("|");
+    // Escaped pipes inside cells must not split columns.
+    const ESCAPED_PIPE = "\u0000";
+    const cells = line.replaceAll("\\|", ESCAPED_PIPE).split("|");
     // A well-formed table line is "| a | b | … |": first and last split
     // pieces are empty borders.
     expect(cells.length, `table line must be pipe-bordered: ${line}`).toBeGreaterThan(2);
     expect(cells[0]?.trim()).toBe("");
     expect(cells[cells.length - 1]?.trim()).toBe("");
-    return cells.slice(1, -1).map((cell) => cell.trim());
+    return cells.slice(1, -1).map((cell) => cell.replaceAll(ESCAPED_PIPE, "\\|").trim());
   };
 
   const headerIndex = lines.findIndex((line) => line.trimStart().startsWith("|"));
@@ -127,7 +129,16 @@ function encodedRowGroups(
   return groups;
 }
 
-/** Assert one appendix row's From cell matches its code from-set. */
+/**
+ * Assert one appendix row's From cell matches its code from-set EXACTLY:
+ * the cell's backtick-quoted state tokens, as a set, must equal the union
+ * of the code splits' sources (substring matching would accept e.g.
+ * `unplanned` for planned — review round 3). "Any active"/"any terminal"
+ * cells carry no backticked states and map to the full set. Which SPLIT of
+ * a multi-source appendix row owns which source (A.1#21a vs #21b) is not
+ * derivable from the table text — that assignment is pinned by the
+ * per-split transition vectors, not here.
+ */
 function expectFromCellMatches(
   table: string,
   parsed: ParsedRow,
@@ -143,9 +154,8 @@ function expectFromCellMatches(
     expect(parsed.fromCell, `${label} must say "${anyActive.text}"`).toContain(anyActive.text);
     return;
   }
-  for (const state of group.from) {
-    expect(parsed.fromCell, `${label} must name ${state}`).toContain(state);
-  }
+  const cellTokens = [...parsed.fromCell.matchAll(/`([^`]+)`/g)].map((m) => m[1] as string).sort();
+  expect(cellTokens, `${label} must name exactly the code sources`).toEqual([...group.from].sort());
 }
 
 describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
