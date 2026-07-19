@@ -45,6 +45,7 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -94,7 +95,8 @@ function stripInheritedAcl(path: string): void {
   try {
     execFileSync("/bin/chmod", ["-N", path], { timeout: 5000, stdio: "ignore" });
   } catch {
-    // Non-fatal: the verification step re-checks and refuses if an ACL remains.
+    // A failed strip is caught fail-closed by the caller, which re-checks
+    // hasExtendedAcl on the created file and refuses if an ACL still remains.
   }
 }
 
@@ -132,6 +134,27 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
+/** Identity of the inode behind an fstat: device + inode number. */
+function inodeKey(stat: Stats): string {
+  return `${stat.dev}:${stat.ino}`;
+}
+
+/** Identity of whatever the path currently resolves to, or undefined if gone. */
+function pathInodeKey(path: string): string | undefined {
+  try {
+    return inodeKey(statSync(path));
+  } catch {
+    return undefined;
+  }
+}
+
+function swapError(path: string): TokenError {
+  return new TokenError(
+    `Refusing to start: token file ${path} changed underneath the daemon during ` +
+      `startup verification. Retry; if it persists, inspect what is rewriting ${JSON.stringify(path)}.`,
+  );
+}
+
 /** Read the whole file through an already-open fd (no path re-resolution). */
 function readAllFromFd(fd: number, sizeHint: number): string {
   const size = Math.min(Math.max(sizeHint, 0), 4096);
@@ -161,7 +184,16 @@ function verifyExistingToken(fd: number, path: string): LoadedToken {
         `Delete it to have the daemon generate a fresh token.`,
     );
   }
-  if (hasExtendedAcl(path)) {
+  // The ACL check runs `ls` on the PATH, not the fd, so bind it to the opened
+  // inode (dev+ino) before AND after: a concurrent swap presenting a clean
+  // inode to `ls` while our fd holds an ACL-bearing one is detected and refused
+  // (round 2, finding 2b). This extends the opened-inode binding (finding 8) to
+  // ACL verification.
+  const identity = inodeKey(stat);
+  if (pathInodeKey(path) !== identity) throw swapError(path);
+  const acl = hasExtendedAcl(path);
+  if (pathInodeKey(path) !== identity) throw swapError(path);
+  if (acl) {
     throw new TokenError(
       `Refusing to start: token file ${path} carries an extended ACL that can ` +
         `grant access beyond its 0600 mode. Clear it with: chmod -N ${JSON.stringify(path)} ` +
@@ -261,6 +293,18 @@ function createTokenAtomically(path: string): LoadedToken {
     closeSync(tmpFd);
   }
   stripInheritedAcl(tmpPath); // strip before publish so the linked inode is clean
+  // Fail closed if the strip did not take (chmod -N denied/unavailable): a
+  // token file created under a directory with an inherited ACL must not ship
+  // world-readable just because the strip failed (round 2, finding 2a). Check
+  // the temp inode BEFORE publishing so the visible path is never ACL-bearing.
+  if (hasExtendedAcl(tmpPath)) {
+    safeUnlink(tmpPath);
+    throw new TokenError(
+      `Refusing to start: a freshly created token file inherited an extended ACL ` +
+        `from its directory and it could not be stripped. Clear the ACL on the ` +
+        `containing directory (chmod -N) so the token can be created owner-only.`,
+    );
+  }
 
   try {
     linkSync(tmpPath, path); // atomic publish; EEXIST means another run won

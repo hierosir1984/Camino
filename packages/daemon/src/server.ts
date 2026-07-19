@@ -40,13 +40,17 @@
  *
  * No CORS grant is ever emitted: cross-origin pages cannot read responses,
  * and preflighted requests fail. Token comparison is constant-time over
- * SHA-256 digests. Responses carry restrictive security headers (CSP
- * self-only, nosniff, deny framing) — the GUI is served exclusively by this
- * daemon, so the tight policy is free.
+ * SHA-256 digests. Every APPLICATION response carries restrictive security
+ * headers (CSP self-only, nosniff, deny framing, no-store) via an onSend hook —
+ * the GUI is served exclusively by this daemon, so the tight policy is free.
+ * A request rejected by the HTTP parser BEFORE Fastify's hook chain (a
+ * malformed URL, a duplicate Content-Length, an illegal Transfer-Encoding
+ * combination) receives a bare 400 with no body and therefore no header to
+ * carry (round 2, finding 5) — there is no content for CSP to protect.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
@@ -82,8 +86,61 @@ function timingSafeStringEqual(presented: string, expected: string): boolean {
 }
 
 /**
+ * Validate that a GUI build directory is a PLAIN, CONTAINED tree: every entry
+ * is a regular file or directory (no symlinks, FIFOs, devices, sockets) inside
+ * `root`. A daemon that serves the tree is only as contained as the tree is —
+ * @fastify/static follows symlinks, and its `allowedPath` check runs before the
+ * open, so a symlink used as a directory index (or swapped in at runtime) can
+ * disclose a file outside the root (round 2, finding 1). Rather than chase that
+ * check-then-open race inside the plugin, we refuse at startup to serve a tree
+ * that is not plain, and serve a 503 instead — Camino owns and builds this
+ * directory, so a plain tree is the correct, verifiable invariant.
+ *
+ * Scope (documented residual): this validates the tree AT STARTUP. A symlink
+ * planted into the build directory AFTER startup is out of the threat model —
+ * write access to the daemon's own GUI build directory already lets an attacker
+ * replace served content directly, so symlink following adds no capability. The
+ * build directory is not a user-writable location on the single-user, local
+ * machine this daemon targets (build plan §1.2 posture).
+ */
+function isPlainContainedTree(root: string): boolean {
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    return false;
+  }
+  const stack: string[] = [realRoot];
+  let budget = 100_000; // bound the walk; the GUI build is small
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      if (--budget <= 0) return false;
+      const full = join(dir, entry.name);
+      let lst: import("node:fs").Stats;
+      try {
+        lst = lstatSync(full);
+      } catch {
+        return false;
+      }
+      if (lst.isSymbolicLink()) return false;
+      if (lst.isDirectory()) stack.push(full);
+      else if (!lst.isFile()) return false; // FIFO / device / socket
+    }
+  }
+  return true;
+}
+
+/**
  * True iff `pathName` (a request path) resolves to a file within `realRoot`,
- * following symlinks. Used to keep static serving inside the GUI build dir.
+ * following symlinks. Defense-in-depth for static serving alongside the
+ * startup plain-tree check; catches lexical `..` escapes regardless.
  */
 function staticPathContained(realRoot: string, pathName: string): boolean {
   let decoded: string;
@@ -117,21 +174,28 @@ function isApiPath(path: string): boolean {
  * (`*`) is refused, because Fastify routes by the URL path while a naive
  * substring check on the raw target would classify it as non-API — the exact
  * divergence that let an absolute-form request reach `/api` tokenlessly (round
- * 1, finding 1). Within origin-form, the path is treated as /api if either its
- * raw or percent-decoded pathname says so; malformed encodings and backslashes
- * are refused.
+ * 1, finding 1).
+ *
+ * The classification is a CONSERVATIVE over-approximation of "is this /api",
+ * not a byte-for-byte reproduction of Fastify's router (round 2, finding 4):
+ * `new URL().pathname` normalises dot segments and converts `\` to `/`, so a
+ * few spellings the router would NOT match as `/api/health` (e.g. `/./api/…`,
+ * `/api\health`) are still classified as /api and token-gated. That is the safe
+ * direction — the failure mode is "an extra request needs a token", never "an
+ * API request skips the token". The percent-decoded form is checked too, so an
+ * encoded `/%61pi` spelling is caught; only a genuinely malformed encoding is
+ * refused outright.
  */
 function classifyPath(rawUrl: string): { api: boolean } | { malformed: true } {
   if (!rawUrl.startsWith("/")) return { malformed: true }; // not origin-form
-  // Parse against a fixed base so the pathname is exactly what the router used;
-  // query/fragment fall away. A parse failure is a refusal, not a guess.
+  // Parse against a fixed base to extract the pathname; query/fragment fall
+  // away. A parse failure is a refusal, not a guess.
   let pathname: string;
   try {
     pathname = new URL(rawUrl, "http://localhost").pathname;
   } catch {
     return { malformed: true };
   }
-  if (pathname.includes("\\")) return { malformed: true };
   let decoded: string;
   try {
     decoded = decodeURIComponent(pathname);
@@ -152,7 +216,11 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
 
   const csrfToken = generateToken();
   const guiRoot = options.guiRoot;
-  const guiAvailable = guiRoot !== undefined && existsSync(guiRoot);
+  const guiExists = guiRoot !== undefined && existsSync(guiRoot);
+  // Serve only a plain, contained tree (finding 1). A present-but-non-plain
+  // directory is "invalid" — served as 503, never disclosed.
+  const guiValid = guiExists && isPlainContainedTree(guiRoot!);
+  const guiMissingReason = guiExists ? "gui-build-invalid" : "gui-build-missing";
 
   /** The `host:port` authorities the daemon answers as, from the bound port. */
   function selfHosts(): Set<string> | undefined {
@@ -257,17 +325,16 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     return { stopping: true };
   });
 
-  if (guiAvailable) {
-    // @fastify/static (via @fastify/send) follows symlinks, so a symlink
-    // planted in the build directory could disclose a file outside it (round
-    // 1, finding 3). We fully own the build dir, but the claim must hold: an
-    // allowedPath hook realpath-resolves each candidate and refuses anything
-    // that resolves outside the real build root. realpath on both sides also
-    // handles a symlinked root (e.g. macOS /tmp → /private/tmp).
+  if (guiValid) {
+    // The tree is verified plain and contained at startup (isPlainContainedTree),
+    // so no symlink can be used as a file or directory index. `dotfiles: 'deny'`
+    // keeps hidden files inside the tree unreadable (round 2, finding 3); the
+    // allowedPath realpath check stays as defense-in-depth against lexical `..`.
     const realGuiRoot = realpathSync(guiRoot!);
     void app.register(fastifyStatic, {
       root: guiRoot!,
       prefix: "/",
+      dotfiles: "deny",
       allowedPath: (pathName) => staticPathContained(realGuiRoot, pathName),
     });
   }
@@ -276,13 +343,16 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     const path = classifyPath(request.url);
     const api = "malformed" in path ? true : path.api;
     if (!api && SAFE_METHODS.has(request.method)) {
-      if (guiAvailable) {
+      if (guiValid) {
         // Single-page fallback: unknown GUI routes render the app shell.
         return reply.sendFile("index.html");
       }
       return reply.code(503).send({
-        error: "gui-build-missing",
-        hint: "run: npm run build -w @camino/gui (or set CAMINO_GUI_DIST)",
+        error: guiMissingReason,
+        hint:
+          guiMissingReason === "gui-build-invalid"
+            ? "the GUI build directory must be a plain tree (no symlinks); rebuild it"
+            : "run: npm run build -w @camino/gui (or set CAMINO_GUI_DIST)",
       });
     }
     return reply.code(404).send({ error: "not-found" });

@@ -102,29 +102,6 @@ describe("GUI serving", () => {
     }
   });
 
-  it("finding 3: does not disclose a file reached by a symlink out of the build dir", async () => {
-    // @fastify/static follows symlinks; the allowedPath realpath check must
-    // refuse a link that resolves outside the build root.
-    const linked = mkdtempSync(join(tmpdir(), "camino-symlink-"));
-    const linkedGui = join(linked, "dist");
-    mkdirSync(linkedGui);
-    writeFileSync(join(linkedGui, "index.html"), "<title>linked shell</title>");
-    const secret = `symlink-secret-${generateToken()}`;
-    writeFileSync(join(linked, "outside.txt"), secret);
-    symlinkSync(join(linked, "outside.txt"), join(linkedGui, "leak.txt"));
-    symlinkSync(join(linked, "outside.txt"), join(linkedGui, "leak.html"));
-
-    const linkedDaemon = await startDaemonServer({ token: TOKEN, guiRoot: linkedGui, port: 0 });
-    try {
-      for (const path of ["/leak.txt", "/leak.html"]) {
-        const response = await fetch(`${linkedDaemon.url}${path}`);
-        expect(await response.text(), path).not.toContain(secret);
-      }
-    } finally {
-      await linkedDaemon.app.close();
-    }
-  });
-
   it("answers 503 with a build hint when the GUI build is absent", async () => {
     const bare = await startDaemonServer({ token: TOKEN, port: 0 });
     try {
@@ -133,6 +110,117 @@ describe("GUI serving", () => {
       expect(await response.text()).toContain("gui-build-missing");
     } finally {
       await bare.app.close();
+    }
+  });
+});
+
+/**
+ * Round-2 regressions: a GUI build directory that is not a plain, contained
+ * tree (a symlink used as a file OR as the directory index) is refused at
+ * startup and served as 503 — never disclosing the symlink's target (finding
+ * 1). Hidden files inside a plain tree are not served (finding 3).
+ */
+describe("round 2 regressions — GUI build containment", () => {
+  function makeGui(build: (dist: string, scratch: string) => void): {
+    gui: string;
+    scratch: string;
+  } {
+    const scratch = mkdtempSync(join(tmpdir(), "camino-r2-static-"));
+    const gui = join(scratch, "dist");
+    mkdirSync(gui);
+    build(gui, scratch);
+    return { gui, scratch };
+  }
+
+  it("finding 1: a symlinked directory index does not disclose its target (served 503)", async () => {
+    const secret = `index-secret-${generateToken()}`;
+    const { gui } = makeGui((dist, scratch) => {
+      writeFileSync(join(scratch, "outside.html"), secret);
+      symlinkSync(join(scratch, "outside.html"), join(dist, "index.html"));
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      const response = await fetch(`${daemon.url}/`);
+      expect(response.status).toBe(503);
+      const body = await response.text();
+      expect(body).toContain("gui-build-invalid");
+      expect(body).not.toContain(secret);
+    } finally {
+      await daemon.app.close();
+    }
+  });
+
+  it("finding 1: an in-tree symlink invalidates the tree; its target is never served", async () => {
+    const secret = `leak-secret-${generateToken()}`;
+    const { gui } = makeGui((dist, scratch) => {
+      writeFileSync(join(dist, "index.html"), "<title>shell</title>");
+      writeFileSync(join(scratch, "outside.txt"), secret);
+      symlinkSync(join(scratch, "outside.txt"), join(dist, "leak.txt"));
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      for (const path of ["/", "/leak.txt"]) {
+        const response = await fetch(`${daemon.url}${path}`);
+        expect(response.status, path).toBe(503);
+        expect(await response.text(), path).not.toContain(secret);
+      }
+    } finally {
+      await daemon.app.close();
+    }
+  });
+
+  it("finding 1: a symlinked SUBDIRECTORY escaping the root is refused", async () => {
+    const secret = `subdir-secret-${generateToken()}`;
+    const { gui } = makeGui((dist, scratch) => {
+      writeFileSync(join(dist, "index.html"), "<title>shell</title>");
+      const outsideDir = join(scratch, "outside-dir");
+      mkdirSync(outsideDir);
+      writeFileSync(join(outsideDir, "secret.txt"), secret);
+      symlinkSync(outsideDir, join(dist, "assets"));
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      const response = await fetch(`${daemon.url}/assets/secret.txt`);
+      expect(await response.text()).not.toContain(secret);
+    } finally {
+      await daemon.app.close();
+    }
+  });
+
+  it("finding 3: hidden files inside a plain tree are not served", async () => {
+    const secret = `dotfile-secret-${generateToken()}`;
+    const { gui } = makeGui((dist) => {
+      writeFileSync(join(dist, "index.html"), "<title>shell</title>");
+      writeFileSync(join(dist, ".secret"), secret);
+      mkdirSync(join(dist, ".hidden"));
+      writeFileSync(join(dist, ".hidden", "secret.txt"), secret);
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      for (const path of ["/.secret", "/.hidden/secret.txt"]) {
+        const response = await fetch(`${daemon.url}${path}`);
+        expect(response.status, path).not.toBe(200);
+        expect(await response.text(), path).not.toContain(secret);
+      }
+    } finally {
+      await daemon.app.close();
+    }
+  });
+
+  it("a plain, contained tree still serves normally (no false invalidation)", async () => {
+    const { gui } = makeGui((dist) => {
+      writeFileSync(join(dist, "index.html"), "<title>SHELL_OK</title>");
+      mkdirSync(join(dist, "assets"));
+      writeFileSync(join(dist, "assets", "app.js"), "1;");
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      expect(await (await fetch(`${daemon.url}/`)).text()).toContain("SHELL_OK");
+      expect((await fetch(`${daemon.url}/assets/app.js`)).status).toBe(200);
+      // SPA fallback still contained.
+      expect(await (await fetch(`${daemon.url}/some/spa/route`)).text()).toContain("SHELL_OK");
+    } finally {
+      await daemon.app.close();
     }
   });
 });
