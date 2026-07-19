@@ -119,7 +119,12 @@ export interface QueuedEntry {
 export interface RepoQueueView {
   /** Execution-bearing holders per lane (at most one each). */
   readonly active: LaneOccupancy;
-  /** Missions waiting in `queued`, FIFO order, both lanes. */
+  /**
+   * Missions waiting in `queued` — DISPLAY ordering: first-entry order
+   * across both lanes (each entry names its lane). ACTIVATION order is per
+   * lane with the urgent lane first (r5 finding 1) — an urgent task never
+   * waits behind older primary missions.
+   */
   readonly queued: readonly QueuedEntry[];
   /**
    * Missions in non-execution-bearing active states (draft, planned, a
@@ -353,10 +358,18 @@ export class SerializationScheduler {
    * `execution-slot-freed` transition. Head computation and record happen
    * in the same synchronous frame (no interleaving in-process). At most one
    * activation per lane per call — the activated mission occupies the slot.
+   *
+   * Cross-lane order (r5 finding 1): the URGENT lane is considered FIRST —
+   * the lane exists to jump the line, and processing primary first let a
+   * younger primary mission activate and then (via symmetric admission)
+   * block an OLDER queued urgent task. FIFO is per lane; between lanes,
+   * urgency wins by construction. The activation audit checks per-lane
+   * order only — cross-lane priority is this method's ordering, exercised
+   * by tests, not re-derived from the log.
    */
   activateNext(repoId: string): ActivationOutcome[] {
     const outcomes: ActivationOutcome[] = [];
-    for (const lane of ["primary", "urgent"] as const) {
+    for (const lane of ["urgent", "primary"] as const) {
       const holders = this.laneHolders(repoId);
       // Same symmetric admission rule as executionSlotFreeFor (r4 finding 1).
       const available =

@@ -588,6 +588,46 @@ describe("MissionIntake — the domain/event seam", () => {
     expect(conflicts.find((c) => c.field === "repoId")?.recordedValue).toBe("some-other-repo");
   });
 
+  it("a malformed-but-present optional binding conflicts instead of vanishing (r5 finding 2)", () => {
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    // A foreign creation carrying a NON-STRING filename (a present,
+    // malformed binding) plus otherwise-matching bound fields.
+    recorder.record({
+      entityKind: "mission",
+      entityId: "dup",
+      event: "mission-created",
+      actor: "prior",
+      cause: "intake.test: malformed filename binding",
+      payload: {
+        source: "prd-intake",
+        contentSha256: contentSha256("c"),
+        repoId: repo.id,
+        title: "t",
+        urgent: false,
+        sourceKind: "pasted",
+        contentFormat: "markdown",
+        filename: 7,
+      },
+    });
+    expect(() =>
+      intake.createFromText({ repoId: repo.id, title: "t", content: "c", actor: "david" }),
+    ).toThrow(/already-exists/);
+    // The domain row has NO filename; the recorded event has a malformed
+    // PRESENT one — that difference must not vanish into "both absent".
+    expect(intake.seamDivergences().creationConflicts).toEqual([
+      { missionId: "dup", field: "filename", recordedValue: "(malformed binding)" },
+    ]);
+  });
+
   it("an urgent-flag divergence between the retained row and its creation event is visible (r4 finding 2)", () => {
     // The reviewer's shape: content, repo, title (and route) all agree —
     // only the urgency differs. Before r4 this was invisible.

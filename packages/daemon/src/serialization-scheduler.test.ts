@@ -572,6 +572,36 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     });
   });
 
+  it("the urgent lane activates before primary: a younger primary cannot leapfrog an older urgent task (r5 finding 1)", () => {
+    const h = newHarness();
+    // A quick task holds primary (unadmittable) so BOTH later missions queue.
+    const q0 = intakeQuickTask(h, "Quick holder", false);
+    expect(planAndApproveQuick(h, q0)).toBe("approved");
+    startQuickExecution(h, q0);
+
+    const qU = intakeQuickTask(h, "Older urgent", true);
+    expect(planAndApproveQuick(h, qU)).toBe("queued"); // lane unavailable (quick primary)
+    const m1 = intakePrdMission(h, "Younger primary");
+    expect(planAndApprove(h, m1)).toBe("queued"); // primary held
+
+    // The holder terminates: both slots are free, the urgent task is OLDER.
+    completeQuickTask(h, q0, "holder-sha");
+    // Urgent activates FIRST; symmetric admission then keeps primary queued.
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "urgent", missionId: qU, to: "approved" },
+    ]);
+    expect(h.recorder.currentState("mission", m1)).toBe("queued");
+
+    // The urgent task lands → the primary follows.
+    startQuickExecution(h, qU);
+    completeQuickTask(h, qU, "urgent-sha");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "primary", missionId: m1, to: "approved" },
+    ]);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
+  });
+
   it("admission is symmetric: a primary approval while the urgent lane is occupied queues (r4 finding 1)", () => {
     const h = newHarness();
     // Urgent-first: an urgent quick task alone on the repo takes the lane

@@ -311,8 +311,11 @@ export class MissionIntake {
    * BECAUSE an unrelated recorded mission already holds the same id is NOT
    * listed here — that case has a PERSISTENT signature in
    * `seamDivergences().creationConflicts` unless the two missions agree on
-   * content, repo, AND title (observationally identical — the intake error
-   * thrown at the seam is then the only signal, stated plainly).
+   * EVERY bound creation field (content hash, repo, title, urgent, source
+   * kind, format, filename — r5 finding 5 updated this from the older
+   * three-field condition), in which case they are observationally
+   * identical apart from timestamps and the intake error thrown at the
+   * seam is the only signal, stated plainly.
    */
   intakeOrphans(): MissionRecord[] {
     const view = this.recorder.currentView;
@@ -410,6 +413,18 @@ export class MissionIntake {
     for (const record of this.store.read({ entityKind: "mission" })) {
       if (record.outcome !== "applied" || record.fromState !== null) continue;
       const normalized: Record<string, string | undefined> = {};
+      // Absence and malformed presence are DIFFERENT facts (r5 finding 2):
+      // a present non-string value must not vanish into "absent" — it
+      // normalizes to a sentinel no real value can equal, so it always
+      // conflicts and is reported as malformed.
+      const normalize = (field: string, expect: "string" | "boolean"): string | undefined => {
+        if (!Object.prototype.hasOwnProperty.call(record.payload, field)) return undefined;
+        const value = record.payload[field];
+        if (expect === "boolean") {
+          return typeof value === "boolean" ? String(value) : "(malformed binding)";
+        }
+        return typeof value === "string" ? value : "(malformed binding)";
+      };
       for (const field of [
         "contentSha256",
         "repoId",
@@ -418,11 +433,9 @@ export class MissionIntake {
         "contentFormat",
         "filename",
       ]) {
-        const value = record.payload[field];
-        normalized[field] = typeof value === "string" ? value : undefined;
+        normalized[field] = normalize(field, "string");
       }
-      const urgent = record.payload["urgent"];
-      normalized["urgent"] = typeof urgent === "boolean" ? String(urgent) : undefined;
+      normalized["urgent"] = normalize("urgent", "boolean");
       bindings.set(record.entityId, normalized);
     }
     return bindings;
@@ -526,7 +539,7 @@ export class MissionIntake {
         outcome.code === "already-exists"
           ? "an unrelated recorded mission already holds this id (id-generation defect); the " +
             "retained row is NOT an intakeOrphans() entry — seamDivergences().creationConflicts " +
-            "carries its persistent signature unless content, repo, and title all coincide, in " +
+            "carries its persistent signature unless EVERY bound creation field coincides, in " +
             "which case this error is the only signal"
           : "see intakeOrphans()";
       throw new Error(

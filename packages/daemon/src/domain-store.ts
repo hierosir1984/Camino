@@ -35,15 +35,19 @@
  * `instr(CAST(col AS BLOB), x'00') = 0` — a byte-level search that does not
  * stop at the NUL the way text functions do (r4 finding 4 corrected r3's
  * "not expressible" claim; the hash column additionally pins byte length).
- * What a privileged raw writer can still do: issue DDL, supply explicit
- * rowids, store a forged-but-valid-hex hash, or store TEXT that is not
- * valid UTF-8 (encoding validation is not expressible in SQLite SQL) —
- * stated, not defended. The API path re-derives hashes, validates every
+ * The byte technique assumes a UTF-8 database, so the constructor refuses
+ * any other encoding (r5 finding 4). What a privileged raw writer can
+ * still do: issue DDL, supply explicit rowids, store a forged-but-valid-
+ * hex hash, store TEXT that is not valid UTF-8 (encoding validation is not
+ * expressible in SQLite SQL), or disable constraint enforcement wholesale
+ * on its own connection (`PRAGMA ignore_check_constraints` — r5 finding 3)
+ * — stated, not defended. The API path re-derives hashes, validates every
  * string it persists (generated ids AND caller-supplied foreign ids
  * included — r3 f4, r4 f3), and assigns rowids monotonically. Opening a
  * database whose user_version claims this schema but whose tables or
  * triggers are missing refuses to start rather than silently recreating an
- * emptied store.
+ * emptied store (rows already forged past disabled constraints are not
+ * re-validated at open).
  */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -302,6 +306,18 @@ export class SqliteDomainStore {
     this.now = options.now ?? (() => new Date());
     this.newId = options.newId ?? (() => crypto.randomUUID());
     this.db = new Database(path);
+    // The blob-cast NUL CHECKs read database-encoding bytes: on a UTF-16
+    // database every ASCII value contains 0x00 bytes and would be falsely
+    // rejected (r5 finding 4). This store requires UTF-8 — the default for
+    // every database it creates — and refuses any other encoding.
+    const encoding = this.db.pragma("encoding", { simple: true }) as string;
+    if (encoding !== "UTF-8") {
+      this.db.close();
+      throw new Error(
+        `domain database ${path} uses encoding ${encoding}; this store requires UTF-8 ` +
+          "(its byte-level NUL constraints assume single-byte-free ASCII text)",
+      );
+    }
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     const version = this.db.pragma("user_version", { simple: true }) as number;

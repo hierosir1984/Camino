@@ -666,6 +666,17 @@ describe("SqliteDomainStore — tamper-evident open", () => {
     expect(() => new SqliteDomainStore(path)).toThrow(/missing missions_immutable_insert_conflict/);
   });
 
+  it("refuses a database whose encoding is not UTF-8 (r5 finding 4)", () => {
+    const path = tempDbPath();
+    // A legal version-zero UTF-16 database: the byte-level NUL checks would
+    // falsely reject every ASCII value on it.
+    const raw = new Database(path);
+    raw.pragma("encoding = 'UTF-16le'");
+    raw.exec("CREATE TABLE pin (x TEXT)"); // fixes the encoding into the file
+    raw.close();
+    expect(() => new SqliteDomainStore(path)).toThrow(/encoding UTF-16le.*requires UTF-8/s);
+  });
+
   it("refuses a database with an unknown schema version", () => {
     const path = tempDbPath();
     const raw = new Database(path);
