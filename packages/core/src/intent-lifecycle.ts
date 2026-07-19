@@ -82,7 +82,13 @@ export interface IntentLogDivergence {
 export const DAVID_ACTOR = "david";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  // GENUINELY plain (round 5, finding 1): a class instance or an object
+  // with a crafted prototype could satisfy `in`-style checks through
+  // inherited fields the JSON clone then drops — validator and fold must
+  // observe the same object.
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === null || proto === Object.prototype;
 }
 
 /**
@@ -138,7 +144,9 @@ function closedSchemaProblem(
     if (!declared.includes(key)) return `unexpected field ${JSON.stringify(key)}`;
   }
   for (const key of declared) {
-    if (!(key in value)) return `missing field ${JSON.stringify(key)}`;
+    // OWN fields only (round 5, finding 1): an inherited field would pass
+    // an `in` check yet vanish in the canonical JSON form.
+    if (!Object.hasOwn(value, key)) return `missing field ${JSON.stringify(key)}`;
   }
   return null;
 }

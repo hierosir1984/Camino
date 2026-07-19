@@ -485,3 +485,33 @@ describe("intent-id grammar and token containment (round 2, finding 1)", () => {
     }
   });
 });
+
+describe("round-5 regression: prototype-backed specs (finding 1)", () => {
+  it("refuses specs whose fields are inherited — validator and fold must see the same object", () => {
+    // The reviewer's probe: every declared field lives on the PROTOTYPE,
+    // so an `in` check passes while the canonical JSON form is {}.
+    const inherited = Object.create({ ...BRANCH_SPEC }) as Record<string, unknown>;
+    expect(validateOperationSpec(inherited, "i1").ok).toBe(false);
+    const decision = decideIntentAppend(new Map(), {
+      intentId: "i1",
+      event: "recorded",
+      actor: "x",
+      payload: inherited,
+    });
+    expect(decision.ok).toBe(false);
+  });
+
+  it("refuses class instances while accepting null-prototype and literal objects", () => {
+    class SpecLike {
+      op = "catch-all";
+      description = "d";
+    }
+    expect(validateOperationSpec(new SpecLike()).ok).toBe(false);
+    const nullProto = Object.assign(Object.create(null), {
+      op: "catch-all",
+      description: "d",
+    }) as Record<string, unknown>;
+    expect(validateOperationSpec(nullProto).ok).toBe(true);
+    expect(validateOperationSpec({ op: "catch-all", description: "d" }).ok).toBe(true);
+  });
+});
