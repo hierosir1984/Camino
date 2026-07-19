@@ -19,3 +19,23 @@ export { buildServer, startDaemonServer } from "./server.js";
 export type { BuildServerOptions, RunningDaemon, StartDaemonOptions } from "./server.js";
 export { generateToken, loadOrCreateToken, TokenError, tokenStatRefusal } from "./token.js";
 export type { LoadedToken } from "./token.js";
+
+export { SqliteDomainStore, contentSha256 } from "./domain-store.js";
+export type { CreateMissionInput, SqliteDomainStoreOptions } from "./domain-store.js";
+export {
+  MissionIntake,
+  INTAKE_ACCEPTED_EXTENSIONS,
+  INTAKE_MAX_CONTENT_BYTES,
+  INTAKE_MAX_TITLE_CHARS,
+} from "./intake.js";
+export { renderMissionContent } from "./render.js";
+export { SerializationScheduler, SCHEDULER_ACTOR } from "./serialization-scheduler.js";
+export type {
+  ActivationOutcome,
+  LaneHolder,
+  LaneOccupancy,
+  QueuedEntry,
+  RepoQueueView,
+  SchedulingLane,
+  SerializationViolation,
+} from "./serialization-scheduler.js";

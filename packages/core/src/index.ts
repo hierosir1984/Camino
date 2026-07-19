@@ -59,3 +59,5 @@ export type { AttemptEvent, AttemptState } from "./attempt.js";
 
 export { emptyView, applyRecord, foldView } from "./views.js";
 export type { AttemptSnapshot, IssueSnapshot, MissionSnapshot, StateView } from "./views.js";
+
+export { queuedEntrySeqs, fifoOrder } from "./serialization.js";
