@@ -18,8 +18,9 @@
  *   obligation for the GUI work packages, not silently assumed here.
  * - Bounded rendering: micromark's resource use is content-dependent and
  *   quadratic-class on pathological inputs. Measured on the dev machine
- *   (r2 finding 2): nested-emphasis runs cost 91 ms at 8 KiB, 289 ms at
- *   16 KiB, 928 ms at 32 KiB, and balanced brackets ~7.9 s at 64 KiB.
+ *   (r2 finding 2, r3 finding 7): nested-emphasis 91 ms at 8 KiB / 289 ms
+ *   at 16 KiB / 928 ms at 32 KiB; nested balanced brackets — the worst
+ *   known shape — ≈520–550 ms at 16 KiB and ~7.9 s at 64 KiB.
  *   Markdown above RENDER_MAX_INPUT_BYTES renders as an escaped
  *   preformatted block with the reason stated inline — shown, never
  *   truncated, never fed to the markdown parser. The escape fallback is a
@@ -35,10 +36,12 @@ import type { MissionContentFormat } from "@camino/shared";
 
 /**
  * Upper bound on input handed to the markdown parser (bytes of UTF-8).
- * 16 KiB: measured worst-case parse ≈ 290 ms on the dev machine — a
- * bounded, tolerable stall for a local single-user daemon; real PRDs
- * above it stay readable via the stated preformatted fallback. Rendering
- * larger documents as markdown needs isolation (a worker with a deadline),
+ * 16 KiB: worst measured shape at the bound is nested balanced brackets at
+ * ≈520–550 ms on the dev machine (r3 finding 7 corrected the earlier
+ * ≈290 ms figure, which was a different shape) — a bounded, tolerable
+ * stall for a local single-user daemon; real PRDs above the bound stay
+ * readable via the stated preformatted fallback. Rendering larger
+ * documents as markdown needs isolation (a worker with a deadline),
  * recorded as a GUI-era work-package concern, not silently assumed here.
  */
 export const RENDER_MAX_INPUT_BYTES = 16 * 1024;

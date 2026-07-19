@@ -535,11 +535,83 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     startQuickExecution(h, qU);
 
     expect(h.scheduler.serializationViolations(h.repoId)).toContainEqual({
-      kind: "urgent-active-while-primary-unparked",
+      kind: "urgent-beside-unadmittable-primary",
       primaryMissionId: m1,
       primaryState: "approved",
       urgentMissionId: qU,
     });
+  });
+
+  it("a bypassed approved+approved pairing is a reported violation even before anything executes (r3 finding 5)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Approved primary");
+    expect(planAndApprove(h, m1)).toBe("approved");
+
+    // Direct recorder call with a dishonest slot attestation: the urgent
+    // task lands in `approved` beside an unparkable `approved` primary.
+    // Neither is executing — but the pairing is wedged (the primary can
+    // never be parked from approved) and must not report green.
+    const qU = intakeQuickTask(h, "Urgent approved beside it", true);
+    apply(h, qU, "contract-attached", {
+      miniReviewAttached: true,
+      observabilityAdjudicated: true,
+    });
+    apply(
+      h,
+      qU,
+      "plan-approved",
+      { riskTierLow: true, neutralConcurred: true, singleIssue: true, executionSlotFree: true },
+      "david",
+    );
+
+    expect(h.scheduler.serializationViolations(h.repoId)).toContainEqual({
+      kind: "urgent-beside-unadmittable-primary",
+      primaryMissionId: m1,
+      primaryState: "approved",
+      urgentMissionId: qU,
+    });
+  });
+
+  it("skipping the A.1#15 preemption step is a reported violation (parkable but unparked)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Executing primary");
+    planAndApprove(h, m1);
+    startExecution(h, m1);
+
+    // Honest approval — the lane admits the urgent task because the primary
+    // is parkable — but the workflow then FAILS to park it before starting.
+    const qU = intakeQuickTask(h, "Urgent that skipped the park", true);
+    expect(planAndApproveQuick(h, qU)).toBe("approved");
+    startQuickExecution(h, qU); // A.1#15 never recorded on m1
+
+    expect(h.scheduler.serializationViolations(h.repoId)).toContainEqual({
+      kind: "urgent-active-while-primary-unparked",
+      primaryMissionId: m1,
+      primaryState: "executing",
+      urgentMissionId: qU,
+    });
+  });
+
+  it("a quick task David paused manually IS parked: the urgent lane opens deliberately (r3 finding 8)", () => {
+    const h = newHarness();
+    const q = intakeQuickTask(h, "Paused quick task", false);
+    expect(planAndApproveQuick(h, q)).toBe("approved");
+    startQuickExecution(h, q);
+    // Quick tasks cannot be PREEMPTED (no A.1b urgent-preemption row), but
+    // David can pause one manually — that is a parked primary.
+    apply(h, q, "mission-paused", { attemptSettled: true }, "david");
+    expect(h.recorder.currentState("mission", q)).toBe("paused-manual");
+
+    const qU = intakeQuickTask(h, "Urgent while quick paused", true);
+    expect(h.scheduler.executionSlotFreeFor(qU)).toBe(true);
+    expect(planAndApproveQuick(h, qU)).toBe("approved");
+    startQuickExecution(h, qU);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+
+    // The urgent task lands; the paused quick task resumes to executing.
+    completeQuickTask(h, qU, "urgent-sha");
+    expect(apply(h, q, "mission-resumed", {}, "david")).toBe("executing");
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
   });
 
   it("the urgent lane is unavailable while a quick task holds primary — no preemption rows exist for quick tasks (r1 finding 3)", () => {
@@ -629,8 +701,10 @@ describe("enforcement boundary (stated, not hidden)", () => {
     startQuickExecution(h, qU);
 
     const violations = h.scheduler.serializationViolations(h.repoId);
+    // A quick task executing on primary is unadmittable (not parked, not
+    // parkable) — the wedged-pairing rule fires.
     expect(violations).toContainEqual({
-      kind: "urgent-active-while-primary-unparked",
+      kind: "urgent-beside-unadmittable-primary",
       primaryMissionId: q,
       primaryState: "executing",
       urgentMissionId: qU,

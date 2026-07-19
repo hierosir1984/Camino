@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteDomainStore } from "./domain-store.js";
+import { SqliteDomainStore, contentSha256 } from "./domain-store.js";
 import { SqliteEventStore } from "./event-store.js";
 import { TransitionRecorder } from "./transition-recorder.js";
 import { INTAKE_MAX_CONTENT_BYTES, MissionIntake } from "./intake.js";
@@ -49,7 +49,7 @@ const CLEAN_SEAM = {
   orphanRows: [],
   eventOnlyMissionIds: [],
   routeConflicts: [],
-  contentConflicts: [],
+  creationConflicts: [],
   hierarchyGaps: { missionIdsWithoutRepo: [], repoIdsWithoutProject: [] },
 };
 
@@ -96,11 +96,13 @@ describe("MissionIntake — pasted PRD text", () => {
     expect(records[0]?.actor).toBe("david");
     expect(records[0]?.fromState).toBeNull();
     expect(records[0]?.toState).toBe("draft");
-    // The creation event records the retained content's identity (the
-    // persistent cross-store binding — r2 finding 9).
+    // The creation event records the retained record's bound identity — the
+    // persistent cross-store binding (r2 finding 9, r3 finding 2).
     expect(records[0]?.payload).toEqual({
       source: "prd-intake",
       contentSha256: result.mission.contentSha256,
+      repoId: h.repoId,
+      title: "Evidence viewer v0",
     });
     expect(h.recorder.currentState("mission", result.mission.id)).toBe("draft");
   });
@@ -491,10 +493,10 @@ describe("MissionIntake — the domain/event seam", () => {
     ]);
   });
 
-  it("an id collision throws AND leaves a persistent contentConflicts signature (r1 f7, r2 f9)", () => {
+  it("an id collision throws AND leaves a persistent creationConflicts signature (r1 f7, r2 f9)", () => {
     // Deterministic ids force the collision the reviewer probed: the event
     // log already holds a mission with the id intake will generate — SAME
-    // route, so route conflicts stay silent; the content hash cannot.
+    // route, so route conflicts stay silent; the bound fields cannot.
     const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
     const events = new SqliteEventStore(":memory:");
     cleanups.push(() => {
@@ -515,14 +517,57 @@ describe("MissionIntake — the domain/event seam", () => {
     const repo = domain.createRepo(project.id, "camino");
     expect(() =>
       intake.createFromText({ repoId: repo.id, title: "t", content: "c", actor: "david" }),
-    ).toThrow(/already-exists.*contentConflicts/s);
+    ).toThrow(/already-exists.*creationConflicts/s);
     // Not an orphan (the id IS recorded) — but the divergence is PERSISTENT:
-    // the recorded creation event carries no hash matching this row.
+    // the recorded creation event carries none of this row's bound fields.
     expect(intake.intakeOrphans()).toEqual([]);
-    const conflicts = intake.seamDivergences().contentConflicts;
-    expect(conflicts).toHaveLength(1);
-    expect(conflicts[0]?.missionId).toBe("dup");
-    expect(conflicts[0]?.recordedContentSha256).toBeUndefined();
+    const conflicts = intake.seamDivergences().creationConflicts;
+    expect(conflicts.map((c) => c.field).sort()).toEqual(["contentSha256", "repoId", "title"]);
+    expect(conflicts.every((c) => c.missionId === "dup")).toBe(true);
+    expect(conflicts.every((c) => c.recordedValue === undefined)).toBe(true);
+  });
+
+  it("a SAME-CONTENT collision under a different title/repo still leaves evidence (r3 finding 2)", () => {
+    // The reviewer's exact shape: identical content, so the content hash
+    // matches — but the recorded repo binding and title cannot.
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    const identical = "# identical";
+    // The prior recorded mission carries FULL bindings (as real intake
+    // would), for a different repo and title.
+    recorder.record({
+      entityKind: "mission",
+      entityId: "dup",
+      event: "mission-created",
+      actor: "prior",
+      cause: "intake.test: prior recorded mission with bindings",
+      payload: {
+        source: "prd-intake",
+        contentSha256: contentSha256(identical),
+        repoId: "some-other-repo",
+        title: "original title",
+      },
+    });
+    expect(() =>
+      intake.createFromText({
+        repoId: repo.id,
+        title: "different title",
+        content: identical,
+        actor: "david",
+      }),
+    ).toThrow(/already-exists/);
+    const conflicts = intake.seamDivergences().creationConflicts;
+    // Content hashes match — repo binding and title still diverge.
+    expect(conflicts.map((c) => c.field).sort()).toEqual(["repoId", "title"]);
+    expect(conflicts.find((c) => c.field === "repoId")?.recordedValue).toBe("some-other-repo");
   });
 
   it("a same-id collision where BOTH creations came through intake still shows a content conflict", () => {

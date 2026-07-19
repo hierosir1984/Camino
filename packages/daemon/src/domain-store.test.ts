@@ -421,6 +421,63 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
     }
   });
 
+  it("validates its own id source: numeric or NUL-carrying generated ids are refused (r3 finding 4)", () => {
+    const numeric = new SqliteDomainStore(":memory:", {
+      newId: () => 42 as unknown as string,
+    });
+    cleanups.push(() => numeric.close());
+    expect(() => numeric.createProject("camino")).toThrow(/non-empty string/);
+
+    const nulled = new SqliteDomainStore(":memory:", { newId: () => "id\0suffix" });
+    cleanups.push(() => nulled.close());
+    expect(() => nulled.createProject("camino")).toThrow(/embedded NUL/);
+  });
+
+  it("rejects BLOB foreign-key identities on raw inserts (r3 finding 4)", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    seedMission(store);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    raw.pragma("foreign_keys = OFF");
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO repos (id, project_id, name, origin_url, created_at) VALUES ('rX', zeroblob(2), 'r', NULL, 'now')",
+        )
+        .run(),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT INTO missions
+             (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+           VALUES ('mX', zeroblob(2), 'integration', 0, 't', 'pasted', 'c', ?, 'markdown', NULL, 'now')`,
+        )
+        .run("0".repeat(64)),
+    ).toThrow(/CHECK/i);
+  });
+
+  it("rejects a NUL-suffixed hash on raw inserts — byte length is pinned (r3 finding 3)", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    const { repoId } = seedMission(store);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    raw.pragma("foreign_keys = OFF");
+    // 64 hex chars + NUL + suffix: char length()=64 and GLOB sees only the
+    // prefix, but the BLOB byte length betrays the hidden suffix.
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT INTO missions
+             (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+           VALUES ('nul-hash', ?, 'integration', 0, 't', 'pasted', 'c', ?, 'markdown', NULL, 'now')`,
+        )
+        .run(repoId, "0".repeat(64) + "\0suffix"),
+    ).toThrow(/CHECK/i);
+  });
+
   it("schema rejects dotfile filenames and non-hex hashes on raw inserts (r2 findings 11/3)", () => {
     const path = tempDbPath();
     const store = newStore(path);

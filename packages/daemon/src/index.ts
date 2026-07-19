@@ -28,7 +28,7 @@ export {
   INTAKE_MAX_CONTENT_BYTES,
   INTAKE_MAX_TITLE_CODE_POINTS,
 } from "./intake.js";
-export type { ContentConflict, RouteConflict, SeamDivergences } from "./intake.js";
+export type { CreationConflict, RouteConflict, SeamDivergences } from "./intake.js";
 export { renderMissionContent, RENDER_MAX_INPUT_BYTES } from "./render.js";
 export { SerializationScheduler, SCHEDULER_ACTOR } from "./serialization-scheduler.js";
 export type {

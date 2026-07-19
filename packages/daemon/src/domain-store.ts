@@ -32,11 +32,16 @@
  * finding 4).
  *
  * Honesty scope: SQLite cannot stop a privileged writer issuing DDL, and a
- * raw writer can supply explicit rowids or a forged (still-hex) hash —
- * that class is stated, not defended; the API path re-derives hashes and
- * assigns rowids monotonically. Opening a database whose user_version
- * claims this schema but whose tables or triggers are missing refuses to
- * start rather than silently recreating an emptied store.
+ * raw writer can supply explicit rowids, a forged (still-hex) hash, or —
+ * because SQLite text functions stop at NUL — TEXT values carrying hidden
+ * NUL suffixes in columns other than the hash (whose CHECK pins byte
+ * length; generic NUL detection in SQL is not reliably expressible, so for
+ * other columns the guarantee is API-side only — r3 finding 3). That class
+ * is stated, not defended; the API path re-derives hashes, validates every
+ * string (generated ids included — r3 finding 4), and assigns rowids
+ * monotonically. Opening a database whose user_version claims this schema
+ * but whose tables or triggers are missing refuses to start rather than
+ * silently recreating an emptied store.
  */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -61,7 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS repos (
   id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
-  project_id TEXT NOT NULL REFERENCES projects(id),
+  project_id TEXT NOT NULL REFERENCES projects(id) CHECK (typeof(project_id) = 'text'),
   name       TEXT NOT NULL CHECK (typeof(name) = 'text' AND length(name) > 0),
   origin_url TEXT,
   created_at TEXT NOT NULL,
@@ -70,7 +75,7 @@ CREATE TABLE IF NOT EXISTS repos (
 
 CREATE TABLE IF NOT EXISTS missions (
   id             TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
-  repo_id        TEXT NOT NULL REFERENCES repos(id),
+  repo_id        TEXT NOT NULL REFERENCES repos(id) CHECK (typeof(repo_id) = 'text'),
   route          TEXT NOT NULL CHECK (route IN ('integration', 'quick-task')),
   urgent         INTEGER NOT NULL CHECK (urgent IN (0, 1)),
   title          TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) > 0),
@@ -79,6 +84,11 @@ CREATE TABLE IF NOT EXISTS missions (
   content_sha256 TEXT NOT NULL CHECK (
                    typeof(content_sha256) = 'text'
                    AND length(content_sha256) = 64
+                   -- Byte length must equal character length: SQLite text
+                   -- functions stop at an embedded NUL, so a NUL-suffixed
+                   -- value passes length/GLOB on its prefix alone (r3
+                   -- finding 3). 64 hex characters are 64 bytes exactly.
+                   AND length(CAST(content_sha256 AS BLOB)) = 64
                    AND content_sha256 NOT GLOB '*[^0-9a-f]*'
                  ),
   content_format TEXT NOT NULL CHECK (content_format IN ('markdown', 'text')),
@@ -245,6 +255,20 @@ function assertRoundTripExact(field: string, value: string): void {
   }
 }
 
+/**
+ * The id source is injectable (tests) and its output is persisted, so it is
+ * validated like any other input: a numeric or NUL-carrying id would be
+ * stored converted (42 → "42.0") or truncated by text functions, breaking
+ * the identity join silently (r3 finding 4).
+ */
+function validatedId(field: string, value: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${field} generator must return a non-empty string`);
+  }
+  assertRoundTripExact(field, value);
+  return value;
+}
+
 export interface SqliteDomainStoreOptions {
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date;
@@ -310,7 +334,11 @@ export class SqliteDomainStore {
       throw new TypeError("project name must be a non-empty string");
     }
     assertRoundTripExact("project name", name);
-    const project: Project = { id: this.newId(), name, createdAt: this.now().toISOString() };
+    const project: Project = {
+      id: validatedId("project id", this.newId()),
+      name,
+      createdAt: this.now().toISOString(),
+    };
     this.db
       .prepare("INSERT INTO projects (id, name, created_at) VALUES (@id, @name, @createdAt)")
       .run(project);
@@ -329,7 +357,7 @@ export class SqliteDomainStore {
       assertRoundTripExact("repo originUrl", originUrl);
     }
     const createdAt = this.now().toISOString();
-    const id = this.newId();
+    const id = validatedId("repo id", this.newId());
     this.db
       .prepare(
         `INSERT INTO repos (id, project_id, name, origin_url, created_at)
@@ -402,7 +430,7 @@ export class SqliteDomainStore {
       }
     }
     const record: MissionRecord = {
-      id: this.newId(),
+      id: validatedId("mission id", this.newId()),
       repoId,
       route,
       urgent,

@@ -13,17 +13,19 @@
  *    resuming via A.1#20 when the urgent task lands.
  *
  * The urgent lane accepts a mission only when the primary holder (if any)
- * is PARKED or PARKABLE (r1 finding 3, tightened by r2 finding 1): parked =
- * paused-urgent / paused-external / paused-manual; parkable = an
- * integration-route mission in `executing`, the one state A.1#15 preempts
- * from. Every other primary holder — a quick task in ANY execution-bearing
- * state (A.1b has no preemption rows at all), or an integration mission in
- * approved / awaiting-merge-approval / merging / escalated / blocked (no
- * preemption row from those states either) — cannot be parked, so an
- * urgent task approved in that window waits in `queued` and activates when
- * the primary becomes parkable or terminates. (Recorded as a spec
- * observation in the PR; appendix amendments adding preemption rows would
- * be David's change-control call, not this WP's.)
+ * is PARKED or PARKABLE (r1 f3, r2 f1, wording per r3 f8): parked =
+ * paused-urgent / paused-external / paused-manual — including a quick task
+ * David paused manually, which is deliberately parked even though quick
+ * tasks can never be PREEMPTED (A.1b has no urgent-preemption row);
+ * parkable = an integration-route mission in `executing`, the one state
+ * A.1#15 preempts from. Every other primary holder — a quick task
+ * running/validating/merging, or an integration mission in approved /
+ * awaiting-merge-approval / merging / escalated / blocked (no preemption
+ * row from those states either) — cannot be parked, so an urgent task
+ * approved in that window waits in `queued` and activates when the primary
+ * becomes parkable, parked, or terminal. (Recorded as a spec observation
+ * in the PR; appendix amendments adding preemption rows would be David's
+ * change-control call, not this WP's.)
  *
  * The scheduler derives everything from the domain store (which mission
  * belongs to which repo, which lane it schedules on) joined with the
@@ -121,7 +123,7 @@ export interface RepoQueueView {
   readonly concurrent: readonly { missionId: string; title: string; state: MissionState }[];
 }
 
-/** Evidence of a serialization invariant breach (r1 findings 2/3, r2 finding 1). */
+/** Evidence of a serialization invariant breach (r1 f2/f3, r2 f1, r3 f5). */
 export type SerializationViolation =
   | {
       /** More than one execution-bearing holder in one lane. */
@@ -131,10 +133,22 @@ export type SerializationViolation =
     }
   | {
       /**
-       * The urgent lane is actively executing while the primary holder is
-       * not parked (paused-*) — including a primary sitting in `approved` /
-       * `awaiting-merge-approval` / `merging` / `escalated` / `blocked`,
-       * which no Appendix A row can park (r2 finding 1).
+       * The urgent lane holds a mission (in ANY execution-bearing state)
+       * beside a primary the lane-admission rule would never have admitted
+       * it next to: not parked, and not parkable (r3 finding 5 — e.g. both
+       * sides sitting in `approved` via bypassed attestations; the primary
+       * can never be parked, so the pair is wedged, not merely early).
+       */
+      readonly kind: "urgent-beside-unadmittable-primary";
+      readonly primaryMissionId: string;
+      readonly primaryState: MissionState;
+      readonly urgentMissionId: string;
+    }
+  | {
+      /**
+       * The urgent lane is ACTIVELY executing while a parkable primary
+       * (integration route in `executing`) has not actually been parked —
+       * the A.1#15 preemption step was skipped (r2 finding 1).
        */
       readonly kind: "urgent-active-while-primary-unparked";
       readonly primaryMissionId: string;
@@ -227,14 +241,22 @@ export class SerializationScheduler {
         });
       }
     }
-    // Cross-lane rule (r1 finding 3, tightened by r2 finding 1): while the
-    // urgent lane actively executes, the primary holder must be PARKED —
-    // "not currently in the ACTIVE set" is not enough, because a primary in
-    // approved/awaiting-merge-approval/merging/escalated/blocked cannot be
-    // parked by any row and stands ready to run beside the urgent task.
+    // Cross-lane rules (r1 f3, r2 f1, r3 f5), mirroring the lane-admission
+    // rule exactly so no bypassed pairing can report green:
+    // (a) an urgent holder beside an UNADMITTABLE primary (not parked, not
+    //     parkable) is a wedged pairing regardless of the urgent's state;
+    // (b) an ACTIVE urgent beside a parkable-but-unparked primary means the
+    //     A.1#15 preemption step was skipped.
     for (const primary of holders.primary) {
       for (const urgent of holders.urgent) {
-        if (
+        if (!this.primaryAdmitsUrgent(primary)) {
+          violations.push({
+            kind: "urgent-beside-unadmittable-primary",
+            primaryMissionId: primary.missionId,
+            primaryState: primary.state,
+            urgentMissionId: urgent.missionId,
+          });
+        } else if (
           ACTIVE_EXECUTION_STATES.includes(urgent.state) &&
           !PARKED_STATES.includes(primary.state)
         ) {
@@ -375,13 +397,16 @@ export class SerializationScheduler {
    */
   private urgentLaneAvailable(holders: { primary: LaneHolder[]; urgent: LaneHolder[] }): boolean {
     if (holders.urgent.length > 0) return false;
-    return holders.primary.every((holder) => {
-      if (PARKED_STATES.includes(holder.state)) return true;
-      return (
-        holder.state === "executing" &&
-        this.domain.getMission(holder.missionId)?.route === "integration"
-      );
-    });
+    return holders.primary.every((holder) => this.primaryAdmitsUrgent(holder));
+  }
+
+  /** Parked (paused-*) or parkable (integration route in `executing`, the A.1#15 source). */
+  private primaryAdmitsUrgent(holder: LaneHolder): boolean {
+    if (PARKED_STATES.includes(holder.state)) return true;
+    return (
+      holder.state === "executing" &&
+      this.domain.getMission(holder.missionId)?.route === "integration"
+    );
   }
 
   private queuedHead(repoId: string, lane: SchedulingLane): string | undefined {

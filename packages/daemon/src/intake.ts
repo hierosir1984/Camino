@@ -69,15 +69,21 @@ export interface RouteConflict {
 }
 
 /**
- * A mission id whose retained content hash disagrees with (or is absent
- * from) its recorded creation event — the persistent signature of an
- * id-collision or a foreign creation write (r2 finding 9).
+ * A mission id whose retained record disagrees with its recorded creation
+ * event on one of the bound fields (content hash, repo binding, title) —
+ * the persistent signature of an id-collision or a foreign creation write
+ * (r2 finding 9, extended per r3 finding 2: content alone was too narrow —
+ * a same-content collision under a different repo or title must still
+ * leave evidence). A collision identical in ALL THREE bound fields is
+ * observationally identical to the recorded mission; the intake error
+ * thrown at the seam remains its only signal, stated plainly.
  */
-export interface ContentConflict {
+export interface CreationConflict {
   readonly missionId: string;
-  readonly domainContentSha256: string;
-  /** The creation event's recorded hash; undefined when the event carries none. */
-  readonly recordedContentSha256?: string;
+  readonly field: "contentSha256" | "repoId" | "title";
+  readonly domainValue: string;
+  /** The creation event's recorded value; undefined when the event carries none. */
+  readonly recordedValue?: string;
 }
 
 /** Bidirectional domain/event seam report — see `MissionIntake.seamDivergences`. */
@@ -85,7 +91,7 @@ export interface SeamDivergences {
   readonly orphanRows: readonly MissionRecord[];
   readonly eventOnlyMissionIds: readonly string[];
   readonly routeConflicts: readonly RouteConflict[];
-  readonly contentConflicts: readonly ContentConflict[];
+  readonly creationConflicts: readonly CreationConflict[];
   /** Referential gaps a foreign writer can leave (missions without a repo, repos without a project). */
   readonly hierarchyGaps: {
     readonly missionIdsWithoutRepo: readonly string[];
@@ -299,8 +305,9 @@ export class MissionIntake {
    * Membership is by id, so a retained row whose creation event was refused
    * BECAUSE an unrelated recorded mission already holds the same id is NOT
    * listed here — that case has a PERSISTENT signature in
-   * `seamDivergences().contentConflicts` (the recorded creation hash cannot
-   * match this row's content), plus the intake error thrown at the seam.
+   * `seamDivergences().creationConflicts` unless the two missions agree on
+   * content, repo, AND title (observationally identical — the intake error
+   * thrown at the seam is then the only signal, stated plainly).
    */
   intakeOrphans(): MissionRecord[] {
     const view = this.recorder.currentView;
@@ -319,10 +326,11 @@ export class MissionIntake {
    * - `eventOnlyMissionIds`: recorded missions with no domain row — state
    *   without retained content (foreign write or partial restore);
    * - `routeConflicts`: domain route vs recorded creation route;
-   * - `contentConflicts`: retained content hash vs the hash the creation
-   *   event recorded (intake stamps `contentSha256` into every creation
-   *   payload) — the persistent signature of an id collision or a foreign
-   *   creation, even when the routes agree;
+   * - `creationConflicts`: the retained record's bound fields (content
+   *   hash, repo binding, title — intake stamps all three into every
+   *   creation payload) vs what the creation event recorded — the
+   *   persistent signature of an id collision or a foreign creation, even
+   *   when routes agree and content matches (r3 finding 2);
    * - `hierarchyGaps`: missions without a repo row, repos without a project
    *   row (foreign writers with foreign keys off).
    * Empty across the board in healthy operation; WP-104's recovery contract
@@ -332,9 +340,9 @@ export class MissionIntake {
     const view = this.recorder.currentView;
     const orphanRows: MissionRecord[] = [];
     const routeConflicts: RouteConflict[] = [];
-    const contentConflicts: ContentConflict[] = [];
+    const creationConflicts: CreationConflict[] = [];
     const domainIds = new Set<string>();
-    const creationHashes = this.recordedCreationHashes();
+    const creationBindings = this.recordedCreationBindings();
     for (const mission of this.domain.listAllMissions()) {
       domainIds.add(mission.id);
       const snapshot = view.missions.get(mission.id);
@@ -349,13 +357,21 @@ export class MissionIntake {
           recordedRoute: snapshot.route,
         });
       }
-      const recorded = creationHashes.get(mission.id);
-      if (recorded !== mission.contentSha256) {
-        contentConflicts.push({
-          missionId: mission.id,
-          domainContentSha256: mission.contentSha256,
-          ...(recorded === undefined ? {} : { recordedContentSha256: recorded }),
-        });
+      const binding = creationBindings.get(mission.id);
+      const comparisons: ReadonlyArray<[CreationConflict["field"], string, string | undefined]> = [
+        ["contentSha256", mission.contentSha256, binding?.contentSha256],
+        ["repoId", mission.repoId, binding?.repoId],
+        ["title", mission.title, binding?.title],
+      ];
+      for (const [field, domainValue, recordedValue] of comparisons) {
+        if (recordedValue !== domainValue) {
+          creationConflicts.push({
+            missionId: mission.id,
+            field,
+            domainValue,
+            ...(recordedValue === undefined ? {} : { recordedValue }),
+          });
+        }
       }
     }
     const eventOnlyMissionIds: string[] = [];
@@ -366,20 +382,30 @@ export class MissionIntake {
       orphanRows,
       eventOnlyMissionIds,
       routeConflicts,
-      contentConflicts,
+      creationConflicts,
       hierarchyGaps: this.domain.hierarchyGaps(),
     };
   }
 
-  /** Content hash each recorded mission's APPLIED creation event carries (if any). */
-  private recordedCreationHashes(): Map<string, string | undefined> {
-    const hashes = new Map<string, string | undefined>();
+  /** The bound fields each recorded mission's APPLIED creation event carries (if any). */
+  private recordedCreationBindings(): Map<
+    string,
+    { contentSha256?: string; repoId?: string; title?: string }
+  > {
+    const bindings = new Map<string, { contentSha256?: string; repoId?: string; title?: string }>();
     for (const record of this.store.read({ entityKind: "mission" })) {
       if (record.outcome !== "applied" || record.fromState !== null) continue;
-      const value = record.payload["contentSha256"];
-      hashes.set(record.entityId, typeof value === "string" ? value : undefined);
+      const pick = (field: string): string | undefined => {
+        const value = record.payload[field];
+        return typeof value === "string" ? value : undefined;
+      };
+      bindings.set(record.entityId, {
+        ...(pick("contentSha256") === undefined ? {} : { contentSha256: pick("contentSha256") }),
+        ...(pick("repoId") === undefined ? {} : { repoId: pick("repoId") }),
+        ...(pick("title") === undefined ? {} : { title: pick("title") }),
+      });
     }
-    return hashes;
+    return bindings;
   }
 
   private validateCommon(repoId: string, title: string, actor: string): IntakeRejection | null {
@@ -455,9 +481,15 @@ export class MissionIntake {
       event: args.creationEvent,
       actor: args.actor,
       cause: args.cause,
-      // The creation event records the retained content's identity — the
-      // persistent cross-store binding seamDivergences() audits (r2 f9).
-      payload: { ...args.creationPayload, contentSha256: mission.contentSha256 },
+      // The creation event records the retained record's bound identity —
+      // content hash, repo binding, and title — the persistent cross-store
+      // binding seamDivergences() audits (r2 f9, r3 f2).
+      payload: {
+        ...args.creationPayload,
+        contentSha256: mission.contentSha256,
+        repoId: mission.repoId,
+        title: mission.title,
+      },
     });
     if (!outcome.ok) {
       // Intake constructs the creation payload itself, so a refusal here is
@@ -469,8 +501,9 @@ export class MissionIntake {
       const surface =
         outcome.code === "already-exists"
           ? "an unrelated recorded mission already holds this id (id-generation defect); the " +
-            "retained row is NOT an intakeOrphans() entry — its persistent signature is in " +
-            "seamDivergences().contentConflicts (the recorded creation hash cannot match this row)"
+            "retained row is NOT an intakeOrphans() entry — seamDivergences().creationConflicts " +
+            "carries its persistent signature unless content, repo, and title all coincide, in " +
+            "which case this error is the only signal"
           : "see intakeOrphans()";
       throw new Error(
         `mission ${mission.id} was retained but its creation event was refused (${outcome.code}) — ` +
