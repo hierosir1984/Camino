@@ -110,6 +110,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a1", "verdict-recorded", { verdict: "pass" });
     apply(recorder, "attempt", "a1", "archival-completed", {
       quotasEnforced: true,
+      ledgerRowReferencesArchive: true,
       archiveWrittenAt: "2026-07-19T10:00:00.000Z",
       ledgerRowAt: "2026-07-19T10:00:01.000Z",
       workspaceDestroyedAt: "2026-07-19T10:00:02.000Z",
@@ -139,6 +140,7 @@ describe("TransitionRecorder", () => {
       rollupAndPrPopulated: true,
       freshnessHolds: true,
       candidateSha: "cand-1",
+      packetHash: "packet-1",
     });
     expect(
       apply(
@@ -312,6 +314,7 @@ describe("TransitionRecorder", () => {
       rollupAndPrPopulated: true,
       freshnessHolds: true,
       candidateSha: "cand-1",
+      packetHash: "packet-1",
     });
     apply(
       recorder,
@@ -330,6 +333,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "mission", "m1", "candidate-rebuilt", {
       green: true,
       newCandidateSha: "cand-2",
+      newPacketHash: "packet-2",
     });
 
     // Approving the STALE SHA is refused — approvals never transfer.
@@ -591,6 +595,7 @@ describe("TransitionRecorder", () => {
       cause: "archival with inverted sub-steps",
       payload: {
         quotasEnforced: true,
+        ledgerRowReferencesArchive: true,
         archiveWrittenAt: "2026-07-19T10:00:05.000Z",
         ledgerRowAt: "2026-07-19T10:00:01.000Z",
         workspaceDestroyedAt: "2026-07-19T10:00:06.000Z",
@@ -601,6 +606,7 @@ describe("TransitionRecorder", () => {
     expect(
       apply(recorder, "attempt", "a1", "archival-completed", {
         quotasEnforced: true,
+        ledgerRowReferencesArchive: true,
         archiveWrittenAt: "2026-07-19T10:00:00.000Z",
         ledgerRowAt: "2026-07-19T10:00:01.000Z",
         workspaceDestroyedAt: "2026-07-19T10:00:02.000Z",
@@ -615,6 +621,7 @@ describe("TransitionRecorder", () => {
       cause: "second archival",
       payload: {
         quotasEnforced: true,
+        ledgerRowReferencesArchive: true,
         archiveWrittenAt: "2026-07-19T10:00:03.000Z",
         ledgerRowAt: "2026-07-19T10:00:04.000Z",
         workspaceDestroyedAt: "2026-07-19T10:00:05.000Z",
@@ -679,5 +686,283 @@ describe("TransitionRecorder", () => {
     const live = structuredClone(recorder.currentView);
     expect(recorder.rebuild()).toEqual(live);
     expect(rebuilt.verify()).toEqual([]);
+  });
+  it("refuses payloads carrying the reserved fields — and logs the refusal (review r1 finding 1)", () => {
+    const { store, recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+
+    // A payload "type" must never redirect the machine to a different row.
+    const forgedType = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-rejected",
+      actor: "david",
+      cause: "payload attempts to smuggle a different event type",
+      payload: { type: "plan-constructed", reviewAttached: true, checklistRendered: true },
+    });
+    expect(forgedType).toMatchObject({ ok: false, code: "malformed-payload" });
+    expect(recorder.currentState("mission", "m1")).toBe("planned");
+
+    // A payload "actor" must never impersonate the envelope actor.
+    const forgedActor = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-approved",
+      actor: "camino:scheduler",
+      cause: "payload attempts to claim David as actor",
+      payload: { actor: "david", dagAcyclic: true, executionSlotFree: true },
+    });
+    expect(forgedActor).toMatchObject({ ok: false, code: "malformed-payload" });
+
+    const rejected = store.read().filter((r) => r.outcome === "rejected");
+    expect(rejected.map((r) => r.rejectionCode)).toEqual([
+      "malformed-payload",
+      "malformed-payload",
+    ]);
+    expect(recorder.verify()).toEqual([]);
+  });
+
+  it("binds David-actioned rows to the envelope actor (review r1 finding 7)", () => {
+    const { recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    const impersonated = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-approved",
+      actor: "mallory",
+      cause: "approval without David as the envelope actor",
+      payload: { dagAcyclic: true, executionSlotFree: true },
+    });
+    expect(impersonated).toMatchObject({ ok: false, code: "guard-rejected" });
+    expect(recorder.currentState("mission", "m1")).toBe("planned");
+    expect(
+      apply(
+        recorder,
+        "mission",
+        "m1",
+        "plan-approved",
+        { dagAcyclic: true, executionSlotFree: true },
+        "david",
+      ),
+    ).toBe("approved");
+  });
+
+  it("decides on the JSON-canonical payload it persists (review r1 finding 5)", () => {
+    const { store, recorder } = newRecorder();
+    // Infinity survives no JSON round-trip: the guard must see null and
+    // refuse, and the log must agree with a re-derivation.
+    const outcome = recorder.record({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "issue-created",
+      actor: "camino:planner",
+      cause: "payload with a non-finite number",
+      payload: { origin: "plan-approval", unmetDependencies: Infinity },
+    });
+    expect(outcome).toMatchObject({ ok: false, code: "guard-rejected" });
+    expect(store.read().at(-1)?.payload["unmetDependencies"]).toBeNull();
+    expect(recorder.verify()).toEqual([]);
+    // A payload JSON cannot represent at all throws before anything is logged.
+    expect(() =>
+      recorder.record({
+        entityKind: "issue",
+        entityId: "i1",
+        event: "issue-created",
+        actor: "camino:planner",
+        cause: "unserializable payload",
+        payload: { origin: "plan-approval", unmetDependencies: 1n as unknown as number },
+      }),
+    ).toThrow(/JSON-serializable/);
+  });
+
+  it("guards refuse (and the log records) a malformed shape instead of throwing (review r1 finding 4)", () => {
+    const { store, recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    apply(
+      recorder,
+      "mission",
+      "m1",
+      "plan-approved",
+      { dagAcyclic: true, executionSlotFree: true },
+      "david",
+    );
+    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "mission-gate-green", {
+      allIssuesTerminal: true,
+      noStrandedRequirement: true,
+      gateGreen: true,
+      reviewPass: true,
+      foldOnBranch: true,
+      rollupAndPrPopulated: true,
+      freshnessHolds: true,
+      candidateSha: "cand-1",
+      packetHash: "packet-1",
+    });
+    apply(
+      recorder,
+      "mission",
+      "m1",
+      "mission-merge-approved",
+      { authority: "david", candidateSha: "cand-1", packetHash: "packet-1" },
+      "david",
+    );
+    const before = store.read().length;
+    // descopedRequirements omitted and mistyped: refused, logged, state kept.
+    for (const payload of [
+      { pushedSha: "cand-1" },
+      { pushedSha: "cand-1", descopedRequirements: "not-an-array" },
+      { pushedSha: "cand-1", descopedRequirements: [1, 2] },
+    ]) {
+      const outcome = recorder.record({
+        entityKind: "mission",
+        entityId: "m1",
+        event: "push-confirmed",
+        actor: "camino:merge",
+        cause: "malformed completion payload",
+        payload,
+      });
+      expect(outcome).toMatchObject({ ok: false, code: "guard-rejected" });
+    }
+    expect(store.read().length).toBe(before + 3);
+    expect(recorder.currentState("mission", "m1")).toBe("merging");
+    expect(recorder.verify()).toEqual([]);
+  });
+
+  it("hands out snapshot views only — mutating one cannot forge recorded context (review r1 finding 2)", () => {
+    const { recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    apply(
+      recorder,
+      "mission",
+      "m1",
+      "plan-approved",
+      { dagAcyclic: true, executionSlotFree: true },
+      "david",
+    );
+    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "mission-gate-green", {
+      allIssuesTerminal: true,
+      noStrandedRequirement: true,
+      gateGreen: true,
+      reviewPass: true,
+      foldOnBranch: true,
+      rollupAndPrPopulated: true,
+      freshnessHolds: true,
+      candidateSha: "cand-real",
+      packetHash: "packet-real",
+    });
+    const leaked = recorder.currentView;
+    const snapshot = leaked.missions.get("m1");
+    expect(snapshot?.currentCandidateSha).toBe("cand-real");
+    if (snapshot) snapshot.currentCandidateSha = "cand-forged";
+    // The recorder's own view is untouched: a forged-SHA approval still fails.
+    const forged = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "mission-merge-approved",
+      actor: "david",
+      cause: "approval of a SHA planted into a leaked view",
+      payload: { authority: "david", candidateSha: "cand-forged", packetHash: "packet-real" },
+    });
+    expect(forged).toMatchObject({ ok: false, code: "guard-rejected" });
+    expect(recorder.currentView.missions.get("m1")?.currentCandidateSha).toBe("cand-real");
+  });
+
+  it("detects a second writer and refuses to record over a stale view (single-writer, CAM-STATE-03)", () => {
+    const path = tempDbPath();
+    const storeA = new SqliteEventStore(path);
+    cleanups.push(() => storeA.close());
+    const recorderA = new TransitionRecorder(storeA);
+    const storeB = new SqliteEventStore(path);
+    cleanups.push(() => storeB.close());
+    const recorderB = new TransitionRecorder(storeB);
+
+    apply(recorderA, "mission", "m1", "mission-created", { source: "prd-intake" });
+    expect(() =>
+      recorderB.record({
+        entityKind: "mission",
+        entityId: "m1",
+        event: "mission-created",
+        actor: "camino:test",
+        cause: "second writer",
+        payload: { source: "prd-intake" },
+      }),
+    ).toThrow(/single-writer/);
+    // After a rebuild the second recorder sees the store and proceeds honestly.
+    recorderB.rebuild();
+    const duplicate = recorderB.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "mission-created",
+      actor: "camino:test",
+      cause: "duplicate creation after rebuild",
+      payload: { source: "prd-intake" },
+    });
+    expect(duplicate).toMatchObject({ ok: false, code: "already-exists" });
+  });
+
+  it("verify() re-derives the log and reports forged rows appended behind the recorder's back", () => {
+    const { store, recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    // Forged rows appended raw behind the recorder: a wrong source state and
+    // a mislabeled rejection of a legal transition.
+    store.append({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-rejected",
+      actor: "david",
+      cause: "forged source state",
+      payload: {},
+      fromState: "draft",
+      toState: "draft",
+      outcome: "applied",
+    });
+    store.append({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "issue-created",
+      actor: "camino:planner",
+      cause: "honest issue creation",
+      payload: { origin: "plan-approval", unmetDependencies: 0 },
+      fromState: null,
+      toState: "ready",
+      outcome: "applied",
+    });
+    store.append({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "provider-window-exhausted",
+      actor: "camino:scheduler",
+      cause: "mislabeled rejection of a legal transition",
+      payload: {},
+      fromState: "ready",
+      toState: null,
+      outcome: "rejected",
+      rejectionCode: "unknown-entity",
+    });
+    const problems = recorder.verify();
+    expect(problems.length).toBeGreaterThanOrEqual(2);
+    expect(problems.some((d) => /fromState/.test(d.problem))).toBe(true);
+    expect(problems.some((d) => /now applies/.test(d.problem))).toBe(true);
   });
 });

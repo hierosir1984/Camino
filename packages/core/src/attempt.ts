@@ -46,6 +46,7 @@ export type AttemptEvent =
   // A.3#4 — cancel (David / urgent preemption / pause / edit) | safe checkpoint or kill-confirm
   | {
       type: "attempt-cancel-requested";
+      actor?: string;
       reason: "david" | "urgent-preemption" | "pause" | "edit";
       settledBy: "checkpoint" | "kill-confirm";
       summaryWritten: boolean;
@@ -60,6 +61,7 @@ export type AttemptEvent =
   | {
       type: "archival-completed";
       quotasEnforced: boolean;
+      ledgerRowReferencesArchive: boolean; // the ledger row references the written archive
       archiveWrittenAt: string; // ISO-8601, strictly ordered
       ledgerRowAt: string;
       workspaceDestroyedAt: string;
@@ -132,13 +134,15 @@ const attemptRows: readonly AttemptRow[] = [
     from: ["running"],
     event: "attempt-cancel-requested",
     guard: {
-      name: "settled-and-summary-written",
+      name: "listed-reason-settled-and-summary-written",
       check: (e) =>
+        ["david", "urgent-preemption", "pause", "edit"].includes(e.reason) &&
+        (e.reason !== "david" || e.actor === "david") &&
         (e.settledBy === "checkpoint" || e.settledBy === "kill-confirm") &&
         attested(e.summaryWritten),
     },
     to: "cancelled",
-    note: "The structured summary is part of the appendix's target cell; the issue transitions per A.2#12/A.2#7a under the same cancellation.",
+    note: "Only the four listed cancellation reasons are legal at runtime; a David-reason cancel must carry David as the envelope actor. The structured summary is part of the appendix's target cell; the issue transitions per A.2#12/A.2#7a under the same cancellation.",
   }),
   // A.3#5 — running | budget breach | kill-confirm | killed-budget
   row({
@@ -181,13 +185,14 @@ const attemptRows: readonly AttemptRow[] = [
     from: ATTEMPT_TERMINAL_STATES,
     event: "archival-completed",
     guard: {
-      name: "quotas-enforced-and-strict-substep-order",
+      name: "quotas-reference-and-strict-substep-order",
       check: (e) =>
         attested(e.quotasEnforced) &&
+        attested(e.ledgerRowReferencesArchive) &&
         strictlyOrdered(e.archiveWrittenAt, e.ledgerRowAt, e.workspaceDestroyedAt),
     },
     to: "archived",
-    note: "A.4#5: archive written under quota → ledger row references it → workspace destroyed; out-of-order or missing sub-steps reject. archived has no outgoing rows, so archival happens exactly once.",
+    note: "A.4#5: archive written under quota → ledger row REFERENCING that archive → workspace destroyed; out-of-order, missing, or unreferenced sub-steps reject. archived has no outgoing rows, so archival happens exactly once.",
   }),
 ];
 

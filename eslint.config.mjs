@@ -17,9 +17,35 @@ const CORE_ALLOWLIST_REGEX = "^(?!(\\.{1,2}(/|$)|@camino/shared(/|$))).*";
 // Test files may additionally import vitest.
 const CORE_TEST_ALLOWLIST_REGEX = "^(?!(\\.{1,2}(/|$)|@camino/shared(/|$)|vitest(/|$))).*";
 
-// Relative-path escapes out of packages/core (e.g. "../../daemon/src/x.js")
-// are caught by path segment, depth-independently.
-const CAMINO_PACKAGE_ESCAPES = ["**/daemon/**", "**/gui/**", "**/node_modules/**"];
+// Relative-path escapes out of packages/core: core/src is FLAT by policy, so
+// every legitimate internal import is "./x.js" — ANY parent traversal ("../")
+// leaves the fenced directory (or would, transitively) and is banned outright,
+// alongside the named package roots for defense in depth. If core/src ever
+// grows subdirectories, this rule must be revisited deliberately.
+const CAMINO_PACKAGE_ESCAPES = [
+  "../**",
+  "**/daemon/**",
+  "**/gui/**",
+  "**/shared/src/**",
+  "**/packages/**",
+  "**/node_modules/**",
+];
+
+// Ambient I/O globals reachable with zero imports (review round 1, WP-101):
+// network and scheduling primitives have no place in pure domain logic.
+const CORE_RESTRICTED_GLOBALS = [
+  { name: "process", message: "packages/core is pure — no process access (purity fence)." },
+  { name: "fetch", message: "packages/core is pure — no network I/O (purity fence)." },
+  { name: "WebSocket", message: "packages/core is pure — no network I/O (purity fence)." },
+  { name: "XMLHttpRequest", message: "packages/core is pure — no network I/O (purity fence)." },
+  { name: "EventSource", message: "packages/core is pure — no network I/O (purity fence)." },
+  { name: "setTimeout", message: "packages/core is pure — no scheduling (purity fence)." },
+  { name: "setInterval", message: "packages/core is pure — no scheduling (purity fence)." },
+  { name: "setImmediate", message: "packages/core is pure — no scheduling (purity fence)." },
+  { name: "clearTimeout", message: "packages/core is pure — no scheduling (purity fence)." },
+  { name: "clearInterval", message: "packages/core is pure — no scheduling (purity fence)." },
+  { name: "clearImmediate", message: "packages/core is pure — no scheduling (purity fence)." },
+];
 
 const CORE_SYNTAX_BANS = [
   {
@@ -82,13 +108,7 @@ function coreFence({ files, allowRegex }) {
           ],
         },
       ],
-      "no-restricted-globals": [
-        "error",
-        {
-          name: "process",
-          message: "packages/core is pure — no process access (purity fence, build plan §1.1).",
-        },
-      ],
+      "no-restricted-globals": ["error", ...CORE_RESTRICTED_GLOBALS],
       // eval / implied-eval are runtime-string escape hatches into anything;
       // pure domain logic has no use for them (WP-000 audit follow-up).
       "no-eval": "error",

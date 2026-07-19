@@ -134,14 +134,21 @@ for (const { machine, legal, illegal, expectedUnreachable, terminalExitRefs } of
       }
     });
 
-    it("multi-source rows accept from every listed source state", () => {
+    it("multi-source rows accept from every listed source state, into the row's target via the row's ref", () => {
       for (const row of machine.rows) {
         if (row.from === null || row.from.length < 2) continue;
         const vector = legal.find((v) => v.ref === row.ref);
         expect(vector, `row ${row.ref} needs a vector to expand`).toBeDefined();
+        expect(typeof row.to, `multi-source row ${row.ref} must have a static target`).toBe(
+          "string",
+        );
         for (const from of row.from) {
           const result = transition(machine, from, (vector as (typeof legal)[number]).event);
-          expect(result.ok, `${row.ref} from ${from}`).toBe(true);
+          expect(result, `${row.ref} from ${from}`).toEqual({
+            ok: true,
+            to: row.to,
+            ref: row.ref,
+          });
         }
       }
     });

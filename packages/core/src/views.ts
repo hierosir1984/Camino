@@ -7,18 +7,14 @@
  *
  * Rejected records never change a view — they are evidence, not state.
  *
- * `verifyReplay` re-runs every recorded transition through the machines and
- * reports divergence; the daemon may run it at recovery as a log-consistency
- * check.
+ * Log re-verification lives in decide.ts (`verifyReplay`), which re-derives
+ * every row through the same decision path the recorder uses.
  */
 import type { EventRecord } from "@camino/shared";
-import { transition } from "./machine.js";
 import type { MissionRoute, MissionState } from "./mission.js";
-import { MISSION_CREATION_EVENTS, missionMachineFor } from "./mission.js";
+import { MISSION_CREATION_EVENTS } from "./mission.js";
 import type { IssueState } from "./issue.js";
-import { issueMachine } from "./issue.js";
 import type { AttemptState } from "./attempt.js";
-import { attemptMachine } from "./attempt.js";
 
 export interface MissionSnapshot {
   state: MissionState;
@@ -27,6 +23,8 @@ export interface MissionSnapshot {
   pausedFrom?: MissionState;
   /** The current merge-candidate SHA (set by gate-green / green rebuild). */
   currentCandidateSha?: string;
+  /** The current candidate's packet hash — the other half of the A.4#4 pair. */
+  currentPacketHash?: string;
   /** The bound approval (A.4#4); cleared on rebuild or return to executing. */
   approval?: { candidateSha: string; packetHash: string };
   /** Quick-task validation failures (A.1b#6); recorded, never counts quota waits. */
@@ -102,9 +100,11 @@ export function applyRecord(view: StateView, record: EventRecord): void {
       // Candidate identity and approval binding (A.4#4).
       if (record.event === "mission-gate-green" || record.event === "quick-validation-green") {
         snapshot.currentCandidateSha = payloadString(record, "candidateSha");
+        snapshot.currentPacketHash = payloadString(record, "packetHash");
       }
       if (record.event === "candidate-rebuilt" && record.payload["green"] === true) {
         snapshot.currentCandidateSha = payloadString(record, "newCandidateSha");
+        snapshot.currentPacketHash = payloadString(record, "newPacketHash");
       }
       if (toState === "awaiting-merge-approval" || toState === "executing") {
         // A new candidate requires a new approval; returning to executing
@@ -165,74 +165,4 @@ export function foldView(records: readonly EventRecord[]): StateView {
   const view = emptyView();
   for (const record of records) applyRecord(view, record);
   return view;
-}
-
-export interface ReplayDivergence {
-  readonly seq: number;
-  readonly problem: string;
-}
-
-/**
- * Re-run every recorded transition through the machines and report rows the
- * machines would decide differently today — applied rows must re-apply to
- * the same target, rejected rows must still reject. An empty result means
- * the log and the machines agree (the code-vs-log half of CAM-STATE-05).
- */
-export function verifyReplay(records: readonly EventRecord[]): ReplayDivergence[] {
-  const divergences: ReplayDivergence[] = [];
-  const view = emptyView();
-  for (const record of records) {
-    const event = { type: record.event, ...record.payload } as never;
-    let outcome: ReturnType<typeof transition>;
-    switch (record.entityKind) {
-      case "mission": {
-        const snapshot = view.missions.get(record.entityId);
-        const route =
-          snapshot?.route ??
-          MISSION_CREATION_EVENTS[record.event] ??
-          // A rejected creation of an unknown route cannot be re-run against
-          // a specific machine; try the integration table.
-          "integration";
-        outcome = transition(missionMachineFor(route), snapshot?.state ?? null, event);
-        break;
-      }
-      case "issue": {
-        const snapshot = view.issues.get(record.entityId);
-        outcome = transition(issueMachine, snapshot?.state ?? null, event);
-        break;
-      }
-      case "attempt": {
-        const snapshot = view.attempts.get(record.entityId);
-        outcome = transition(attemptMachine, snapshot?.state ?? null, event);
-        break;
-      }
-    }
-    if (record.outcome === "applied") {
-      if (!outcome.ok) {
-        divergences.push({
-          seq: record.seq,
-          problem: `applied as ${record.toState} but the machine now rejects (${outcome.code})`,
-        });
-      } else if (outcome.to !== record.toState) {
-        divergences.push({
-          seq: record.seq,
-          problem: `applied as ${record.toState} but the machine now targets ${outcome.to}`,
-        });
-      }
-      applyRecord(view, record);
-    } else if (outcome.ok) {
-      // Recorded as rejected for a machine-level reason yet legal now: only
-      // a divergence when the recorded rejection was machine-decided.
-      if (
-        record.rejectionCode === "illegal-transition" ||
-        record.rejectionCode === "guard-rejected"
-      ) {
-        divergences.push({
-          seq: record.seq,
-          problem: `rejected (${record.rejectionCode}) but the machine now applies to ${outcome.to}`,
-        });
-      }
-    }
-  }
-  return divergences;
 }

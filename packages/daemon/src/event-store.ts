@@ -3,12 +3,17 @@
  * @camino/shared EventStore interface.
  *
  * Append-only is enforced in the schema itself, not just by API shape:
- * BEFORE UPDATE / BEFORE DELETE triggers abort any mutation of recorded
- * rows, so even future daemon code holding the same connection cannot
- * rewrite history. CHECK constraints pin the envelope invariants (applied
- * rows carry a target state, rejected rows carry a rejection code and no
- * target). `seq` is AUTOINCREMENT so append order is total and never
- * reused.
+ * BEFORE UPDATE / BEFORE DELETE triggers abort row mutation on every
+ * connection, ours or raw. Scope stated honestly: SQLite offers no defense
+ * against a writer issuing DDL (DROP TRIGGER / DROP TABLE / PRAGMA
+ * writable_schema) — the triggers guard against mutation *bugs*, not a
+ * privileged adversary. What the store adds against tampering is
+ * detection: opening a database whose user_version claims this schema but
+ * whose table or append-only triggers are missing refuses to start rather
+ * than silently recreating an emptied log. CHECK constraints pin the
+ * envelope invariants (applied rows carry a target state, rejected rows
+ * carry a rejection code and no target). `seq` is AUTOINCREMENT: strictly
+ * increasing and never reused.
  */
 import Database from "better-sqlite3";
 import { ENTITY_KINDS } from "@camino/shared";
@@ -37,7 +42,7 @@ CREATE TABLE IF NOT EXISTS events (
   to_state       TEXT,
   outcome        TEXT    NOT NULL CHECK (outcome IN ('applied', 'rejected')),
   rejection_code TEXT    CHECK (
-                   rejection_code IN ('illegal-transition', 'guard-rejected', 'unknown-entity', 'already-exists')
+                   rejection_code IN ('illegal-transition', 'guard-rejected', 'unknown-entity', 'already-exists', 'malformed-payload')
                  ),
   recorded_at    TEXT    NOT NULL,
   -- Envelope invariants: applied rows land somewhere; rejected rows say why
@@ -126,9 +131,26 @@ export class SqliteEventStore implements EventStore {
         `events database ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
       );
     } else {
-      // Re-assert schema objects (idempotent) so a file with the right
-      // version but missing triggers cannot silently accept mutation.
-      this.db.exec(SCHEMA);
+      // Tamper evidence: a database claiming this schema version must still
+      // carry the events table and both append-only triggers. Recreating a
+      // missing object here would silently accept a rewritten or emptied
+      // log — refuse instead.
+      const objects = this.db
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE (type = 'table' AND name = 'events')
+              OR (type = 'trigger' AND name IN ('events_append_only_update', 'events_append_only_delete'))`,
+        )
+        .all() as Array<{ name: string }>;
+      const names = new Set(objects.map((o) => o.name));
+      for (const required of ["events", "events_append_only_update", "events_append_only_delete"]) {
+        if (!names.has(required)) {
+          throw new Error(
+            `events database ${path} claims schema version ${version} but is missing ${required} — ` +
+              "refusing to open a possibly tampered or truncated log",
+          );
+        }
+      }
     }
     this.insert = this.db.prepare(
       `INSERT INTO events

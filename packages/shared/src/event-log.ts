@@ -23,7 +23,8 @@ export type RejectionCode =
   | "illegal-transition" // no Appendix A row matches (state, event)
   | "guard-rejected" // rows matched but every guard refused the payload
   | "unknown-entity" // event for an entity with no creation record
-  | "already-exists"; // creation event for an entity that already exists
+  | "already-exists" // creation event for an entity that already exists
+  | "malformed-payload"; // reserved fields ("type"/"actor") or non-JSON payload
 
 /** What a caller submits for appending; the store assigns `seq` and `recordedAt`. */
 export interface EventInput {
@@ -46,7 +47,7 @@ export interface EventInput {
   readonly rejectionCode?: RejectionCode;
 }
 
-/** A persisted event row. `seq` is the global append order (gap-free per store). */
+/** A persisted event row. `seq` is strictly increasing and never reused (append order). */
 export interface EventRecord extends EventInput {
   readonly seq: number;
   /** ISO-8601 UTC timestamp assigned at append time. */

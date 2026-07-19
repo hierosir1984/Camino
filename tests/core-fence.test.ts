@@ -109,6 +109,34 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     source:
       'import { SqliteEventStore } from "@camino/daemon";\nexport const leak = SqliteEventStore;\n',
   },
+  // Gap classes surfaced by the WP-101 review round 1: ambient I/O globals
+  // reachable with zero imports, and parent-traversal relative escapes.
+  {
+    name: "ambient fetch global (no import at all)",
+    file: "__fence_trip__fetch.ts",
+    source: 'export const leak = fetch("https://example.invalid");\n',
+  },
+  {
+    name: "ambient WebSocket global",
+    file: "__fence_trip__websocket.ts",
+    source: 'export const leak = new WebSocket("wss://example.invalid");\n',
+  },
+  {
+    name: "ambient timer scheduling",
+    file: "__fence_trip__timer.ts",
+    source: "export const leak = setTimeout(() => {}, 1);\n",
+  },
+  {
+    name: "relative parent-traversal into shared sources",
+    file: "__fence_trip__parent.ts",
+    source:
+      'import { REQUIREMENT_ID_PATTERN } from "../../shared/src/requirement-id.js";\nexport const leak = REQUIREMENT_ID_PATTERN;\n',
+  },
+  {
+    name: "any parent traversal at all (core/src is flat by policy)",
+    file: "__fence_trip__updir.ts",
+    source: 'import { anything } from "../vitest.config.js";\nexport const leak = anything;\n',
+  },
 ];
 
 describe("packages/core import fence", () => {

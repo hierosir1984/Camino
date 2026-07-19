@@ -77,6 +77,7 @@ export type IssueEvent =
   // A.2#16 — merge approval
   | {
       type: "merge-approved";
+      actor?: string;
       authority: "david" | "tier-1";
       target: "mission-branch" | "main-candidate";
       baseCheckPassed: boolean;
@@ -88,18 +89,18 @@ export type IssueEvent =
   // A.2#20 — replan complete under contract v(n+1)
   | { type: "replan-complete"; unmetDependencies: number }
   // A.2#21 — David answers an escalation
-  | { type: "escalation-answered"; resolution: "retry" | "cancel" }
+  | { type: "escalation-answered"; actor?: string; resolution: "retry" | "cancel" }
   // A.2#22 — David cancels
-  | { type: "issue-cancelled" }
+  | { type: "issue-cancelled"; actor?: string }
   // A.2#23 — resource restored / question answered
   | { type: "block-resolved" }
   // A.2#24 — cleanup failure during teardown
   | { type: "cleanup-failed"; recorded: boolean };
 
 /** Recorded-context contract (see mission.ts): recorder-enriched fields. */
-export const ISSUE_CONTEXT_ENRICHMENT: Readonly<Record<string, EnrichmentSpec>> = {
-  "attempt-failed": { field: "failureCount", source: "next-issue-failure-count" },
-  "validation-failed": { field: "failureCount", source: "next-issue-failure-count" },
+export const ISSUE_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> = {
+  "attempt-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
+  "validation-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
 };
 
 /**
@@ -256,10 +257,13 @@ const issueRows: readonly IssueRow[] = [
     event: "attempt-failed",
     guard: {
       name: "retriable-failure-count",
-      check: (e) => typeof e.failureCount === "number" && e.failureCount < 4,
+      check: (e) =>
+        Number.isInteger(e.failureCount) &&
+        (e.failureCount as number) >= 1 &&
+        (e.failureCount as number) < 4,
     },
     to: "ready",
-    note: "failureCount is recorded context; family switch after 2 failures is retryPolicy advice to the scheduler, not a state change.",
+    note: "failureCount is recorded context (a positive integer); family switch after 2 failures is retryPolicy advice to the scheduler, not a state change.",
   }),
   row({
     ref: "A.2#9b",
@@ -267,7 +271,7 @@ const issueRows: readonly IssueRow[] = [
     event: "attempt-failed",
     guard: {
       name: "failure-count-exhausted",
-      check: (e) => typeof e.failureCount === "number" && e.failureCount >= 4,
+      check: (e) => Number.isInteger(e.failureCount) && (e.failureCount as number) >= 4,
     },
     to: "escalated",
   }),
@@ -326,13 +330,14 @@ const issueRows: readonly IssueRow[] = [
     from: ["merge-pending"],
     event: "merge-approved",
     guard: {
-      name: "authority-scoped-to-target-and-base-check",
+      name: "mission-branch-authority-and-base-check",
       check: (e) =>
         attested(e.baseCheckPassed) &&
-        (e.authority === "david" || (e.authority === "tier-1" && e.target === "mission-branch")),
+        e.target === "mission-branch" &&
+        (e.authority === "david" ? e.actor === "david" : e.authority === "tier-1"),
     },
     to: "merged",
-    note: "Tier-1 autonomy never applies to a main candidate (A.1b preamble); the fast subset runs post-merge and its failure creates a repair issue (A.2#18 → creation row A.2#1c).",
+    note: "The row's target cell is 'merged (into mission branch)': it applies to mission-branch targets ONLY, for every authority — quick-task (main-candidate) issues have no merge row at all per A.1b, which is audit finding AMEND-1. Tier-1 is additionally the only non-David authority. The fast subset runs post-merge and its failure creates a repair issue (A.2#18 → creation row A.2#1c).",
   }),
   // A.2#17 — merge-pending | mission branch advanced since validation | — | ready (revalidation)
   row({
@@ -372,14 +377,20 @@ const issueRows: readonly IssueRow[] = [
     ref: "A.2#21a",
     from: ["escalated"],
     event: "escalation-answered",
-    guard: { name: "answer-retry", check: (e) => e.resolution === "retry" },
+    guard: {
+      name: "david-answers-retry",
+      check: (e) => e.actor === "david" && e.resolution === "retry",
+    },
     to: "ready",
   }),
   row({
     ref: "A.2#21b",
     from: ["escalated"],
     event: "escalation-answered",
-    guard: { name: "answer-cancel", check: (e) => e.resolution === "cancel" },
+    guard: {
+      name: "david-answers-cancel",
+      check: (e) => e.actor === "david" && e.resolution === "cancel",
+    },
     to: "cancelled",
     note: "One appendix row, guard-split on David's answer.",
   }),
@@ -388,6 +399,7 @@ const issueRows: readonly IssueRow[] = [
     ref: "A.2#22",
     from: ISSUE_ACTIVE_STATES,
     event: "issue-cancelled",
+    guard: { name: "actor-is-david", check: (e) => e.actor === "david" },
     to: "cancelled",
   }),
   // A.2#23 — blocked | resource restored / question answered | — | ready

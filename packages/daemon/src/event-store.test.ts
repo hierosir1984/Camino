@@ -155,6 +155,7 @@ describe("SqliteEventStore", () => {
     expect(() => insert("draft", "rejected", "illegal-transition")).toThrow(/CHECK/);
     expect(() => insert(null, "rejected", null)).toThrow(/CHECK/);
     expect(() => insert(null, "rejected", "not-a-code")).toThrow(/CHECK/);
+    expect(() => insert(null, "rejected", "malformed-payload")).not.toThrow();
     expect(() => insert("draft", "applied", null)).not.toThrow();
   });
 
@@ -192,5 +193,24 @@ describe("SqliteEventStore", () => {
     circular["self"] = circular;
     expect(() => store.append(applied({ payload: circular }))).toThrow(/JSON-serializable/);
     expect(store.read()).toEqual([]);
+  });
+  it("refuses to open a version-claiming database whose append-only triggers are missing", () => {
+    const path = tempDbPath();
+    openStore(path);
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER events_append_only_update");
+    raw.close();
+    expect(() => new SqliteEventStore(path)).toThrow(/missing events_append_only_update/);
+  });
+
+  it("refuses to open a version-claiming database whose events table is gone (no silent re-create)", () => {
+    const path = tempDbPath();
+    const first = openStore(path);
+    first.append(applied());
+    first.close();
+    const raw = new Database(path);
+    raw.exec("DROP TABLE events");
+    raw.close();
+    expect(() => new SqliteEventStore(path)).toThrow(/missing events/);
   });
 });

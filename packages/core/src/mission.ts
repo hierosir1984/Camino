@@ -12,7 +12,7 @@
  * the derived view, never by the caller — see MISSION_CONTEXT_ENRICHMENT.
  */
 import type { EnrichmentSpec, MachineDef, TransitionRow } from "./machine.js";
-import { attested, nonEmptyString } from "./machine.js";
+import { attested, nonEmptyString, stringArray } from "./machine.js";
 
 export const MISSION_ACTIVE_STATES = [
   "queued",
@@ -88,9 +88,10 @@ export type MissionEvent =
       miniReviewAttached: boolean;
       observabilityAdjudicated: boolean;
     }
-  // A.1#3 / A.1b#3 — David approves plan (+ checklist)
+  // A.1#3 / A.1b#3 — David approves plan (+ checklist); actor is reserved (envelope-copied)
   | {
       type: "plan-approved";
+      actor?: string;
       dagAcyclic: boolean;
       executionSlotFree: boolean;
       riskTierLow?: boolean; // A.1b gates
@@ -98,7 +99,7 @@ export type MissionEvent =
       singleIssue?: boolean;
     }
   // A.1#4 — David rejects / edits
-  | { type: "plan-rejected" }
+  | { type: "plan-rejected"; actor?: string }
   // A.1#5 — execution slot frees
   | { type: "execution-slot-freed"; fifoHead: boolean }
   // A.1#6 — integration branch + mission PR created
@@ -116,6 +117,7 @@ export type MissionEvent =
       rollupAndPrPopulated: boolean; // A.4#3
       freshnessHolds: boolean;
       candidateSha: string;
+      packetHash: string; // the candidate's packet identity (A.4#4 pair)
     }
   // A.1#8/#9 — mission gate red, or CAM-VAL-06a review fail
   | { type: "mission-gate-red"; repairFitsApprovedScope: boolean }
@@ -124,31 +126,36 @@ export type MissionEvent =
       type: "quick-validation-green";
       packetPopulated: boolean;
       rollupAndPrPopulated: boolean; // A.4#3 (both routes)
+      contractChecksGreen: boolean; // A.1b preamble: the task's full contract checks…
+      repoFastSuiteGreen: boolean; // …plus the repo fast suite, at the exact candidate
       freshnessVsMainHolds: boolean;
       candidateSha: string;
+      packetHash: string;
     }
   // A.1b#6 — validation red (failureCount is recorded context)
   | { type: "quick-validation-red"; failureCount?: number }
   // A.1#10 / A.1b#7 — merge approval (binds to candidate SHA + packet hash, A.4#4)
   | {
       type: "mission-merge-approved";
+      actor?: string;
       authority: "david" | "tier-2" | "tier-3";
       candidateSha: string;
       packetHash: string;
       currentCandidateSha?: string; // recorded context
+      currentPacketHash?: string; // recorded context
     }
   // A.1#11 / A.1b#8 — David rejects with reason
-  | { type: "mission-merge-rejected"; reason: string }
+  | { type: "mission-merge-rejected"; actor?: string; reason: string }
   // A.1#12/#13, A.1b#9 — base moved → candidate rebuilt and revalidated
-  | { type: "candidate-rebuilt"; green: boolean; newCandidateSha: string }
+  | { type: "candidate-rebuilt"; green: boolean; newCandidateSha: string; newPacketHash?: string }
   // A.1#14 — ExternalEdit impact on mission scope
   | { type: "external-edit-detected" }
   // A.1#15 — urgent task claims the lane
   | { type: "urgent-preemption" }
   // A.1#16 — David pauses (any active)
-  | { type: "mission-paused"; attemptSettled: boolean }
+  | { type: "mission-paused"; actor?: string; attemptSettled: boolean }
   // A.1#17 — David resumes (resumeTo is recorded context: the state at pause time)
-  | { type: "mission-resumed"; resumeTo?: MissionState }
+  | { type: "mission-resumed"; actor?: string; resumeTo?: MissionState }
   // A.1#18 — escalation raised requiring David
   | { type: "escalation-raised" }
   // A.1#19 — blocker with no automated path
@@ -167,7 +174,7 @@ export type MissionEvent =
   // A.1#23 / A.1b#10 — base moved > retry bound (registry item 1: 2 rebuilds)
   | { type: "rebuilds-exhausted"; rebuildCount: number }
   // A.1#24 — David abandons mission
-  | { type: "mission-abandoned" }
+  | { type: "mission-abandoned"; actor?: string }
   // A.1b#12 — any CAM-MERGE-01 gate found violated
   | {
       type: "gate-violation-detected";
@@ -180,11 +187,14 @@ export type MissionEvent =
  * derived view (never trusting caller-supplied values) before running the
  * transition. Pure declaration; the recorder implements it.
  */
-export const MISSION_CONTEXT_ENRICHMENT: Readonly<Record<string, EnrichmentSpec>> = {
-  "mission-resumed": { field: "resumeTo", source: "paused-from" },
-  "mission-merge-approved": { field: "currentCandidateSha", source: "current-candidate-sha" },
-  "push-confirmed": { field: "approvedCandidateSha", source: "approved-candidate-sha" },
-  "quick-validation-red": { field: "failureCount", source: "next-mission-failure-count" },
+export const MISSION_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> = {
+  "mission-resumed": [{ field: "resumeTo", source: "paused-from" }],
+  "mission-merge-approved": [
+    { field: "currentCandidateSha", source: "current-candidate-sha" },
+    { field: "currentPacketHash", source: "current-packet-hash" },
+  ],
+  "push-confirmed": [{ field: "approvedCandidateSha", source: "approved-candidate-sha" }],
+  "quick-validation-red": [{ field: "failureCount", source: "next-mission-failure-count" }],
 };
 
 type MissionRow = TransitionRow<MissionState, MissionEvent>;
@@ -222,6 +232,7 @@ const planRejected = row({
   ref: "A.1#4",
   from: ["planned"],
   event: "plan-rejected",
+  guard: { name: "actor-is-david", check: (e) => e.actor === "david" },
   to: "draft",
 });
 
@@ -240,7 +251,10 @@ const manualPause = row({
   ref: "A.1#16",
   from: MISSION_ACTIVE_STATES,
   event: "mission-paused",
-  guard: { name: "attempt-settled", check: (e) => attested(e.attemptSettled) },
+  guard: {
+    name: "david-pauses-with-attempt-settled",
+    check: (e) => e.actor === "david" && attested(e.attemptSettled),
+  },
   to: "paused-manual",
   note: "Includes paused-manual itself (any active); the view keeps the first pausedFrom so a re-pause cannot lose the resume target.",
 });
@@ -250,6 +264,7 @@ const manualResume = row({
   ref: "A.1#17",
   from: ["paused-manual"],
   event: "mission-resumed",
+  guard: { name: "actor-is-david", check: (e) => e.actor === "david" },
   to: {
     name: "recorded-prior-state",
     derive: (e) =>
@@ -295,6 +310,7 @@ const abandoned = row({
   ref: "A.1#24",
   from: MISSION_ACTIVE_STATES,
   event: "mission-abandoned",
+  guard: { name: "actor-is-david", check: (e) => e.actor === "david" },
   to: "abandoned",
   note: "The guard 'intent ledger untouched' (CAM-CANON-01) is structural — core has no ledger surface to touch — not a runtime check.",
 });
@@ -307,7 +323,13 @@ const integrationRows: readonly MissionRow[] = [
     ref: "A.1#1",
     from: null,
     event: "mission-created",
+    guard: {
+      name: "re-route-carries-reference",
+      check: (e) =>
+        e.source === "prd-intake" || (e.source === "re-routed" && nonEmptyString(e.reroutedFrom)),
+    },
     to: "draft",
+    note: "A re-routed successor must reference the terminal quick-task record (A.1b#12 'referencing this record').",
   }),
   // A.1#2 — draft | plan constructed + falsification review attached | checklist rendered | planned
   row({
@@ -326,8 +348,8 @@ const integrationRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "dag-acyclic-and-slot-free",
-      check: (e) => attested(e.dagAcyclic) && attested(e.executionSlotFree),
+      name: "david-approves-dag-acyclic-slot-free",
+      check: (e) => e.actor === "david" && attested(e.dagAcyclic) && attested(e.executionSlotFree),
     },
     to: "approved",
   }),
@@ -336,8 +358,8 @@ const integrationRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "dag-acyclic-and-slot-taken",
-      check: (e) => attested(e.dagAcyclic) && e.executionSlotFree === false,
+      name: "david-approves-dag-acyclic-slot-taken",
+      check: (e) => e.actor === "david" && attested(e.dagAcyclic) && e.executionSlotFree === false,
     },
     to: "queued",
     note: "One appendix row, guard-split: 'execution slot free, else queued'. A cyclic DAG matches neither split — rejected.",
@@ -367,9 +389,11 @@ const integrationRows: readonly MissionRow[] = [
         attested(e.foldOnBranch) &&
         attested(e.rollupAndPrPopulated) &&
         attested(e.freshnessHolds) &&
-        nonEmptyString(e.candidateSha),
+        nonEmptyString(e.candidateSha) &&
+        nonEmptyString(e.packetHash),
     },
     to: "awaiting-merge-approval",
+    note: "Candidate identity is the (SHA, packet hash) pair — recorded here, bound by A.1#10 (A.4#4).",
   }),
   // A.1#8 — executing | mission gate red, or CAM-VAL-06a review fail | repair fits approved scope | executing
   row({
@@ -400,22 +424,26 @@ const integrationRows: readonly MissionRow[] = [
     from: ["awaiting-merge-approval"],
     event: "mission-merge-approved",
     guard: {
-      name: "integration-authority-and-sha-binding",
+      name: "integration-authority-and-pair-binding",
       check: (e) =>
-        (e.authority === "david" || e.authority === "tier-2") &&
+        (e.authority === "david" ? e.actor === "david" : e.authority === "tier-2") &&
         nonEmptyString(e.candidateSha) &&
         nonEmptyString(e.packetHash) &&
-        e.candidateSha === e.currentCandidateSha,
+        e.candidateSha === e.currentCandidateSha &&
+        e.packetHash === e.currentPacketHash,
     },
     to: "merging",
-    note: "Approval binds to (candidate SHA, packet hash) — A.4#4; currentCandidateSha is recorded context, so approving a stale SHA rejects.",
+    note: "Approval binds to the recorded (candidate SHA, packet hash) pair — A.4#4; a stale SHA or a hash that is not the candidate's recorded packet rejects. David-authority approvals must carry David as the envelope actor.",
   }),
   // A.1#11 — awaiting-merge-approval | David rejects with reason | — | executing
   row({
     ref: "A.1#11",
     from: ["awaiting-merge-approval"],
     event: "mission-merge-rejected",
-    guard: { name: "reason-stated", check: (e) => nonEmptyString(e.reason) },
+    guard: {
+      name: "david-rejects-with-reason",
+      check: (e) => e.actor === "david" && nonEmptyString(e.reason),
+    },
     to: "executing",
   }),
   // A.1#12 — merging | base moved → candidate rebuilt and revalidated | new candidate green | awaiting-merge-approval
@@ -425,10 +453,11 @@ const integrationRows: readonly MissionRow[] = [
     event: "candidate-rebuilt",
     guard: {
       name: "new-candidate-green",
-      check: (e) => attested(e.green) && nonEmptyString(e.newCandidateSha),
+      check: (e) =>
+        attested(e.green) && nonEmptyString(e.newCandidateSha) && nonEmptyString(e.newPacketHash),
     },
     to: "awaiting-merge-approval",
-    note: "A new candidate requires a new approval — the view clears the approval binding on this transition (A.4#4).",
+    note: "A new candidate requires a new approval — the view records the new (SHA, packet hash) pair and clears the approval binding (A.4#4).",
   }),
   // A.1#13 — merging | rebuilt candidate red | — | executing
   row({
@@ -478,6 +507,7 @@ const integrationRows: readonly MissionRow[] = [
       check: (e) =>
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
+        stringArray(e.descopedRequirements) &&
         e.descopedRequirements.length === 0,
     },
     to: "complete",
@@ -491,10 +521,11 @@ const integrationRows: readonly MissionRow[] = [
       check: (e) =>
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
+        stringArray(e.descopedRequirements) &&
         e.descopedRequirements.length > 0,
     },
     to: "complete-with-residue",
-    note: "One appendix row, guard-split on the descoped-requirements list; approvedCandidateSha is recorded context from the bound approval.",
+    note: "One appendix row, guard-split on the descoped-requirements list (which must be a real string array); approvedCandidateSha is recorded context from the bound approval.",
   }),
   // A.1#23 — merging | base moved > retry bound | 2 rebuilds exhausted | escalated
   row({
@@ -535,8 +566,9 @@ const quickTaskRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "quick-gates-and-slot-free",
+      name: "david-approves-quick-gates-slot-free",
       check: (e) =>
+        e.actor === "david" &&
         attested(e.riskTierLow) &&
         attested(e.neutralConcurred) &&
         attested(e.singleIssue) &&
@@ -549,8 +581,9 @@ const quickTaskRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "quick-gates-and-slot-taken",
+      name: "david-approves-quick-gates-slot-taken",
       check: (e) =>
+        e.actor === "david" &&
         attested(e.riskTierLow) &&
         attested(e.neutralConcurred) &&
         attested(e.singleIssue) &&
@@ -578,11 +611,14 @@ const quickTaskRows: readonly MissionRow[] = [
       check: (e) =>
         attested(e.packetPopulated) &&
         attested(e.rollupAndPrPopulated) &&
+        attested(e.contractChecksGreen) &&
+        attested(e.repoFastSuiteGreen) &&
         attested(e.freshnessVsMainHolds) &&
-        nonEmptyString(e.candidateSha),
+        nonEmptyString(e.candidateSha) &&
+        nonEmptyString(e.packetHash),
     },
     to: "awaiting-merge-approval",
-    note: "rollupAndPrPopulated encodes A.4#3, which applies to both routes.",
+    note: "rollupAndPrPopulated encodes A.4#3 (both routes); contract checks + repo fast suite encode the A.1b preamble's quick-task validation scope; candidate identity is the (SHA, packet hash) pair.",
   }),
   // A.1b#6 — executing | validation red | retry per A.2 | executing; 4 failures → escalated
   row({
@@ -591,10 +627,13 @@ const quickTaskRows: readonly MissionRow[] = [
     event: "quick-validation-red",
     guard: {
       name: "retriable-failure-count",
-      check: (e) => typeof e.failureCount === "number" && e.failureCount < 4,
+      check: (e) =>
+        Number.isInteger(e.failureCount) &&
+        (e.failureCount as number) >= 1 &&
+        (e.failureCount as number) < 4,
     },
     to: "executing",
-    note: "failureCount is recorded context (view-derived); family switch after 2 failures is routing advice — see retryPolicy.",
+    note: "failureCount is recorded context (a positive integer, view-derived); family switch after 2 failures is routing advice — see retryPolicy.",
   }),
   row({
     ref: "A.1b#6b",
@@ -602,7 +641,7 @@ const quickTaskRows: readonly MissionRow[] = [
     event: "quick-validation-red",
     guard: {
       name: "failure-count-exhausted",
-      check: (e) => typeof e.failureCount === "number" && e.failureCount >= 4,
+      check: (e) => Number.isInteger(e.failureCount) && (e.failureCount as number) >= 4,
     },
     to: "escalated",
   }),
@@ -612,22 +651,26 @@ const quickTaskRows: readonly MissionRow[] = [
     from: ["awaiting-merge-approval"],
     event: "mission-merge-approved",
     guard: {
-      name: "quick-authority-and-sha-binding",
+      name: "quick-authority-and-pair-binding",
       check: (e) =>
-        (e.authority === "david" || e.authority === "tier-3") &&
+        (e.authority === "david" ? e.actor === "david" : e.authority === "tier-3") &&
         nonEmptyString(e.candidateSha) &&
         nonEmptyString(e.packetHash) &&
-        e.candidateSha === e.currentCandidateSha,
+        e.candidateSha === e.currentCandidateSha &&
+        e.packetHash === e.currentPacketHash,
     },
     to: "merging",
-    note: "Landing authority per the A.1b preamble: David or tier-3 only; packet-hash binding per A.4#4 (both routes).",
+    note: "Landing authority per the A.1b preamble: David or tier-3 only; (SHA, packet hash) pair binding per A.4#4 (both routes).",
   }),
   // A.1b#8 — awaiting-merge-approval | David rejects with reason | — | executing (repair attempt)
   row({
     ref: "A.1b#8",
     from: ["awaiting-merge-approval"],
     event: "mission-merge-rejected",
-    guard: { name: "reason-stated", check: (e) => nonEmptyString(e.reason) },
+    guard: {
+      name: "david-rejects-with-reason",
+      check: (e) => e.actor === "david" && nonEmptyString(e.reason),
+    },
     to: "executing",
   }),
   // A.1b#9 — merging | base moved → rebuild + revalidate | green | awaiting-merge-approval (new approval required)
@@ -637,7 +680,8 @@ const quickTaskRows: readonly MissionRow[] = [
     event: "candidate-rebuilt",
     guard: {
       name: "new-candidate-green",
-      check: (e) => attested(e.green) && nonEmptyString(e.newCandidateSha),
+      check: (e) =>
+        attested(e.green) && nonEmptyString(e.newCandidateSha) && nonEmptyString(e.newPacketHash),
     },
     to: "awaiting-merge-approval",
   }),
@@ -659,10 +703,11 @@ const quickTaskRows: readonly MissionRow[] = [
       check: (e) =>
         nonEmptyString(e.pushedSha) &&
         e.pushedSha === e.approvedCandidateSha &&
+        stringArray(e.descopedRequirements) &&
         e.descopedRequirements.length === 0,
     },
     to: "complete",
-    note: "A.1b has no residue terminal; a non-empty descoped list rejects rather than landing silently.",
+    note: "A.1b has no residue terminal; a non-empty (or malformed) descoped list rejects rather than landing silently.",
   }),
   manualPause, // A.1b←A.1#16 (inherited)
   manualResume, // A.1b←A.1#17 (inherited)

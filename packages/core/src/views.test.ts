@@ -5,7 +5,8 @@
  */
 import { describe, expect, it } from "vitest";
 import type { EventRecord } from "@camino/shared";
-import { applyRecord, emptyView, foldView, verifyReplay } from "./views.js";
+import { applyRecord, emptyView, foldView } from "./views.js";
+import { verifyReplay } from "./decide.js";
 
 let seqCounter = 0;
 
@@ -170,8 +171,14 @@ describe("foldView", () => {
         toState: "draft",
       }),
     );
-    apply("mission-gate-green", { candidateSha: "cand-1" }, "executing", "awaiting-merge-approval");
+    apply(
+      "mission-gate-green",
+      { candidateSha: "cand-1", packetHash: "p-hash-1" },
+      "executing",
+      "awaiting-merge-approval",
+    );
     expect(view.missions.get("m1")?.currentCandidateSha).toBe("cand-1");
+    expect(view.missions.get("m1")?.currentPacketHash).toBe("p-hash-1");
     apply(
       "mission-merge-approved",
       { candidateSha: "cand-1", packetHash: "p1", authority: "david" },
@@ -182,11 +189,12 @@ describe("foldView", () => {
     // Base moved: rebuild green → new candidate, approval binding cleared.
     apply(
       "candidate-rebuilt",
-      { green: true, newCandidateSha: "cand-2" },
+      { green: true, newCandidateSha: "cand-2", newPacketHash: "p-hash-2" },
       "merging",
       "awaiting-merge-approval",
     );
     expect(view.missions.get("m1")?.currentCandidateSha).toBe("cand-2");
+    expect(view.missions.get("m1")?.currentPacketHash).toBe("p-hash-2");
     expect(view.missions.get("m1")?.approval).toBeUndefined();
   });
 

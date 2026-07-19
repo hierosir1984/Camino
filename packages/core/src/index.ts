@@ -3,7 +3,13 @@
 // Appendix A state machines live behind this boundary (WP-101).
 export { exhaustive } from "./exhaustive.js";
 
-export { transition, attested, nonEmptyString } from "./machine.js";
+export {
+  transition,
+  attested,
+  nonEmptyString,
+  stringArray,
+  RESERVED_PAYLOAD_FIELDS,
+} from "./machine.js";
 export type {
   EnrichmentSource,
   EnrichmentSpec,
@@ -13,6 +19,9 @@ export type {
   TransitionRow,
   TransitionTarget,
 } from "./machine.js";
+
+export { decideTransition, verifyReplay } from "./decide.js";
+export type { Decision, DecisionInput, ReplayDivergence } from "./decide.js";
 
 export {
   MISSION_ACTIVE_STATES,
@@ -48,11 +57,5 @@ export {
 } from "./attempt.js";
 export type { AttemptEvent, AttemptState } from "./attempt.js";
 
-export { emptyView, applyRecord, foldView, verifyReplay } from "./views.js";
-export type {
-  AttemptSnapshot,
-  IssueSnapshot,
-  MissionSnapshot,
-  ReplayDivergence,
-  StateView,
-} from "./views.js";
+export { emptyView, applyRecord, foldView } from "./views.js";
+export type { AttemptSnapshot, IssueSnapshot, MissionSnapshot, StateView } from "./views.js";
