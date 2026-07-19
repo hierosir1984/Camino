@@ -21,6 +21,42 @@ export type {
   IntakeResult,
 } from "./domain.js";
 
+// WP-104: the §4.4 idempotency contract as code (CAM-STATE-02).
+export {
+  OPERATION_CLASSES,
+  OPERATION_TARGET_KINDS,
+  LABEL_DESIRED_STATES,
+  INTENT_EVENTS,
+  INTENT_STATUSES,
+  IndeterminateOutcomeError,
+} from "./external-ops.js";
+export type {
+  OperationClass,
+  OperationTargetKind,
+  LabelDesiredState,
+  BranchCreateSpec,
+  PushSpec,
+  PrCreateSpec,
+  MergeByPushSpec,
+  LabelSetSpec,
+  CommentPostSpec,
+  WorkflowDispatchSpec,
+  TestServiceMutationSpec,
+  CatchAllSpec,
+  ExternalOperationSpec,
+  OperationResult,
+  IntentEventName,
+  IntentStatus,
+  IntentEventRecord,
+  GitHubMutationTransport,
+  TestServiceMutationTransport,
+  CatchAllMutationTransport,
+  MutationTransports,
+  ObservedPullRequest,
+  ObservedWorkflowRun,
+  GitHubQueryTransport,
+} from "./external-ops.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,

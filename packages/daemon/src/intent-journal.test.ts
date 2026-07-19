@@ -1,0 +1,271 @@
+/**
+ * Intent journal shell (WP-104): append-only enforced in the schema,
+ * tamper-evident open, CAS append, single-observation payloads, and the
+ * fail-closed adoption gate — the WP-101 store discipline applied to the
+ * journal.
+ */
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { IntentJournal } from "./intent-journal.js";
+import { WriterLock } from "./writer-lock.js";
+
+const SHA_A = "a".repeat(40);
+const BRANCH_SPEC = {
+  op: "branch-create",
+  repo: "r",
+  branch: "camino/issue-1",
+  targetSha: SHA_A,
+} as const;
+
+let dirs: string[] = [];
+function journalPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "camino-journal-"));
+  dirs.push(dir);
+  return join(dir, "intents.sqlite");
+}
+afterEach(() => {
+  for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  dirs = [];
+});
+
+function walkToConfirmed(journal: IntentJournal, intentId = "i1"): void {
+  journal.append({ intentId, event: "recorded", actor: "camino:executor", payload: BRANCH_SPEC });
+  journal.append({ intentId, event: "execution-started", actor: "camino:executor", payload: {} });
+  journal.append({
+    intentId,
+    event: "confirmed",
+    actor: "camino:executor",
+    payload: { via: "response", result: { branch: "camino/issue-1" }, note: "ok" },
+  });
+}
+
+describe("IntentJournal basics", () => {
+  it("appends, reads back, and folds the lifecycle", () => {
+    const path = journalPath();
+    const journal = new IntentJournal(path);
+    walkToConfirmed(journal);
+    const rows = journal.read();
+    expect(rows.map((r) => r.event)).toEqual(["recorded", "execution-started", "confirmed"]);
+    expect(rows[0]!.payload).toEqual(BRANCH_SPEC);
+    const entry = journal.entry("i1")!;
+    expect(entry.status).toBe("confirmed");
+    expect(entry.executionStartedCount).toBe(1);
+    expect(entry.result).toEqual({ branch: "camino/issue-1" });
+    journal.close();
+  });
+
+  it("a fresh journal over the same file folds the identical view (recovery is replay)", () => {
+    const path = journalPath();
+    const first = new IntentJournal(path);
+    walkToConfirmed(first);
+    const before = first.currentView();
+    first.close();
+    const second = new IntentJournal(path);
+    expect(second.currentView()).toEqual(before);
+    second.close();
+  });
+
+  it("refuses illegal appends loudly (throw, not a refusal row — internal writers only)", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} }),
+    ).toThrow(/no recorded row/);
+    journal.append({
+      intentId: "i1",
+      event: "recorded",
+      actor: "camino:executor",
+      payload: BRANCH_SPEC,
+    });
+    expect(() =>
+      journal.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC }),
+    ).toThrow(/already exists/);
+    expect(() =>
+      journal.append({
+        intentId: "i1",
+        event: "confirmed",
+        actor: "x",
+        payload: { via: "response", result: {}, note: "n" },
+      }),
+    ).toThrow(/not legal from status/);
+    journal.close();
+  });
+
+  it("refuses an invalid operation spec at the durable boundary", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({
+        intentId: "i1",
+        event: "recorded",
+        actor: "x",
+        payload: { op: "branch-create", repo: "r", branch: "b", targetSha: "not-a-sha" },
+      }),
+    ).toThrow(/40-character/);
+    journal.close();
+  });
+
+  it("binds retry-authorized to the David actor through the shell too", () => {
+    const journal = new IntentJournal(journalPath());
+    journal.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+    journal.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} });
+    journal.append({
+      intentId: "i1",
+      event: "ambiguity-recorded",
+      actor: "camino:recovery",
+      payload: { reason: "unknown" },
+    });
+    journal.append({
+      intentId: "i1",
+      event: "escalated",
+      actor: "camino:recovery",
+      payload: { reason: "unknown" },
+    });
+    expect(() =>
+      journal.append({
+        intentId: "i1",
+        event: "retry-authorized",
+        actor: "camino:recovery",
+        payload: { reason: "r" },
+      }),
+    ).toThrow(/David/);
+    journal.close();
+  });
+
+  it("observes the payload exactly once (single-observation canonicalization)", () => {
+    const journal = new IntentJournal(journalPath());
+    let reads = 0;
+    const sneaky = {
+      op: "catch-all",
+      get description(): string {
+        reads += 1;
+        return reads === 1 ? "first read" : "different on later reads";
+      },
+    };
+    journal.append({
+      intentId: "i1",
+      event: "recorded",
+      actor: "x",
+      payload: sneaky as unknown as Readonly<Record<string, unknown>>,
+    });
+    const stored = journal.read()[0]!.payload;
+    expect(stored["description"]).toBe("first read");
+    expect(journal.entry("i1")!.spec).toEqual({ op: "catch-all", description: "first read" });
+    journal.close();
+  });
+
+  it("refuses payloads JSON cannot hold as a plain object", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({
+        intentId: "i1",
+        event: "recorded",
+        actor: "x",
+        payload: { toJSON: () => [] } as unknown as Readonly<Record<string, unknown>>,
+      }),
+    ).toThrow(/plain JSON object/);
+    journal.close();
+  });
+
+  it("CAS: a stale expectedLastSeq refuses without writing", () => {
+    const journal = new IntentJournal(journalPath());
+    journal.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+    expect(() =>
+      journal.append(
+        { intentId: "i1", event: "execution-started", actor: "x", payload: {} },
+        { expectedLastSeq: 0 },
+      ),
+    ).toThrow(/advanced beyond/);
+    expect(journal.read()).toHaveLength(1);
+    journal.close();
+  });
+
+  it("nonTerminal lists exactly the unresolved statuses", () => {
+    const journal = new IntentJournal(journalPath());
+    walkToConfirmed(journal, "done");
+    journal.append({ intentId: "pending", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+    journal.append({
+      intentId: "inflight",
+      event: "recorded",
+      actor: "x",
+      payload: BRANCH_SPEC,
+    });
+    journal.append({ intentId: "inflight", event: "execution-started", actor: "x", payload: {} });
+    const ids = journal.nonTerminal().map((s) => s.intentId);
+    expect(ids).toEqual(["pending", "inflight"]);
+    journal.close();
+  });
+});
+
+describe("IntentJournal durability shell", () => {
+  it("append-only is enforced by schema triggers on RAW connections", () => {
+    const path = journalPath();
+    const journal = new IntentJournal(path);
+    walkToConfirmed(journal);
+    journal.close();
+    const raw = new Database(path);
+    expect(() =>
+      raw.prepare("UPDATE intent_events SET actor = 'forged' WHERE seq = 1").run(),
+    ).toThrow(/append-only/);
+    expect(() => raw.prepare("DELETE FROM intent_events WHERE seq = 1").run()).toThrow(
+      /append-only/,
+    );
+    raw.close();
+  });
+
+  it("refuses to open a version-claiming database missing its triggers (tamper evidence)", () => {
+    const path = journalPath();
+    new IntentJournal(path).close();
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER intent_events_append_only_update");
+    raw.close();
+    expect(() => new IntentJournal(path)).toThrow(/missing intent_events_append_only_update/);
+  });
+
+  it("refuses a schema version it does not know", () => {
+    const path = journalPath();
+    new IntentJournal(path).close();
+    const raw = new Database(path);
+    raw.pragma("user_version = 99");
+    raw.close();
+    expect(() => new IntentJournal(path)).toThrow(/schema version 99/);
+  });
+
+  it("refuses a non-UTF-8 database (the NUL byte checks assume UTF-8)", () => {
+    const path = journalPath();
+    const raw = new Database(path);
+    raw.pragma("encoding = 'UTF-16le'");
+    raw.exec("CREATE TABLE seed (x TEXT)"); // forces the encoding to stick
+    raw.close();
+    expect(() => new IntentJournal(path)).toThrow(/UTF-8/);
+  });
+
+  it("fail-closed adoption: refuses a journal whose history the lifecycle rejects", () => {
+    const path = journalPath();
+    new IntentJournal(path).close();
+    const raw = new Database(path);
+    // Forge a confirmed row with no recorded/execution-started history.
+    raw
+      .prepare(
+        `INSERT INTO intent_events (intent_id, event, actor, payload, recorded_at)
+         VALUES ('forged', 'confirmed', 'x', '{"via":"response","result":{},"note":"n"}', '2026-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    raw.close();
+    expect(() => new IntentJournal(path)).toThrow(/fails lifecycle verification/);
+  });
+
+  it("asserts the writer lock is held on every append when wired", () => {
+    const path = journalPath();
+    const lockPath = `${path}.lock`;
+    const lock = WriterLock.acquire(lockPath);
+    const journal = new IntentJournal(path, { writerLock: lock });
+    journal.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+    lock.release();
+    expect(() =>
+      journal.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} }),
+    ).toThrow(/without the writer lock held/);
+    journal.close();
+  });
+});

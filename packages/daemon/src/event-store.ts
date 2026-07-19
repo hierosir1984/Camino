@@ -106,11 +106,20 @@ function validateInput(input: EventInput): void {
 export interface SqliteEventStoreOptions {
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date;
+  /**
+   * The daemon's durable cross-process writer lock (WP-104). When present,
+   * every append asserts it is still held — in-process defense-in-depth
+   * beneath the kernel file lock the recovery composition (recovery.ts)
+   * acquires before opening this store. Unit tests may open a store
+   * without it; the production path always wires it (CAM-STATE-03).
+   */
+  readonly writerLock?: { assertHeld(context: string): void };
 }
 
 export class SqliteEventStore implements EventStore {
   private readonly db: Database.Database;
   private readonly now: () => Date;
+  private readonly writerLock: { assertHeld(context: string): void } | undefined;
   private readonly insert: Database.Statement;
 
   /**
@@ -119,6 +128,7 @@ export class SqliteEventStore implements EventStore {
    */
   constructor(path: string, options: SqliteEventStoreOptions = {}) {
     this.now = options.now ?? (() => new Date());
+    this.writerLock = options.writerLock;
     this.db = new Database(path);
     // WAL for durable concurrent reads on file databases (PRD §6); SQLite
     // keeps ":memory:" databases on the "memory" journal, which is fine.
@@ -162,6 +172,7 @@ export class SqliteEventStore implements EventStore {
   }
 
   append(input: EventInput, options: AppendOptions = {}): EventRecord {
+    this.writerLock?.assertHeld("event store append");
     // Snapshot every field exactly once: exotic caller objects with accessor
     // properties must not let validation, insertion, and the returned record
     // read different values (WP-101 review round 3).
@@ -214,7 +225,8 @@ export class SqliteEventStore implements EventStore {
         if (lastSeq.last !== expectedLastSeq) {
           throw new Error(
             `event store advanced beyond the writer's view (seq ${lastSeq.last} > ${expectedLastSeq}): ` +
-              "a second writer violated the single-writer contract (CAM-STATE-03; the durable recovery lock lands with WP-104)",
+              "a second writer violated the single-writer contract (CAM-STATE-03; in-process " +
+              "defense-in-depth beneath the durable cross-process writer lock, writer-lock.ts)",
           );
         }
       }
