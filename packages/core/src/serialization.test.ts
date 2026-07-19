@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { EventRecord } from "@camino/shared";
-import { fifoOrder, queuedEntrySeqs } from "./serialization.js";
+import { auditActivationOrder, fifoOrder, queuedEntrySeqs } from "./serialization.js";
 
 function record(overrides: Partial<EventRecord> & { seq: number }): EventRecord {
   return {
@@ -84,5 +84,100 @@ describe("fifoOrder", () => {
     const ids = ["mB", "mA"];
     fifoOrder(ids, new Map([["mA", 1]]));
     expect(ids).toEqual(["mB", "mA"]);
+  });
+});
+
+describe("auditActivationOrder", () => {
+  const LANES = new Map<string, "primary" | "urgent">([
+    ["mA", "primary"],
+    ["mB", "primary"],
+    ["mU", "urgent"],
+  ]);
+
+  function activation(seq: number, entityId: string): EventRecord {
+    return record({
+      seq,
+      entityId,
+      event: "execution-slot-freed",
+      fromState: "queued",
+      toState: "approved",
+    });
+  }
+
+  it("accepts in-order activations", () => {
+    const deviations = auditActivationOrder(
+      [
+        record({ seq: 1, entityId: "mA" }), // mA enters queued
+        record({ seq: 2, entityId: "mB" }), // mB enters queued behind it
+        activation(3, "mA"),
+        activation(4, "mB"),
+      ],
+      LANES,
+    );
+    expect(deviations).toEqual([]);
+  });
+
+  it("reports an activation that jumped the queue (r1 finding 4)", () => {
+    const deviations = auditActivationOrder(
+      [
+        record({ seq: 1, entityId: "mA" }),
+        record({ seq: 2, entityId: "mB" }),
+        activation(3, "mB"), // mA was the head
+      ],
+      LANES,
+    );
+    expect(deviations).toEqual([
+      { seq: 3, missionId: "mB", lane: "primary", expectedHeadId: "mA" },
+    ]);
+  });
+
+  it("audits lanes independently and honours first-entry order across re-entry", () => {
+    const deviations = auditActivationOrder(
+      [
+        record({ seq: 1, entityId: "mA" }),
+        record({ seq: 2, entityId: "mU" }), // urgent lane's own line
+        record({ seq: 3, entityId: "mB" }),
+        // mA pauses out of queued and resumes back in: keeps first-entry order.
+        record({
+          seq: 4,
+          entityId: "mA",
+          event: "mission-paused",
+          fromState: "queued",
+          toState: "paused-manual",
+        }),
+        record({
+          seq: 5,
+          entityId: "mA",
+          event: "mission-resumed",
+          fromState: "paused-manual",
+          toState: "queued",
+        }),
+        activation(6, "mU"), // urgent head — its lane has only mU
+        activation(7, "mA"), // primary head by first entry (seq 1 < 3)
+        activation(8, "mB"),
+      ],
+      LANES,
+    );
+    expect(deviations).toEqual([]);
+  });
+
+  it("ignores rejected rows and missions outside the lane map", () => {
+    const deviations = auditActivationOrder(
+      [
+        record({ seq: 1, entityId: "other-repo-mission" }),
+        record({ seq: 2, entityId: "mA" }),
+        record({
+          seq: 3,
+          entityId: "mA",
+          event: "execution-slot-freed",
+          outcome: "rejected",
+          toState: null,
+          rejectionCode: "guard-rejected",
+        }),
+        activation(4, "mA"),
+      ],
+      LANES,
+    );
+    expect(deviations).toEqual([]);
   });
 });

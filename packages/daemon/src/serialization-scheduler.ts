@@ -8,25 +8,41 @@
  *    execution-bearing state (core's isExecutionBearing over the recorded
  *    view — Appendix A serialization rule as amended per AMEND-2);
  *  - the URGENT lane, held by an urgent quick task in an execution-bearing
- *    state. While the lane is occupied the primary holder sits in
- *    `paused-urgent` (A.1#15) and STILL holds the primary slot — resuming
- *    via A.1#20 when the urgent task lands.
+ *    state. While the lane is occupied an integration-route primary holder
+ *    sits in `paused-urgent` (A.1#15) and STILL holds the primary slot —
+ *    resuming via A.1#20 when the urgent task lands.
+ *
+ * Quick tasks are not preemptible (review round 1, finding 3): Appendix A
+ * gives A.1b no urgent-preemption/interruption-resolved rows, so a quick
+ * task holding the primary slot cannot be parked the way an integration
+ * mission can. The urgent lane therefore counts as unavailable while a
+ * quick task holds primary — an urgent task approved in that window waits
+ * in `queued` and activates when the quick task terminates. (Recorded as a
+ * spec observation in the PR; an appendix amendment adding quick-task
+ * preemption rows would be David's change-control call, not this WP's.)
  *
  * The scheduler derives everything from the domain store (which mission
  * belongs to which repo, which lane it schedules on) joined with the
  * recorder's derived view (state, pausedFrom) and the event log (FIFO order
  * = first entry into `queued`, core's queuedEntrySeqs). It never bypasses
  * the recorder: activation is a recorded `execution-slot-freed` transition
- * (A.1#5), and the slot-free facts consumed by plan approval
- * (`executionSlotFreeFor`) are computed here so callers attest honestly.
+ * (A.1#5), and plan approval goes through `approvePlan`, which computes the
+ * slot fact and records the transition in ONE synchronous frame — the
+ * check cannot interleave with another in-process record (r1 finding 2's
+ * check/record race), and a cross-process interleaving is refused by the
+ * store's compare-and-swap append (the durable recovery lock is WP-104).
  *
  * Enforcement boundary, stated plainly: Appendix A guards check ATTESTED
- * facts; the scheduler is the honest source of the slot attestations, and
- * every in-process caller is expected to consult it. A caller that attests
- * a free slot against this module's answer is a daemon bug, not a schema
- * the machine can refuse — the recorded view carries no repo binding, so
- * recorded-context enrichment cannot overwrite slot facts today.
- * `serializationViolations` makes any resulting double-occupancy visible.
+ * facts; the scheduler is the honest source of the slot and FIFO facts
+ * (`approvePlan`, `activateNext`), and every in-process caller is expected
+ * to route through it. A caller that attests its own facts against this
+ * module's answers is a daemon bug, not a schema the machine can refuse —
+ * the recorded view carries no repo binding, so recorded-context
+ * enrichment cannot overwrite these facts today. What the module ships
+ * instead is complete visibility: `serializationViolations` surfaces
+ * double-occupancy AND concurrent active execution across lanes, and
+ * `auditActivations` re-derives every recorded activation against FIFO
+ * order (r1 findings 2/3/4).
  *
  * The urgent preemption WORKFLOW — checkpoint-cancel of the running
  * attempt, urgent lands on main first, mission branch merges main back in
@@ -37,20 +53,28 @@
  */
 import type { EventStore } from "@camino/shared";
 import type { MissionRecord } from "@camino/shared";
-import type { MissionState } from "@camino/core";
+import type { ActivationDeviation, MissionState } from "@camino/core";
 import {
   MISSION_TERMINAL_STATES,
+  auditActivationOrder,
   fifoOrder,
   isExecutionBearing,
   queuedEntrySeqs,
 } from "@camino/core";
 import type { SqliteDomainStore } from "./domain-store.js";
-import type { TransitionRecorder } from "./transition-recorder.js";
+import type { RecordOutcome, TransitionRecorder } from "./transition-recorder.js";
 
 export type SchedulingLane = "primary" | "urgent";
 
 /** The actor recorded on scheduler-initiated transitions. */
 export const SCHEDULER_ACTOR = "camino:scheduler";
+
+/** States in which a holder is actively driving work/validation/merge. */
+const ACTIVE_EXECUTION_STATES: readonly MissionState[] = [
+  "executing",
+  "awaiting-merge-approval",
+  "merging",
+];
 
 export interface LaneHolder {
   readonly missionId: string;
@@ -86,10 +110,32 @@ export interface RepoQueueView {
   readonly concurrent: readonly { missionId: string; title: string; state: MissionState }[];
 }
 
-/** Evidence of a lane invariant breach: more than one holder in one lane. */
-export interface SerializationViolation {
-  readonly lane: SchedulingLane;
-  readonly missionIds: readonly string[];
+/** Evidence of a serialization invariant breach (r1 findings 2/3). */
+export type SerializationViolation =
+  | {
+      /** More than one execution-bearing holder in one lane. */
+      readonly kind: "multi-holder";
+      readonly lane: SchedulingLane;
+      readonly missionIds: readonly string[];
+    }
+  | {
+      /** Both lanes actively executing at once — the primary was not parked. */
+      readonly kind: "concurrent-active-execution";
+      readonly primaryMissionId: string;
+      readonly urgentMissionId: string;
+    };
+
+/** Facts David attests when approving an integration-route plan (A.1#3). */
+export interface IntegrationApprovalFacts {
+  readonly checklistApproved: boolean;
+  readonly dagAcyclic: boolean;
+}
+
+/** Facts David attests when approving a quick task (A.1b#3 gates). */
+export interface QuickTaskApprovalFacts {
+  readonly riskTierLow: boolean;
+  readonly neutralConcurred: boolean;
+  readonly singleIssue: boolean;
 }
 
 export interface ActivationOutcome {
@@ -109,6 +155,37 @@ export class SerializationScheduler {
     this.store = store;
   }
 
+  /**
+   * Record David's plan approval with the slot fact computed by the
+   * scheduler itself, in one synchronous frame (r1 finding 2): between the
+   * slot computation and the recorder append there is no await point, so no
+   * other in-process record() can interleave. The guard-split routes the
+   * mission to `approved` (slot free) or `queued` (slot taken); the caller
+   * attests only the facts that are genuinely theirs (checklist, DAG, or
+   * the quick-task gates).
+   */
+  approvePlan(
+    missionId: string,
+    actor: string,
+    facts: IntegrationApprovalFacts | QuickTaskApprovalFacts,
+  ): RecordOutcome {
+    const mission = this.requireMission(missionId);
+    if (mission.route === "integration" && !("checklistApproved" in facts)) {
+      throw new TypeError("integration-route approval requires IntegrationApprovalFacts");
+    }
+    if (mission.route === "quick-task" && !("riskTierLow" in facts)) {
+      throw new TypeError("quick-task approval requires QuickTaskApprovalFacts");
+    }
+    return this.recorder.record({
+      entityKind: "mission",
+      entityId: missionId,
+      event: "plan-approved",
+      actor,
+      cause: `plan approval with scheduler-computed slot fact (repo ${mission.repoId})`,
+      payload: { ...facts, executionSlotFree: this.executionSlotFreeFor(missionId) },
+    });
+  }
+
   /** Which mission (if any) holds each of the repo's two slots right now. */
   laneOccupancy(repoId: string): LaneOccupancy {
     const holders = this.laneHolders(repoId);
@@ -120,13 +197,35 @@ export class SerializationScheduler {
     };
   }
 
-  /** Non-empty exactly when a lane holds more than one execution-bearing mission. */
+  /** Non-empty exactly when a serialization invariant is breached (see the type). */
   serializationViolations(repoId: string): SerializationViolation[] {
     const holders = this.laneHolders(repoId);
     const violations: SerializationViolation[] = [];
     for (const lane of ["primary", "urgent"] as const) {
       if (holders[lane].length > 1) {
-        violations.push({ lane, missionIds: holders[lane].map((h) => h.missionId) });
+        violations.push({
+          kind: "multi-holder",
+          lane,
+          missionIds: holders[lane].map((h) => h.missionId),
+        });
+      }
+    }
+    // Cross-lane rule (r1 finding 3): while the urgent lane actively
+    // executes, the primary holder must be parked (paused-urgent /
+    // paused-manual) or pre-start — two lanes actively executing at once is
+    // exactly what per-repo serialization exists to prevent.
+    for (const primary of holders.primary) {
+      for (const urgent of holders.urgent) {
+        if (
+          ACTIVE_EXECUTION_STATES.includes(primary.state) &&
+          ACTIVE_EXECUTION_STATES.includes(urgent.state)
+        ) {
+          violations.push({
+            kind: "concurrent-active-execution",
+            primaryMissionId: primary.missionId,
+            urgentMissionId: urgent.missionId,
+          });
+        }
       }
     }
     return violations;
@@ -135,22 +234,27 @@ export class SerializationScheduler {
   /**
    * The slot-free fact for THIS mission's plan approval (A.1#3 / A.1b#3
    * `executionSlotFree`): whether the lane the mission schedules on —
-   * primary normally, the urgent lane for an urgent quick task — has no
-   * holder. Callers pass the answer into the plan-approved payload; the
-   * guard-split routes the mission to `approved` (free) or `queued` (taken).
+   * primary normally, the urgent lane for an urgent quick task — can accept
+   * it. The urgent lane additionally counts as unavailable while a quick
+   * task holds primary (no preemption rows exist for quick tasks — see the
+   * module note). Exposed for inspection/display; approval itself must go
+   * through `approvePlan`, which computes this fact in the same synchronous
+   * frame as the record (r1 finding 2).
    */
   executionSlotFreeFor(missionId: string): boolean {
     const mission = this.requireMission(missionId);
-    const lane: SchedulingLane = mission.urgent ? "urgent" : "primary";
-    return this.laneHolders(mission.repoId)[lane].length === 0;
+    const holders = this.laneHolders(mission.repoId);
+    if (mission.urgent) return this.urgentLaneAvailable(holders);
+    return holders.primary.length === 0;
   }
 
   /** The visible per-repo queue (CAM-CORE-08: a waiting mission waits VISIBLY). */
   repoQueue(repoId: string): RepoQueueView {
     const view = this.recorder.currentView;
-    const entrySeqs = queuedEntrySeqs(this.store.read({ entityKind: "mission" }));
+    const missionRecords = this.store.read({ entityKind: "mission" });
+    const entrySeqs = queuedEntrySeqs(missionRecords);
     const recordedAtBySeq = new Map<number, string>();
-    for (const record of this.store.read({ entityKind: "mission" })) {
+    for (const record of missionRecords) {
       recordedAtBySeq.set(record.seq, record.recordedAt);
     }
 
@@ -161,7 +265,7 @@ export class SerializationScheduler {
 
     for (const mission of this.domain.listMissions(repoId)) {
       const snapshot = view.missions.get(mission.id);
-      if (snapshot === undefined) continue; // no creation event yet — intakeOrphans() surfaces these
+      if (snapshot === undefined) continue; // no creation event — seamDivergences() surfaces these
       byId.set(mission.id, mission);
       const state = snapshot.state;
       if (isExecutionBearing(state, snapshot.pausedFrom)) {
@@ -194,15 +298,19 @@ export class SerializationScheduler {
   }
 
   /**
-   * FIFO activation (A.1#5): for each lane with no holder, move the head of
-   * that lane's `queued` line to `approved` via a recorded
-   * `execution-slot-freed` transition. At most one activation per lane per
-   * call — the activated mission occupies the slot. Returns what activated.
+   * FIFO activation (A.1#5): for each lane that can accept a mission, move
+   * the head of that lane's `queued` line to `approved` via a recorded
+   * `execution-slot-freed` transition. Head computation and record happen
+   * in the same synchronous frame (no interleaving in-process). At most one
+   * activation per lane per call — the activated mission occupies the slot.
    */
   activateNext(repoId: string): ActivationOutcome[] {
     const outcomes: ActivationOutcome[] = [];
     for (const lane of ["primary", "urgent"] as const) {
-      if (this.laneHolders(repoId)[lane].length > 0) continue;
+      const holders = this.laneHolders(repoId);
+      const available =
+        lane === "urgent" ? this.urgentLaneAvailable(holders) : holders.primary.length === 0;
+      if (!available) continue;
       const head = this.queuedHead(repoId, lane);
       if (head === undefined) continue;
       const outcome = this.recorder.record({
@@ -222,6 +330,33 @@ export class SerializationScheduler {
       outcomes.push({ lane, missionId: head, to: outcome.to as MissionState });
     }
     return outcomes;
+  }
+
+  /**
+   * Re-derive every recorded activation for this repo against FIFO order
+   * (r1 finding 4): a false `fifoHead` attestation produces an activation
+   * replay verifies happily; this audit reports it. Empty means every
+   * activation went to the then-head of its lane.
+   */
+  auditActivations(repoId: string): ActivationDeviation[] {
+    const laneOf = new Map<string, SchedulingLane>();
+    for (const mission of this.domain.listMissions(repoId)) {
+      laneOf.set(mission.id, mission.urgent ? "urgent" : "primary");
+    }
+    return auditActivationOrder(this.store.read({ entityKind: "mission" }), laneOf);
+  }
+
+  /**
+   * The urgent lane accepts a mission when it has no holder AND the primary
+   * holder (if any) is not a quick task — quick tasks have no preemption
+   * rows, so an urgent task activating beside one could only run
+   * concurrently with it (see the module note and r1 finding 3).
+   */
+  private urgentLaneAvailable(holders: { primary: LaneHolder[]; urgent: LaneHolder[] }): boolean {
+    if (holders.urgent.length > 0) return false;
+    return !holders.primary.some(
+      (holder) => this.domain.getMission(holder.missionId)?.route === "quick-task",
+    );
   }
 
   private queuedHead(repoId: string, lane: SchedulingLane): string | undefined {

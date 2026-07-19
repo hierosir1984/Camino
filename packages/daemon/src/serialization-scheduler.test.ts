@@ -7,9 +7,11 @@
  * at the state-machine level through the transition recorder.
  *
  * Every transition here goes through the WP-101 recorder — the scheduler
- * never bypasses it. The urgent preemption WORKFLOW (checkpoint-cancel,
- * land-first, merge-back, revalidate) is CAM-PLAN-10 [P2]: recorded, not
- * built — these tests exercise the lane and the machine rows only.
+ * never bypasses it. Plan approval goes through `approvePlan` (the honest,
+ * single-synchronous-frame path — r1 finding 2); FIFO activations are
+ * audited against the log (r1 finding 4); the urgent lane respects
+ * quick-task non-preemptibility (r1 finding 3). The urgent preemption
+ * WORKFLOW is CAM-PLAN-10 [P2]: recorded, not built.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { SqliteDomainStore } from "./domain-store.js";
@@ -93,40 +95,30 @@ function intakeQuickTask(h: Harness, title: string, urgent: boolean): string {
   return result.ok ? result.mission.id : "";
 }
 
-/** Plan an integration mission, then approve it with the scheduler-computed slot fact. */
+/** Plan an integration mission, then approve through the scheduler (honest path). */
 function planAndApprove(h: Harness, missionId: string): string {
   apply(h, missionId, "plan-constructed", { reviewAttached: true, checklistRendered: true });
-  return apply(
-    h,
-    missionId,
-    "plan-approved",
-    {
-      checklistApproved: true,
-      dagAcyclic: true,
-      executionSlotFree: h.scheduler.executionSlotFreeFor(missionId),
-    },
-    "david",
-  );
+  const outcome = h.scheduler.approvePlan(missionId, "david", {
+    checklistApproved: true,
+    dagAcyclic: true,
+  });
+  expect(outcome.ok, `${missionId} approval should apply`).toBe(true);
+  return outcome.ok ? outcome.to : "";
 }
 
-/** Plan a quick task, then approve it with the scheduler-computed slot fact. */
+/** Plan a quick task, then approve through the scheduler (honest path). */
 function planAndApproveQuick(h: Harness, missionId: string): string {
   apply(h, missionId, "contract-attached", {
     miniReviewAttached: true,
     observabilityAdjudicated: true,
   });
-  return apply(
-    h,
-    missionId,
-    "plan-approved",
-    {
-      riskTierLow: true,
-      neutralConcurred: true,
-      singleIssue: true,
-      executionSlotFree: h.scheduler.executionSlotFreeFor(missionId),
-    },
-    "david",
-  );
+  const outcome = h.scheduler.approvePlan(missionId, "david", {
+    riskTierLow: true,
+    neutralConcurred: true,
+    singleIssue: true,
+  });
+  expect(outcome.ok, `${missionId} quick approval should apply`).toBe(true);
+  return outcome.ok ? outcome.to : "";
 }
 
 /** approved → executing on the integration route (A.1#6). */
@@ -135,6 +127,14 @@ function startExecution(h: Harness, missionId: string): void {
     branchCreated: true,
     missionPrCreated: true,
     onboardingChecksGreen: true,
+  });
+}
+
+/** approved → executing on the quick-task route (A.1b#4). */
+function startQuickExecution(h: Harness, missionId: string): void {
+  apply(h, missionId, "quick-task-execution-started", {
+    targetIsMainCandidate: true,
+    noIntegrationBranchNoFold: true,
   });
 }
 
@@ -191,7 +191,7 @@ function completeQuickTask(h: Harness, missionId: string, sha: string): void {
 }
 
 describe("CAM-CORE-08 — a second mission on the same repo waits visibly in `queued`", () => {
-  it("routes the second approval to queued via the honest slot attestation and shows it waiting", () => {
+  it("routes the second approval to queued via approvePlan and shows it waiting", () => {
     const h = newHarness();
     const m1 = intakePrdMission(h, "First mission");
     const m2 = intakePrdMission(h, "Second mission");
@@ -199,7 +199,7 @@ describe("CAM-CORE-08 — a second mission on the same repo waits visibly in `qu
     expect(planAndApprove(h, m1)).toBe("approved"); // slot free → approved (A.1#3a)
     startExecution(h, m1);
 
-    // The slot is now held; the scheduler attests that honestly and the
+    // The slot is now held; approvePlan computes the fact itself and the
     // guard-split routes the second mission to `queued` (A.1#3b).
     expect(h.scheduler.executionSlotFreeFor(m2)).toBe(false);
     expect(planAndApprove(h, m2)).toBe("queued");
@@ -213,6 +213,42 @@ describe("CAM-CORE-08 — a second mission on the same repo waits visibly in `qu
     expect(queue.queued[0]?.queuedSinceSeq).toBeGreaterThan(0);
     expect(queue.queued[0]?.queuedSince).not.toBe("");
     expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+  });
+
+  it("sequential approvePlan calls cannot double-book the slot (r1 finding 2)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "A");
+    const m2 = intakePrdMission(h, "B");
+    apply(h, m1, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+    apply(h, m2, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+
+    // Both approvals go through the scheduler; the slot fact is computed in
+    // the same synchronous frame as the record, so the second call sees the
+    // first one's outcome — approved-then-queued, never approved-approved.
+    const first = h.scheduler.approvePlan(m1, "david", {
+      checklistApproved: true,
+      dagAcyclic: true,
+    });
+    const second = h.scheduler.approvePlan(m2, "david", {
+      checklistApproved: true,
+      dagAcyclic: true,
+    });
+    expect(first.ok && first.to).toBe("approved");
+    expect(second.ok && second.to).toBe("queued");
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+  });
+
+  it("approvePlan refuses facts that do not match the mission's route", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Integration mission");
+    apply(h, m1, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+    expect(() =>
+      h.scheduler.approvePlan(m1, "david", {
+        riskTierLow: true,
+        neutralConcurred: true,
+        singleIssue: true,
+      }),
+    ).toThrow(/IntegrationApprovalFacts/);
   });
 
   it("intake and planning proceed concurrently while the slot is held", () => {
@@ -283,6 +319,8 @@ describe("FIFO activation when the slot frees (A.1#5)", () => {
 
     // The slot is taken again (approved is execution-bearing): no double activation.
     expect(h.scheduler.activateNext(h.repoId)).toEqual([]);
+    // Every recorded activation went to the then-head (r1 finding 4).
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
   });
 
   it("a mission paused while queued keeps its FIFO place across resume", () => {
@@ -306,6 +344,35 @@ describe("FIFO activation when the slot frees (A.1#5)", () => {
     const outcomes = h.scheduler.activateNext(h.repoId);
     // First entry wins: m2 queued before m3 and did not lose its place.
     expect(outcomes).toEqual([{ lane: "primary", missionId: m2, to: "approved" }]);
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
+  });
+
+  it("a false fifoHead attestation is reported by the activation audit (r1 finding 4)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Holder");
+    const m2 = intakePrdMission(h, "True head");
+    const m3 = intakePrdMission(h, "Queue jumper");
+
+    planAndApprove(h, m1);
+    startExecution(h, m1);
+    expect(planAndApprove(h, m2)).toBe("queued");
+    expect(planAndApprove(h, m3)).toBe("queued");
+    completeMission(h, m1);
+
+    // A caller bypasses the scheduler and attests head-of-queue for the
+    // SECOND waiter. The machine checks the attested fact, so it applies —
+    // and the audit re-derives the truth from the log.
+    apply(h, m3, "execution-slot-freed", { fifoHead: true });
+    expect(h.recorder.currentState("mission", m3)).toBe("approved");
+    expect(h.recorder.verify()).toEqual([]); // replay is content with the attested row
+
+    const deviations = h.scheduler.auditActivations(h.repoId);
+    expect(deviations).toHaveLength(1);
+    expect(deviations[0]).toMatchObject({
+      missionId: m3,
+      lane: "primary",
+      expectedHeadId: m2,
+    });
   });
 });
 
@@ -357,10 +424,7 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     expect(h.recorder.currentState("mission", m1)).toBe("paused-urgent");
 
     // The urgent task executes per A.1b#4 while the primary holds its slot.
-    apply(h, qU, "quick-task-execution-started", {
-      targetIsMainCandidate: true,
-      noIntegrationBranchNoFold: true,
-    });
+    startQuickExecution(h, qU);
     const during = h.scheduler.laneOccupancy(h.repoId);
     expect(during.primary).toEqual({ missionId: m1, state: "paused-urgent" });
     expect(during.urgent).toEqual({ missionId: qU, state: "executing" });
@@ -386,10 +450,7 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     const qU = intakeQuickTask(h, "Urgent A", true);
     planAndApproveQuick(h, qU);
     apply(h, m1, "urgent-preemption", {}, "camino:scheduler");
-    apply(h, qU, "quick-task-execution-started", {
-      targetIsMainCandidate: true,
-      noIntegrationBranchNoFold: true,
-    });
+    startQuickExecution(h, qU);
 
     // A second urgent task finds the LANE held → queued (A.1b#3b).
     const qV = intakeQuickTask(h, "Urgent B", true);
@@ -406,6 +467,7 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     expect(outcomes).toEqual([{ lane: "urgent", missionId: qV, to: "approved" }]);
     // The primary mission is still preempted, untouched by lane activation.
     expect(h.recorder.currentState("mission", m1)).toBe("paused-urgent");
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
   });
 
   it("a non-urgent quick task competes for the PRIMARY slot, not the lane", () => {
@@ -421,6 +483,38 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
       missionId: q,
       lane: "primary",
     });
+  });
+
+  it("the urgent lane is unavailable while a quick task holds primary — no preemption rows exist for quick tasks (r1 finding 3)", () => {
+    const h = newHarness();
+    // A non-urgent quick task takes the primary slot and starts executing.
+    const q = intakeQuickTask(h, "Plain quick task", false);
+    expect(planAndApproveQuick(h, q)).toBe("approved");
+    startQuickExecution(h, q);
+
+    // The quick-task machine has no A.1#15 row: preemption is illegal.
+    const preemption = h.recorder.record({
+      entityKind: "mission",
+      entityId: q,
+      event: "urgent-preemption",
+      actor: "camino:scheduler",
+      cause: "scheduler.test: preemption attempt on a quick task",
+      payload: {},
+    });
+    expect(preemption.ok).toBe(false);
+
+    // So the urgent lane counts as unavailable: an urgent task queues
+    // instead of activating beside it…
+    const qU = intakeQuickTask(h, "Urgent behind quick", true);
+    expect(h.scheduler.executionSlotFreeFor(qU)).toBe(false);
+    expect(planAndApproveQuick(h, qU)).toBe("queued");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([]); // lane not available
+
+    // …and activates the moment the quick task terminates.
+    completeQuickTask(h, q, "quick-sha");
+    const outcomes = h.scheduler.activateNext(h.repoId);
+    expect(outcomes).toEqual([{ lane: "urgent", missionId: qU, to: "approved" }]);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
   });
 });
 
@@ -449,7 +543,39 @@ describe("enforcement boundary (stated, not hidden)", () => {
 
     const violations = h.scheduler.serializationViolations(h.repoId);
     expect(violations).toHaveLength(1);
-    expect(violations[0]?.lane).toBe("primary");
-    expect([...(violations[0]?.missionIds ?? [])].sort()).toEqual([m1, m2].sort());
+    expect(violations[0]?.kind).toBe("multi-holder");
+    if (violations[0]?.kind !== "multi-holder") return;
+    expect(violations[0].lane).toBe("primary");
+    expect([...violations[0].missionIds].sort()).toEqual([m1, m2].sort());
+  });
+
+  it("concurrent active execution across lanes is visible as a violation (r1 finding 3)", () => {
+    const h = newHarness();
+    // Force the breach with dishonest attestations: a quick task executing
+    // on primary AND an urgent task executing on the lane.
+    const q = intakeQuickTask(h, "Quick on primary", false);
+    expect(planAndApproveQuick(h, q)).toBe("approved");
+    startQuickExecution(h, q);
+
+    const qU = intakeQuickTask(h, "Urgent beside it", true);
+    apply(h, qU, "contract-attached", {
+      miniReviewAttached: true,
+      observabilityAdjudicated: true,
+    });
+    apply(
+      h,
+      qU,
+      "plan-approved",
+      { riskTierLow: true, neutralConcurred: true, singleIssue: true, executionSlotFree: true },
+      "david",
+    );
+    startQuickExecution(h, qU);
+
+    const violations = h.scheduler.serializationViolations(h.repoId);
+    expect(violations).toContainEqual({
+      kind: "concurrent-active-execution",
+      primaryMissionId: q,
+      urgentMissionId: qU,
+    });
   });
 });

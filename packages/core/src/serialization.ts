@@ -54,3 +54,57 @@ export function fifoOrder(
     return a < b ? -1 : a > b ? 1 : 0;
   });
 }
+
+/** An activation that did not go to the FIFO head of its lane at its point in the log. */
+export interface ActivationDeviation {
+  /** Seq of the `execution-slot-freed` record that activated out of order. */
+  readonly seq: number;
+  /** The mission that was activated. */
+  readonly missionId: string;
+  readonly lane: "primary" | "urgent";
+  /** The mission that was the lane's FIFO head at that point. */
+  readonly expectedHeadId: string;
+}
+
+/**
+ * Audit every recorded activation against FIFO order (review round 1,
+ * finding 4): the Appendix A guard records an ATTESTED `fifoHead` fact, so
+ * a false attestation produces an out-of-order activation that replay
+ * happily verifies. This audit re-derives, at each applied
+ * `execution-slot-freed` record, which mission actually was the lane's
+ * FIFO head among the then-queued missions, and reports every activation
+ * that disagrees. Pure over the log plus the lane assignment (which is
+ * domain data — the caller supplies mission id → lane for the repo's
+ * missions; ids absent from the map are outside the audit's scope).
+ */
+export function auditActivationOrder(
+  records: readonly EventRecord[],
+  laneOf: ReadonlyMap<string, "primary" | "urgent">,
+): ActivationDeviation[] {
+  const deviations: ActivationDeviation[] = [];
+  const firstEntry = new Map<string, number>();
+  const queuedNow = new Set<string>();
+  for (const record of records) {
+    if (record.outcome !== "applied" || record.entityKind !== "mission") continue;
+    if (!laneOf.has(record.entityId)) continue;
+    if (record.toState === "queued" && !firstEntry.has(record.entityId)) {
+      firstEntry.set(record.entityId, record.seq);
+    }
+    if (record.event === "execution-slot-freed" && record.fromState === "queued") {
+      const lane = laneOf.get(record.entityId) as "primary" | "urgent";
+      const contenders = [...queuedNow].filter((id) => laneOf.get(id) === lane);
+      const head = fifoOrder(contenders, firstEntry)[0];
+      if (head !== undefined && head !== record.entityId) {
+        deviations.push({
+          seq: record.seq,
+          missionId: record.entityId,
+          lane,
+          expectedHeadId: head,
+        });
+      }
+    }
+    if (record.toState === "queued") queuedNow.add(record.entityId);
+    else queuedNow.delete(record.entityId);
+  }
+  return deviations;
+}

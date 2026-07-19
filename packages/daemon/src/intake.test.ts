@@ -291,11 +291,80 @@ describe("MissionIntake — quick tasks", () => {
   });
 });
 
+describe("MissionIntake — ill-formed text is refused, never lossily stored (r1 finding 6)", () => {
+  it("rejects pasted PRD text carrying an unpaired surrogate", () => {
+    const h = newHarness();
+    const result = h.intake.createFromText({
+      repoId: h.repoId,
+      title: "t",
+      content: "A\uD800B",
+      actor: "david",
+    });
+    expect(result).toMatchObject({ ok: false, code: "not-utf8" });
+    if (result.ok) return;
+    expect(result.reason).toContain("unpaired surrogate");
+    expectNothingStored(h);
+  });
+
+  it("rejects quick-task descriptions and titles carrying unpaired surrogates", () => {
+    const h = newHarness();
+    const badDescription = h.intake.createQuickTask({
+      repoId: h.repoId,
+      title: "t",
+      description: "fix \uDC00 this",
+      urgent: false,
+      actor: "david",
+    });
+    expect(badDescription).toMatchObject({ ok: false, code: "not-utf8" });
+    const badTitle = h.intake.createFromText({
+      repoId: h.repoId,
+      title: "broken \uD800 title",
+      content: "fine content",
+      actor: "david",
+    });
+    expect(badTitle).toMatchObject({ ok: false, code: "invalid-request" });
+    expectNothingStored(h);
+  });
+});
+
+describe("MissionIntake — title bound counts code points (r1 finding 12)", () => {
+  it("accepts 300 astral code points (600 UTF-16 units)", () => {
+    const h = newHarness();
+    const title = "🚀".repeat(300); // 300 code points, 600 UTF-16 units
+    const result = h.intake.createFromText({
+      repoId: h.repoId,
+      title,
+      content: "content",
+      actor: "david",
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects above the bound with the count stated in code points", () => {
+    const h = newHarness();
+    const title = "🚀".repeat(501);
+    const result = h.intake.createFromText({
+      repoId: h.repoId,
+      title,
+      content: "content",
+      actor: "david",
+    });
+    expect(result).toMatchObject({ ok: false, code: "invalid-request" });
+    if (result.ok) return;
+    expect(result.reason).toContain("501 code points");
+  });
+});
+
 describe("MissionIntake — the domain/event seam", () => {
-  it("healthy intake leaves no orphans", () => {
+  it("healthy intake leaves no orphans and no divergences", () => {
     const h = newHarness();
     h.intake.createFromText({ repoId: h.repoId, title: "t", content: "c", actor: "david" });
     expect(h.intake.intakeOrphans()).toEqual([]);
+    expect(h.intake.seamDivergences()).toEqual({
+      orphanRows: [],
+      eventOnlyMissionIds: [],
+      routeConflicts: [],
+    });
   });
 
   it("a domain row without a creation event is visible via intakeOrphans()", () => {
@@ -312,5 +381,76 @@ describe("MissionIntake — the domain/event seam", () => {
       contentFormat: "markdown",
     });
     expect(h.intake.intakeOrphans().map((m) => m.id)).toEqual([stranded.id]);
+    expect(h.intake.seamDivergences().orphanRows.map((m) => m.id)).toEqual([stranded.id]);
+  });
+
+  it("a recorded mission without a domain row is visible via seamDivergences() (r1 finding 8)", () => {
+    const h = newHarness();
+    // A foreign write records mission state with no retained content.
+    h.recorder.record({
+      entityKind: "mission",
+      entityId: "event-only",
+      event: "mission-created",
+      actor: "camino:test",
+      cause: "intake.test: state without content",
+      payload: { source: "prd-intake" },
+    });
+    expect(h.intake.seamDivergences().eventOnlyMissionIds).toEqual(["event-only"]);
+    expect(h.intake.intakeOrphans()).toEqual([]); // one-directional surface, by design
+  });
+
+  it("a domain/recorded route disagreement is visible via seamDivergences() (r1 finding 8)", () => {
+    const h = newHarness();
+    // Construct the split brain directly: a quick-task domain row whose id
+    // was recorded with an INTEGRATION creation event.
+    const row = h.domain.createMission({
+      repoId: h.repoId,
+      route: "quick-task",
+      urgent: false,
+      title: "split brain",
+      sourceKind: "quick-task",
+      content: "description",
+      contentFormat: "text",
+    });
+    h.recorder.record({
+      entityKind: "mission",
+      entityId: row.id,
+      event: "mission-created",
+      actor: "camino:test",
+      cause: "intake.test: conflicting creation route",
+      payload: { source: "prd-intake" },
+    });
+    expect(h.intake.seamDivergences().routeConflicts).toEqual([
+      { missionId: row.id, domainRoute: "quick-task", recordedRoute: "integration" },
+    ]);
+  });
+
+  it("an id collision at the seam throws with the honest surface pointer (r1 finding 7)", () => {
+    // Deterministic ids force the collision the reviewer probed: the event
+    // log already holds a mission with the id intake will generate.
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder);
+    recorder.record({
+      entityKind: "mission",
+      entityId: "dup",
+      event: "mission-created",
+      actor: "prior",
+      cause: "intake.test: pre-existing recorded mission",
+      payload: { source: "prd-intake" },
+    });
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    expect(() =>
+      intake.createFromText({ repoId: repo.id, title: "t", content: "c", actor: "david" }),
+    ).toThrow(/already-exists.*NOT an intakeOrphans\(\) entry/s);
+    // And indeed: not an orphan (the id IS recorded), routes agree, so the
+    // thrown error is the primary signal — exactly what it says.
+    expect(intake.intakeOrphans()).toEqual([]);
   });
 });

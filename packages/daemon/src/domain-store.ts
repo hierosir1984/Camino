@@ -9,8 +9,20 @@
  * Mission rows are immutable at the schema level (CAM-CORE-02: original
  * content retained immutably): BEFORE UPDATE / BEFORE DELETE triggers abort
  * mutation on every connection, ours or raw — the same posture as the event
- * log. Projects and repos are permanent too in v1 (no update/delete API;
- * missions reference them by foreign key with RESTRICT semantics).
+ * log — and BEFORE INSERT conflict guards close the REPLACE class (review
+ * round 1, finding 1: `INSERT OR REPLACE` resolves a key conflict by
+ * deleting the old row WITHOUT firing DELETE triggers unless the writer
+ * opted into recursive triggers; the insert guard aborts before resolution
+ * can delete anything). Projects and repos are permanent too in v1 (no
+ * update/delete API; the same insert guards cover their UNIQUE conflicts,
+ * which REPLACE could otherwise resolve by deletion).
+ *
+ * Cross-field coherence is enforced at the durable boundary itself, not
+ * just in intake (round 1, finding 10): route ↔ source kind, source kind ↔
+ * content format (file format must agree with the filename extension),
+ * non-empty well-formed content. The stored content hash is re-derived from
+ * the content by this API; a raw writer inserting a forged hash is the same
+ * privileged class as DDL — stated, not defended.
  *
  * Same honesty scope as the event store: SQLite cannot stop a privileged
  * writer issuing DDL; the triggers guard against mutation bugs, and opening
@@ -55,7 +67,7 @@ CREATE TABLE IF NOT EXISTS missions (
   urgent         INTEGER NOT NULL CHECK (urgent IN (0, 1)),
   title          TEXT NOT NULL CHECK (length(title) > 0),
   source_kind    TEXT NOT NULL CHECK (source_kind IN ('pasted', 'file', 'quick-task')),
-  content        TEXT NOT NULL,
+  content        TEXT NOT NULL CHECK (length(content) > 0),
   content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
   content_format TEXT NOT NULL CHECK (content_format IN ('markdown', 'text')),
   filename       TEXT,
@@ -63,7 +75,19 @@ CREATE TABLE IF NOT EXISTS missions (
   -- The urgent lane belongs to quick tasks only (CAM-CORE-08).
   CHECK (urgent = 0 OR route = 'quick-task'),
   -- A filename is present exactly for file intake.
-  CHECK ((source_kind = 'file') = (filename IS NOT NULL))
+  CHECK ((source_kind = 'file') = (filename IS NOT NULL)),
+  -- Route ↔ source coherence: quick tasks come only from quick-task intake,
+  -- integration missions only from pasted text or files (r1 finding 10).
+  CHECK ((route = 'quick-task') = (source_kind = 'quick-task')),
+  -- Source ↔ format coherence: quick tasks are text, pasted PRD text is
+  -- markdown, and a file's format must agree with its extension.
+  CHECK (source_kind != 'quick-task' OR content_format = 'text'),
+  CHECK (source_kind != 'pasted' OR content_format = 'markdown'),
+  CHECK (
+    source_kind != 'file'
+    OR (lower(substr(filename, -3)) = '.md' AND content_format = 'markdown')
+    OR (lower(substr(filename, -4)) = '.txt' AND content_format = 'text')
+  )
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_repo ON missions (repo_id, created_at);
@@ -79,6 +103,33 @@ BEFORE DELETE ON missions
 BEGIN
   SELECT RAISE(ABORT, 'mission records are immutable (CAM-CORE-02): DELETE rejected');
 END;
+
+-- REPLACE-class guard (r1 finding 1): INSERT OR REPLACE resolves a key
+-- conflict by DELETING the conflicting row without firing DELETE triggers
+-- (unless the writer enabled recursive triggers). Aborting the INSERT while
+-- a conflicting row exists closes that path on every connection.
+CREATE TRIGGER IF NOT EXISTS missions_immutable_insert_conflict
+BEFORE INSERT ON missions
+WHEN EXISTS (SELECT 1 FROM missions WHERE id = NEW.id)
+BEGIN
+  SELECT RAISE(ABORT, 'mission records are immutable (CAM-CORE-02): conflicting INSERT rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS projects_permanent_insert_conflict
+BEFORE INSERT ON projects
+WHEN EXISTS (SELECT 1 FROM projects WHERE id = NEW.id OR name = NEW.name)
+BEGIN
+  SELECT RAISE(ABORT, 'project rows are permanent: conflicting INSERT rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS repos_permanent_insert_conflict
+BEFORE INSERT ON repos
+WHEN EXISTS (
+  SELECT 1 FROM repos WHERE id = NEW.id OR (project_id = NEW.project_id AND name = NEW.name)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'repo rows are permanent: conflicting INSERT rejected');
+END;
 `;
 
 const REQUIRED_OBJECTS = [
@@ -87,6 +138,9 @@ const REQUIRED_OBJECTS = [
   "missions",
   "missions_immutable_update",
   "missions_immutable_delete",
+  "missions_immutable_insert_conflict",
+  "projects_permanent_insert_conflict",
+  "repos_permanent_insert_conflict",
 ] as const;
 
 interface ProjectRow {
@@ -168,11 +222,7 @@ export class SqliteDomainStore {
       // carry the tables and the mission-immutability triggers. Recreating a
       // missing object here would silently accept a rewritten store — refuse.
       const objects = this.db
-        .prepare(
-          `SELECT name FROM sqlite_master
-           WHERE (type = 'table' AND name IN ('projects', 'repos', 'missions'))
-              OR (type = 'trigger' AND name IN ('missions_immutable_update', 'missions_immutable_delete'))`,
-        )
+        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
         .all() as Array<{ name: string }>;
       const names = new Set(objects.map((o) => o.name));
       for (const required of REQUIRED_OBJECTS) {
@@ -237,11 +287,49 @@ export class SqliteDomainStore {
     if (typeof title !== "string" || title.length === 0) {
       throw new TypeError("mission title must be a non-empty string");
     }
-    if (typeof content !== "string") {
-      throw new TypeError("mission content must be a string");
+    if (typeof content !== "string" || content.length === 0) {
+      throw new TypeError("mission content must be a non-empty string");
+    }
+    // Ill-formed UTF-16 (unpaired surrogates) cannot round-trip through the
+    // store: SQLite would persist replacement characters, silently breaking
+    // both exact retention and hash agreement (r1 finding 6). Refuse instead.
+    for (const [field, value] of [
+      ["content", content],
+      ["title", title],
+      ...(filename === undefined ? [] : ([["filename", filename]] as const)),
+    ] as const) {
+      if (!value.isWellFormed()) {
+        throw new TypeError(
+          `mission ${field} contains unpaired surrogate code units and cannot be retained exactly`,
+        );
+      }
     }
     if ((sourceKind === "file") !== (typeof filename === "string" && filename.length > 0)) {
       throw new TypeError("filename must be present exactly for file intake");
+    }
+    // Cross-field coherence at the durable boundary (r1 finding 10) —
+    // mirrored by schema CHECKs; validated here for clear errors.
+    if ((route === "quick-task") !== (sourceKind === "quick-task")) {
+      throw new TypeError("route and source kind must agree (quick-task ⇔ quick-task intake)");
+    }
+    if (sourceKind === "quick-task" && contentFormat !== "text") {
+      throw new TypeError("quick-task content is text");
+    }
+    if (sourceKind === "pasted" && contentFormat !== "markdown") {
+      throw new TypeError("pasted PRD text is markdown");
+    }
+    if (sourceKind === "file" && filename !== undefined) {
+      const lower = filename.toLowerCase();
+      const expected = lower.endsWith(".md")
+        ? "markdown"
+        : lower.endsWith(".txt")
+          ? "text"
+          : undefined;
+      if (expected === undefined || expected !== contentFormat) {
+        throw new TypeError(
+          `file content format must agree with the filename extension (${filename} vs ${contentFormat})`,
+        );
+      }
     }
     const record: MissionRecord = {
       id: this.newId(),
@@ -288,9 +376,9 @@ export class SqliteDomainStore {
   }
 
   listProjects(): Project[] {
-    const rows = this.db
-      .prepare("SELECT * FROM projects ORDER BY created_at, id")
-      .all() as ProjectRow[];
+    // rowid is SQLite's monotone insertion counter: exact insertion order,
+    // deterministic under equal timestamps (r1 finding 11).
+    const rows = this.db.prepare("SELECT * FROM projects ORDER BY rowid").all() as ProjectRow[];
     return rows.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at }));
   }
 
@@ -301,7 +389,7 @@ export class SqliteDomainStore {
 
   listRepos(projectId: string): Repo[] {
     const rows = this.db
-      .prepare("SELECT * FROM repos WHERE project_id = ? ORDER BY created_at, id")
+      .prepare("SELECT * FROM repos WHERE project_id = ? ORDER BY rowid")
       .all(projectId) as RepoRow[];
     return rows.map(toRepo);
   }
@@ -312,10 +400,10 @@ export class SqliteDomainStore {
     return row === undefined ? undefined : toMission(row);
   }
 
-  /** All missions of a repo, intake order — the scheduler's join surface. */
+  /** All missions of a repo in exact insertion order (rowid) — the scheduler's join surface. */
   listMissions(repoId: string): MissionRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM missions WHERE repo_id = ? ORDER BY created_at, id")
+      .prepare("SELECT * FROM missions WHERE repo_id = ? ORDER BY rowid")
       .all(repoId) as MissionRow[];
     return rows.map(toMission);
   }

@@ -26,15 +26,18 @@ export {
   MissionIntake,
   INTAKE_ACCEPTED_EXTENSIONS,
   INTAKE_MAX_CONTENT_BYTES,
-  INTAKE_MAX_TITLE_CHARS,
+  INTAKE_MAX_TITLE_CODE_POINTS,
 } from "./intake.js";
-export { renderMissionContent } from "./render.js";
+export type { RouteConflict, SeamDivergences } from "./intake.js";
+export { renderMissionContent, RENDER_MAX_INPUT_BYTES } from "./render.js";
 export { SerializationScheduler, SCHEDULER_ACTOR } from "./serialization-scheduler.js";
 export type {
   ActivationOutcome,
+  IntegrationApprovalFacts,
   LaneHolder,
   LaneOccupancy,
   QueuedEntry,
+  QuickTaskApprovalFacts,
   RepoQueueView,
   SchedulingLane,
   SerializationViolation,

@@ -123,8 +123,10 @@ describe("SqliteDomainStore — schema and hierarchy", () => {
     const store = newStore();
     const project = store.createProject("camino");
     store.createRepo(project.id, "repo");
-    expect(() => store.createProject("camino")).toThrow(/UNIQUE/i);
-    expect(() => store.createRepo(project.id, "repo")).toThrow(/UNIQUE/i);
+    // The insert-conflict guards fire before the UNIQUE constraint would,
+    // with a clearer message — duplicates are rejected either way.
+    expect(() => store.createProject("camino")).toThrow(/permanent|UNIQUE/i);
+    expect(() => store.createRepo(project.id, "repo")).toThrow(/permanent|UNIQUE/i);
     // The same repo name under a DIFFERENT project is fine (per-project scope).
     const other = store.createProject("other");
     expect(() => store.createRepo(other.id, "repo")).not.toThrow();
@@ -148,6 +150,45 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
 
     // The original content survives, byte for byte.
     expect(store.getMission(missionId)?.content).toBe("# PRD\n\nRetained verbatim.");
+  });
+
+  it("rejects INSERT OR REPLACE on all three tables on a raw connection (r1 finding 1)", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    const { projectId, repoId, missionId } = seedMission(store);
+
+    // REPLACE resolves a key conflict by DELETING the old row without firing
+    // DELETE triggers (unless recursive triggers are on) — the BEFORE INSERT
+    // conflict guards must abort it on every connection.
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT OR REPLACE INTO missions
+             (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+           VALUES (?, ?, 'integration', 0, 'REPLACED', 'pasted', 'REPLACED CONTENT', ?, 'markdown', NULL, 'now')`,
+        )
+        .run(missionId, repoId, "0".repeat(64)),
+    ).toThrow(/immutable/);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT OR REPLACE INTO projects (id, name, created_at) VALUES (?, 'camino', 'now')",
+        )
+        .run(projectId),
+    ).toThrow(/permanent/);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT OR REPLACE INTO repos (id, project_id, name, origin_url, created_at) VALUES (?, ?, 'camino', NULL, 'now')",
+        )
+        .run(repoId, projectId),
+    ).toThrow(/permanent/);
+
+    // The original rows survive untouched.
+    expect(store.getMission(missionId)?.content).toBe("# PRD\n\nRetained verbatim.");
+    expect(store.getProject(projectId)?.name).toBe("camino");
   });
 
   it("schema CHECKs pin the lane rule: urgent is quick-task-only", () => {
@@ -209,6 +250,158 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
     });
     expect(mission.contentSha256).toBe(contentSha256("exact content"));
   });
+
+  it("refuses ill-formed strings that cannot round-trip through SQLite (r1 finding 6)", () => {
+    const store = newStore();
+    const { repoId } = seedMission(store);
+    const base = {
+      repoId,
+      route: "integration",
+      urgent: false,
+      sourceKind: "pasted",
+      contentFormat: "markdown",
+    } as const;
+    expect(() => store.createMission({ ...base, title: "t", content: "A\uD800B" })).toThrow(
+      /unpaired surrogate/,
+    );
+    expect(() =>
+      store.createMission({ ...base, title: "bad \uDC00 title", content: "fine" }),
+    ).toThrow(/unpaired surrogate/);
+  });
+
+  it("enforces cross-field coherence at the durable boundary (r1 finding 10)", () => {
+    const store = newStore();
+    const { repoId } = seedMission(store);
+    // Empty content.
+    expect(() =>
+      store.createMission({
+        repoId,
+        route: "quick-task",
+        urgent: true,
+        title: "t",
+        sourceKind: "quick-task",
+        content: "",
+        contentFormat: "text",
+      }),
+    ).toThrow(/non-empty/);
+    // Route ↔ source disagreement (the reviewer's exact shape).
+    expect(() =>
+      store.createMission({
+        repoId,
+        route: "quick-task",
+        urgent: true,
+        title: "t",
+        sourceKind: "pasted",
+        content: "c",
+        contentFormat: "markdown",
+      }),
+    ).toThrow(/route and source kind/);
+    // File format disagreeing with the extension (the reviewer's exact shape).
+    expect(() =>
+      store.createMission({
+        repoId,
+        route: "integration",
+        urgent: false,
+        title: "t",
+        sourceKind: "file",
+        content: "c",
+        contentFormat: "text",
+        filename: "spec.md",
+      }),
+    ).toThrow(/agree with the filename extension/);
+    // Quick-task content must be text; pasted must be markdown.
+    expect(() =>
+      store.createMission({
+        repoId,
+        route: "quick-task",
+        urgent: false,
+        title: "t",
+        sourceKind: "quick-task",
+        content: "c",
+        contentFormat: "markdown",
+      }),
+    ).toThrow(/text/);
+    expect(() =>
+      store.createMission({
+        repoId,
+        route: "integration",
+        urgent: false,
+        title: "t",
+        sourceKind: "pasted",
+        content: "c",
+        contentFormat: "text",
+      }),
+    ).toThrow(/markdown/);
+  });
+
+  it("schema CHECKs enforce the same coherence against raw inserts", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    const { repoId } = seedMission(store);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    const insert = raw.prepare(
+      `INSERT INTO missions
+         (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+       VALUES (?, ?, ?, ?, 't', ?, ?, ?, ?, ?, 'now')`,
+    );
+    const hash = "0".repeat(64);
+    // route/source disagreement, wrong quick-task format, wrong file
+    // extension pairing, empty content — all rejected by CHECKs.
+    expect(() =>
+      insert.run("x1", repoId, "quick-task", 1, "pasted", "c", hash, "markdown", null),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      insert.run("x2", repoId, "quick-task", 0, "quick-task", "c", hash, "markdown", null),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      insert.run("x3", repoId, "integration", 0, "file", "c", hash, "text", "spec.md"),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      insert.run("x4", repoId, "integration", 0, "pasted", "", hash, "markdown", null),
+    ).toThrow(/CHECK/i);
+  });
+
+  it("lists in exact insertion order under equal timestamps and adverse ids (r1 finding 11)", () => {
+    // Frozen clock + descending ids: created_at cannot break ties and id
+    // order is the REVERSE of insertion — only rowid gives intake order.
+    const ids = ["z-project", "y-repo", "x-first", "w-second", "v-third"];
+    const store = new SqliteDomainStore(":memory:", {
+      now: () => new Date("2026-07-19T00:00:00.000Z"),
+      newId: () => ids.shift() ?? "exhausted",
+    });
+    cleanups.push(() => store.close());
+    const project = store.createProject("camino");
+    const repo = store.createRepo(project.id, "camino");
+    const first = store.createMission({
+      repoId: repo.id,
+      route: "integration",
+      urgent: false,
+      title: "first",
+      sourceKind: "pasted",
+      content: "1",
+      contentFormat: "markdown",
+    });
+    const second = store.createMission({
+      repoId: repo.id,
+      route: "integration",
+      urgent: false,
+      title: "second",
+      sourceKind: "pasted",
+      content: "2",
+      contentFormat: "markdown",
+    });
+    const third = store.createMission({
+      repoId: repo.id,
+      route: "integration",
+      urgent: false,
+      title: "third",
+      sourceKind: "pasted",
+      content: "3",
+      contentFormat: "markdown",
+    });
+    expect(store.listMissions(repo.id).map((m) => m.id)).toEqual([first.id, second.id, third.id]);
+  });
 });
 
 describe("SqliteDomainStore — tamper-evident open", () => {
@@ -223,6 +416,19 @@ describe("SqliteDomainStore — tamper-evident open", () => {
     raw.close();
 
     expect(() => new SqliteDomainStore(path)).toThrow(/missing missions_immutable_update/);
+  });
+
+  it("refuses a database missing the REPLACE-class insert guard", () => {
+    const path = tempDbPath();
+    const store = new SqliteDomainStore(path);
+    seedMission(store);
+    store.close();
+
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER missions_immutable_insert_conflict");
+    raw.close();
+
+    expect(() => new SqliteDomainStore(path)).toThrow(/missing missions_immutable_insert_conflict/);
   });
 
   it("refuses a database with an unknown schema version", () => {
