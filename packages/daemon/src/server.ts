@@ -105,13 +105,20 @@ function timingSafeStringEqual(presented: string, expected: string): boolean {
  * refused, round 3, finding 8) or a directory, and nothing is a symlink,
  * device, FIFO, or socket.
  *
- * Scope (documented residual): this validates the tree AT STARTUP. A symlink or
- * hardlink planted into the build directory AFTER startup is out of the threat
- * model — write access to the daemon's own GUI build directory already lets an
- * attacker replace served content directly, so link following adds no
- * capability. The build directory is not a user-writable location on the
- * single-user, local machine this daemon targets (build plan §1.2 posture). A
- * symlinked ROOT is handled separately by pinning the resolved path (finding 3).
+ * Scope (documented residual): the daemon serves a directory whose path is
+ * under the user's own control. Its integrity depends on the OS enforcing the
+ * permissions of every component of that path — the build directory and each of
+ * its ancestors. An attacker who can rename or rebind those directories (round
+ * 4, findings 2/3) either IS the owner (attacking themselves, meaningless) or
+ * has already compromised the user's account, at which point the served content
+ * — and the token, and everything else — is forfeit. This is the same boundary
+ * as the token's state directory: it rests on the user's own filesystem
+ * integrity, which is the OS's job, not the daemon's. What the daemon adds is
+ * defense against the ACCIDENTAL and the DETECTABLE: a non-plain tree is refused
+ * at startup, the resolved root is pinned, and each request re-confirms the root
+ * still names the startup inode (rootInodeUnchanged) so a persistent post-start
+ * swap is caught rather than served. A sub-request-window TOCTOU remains and is
+ * within the boundary above.
  */
 function isPlainContainedTree(root: string): boolean {
   let realRoot: string;
@@ -147,6 +154,39 @@ function isPlainContainedTree(root: string): boolean {
     }
   }
   return true;
+}
+
+/** A GUI root resolved once at startup, with the inode identity it then had. */
+interface ResolvedGuiRoot {
+  realRoot: string;
+  inode: string; // `${dev}:${ino}` of realRoot at startup
+}
+
+/** Resolve the GUI root's real path and record its inode identity (once). */
+function resolveGuiRoot(guiRoot: string): ResolvedGuiRoot | undefined {
+  try {
+    const realRoot = realpathSync(guiRoot);
+    const stat = lstatSync(realRoot);
+    return { realRoot, inode: `${stat.dev}:${stat.ino}` };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True iff the resolved root path still names the SAME inode it did at startup.
+ * A parent-directory rename can swap a different directory into the resolved
+ * pathname without touching the build directory itself (round 4, finding 3);
+ * detecting the changed inode lets the request be refused instead of serving
+ * the swapped tree.
+ */
+function rootInodeUnchanged(gui: ResolvedGuiRoot): boolean {
+  try {
+    const stat = lstatSync(gui.realRoot);
+    return `${stat.dev}:${stat.ino}` === gui.inode;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -229,9 +269,13 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   const csrfToken = generateToken();
   const guiRoot = options.guiRoot;
   const guiExists = guiRoot !== undefined && existsSync(guiRoot);
-  // Serve only a plain, contained tree (finding 1). A present-but-non-plain
-  // directory is "invalid" — served as 503, never disclosed.
-  const guiValid = guiExists && isPlainContainedTree(guiRoot!);
+  // Resolve the GUI root to its real path EXACTLY ONCE (round 4, finding 2:
+  // separate realpath calls for validate vs. serve could resolve different
+  // trees if a symlink was rebound between them). Everything downstream —
+  // validation, the served root, and the runtime identity pin — uses this one
+  // resolved path and its inode.
+  const gui = guiExists ? resolveGuiRoot(guiRoot!) : undefined;
+  const guiValid = gui !== undefined && isPlainContainedTree(gui.realRoot);
   const guiMissingReason = guiExists ? "gui-build-invalid" : "gui-build-missing";
 
   /** The `host:port` authorities the daemon answers as, from the bound port. */
@@ -338,20 +382,22 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   });
 
   if (guiValid) {
-    // The tree is verified plain and contained at startup (isPlainContainedTree),
-    // so no symlink can be used as a file or directory index. `dotfiles: 'deny'`
-    // keeps hidden files inside the tree unreadable (round 2, finding 3); the
-    // allowedPath realpath check stays as defense-in-depth against lexical `..`.
-    // Serve from the RESOLVED real path, not the caller's (possibly symlinked)
-    // guiRoot — otherwise rebinding a symlinked root after startup would swap
-    // the served directory (round 3, finding 3). The resolved path is pinned
-    // for the process lifetime.
-    const realGuiRoot = realpathSync(guiRoot!);
+    // Serve from the single resolved real path (round 4, finding 2). Two
+    // startup defenses plus one runtime defense:
+    //  - the tree was verified plain and contained (isPlainContainedTree), so
+    //    no symlink can be a file or directory index;
+    //  - `dotfiles: 'deny'` keeps hidden files unreadable (round 2, finding 3);
+    //  - the allowedPath hook re-confirms, per request, that the resolved root
+    //    still names the SAME inode observed at startup (round 4, finding 3: a
+    //    directory swapped in by renaming the parent would otherwise be served)
+    //    and that the target stays within it (defense against lexical `..`).
+    const served = gui!;
     void app.register(fastifyStatic, {
-      root: realGuiRoot,
+      root: served.realRoot,
       prefix: "/",
       dotfiles: "deny",
-      allowedPath: (pathName) => staticPathContained(realGuiRoot, pathName),
+      allowedPath: (pathName) =>
+        rootInodeUnchanged(served) && staticPathContained(served.realRoot, pathName),
     });
   }
 
@@ -359,7 +405,7 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     const path = classifyPath(request.url);
     const api = "malformed" in path ? true : path.api;
     if (!api && SAFE_METHODS.has(request.method)) {
-      if (guiValid) {
+      if (guiValid && rootInodeUnchanged(gui!)) {
         // Single-page fallback: unknown GUI routes render the app shell.
         return reply.sendFile("index.html");
       }

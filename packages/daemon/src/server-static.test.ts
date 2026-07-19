@@ -10,6 +10,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -276,6 +277,34 @@ describe("round 2 regressions — GUI build containment", () => {
       await daemon.app.close();
     }
   });
+
+  it("finding 2/3: swapping the served directory's inode via a parent rename is detected, not served", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "camino-parent-swap-"));
+    const gui = join(scratch, "gui");
+    mkdirSync(gui);
+    writeFileSync(join(gui, "index.html"), "<title>STABLE_ORIGINAL</title>");
+    const secret = `parent-swap-secret-${generateToken()}`;
+    const replacement = join(scratch, "replacement");
+    mkdirSync(replacement);
+    writeFileSync(join(replacement, "index.html"), `<title>${secret}</title>`);
+    writeFileSync(join(replacement, "loot.txt"), secret);
+
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      expect(await (await fetch(`${daemon.url}/`)).text()).toContain("STABLE_ORIGINAL");
+      // Swap a different inode into the SAME resolved pathname by renaming the
+      // parent's entries — no write inside the validated build directory itself.
+      renameSync(gui, join(scratch, "gui-old"));
+      renameSync(replacement, gui);
+      for (const path of ["/", "/loot.txt"]) {
+        const response = await fetch(`${daemon.url}${path}`);
+        expect(response.status, path).toBe(503);
+        expect(await response.text(), path).not.toContain(secret);
+      }
+    } finally {
+      await daemon.app.close();
+    }
+  });
 });
 
 describe("real GUI build end-to-end", () => {
@@ -304,26 +333,37 @@ describe("real GUI build end-to-end", () => {
     }
   });
 
-  it("finding 6: the build refuses a dangerous OUT_DIR instead of wiping it", () => {
+  it("finding 6/1: the build refuses a dangerous OUT_DIR instead of wiping it", () => {
     const buildScript = fileURLToPath(new URL("../../gui/build.mjs", import.meta.url));
-    // A directory with a sentinel that must survive a refused build.
+    // A directory with a sentinel that must survive every refused build.
     const guard = mkdtempSync(join(tmpdir(), "camino-outdir-guard-"));
     const sentinel = join(guard, "sentinel.txt");
     writeFileSync(sentinel, "keep me");
+    // A symlink alias that resolves to the home directory (round 4, finding 1).
+    const homeAlias = join(guard, "home-alias");
+    symlinkSync(homedir(), homeAlias);
 
-    for (const dangerous of ["/", homedir()]) {
-      let threw = false;
+    const runBuild = (outDir: string, cwd?: string): boolean => {
       try {
         execFileSync(process.execPath, [buildScript], {
-          env: { ...process.env, OUT_DIR: dangerous },
+          env: { ...process.env, OUT_DIR: outDir },
+          cwd,
           stdio: "pipe",
         });
+        return false;
       } catch {
-        threw = true;
+        return true;
       }
-      expect(threw, `OUT_DIR=${dangerous} should be refused`).toBe(true);
-    }
-    // The refusal never ran rmSync; unrelated files are untouched.
+    };
+
+    // Absolute dangerous targets, a symlink alias to home, and a relative "."
+    // (which resolves to the cwd) must all be refused before any rmSync.
+    expect(runBuild("/"), "OUT_DIR=/").toBe(true);
+    expect(runBuild(homedir()), "OUT_DIR=$HOME").toBe(true);
+    expect(runBuild(homeAlias), "OUT_DIR=symlink→$HOME").toBe(true);
+    expect(runBuild(".", guard), "OUT_DIR=. from a scratch cwd").toBe(true);
+
+    // None of the refusals ran rmSync; the cwd and its sentinel are untouched.
     expect(existsSync(sentinel)).toBe(true);
   });
 });

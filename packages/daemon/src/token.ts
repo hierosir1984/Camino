@@ -158,7 +158,7 @@ function verifyStateDir(home: string): void {
     stat = lstatSync(home);
   } catch (error) {
     throw new TokenError(
-      `Refusing to start: cannot stat state directory ${home}: ${String(error)}`,
+      `Refusing to start: cannot stat state directory ${home}: ${redactErrno(error)}`,
     );
   }
   if (!stat.isDirectory()) {
@@ -174,11 +174,16 @@ function verifyStateDir(home: string): void {
         `user (uid ${uid}). Fix ownership (chown) or move it aside.`,
     );
   }
+  // The confidentiality requirement is that NO other user can reach the token
+  // — i.e. no group/other permission bits — not an exact 0700 (round 4, finding
+  // 4: an owner-only 0500 is equally confidential for an existing token). We
+  // create the directory 0700; we accept any owner-only mode on an existing one.
   const mode = stat.mode & 0o777;
-  if (mode !== 0o700) {
+  if ((mode & 0o077) !== 0) {
     throw new TokenError(
-      `Refusing to start: state directory ${home} has permissions 0${mode.toString(8)} — must be ` +
-        `0700 so no other user can reach the token. Fix with: chmod 700 ${JSON.stringify(home)}.`,
+      `Refusing to start: state directory ${home} has permissions 0${mode.toString(8)} — group and ` +
+        `other access must be 0 so no other user can reach the token. Fix with: ` +
+        `chmod 700 ${JSON.stringify(home)}.`,
     );
   }
   if (hasExtendedAcl(home)) {
@@ -255,8 +260,14 @@ export function loadOrCreateToken(env: NodeJS.ProcessEnv = process.env): LoadedT
   const home = caminoHome(env);
   const path = tokenFilePath(env);
   if (!existsSync(home)) {
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    chmodSync(home, 0o700); // mkdir's mode is umask-masked; force owner-only
+    try {
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      chmodSync(home, 0o700); // mkdir's mode is umask-masked; force owner-only
+    } catch (error) {
+      throw new TokenError(
+        `Refusing to start: cannot create state directory ${home}: ${redactErrno(error)}.`,
+      );
+    }
     stripInheritedAcl(home); // a directory ACL must not widen what we create
   }
   // The state directory is the confidentiality gate (round 3, findings 1/2):
@@ -296,7 +307,9 @@ function openExistingToken(path: string): number | undefined {
           `Replace it with a regular file (chmod 600) or delete it.`,
       );
     }
-    throw new TokenError(`Refusing to start: cannot open token file ${path}: ${String(error)}`);
+    throw new TokenError(
+      `Refusing to start: cannot open token file ${path}: ${redactErrno(error)}`,
+    );
   }
 }
 
@@ -308,8 +321,11 @@ function openExistingToken(path: string): number | undefined {
  * Ordering matters (round 3, findings 2 and 4): the temp file's ACL is stripped
  * and verified ACL-free BEFORE any secret bytes are written, so the token is
  * never on disk while an inherited ACL is active. Any failure before publish
- * unlinks the temp file and raises a clean TokenError — a partially-written
- * secret is never left behind, and no raw OS error string is surfaced.
+ * best-effort unlinks the temp file and raises a clean TokenError with only an
+ * errno code (no raw OS message). If that cleanup unlink itself fails (the state
+ * directory was made unwritable mid-flight), the leftover is a 0600 file inside
+ * the 0700 owner-only directory — never read as a token, never cross-user
+ * (round 4, finding 6).
  */
 function createTokenAtomically(path: string): LoadedToken {
   const token = generateToken();
@@ -323,7 +339,7 @@ function createTokenAtomically(path: string): LoadedToken {
     );
   } catch (error) {
     throw new TokenError(
-      `Refusing to start: cannot create temporary token file ${tmpPath}: ${String(error)}`,
+      `Refusing to start: cannot create temporary token file ${tmpPath}: ${redactErrno(error)}`,
     );
   }
 
@@ -388,6 +404,10 @@ function safeUnlink(path: string): void {
   try {
     unlinkSync(path);
   } catch {
-    // A leftover temp file is harmless (0600, never read); nothing to do.
+    // Cleanup is best-effort (round 4, finding 6): if the state directory was
+    // made unwritable mid-flight the unlink can fail, leaving a 0600 temp file.
+    // That leftover is 0600 inside the 0700 owner-only state directory, so it is
+    // never a cross-user exposure — the token file naming (`auth-token`) means
+    // it is never read as a token, and the directory gate keeps it owner-only.
   }
 }

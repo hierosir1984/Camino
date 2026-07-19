@@ -226,7 +226,21 @@ describe("finding 1/2: state directory is the confidentiality gate", () => {
     const { env, home } = scratchHome();
     mkdirSync(home, { recursive: true, mode: 0o700 });
     chmodSync(home, 0o755);
-    expect(() => loadOrCreateToken(env)).toThrow(/0700/);
+    expect(() => loadOrCreateToken(env)).toThrow(/group and other access must be 0/);
+  });
+
+  it("accepts an owner-only 0500 state directory holding an existing token", () => {
+    // 0500 is as confidential as 0700 for an existing token (round 4, finding 4).
+    const { env, home, tokenPath } = scratchHome();
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const token = generateToken();
+    writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
+    chmodSync(home, 0o500);
+    try {
+      expect(loadOrCreateToken(env).token).toBe(token);
+    } finally {
+      chmodSync(home, 0o700); // restore so the temp dir can be cleaned
+    }
   });
 
   it("refuses when the state directory path is a regular file, not a directory", () => {
@@ -240,6 +254,24 @@ describe("finding 1/2: state directory is the confidentiality gate", () => {
     const { env, home } = scratchHome();
     mkdirSync(home, { recursive: true, mode: 0o700 });
     expect(loadOrCreateToken(env).created).toBe(true);
+  });
+
+  it("finding 5: surfaces a clean TokenError with only an errno code, not a raw OS message", () => {
+    // A CAMINO_HOME whose parent is a regular file → ENOTDIR on mkdir.
+    const scratch = mkdtempSync(join(tmpdir(), "camino-errno-"));
+    const aFile = join(scratch, "afile");
+    writeFileSync(aFile, "x");
+    const badHome = join(aFile, "child");
+    try {
+      loadOrCreateToken({ CAMINO_HOME: badHome });
+      expect.unreachable("should have refused");
+    } catch (error) {
+      expect(error).toBeInstanceOf(TokenError);
+      const message = (error as Error).message;
+      // The raw node message ("ENOTDIR: not a directory, mkdir '/…/child'") must
+      // not leak; only the errno code is surfaced.
+      expect(message).not.toMatch(/not a directory, mkdir|no such file or directory/);
+    }
   });
 });
 
