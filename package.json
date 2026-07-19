@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "test": "eslint . && prettier --check . && tsc -b && vitest run",
-    "daemon": "npm run build -w @camino/gui && node --import tsx packages/daemon/src/main.ts",
+    "daemon": "node packages/gui/build.mjs && node --import tsx packages/daemon/src/main.ts",
     "spike:test": "vitest run spikes",
     "spike:dispatch": "node --import tsx spikes/dispatch/run.ts",
     "spike:plan-probe": "node --import tsx spikes/plan-probe/run.ts",

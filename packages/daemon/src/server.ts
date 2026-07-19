@@ -43,10 +43,14 @@
  * SHA-256 digests. Every APPLICATION response carries restrictive security
  * headers (CSP self-only, nosniff, deny framing, no-store) via an onSend hook —
  * the GUI is served exclusively by this daemon, so the tight policy is free.
- * A request rejected by the HTTP parser BEFORE Fastify's hook chain (a
- * malformed URL, a duplicate Content-Length, an illegal Transfer-Encoding
- * combination) receives a bare 400 with no body and therefore no header to
- * carry (round 2, finding 5) — there is no content for CSP to protect.
+ * A request rejected by the HTTP parser or router BEFORE Fastify's hook chain
+ * (a malformed URL, a duplicate Content-Length, an illegal Transfer-Encoding
+ * combination) receives Fastify's default client-error response — a fixed
+ * generic JSON body (`{"error":"Bad Request",...}`) WITHOUT these headers
+ * (round 2 finding 5 / round 3 finding 7). That body carries no
+ * attacker-controlled or reflected content, so the absent CSP protects nothing
+ * that exists; the headers are guaranteed on every response the application
+ * itself produces.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
@@ -96,12 +100,18 @@ function timingSafeStringEqual(presented: string, expected: string): boolean {
  * that is not plain, and serve a 503 instead — Camino owns and builds this
  * directory, so a plain tree is the correct, verifiable invariant.
  *
- * Scope (documented residual): this validates the tree AT STARTUP. A symlink
- * planted into the build directory AFTER startup is out of the threat model —
- * write access to the daemon's own GUI build directory already lets an attacker
- * replace served content directly, so symlink following adds no capability. The
- * build directory is not a user-writable location on the single-user, local
- * machine this daemon targets (build plan §1.2 posture).
+ * A "plain contained tree" here means: every entry is a regular file (with a
+ * single link — a hardlink whose inode also has a name outside the tree is
+ * refused, round 3, finding 8) or a directory, and nothing is a symlink,
+ * device, FIFO, or socket.
+ *
+ * Scope (documented residual): this validates the tree AT STARTUP. A symlink or
+ * hardlink planted into the build directory AFTER startup is out of the threat
+ * model — write access to the daemon's own GUI build directory already lets an
+ * attacker replace served content directly, so link following adds no
+ * capability. The build directory is not a user-writable location on the
+ * single-user, local machine this daemon targets (build plan §1.2 posture). A
+ * symlinked ROOT is handled separately by pinning the resolved path (finding 3).
  */
 function isPlainContainedTree(root: string): boolean {
   let realRoot: string;
@@ -131,7 +141,9 @@ function isPlainContainedTree(root: string): boolean {
       }
       if (lst.isSymbolicLink()) return false;
       if (lst.isDirectory()) stack.push(full);
-      else if (!lst.isFile()) return false; // FIFO / device / socket
+      else if (!lst.isFile())
+        return false; // FIFO / device / socket
+      else if (lst.nlink > 1) return false; // hardlink: inode may be named outside the tree
     }
   }
   return true;
@@ -330,9 +342,13 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     // so no symlink can be used as a file or directory index. `dotfiles: 'deny'`
     // keeps hidden files inside the tree unreadable (round 2, finding 3); the
     // allowedPath realpath check stays as defense-in-depth against lexical `..`.
+    // Serve from the RESOLVED real path, not the caller's (possibly symlinked)
+    // guiRoot — otherwise rebinding a symlinked root after startup would swap
+    // the served directory (round 3, finding 3). The resolved path is pinned
+    // for the process lifetime.
     const realGuiRoot = realpathSync(guiRoot!);
     void app.register(fastifyStatic, {
-      root: guiRoot!,
+      root: realGuiRoot,
       prefix: "/",
       dotfiles: "deny",
       allowedPath: (pathName) => staticPathContained(realGuiRoot, pathName),

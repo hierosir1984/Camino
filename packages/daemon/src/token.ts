@@ -11,23 +11,33 @@
  * enforced with fchmod so an unusual umask cannot widen it, and with any
  * inherited ACL stripped so a directory ACL cannot widen it either).
  *
- * Hardening folded from round 1:
+ * The confidentiality boundary is the STATE DIRECTORY, not the token file's
+ * own bits (round 3). `~/.camino` is created and verified as a real directory,
+ * owned by the daemon user, mode exactly 0700, with no extended ACL
+ * (verifyStateDir). A token inside a 0700 owner-only directory is unreachable
+ * by other users regardless of the file's own permissions, and every
+ * file-level attack the review surfaced — inode swap, symlink/hardlink plant,
+ * ACL widening on the token file — requires WRITE access to that directory,
+ * which is limited to the owner (attacking themselves, meaningless) and root
+ * (who can read the token regardless of any check). Camino does not defend
+ * against a compromised user account or root; it relies on the OS enforcing
+ * the directory's permissions, which it verifies at startup. The file-level
+ * mode/owner/ACL checks below are defense-in-depth against ACCIDENTAL
+ * misconfiguration, not against an active attacker with directory write.
+ *
+ * Hardening folded from earlier rounds:
  *  - the existing-file open is non-blocking, so a FIFO or device left at the
- *    token path is refused instead of hanging startup on the open (finding 4);
- *  - a new token is written to a unique temp file and published into place with
- *    an atomic link(), so the `auth-token` pathname is never observable in a
- *    half-written state by a concurrent first run (finding 5);
- *  - mode bits alone do not prove owner-only on macOS, where an ACL grants
- *    access independently; the ACL is checked (and, on our created files,
- *    stripped) on darwin. On other POSIX platforms mode + ownership are
- *    enforced and ACL-based widening is a documented residual (finding 2).
+ *    token path is refused instead of hanging startup on the open (round 1);
+ *  - a new token is written to a unique temp file and published with an atomic
+ *    link(), so the `auth-token` pathname is never observable half-written by a
+ *    concurrent first run (round 1); the ACL is stripped and verified on the
+ *    EMPTY temp file before any secret bytes are written, and any pre-publish
+ *    failure unlinks the temp file and raises a clean TokenError (round 3);
+ *  - the file is fstat-checked and read through the opened fd, so the token in
+ *    use always comes from a validated 0600 inode (round 1, finding 8).
  *
- * Verification binds to the OPENED INODE: the file is fstat-checked and read
- * through the same fd, so a concurrent swap of the directory entry cannot
- * substitute a different token into the running daemon. The on-disk path
- * naming a different file afterwards does not affect the loaded token
- * (finding 8 is scoped to that, not a compromise of the token in use).
- *
+ * ACL detection/stripping is implemented on darwin; on other POSIX platforms
+ * mode + ownership are enforced and ACL detection is a documented residual.
  * POSIX semantics (mode bits, uid, O_NOFOLLOW) are assumed; the walking
  * skeleton targets macOS and Linux (build plan §1.2 posture).
  */
@@ -42,10 +52,10 @@ import {
   fstatSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readSync,
-  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -134,25 +144,49 @@ function currentUid(): number | undefined {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
 
-/** Identity of the inode behind an fstat: device + inode number. */
-function inodeKey(stat: Stats): string {
-  return `${stat.dev}:${stat.ino}`;
-}
-
-/** Identity of whatever the path currently resolves to, or undefined if gone. */
-function pathInodeKey(path: string): string | undefined {
+/**
+ * Verify the state directory is the confidentiality gate it must be: a real
+ * directory (not a symlink), owned by the daemon user, mode exactly 0700 (no
+ * group/other bits), and free of an extended ACL. This is what makes every
+ * file-level attack (inode swap, symlink/hardlink plant, ACL widening) require
+ * write access to an owner-only directory — the owner or root — rather than any
+ * local user. Fail-closed: a wrong shape refuses startup with a precise fix.
+ */
+function verifyStateDir(home: string): void {
+  let stat: Stats;
   try {
-    return inodeKey(statSync(path));
-  } catch {
-    return undefined;
+    stat = lstatSync(home);
+  } catch (error) {
+    throw new TokenError(
+      `Refusing to start: cannot stat state directory ${home}: ${String(error)}`,
+    );
   }
-}
-
-function swapError(path: string): TokenError {
-  return new TokenError(
-    `Refusing to start: token file ${path} changed underneath the daemon during ` +
-      `startup verification. Retry; if it persists, inspect what is rewriting ${JSON.stringify(path)}.`,
-  );
+  if (!stat.isDirectory()) {
+    throw new TokenError(
+      `Refusing to start: ${home} is not a directory (a symlink or file in its place is refused). ` +
+        `Move it aside so the daemon can create an owner-only ~/.camino.`,
+    );
+  }
+  const uid = currentUid();
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new TokenError(
+      `Refusing to start: state directory ${home} is owned by uid ${stat.uid}, not the daemon ` +
+        `user (uid ${uid}). Fix ownership (chown) or move it aside.`,
+    );
+  }
+  const mode = stat.mode & 0o777;
+  if (mode !== 0o700) {
+    throw new TokenError(
+      `Refusing to start: state directory ${home} has permissions 0${mode.toString(8)} — must be ` +
+        `0700 so no other user can reach the token. Fix with: chmod 700 ${JSON.stringify(home)}.`,
+    );
+  }
+  if (hasExtendedAcl(home)) {
+    throw new TokenError(
+      `Refusing to start: state directory ${home} carries an extended ACL that can grant other ` +
+        `users access. Clear it with: chmod -N ${JSON.stringify(home)}.`,
+    );
+  }
 }
 
 /** Read the whole file through an already-open fd (no path re-resolution). */
@@ -184,16 +218,15 @@ function verifyExistingToken(fd: number, path: string): LoadedToken {
         `Delete it to have the daemon generate a fresh token.`,
     );
   }
-  // The ACL check runs `ls` on the PATH, not the fd, so bind it to the opened
-  // inode (dev+ino) before AND after: a concurrent swap presenting a clean
-  // inode to `ls` while our fd holds an ACL-bearing one is detected and refused
-  // (round 2, finding 2b). This extends the opened-inode binding (finding 8) to
-  // ACL verification.
-  const identity = inodeKey(stat);
-  if (pathInodeKey(path) !== identity) throw swapError(path);
-  const acl = hasExtendedAcl(path);
-  if (pathInodeKey(path) !== identity) throw swapError(path);
-  if (acl) {
+  // Best-effort file-ACL check: catches the accidental case (a user ran
+  // `chmod +a` on the token file). It runs `ls` on the PATH, not the fd, so it
+  // is NOT a defense against an active attacker racing inode swaps — that is
+  // handled structurally by the directory gate (verifyStateDir): every such
+  // attack needs write access to the 0700 owner-only state directory, which is
+  // limited to the owner (attacking themselves, meaningless) and root (who can
+  // read the token regardless). See the module header. The token bytes read
+  // below still come from the opened fd (inode-bound, finding 8).
+  if (hasExtendedAcl(path)) {
     throw new TokenError(
       `Refusing to start: token file ${path} carries an extended ACL that can ` +
         `grant access beyond its 0600 mode. Clear it with: chmod -N ${JSON.stringify(path)} ` +
@@ -226,6 +259,12 @@ export function loadOrCreateToken(env: NodeJS.ProcessEnv = process.env): LoadedT
     chmodSync(home, 0o700); // mkdir's mode is umask-masked; force owner-only
     stripInheritedAcl(home); // a directory ACL must not widen what we create
   }
+  // The state directory is the confidentiality gate (round 3, findings 1/2):
+  // a token inside a 0700 owner-only directory is unreachable by other users
+  // regardless of the file's own ACL, and every inode-swap/symlink/hardlink
+  // attack on the token file needs write access to this directory. Verify it
+  // fail-closed before trusting anything inside it.
+  verifyStateDir(home);
 
   const existing = openExistingToken(path);
   if (existing !== undefined) {
@@ -265,6 +304,12 @@ function openExistingToken(path: string): number | undefined {
  * Write a fresh token to a unique temp file, then publish it atomically with
  * link() so the visible `auth-token` path never exists half-written. If another
  * first run published first (link → EEXIST), read and return theirs.
+ *
+ * Ordering matters (round 3, findings 2 and 4): the temp file's ACL is stripped
+ * and verified ACL-free BEFORE any secret bytes are written, so the token is
+ * never on disk while an inherited ACL is active. Any failure before publish
+ * unlinks the temp file and raises a clean TokenError — a partially-written
+ * secret is never left behind, and no raw OS error string is surfaced.
  */
 function createTokenAtomically(path: string): LoadedToken {
   const token = generateToken();
@@ -281,30 +326,34 @@ function createTokenAtomically(path: string): LoadedToken {
       `Refusing to start: cannot create temporary token file ${tmpPath}: ${String(error)}`,
     );
   }
+
+  // Everything from here until publish either succeeds or unlinks the temp file
+  // and rethrows a clean TokenError — no secret bytes survive a failure.
   try {
     fchmodSync(tmpFd, 0o600); // umask-independent: open()'s mode is masked, this is not
+    // Strip and verify ACL-free on the EMPTY file, before writing the secret.
+    stripInheritedAcl(tmpPath);
+    if (hasExtendedAcl(tmpPath)) {
+      throw new TokenError(
+        `Refusing to start: a freshly created token file inherited an extended ACL from its ` +
+          `directory and it could not be stripped. Clear the ACL on the containing directory ` +
+          `(chmod -N) so the token can be created owner-only.`,
+      );
+    }
     const payload = Buffer.from(`${token}\n`, "utf8");
     let offset = 0;
     while (offset < payload.length) {
       offset += writeSync(tmpFd, payload, offset, payload.length - offset);
     }
     fsyncSync(tmpFd);
-  } finally {
+  } catch (error) {
     closeSync(tmpFd);
-  }
-  stripInheritedAcl(tmpPath); // strip before publish so the linked inode is clean
-  // Fail closed if the strip did not take (chmod -N denied/unavailable): a
-  // token file created under a directory with an inherited ACL must not ship
-  // world-readable just because the strip failed (round 2, finding 2a). Check
-  // the temp inode BEFORE publishing so the visible path is never ACL-bearing.
-  if (hasExtendedAcl(tmpPath)) {
     safeUnlink(tmpPath);
-    throw new TokenError(
-      `Refusing to start: a freshly created token file inherited an extended ACL ` +
-        `from its directory and it could not be stripped. Clear the ACL on the ` +
-        `containing directory (chmod -N) so the token can be created owner-only.`,
-    );
+    throw error instanceof TokenError
+      ? error
+      : new TokenError(`Refusing to start: cannot write token file: ${redactErrno(error)}`);
   }
+  closeSync(tmpFd);
 
   try {
     linkSync(tmpPath, path); // atomic publish; EEXIST means another run won
@@ -321,10 +370,18 @@ function createTokenAtomically(path: string): LoadedToken {
         closeSync(raced);
       }
     }
-    throw new TokenError(`Refusing to start: cannot publish token file ${path}: ${String(error)}`);
+    throw new TokenError(
+      `Refusing to start: cannot publish token file ${path}: ${redactErrno(error)}`,
+    );
   }
   safeUnlink(tmpPath); // the published path now holds the inode; drop the temp name
   return { token, path, created: true };
+}
+
+/** Surface only the errno code, never a raw message that could echo a secret path. */
+function redactErrno(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code ?? "I/O error";
 }
 
 function safeUnlink(path: string): void {

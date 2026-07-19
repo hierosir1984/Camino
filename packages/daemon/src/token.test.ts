@@ -93,8 +93,9 @@ describe("loadOrCreateToken", () => {
   });
 
   it("refuses a token path that is a directory", () => {
-    const { env, tokenPath } = scratchHome();
-    mkdirSync(tokenPath, { recursive: true });
+    const { env, home, tokenPath } = scratchHome();
+    mkdirSync(home, { recursive: true, mode: 0o700 }); // valid state dir…
+    mkdirSync(tokenPath); // …but the token path itself is a directory
     expect(() => loadOrCreateToken(env)).toThrow(TokenError);
   });
 
@@ -186,23 +187,59 @@ describe("finding 2: extended-ACL detection (darwin)", () => {
     },
   );
 
-  it.skipIf(process.platform !== "darwin")("creates a token file free of inherited ACLs", () => {
-    const { env, home, tokenPath } = scratchHome();
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    // A directory ACL with file_inherit would propagate to a naively-created file.
-    execFileSync("/bin/chmod", ["+a", "everyone allow read,file_inherit", home]);
-    const loaded = loadOrCreateToken(env);
-    expect(loaded.created).toBe(true);
-    expect(hasExtendedAcl(tokenPath)).toBe(false);
-    // And a second startup accepts the file it just created.
-    expect(loadOrCreateToken(env).token).toBe(loaded.token);
-  });
+  it.skipIf(process.platform !== "darwin")(
+    "strips a directory's inherited ACL when it creates the state dir + token",
+    () => {
+      // scratchHome's parent temp dir is created here; loadOrCreateToken creates
+      // the state dir under it and strips any inherited ACL from both dir + file.
+      const { env, home, tokenPath } = scratchHome();
+      const loaded = loadOrCreateToken(env);
+      expect(loaded.created).toBe(true);
+      expect(hasExtendedAcl(home)).toBe(false);
+      expect(hasExtendedAcl(tokenPath)).toBe(false);
+      // A second startup accepts the ACL-free dir + file it just created.
+      expect(loadOrCreateToken(env).token).toBe(loaded.token);
+    },
+  );
+
+  it.skipIf(process.platform !== "darwin")(
+    "refuses a state directory widened by an extended ACL (the confidentiality gate)",
+    () => {
+      const { env, home } = scratchHome();
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      execFileSync("/bin/chmod", ["+a", "everyone allow read,file_inherit", home]);
+      expect(hasExtendedAcl(home)).toBe(true);
+      expect(() => loadOrCreateToken(env)).toThrow(/ACL/);
+    },
+  );
 
   it("reports no ACL on non-darwin platforms (documented residual)", () => {
     if (process.platform === "darwin") return;
     const { env, tokenPath } = scratchHome();
     loadOrCreateToken(env);
     expect(hasExtendedAcl(tokenPath)).toBe(false);
+  });
+});
+
+describe("finding 1/2: state directory is the confidentiality gate", () => {
+  it("refuses a state directory that is group/other-accessible", () => {
+    const { env, home } = scratchHome();
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    chmodSync(home, 0o755);
+    expect(() => loadOrCreateToken(env)).toThrow(/0700/);
+  });
+
+  it("refuses when the state directory path is a regular file, not a directory", () => {
+    const parent = mkdtempSync(join(tmpdir(), "camino-gate-"));
+    const home = join(parent, "camino-home");
+    writeFileSync(home, "not a directory");
+    expect(() => loadOrCreateToken({ CAMINO_HOME: home })).toThrow(/not a directory/);
+  });
+
+  it("accepts a correctly 0700 owner-only state directory", () => {
+    const { env, home } = scratchHome();
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    expect(loadOrCreateToken(env).created).toBe(true);
   });
 });
 

@@ -5,9 +5,17 @@
  * directory, and serves the REAL @camino/gui build output end-to-end.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { request as httpRequest } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -223,6 +231,51 @@ describe("round 2 regressions — GUI build containment", () => {
       await daemon.app.close();
     }
   });
+
+  it("finding 3: rebinding a symlinked GUI root after startup does not change what is served", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "camino-root-rebind-"));
+    const targetA = join(scratch, "a");
+    const targetB = join(scratch, "b");
+    mkdirSync(targetA);
+    mkdirSync(targetB);
+    writeFileSync(join(targetA, "index.html"), "<title>SHELL_A</title>");
+    const secret = `rebind-secret-${generateToken()}`;
+    writeFileSync(join(targetB, "index.html"), `<title>${secret}</title>`);
+    writeFileSync(join(targetB, "loot.txt"), secret);
+    const rootLink = join(scratch, "root");
+    symlinkSync(targetA, rootLink);
+
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: rootLink, port: 0 });
+    try {
+      expect(await (await fetch(`${daemon.url}/`)).text()).toContain("SHELL_A");
+      // Rebind the root symlink to a pre-existing dir NOT modified after startup.
+      rmSync(rootLink);
+      symlinkSync(targetB, rootLink);
+      expect(await (await fetch(`${daemon.url}/`)).text()).toContain("SHELL_A");
+      expect(await (await fetch(`${daemon.url}/loot.txt`)).text()).not.toContain(secret);
+    } finally {
+      await daemon.app.close();
+    }
+  });
+
+  it("finding 8: a hardlink whose inode is named outside the tree invalidates it", async () => {
+    const secret = `hardlink-secret-${generateToken()}`;
+    const { gui } = makeGui((dist, scratch) => {
+      writeFileSync(join(dist, "index.html"), "<title>shell</title>");
+      writeFileSync(join(scratch, "outside.txt"), secret);
+      linkSync(join(scratch, "outside.txt"), join(dist, "hard.txt")); // hardlink, nlink=2
+    });
+    const daemon = await startDaemonServer({ token: TOKEN, guiRoot: gui, port: 0 });
+    try {
+      for (const path of ["/", "/hard.txt"]) {
+        const response = await fetch(`${daemon.url}${path}`);
+        expect(response.status, path).toBe(503);
+        expect(await response.text(), path).not.toContain(secret);
+      }
+    } finally {
+      await daemon.app.close();
+    }
+  });
 });
 
 describe("real GUI build end-to-end", () => {
@@ -249,5 +302,28 @@ describe("real GUI build end-to-end", () => {
     } finally {
       await real.app.close();
     }
+  });
+
+  it("finding 6: the build refuses a dangerous OUT_DIR instead of wiping it", () => {
+    const buildScript = fileURLToPath(new URL("../../gui/build.mjs", import.meta.url));
+    // A directory with a sentinel that must survive a refused build.
+    const guard = mkdtempSync(join(tmpdir(), "camino-outdir-guard-"));
+    const sentinel = join(guard, "sentinel.txt");
+    writeFileSync(sentinel, "keep me");
+
+    for (const dangerous of ["/", homedir()]) {
+      let threw = false;
+      try {
+        execFileSync(process.execPath, [buildScript], {
+          env: { ...process.env, OUT_DIR: dangerous },
+          stdio: "pipe",
+        });
+      } catch {
+        threw = true;
+      }
+      expect(threw, `OUT_DIR=${dangerous} should be refused`).toBe(true);
+    }
+    // The refusal never ran rmSync; unrelated files are untouched.
+    expect(existsSync(sentinel)).toBe(true);
   });
 });
