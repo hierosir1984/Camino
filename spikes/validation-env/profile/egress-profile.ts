@@ -1,0 +1,142 @@
+// Egress-profile composer — WP-005 (CAM-VAL-03 egress half).
+//
+// Renders `docker run` arguments for the validation-environment egress
+// profile: default-deny egress with a per-run allowlist, taken as DATA. The
+// container image (see Dockerfile/entrypoint.sh next to this file) installs
+// the rules as root and drops to an unprivileged workload user, so the
+// workload cannot alter the rules it runs under. NET_ADMIN is granted to the
+// container for the root-owned setup step only — the unprivileged workload
+// process cannot exercise it.
+//
+// Reuse shape: WP-107 (worker egress — allowlist from per-repo config) and
+// WP-115 (validation runner — allowlisted test endpoints) productize exactly
+// this composer + entrypoint pair.
+
+export interface EgressAllowlistEntry {
+  host: string;
+  port: number;
+}
+
+export interface EgressProfileRun {
+  image: string;
+  /**
+   * A user-defined docker network: the entrypoint resolves allowlist names via
+   * the network's embedded DNS at setup time (the default bridge has none).
+   */
+  network: string;
+  /** Empty list = deny-all (the baseline posture). */
+  allowlist: EgressAllowlistEntry[];
+  name?: string;
+  env?: Record<string, string>;
+  readonlyMounts?: { hostPath: string; containerPath: string }[];
+}
+
+// Conservative host shape (DNS names or IPv4 literals). Anything that could
+// corrupt the space-separated host:port env contract — whitespace, colons,
+// shell metacharacters — is rejected outright.
+const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// A user-defined network NAME only (Docker network names are
+// [A-Za-z0-9][A-Za-z0-9_.-]*). This deliberately excludes the reserved
+// networks whose namespace is NOT the container's own: `host` and
+// `container:<id>` share another namespace, so the root bootstrap's
+// `iptables -F/-P DROP` would rewrite the HOST (or a sibling's) firewall;
+// `none`/`bridge`/`host-gateway` are likewise not owned isolated bridges.
+const NETWORK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const RESERVED_NETWORKS = new Set(["host", "none", "bridge", "default", "host-gateway"]);
+// The root entrypoint and its tools live here; a caller-supplied mount must not
+// cover them, and CAMINO_EGRESS_* is composed, never caller-supplied.
+const RESERVED_ENV_PREFIX = "CAMINO_EGRESS_";
+const PROTECTED_MOUNT_TARGETS = [
+  "/",
+  "/usr/local/bin",
+  "/sbin",
+  "/usr/sbin",
+  "/bin",
+  "/usr/bin",
+  "/etc",
+  "/lib",
+];
+
+function assertSafeNetwork(network: string): void {
+  if (!network) throw new Error("egress profile requires a user-defined network");
+  if (network.includes(":") || !NETWORK_NAME_RE.test(network) || RESERVED_NETWORKS.has(network)) {
+    throw new Error(
+      `egress profile network ${JSON.stringify(network)} rejected — requires an owned, isolated ` +
+        "user-defined bridge (not host/none/bridge/container:<id>, which share another namespace " +
+        "the root bootstrap would rewrite; fail-closed)",
+    );
+  }
+}
+
+function assertSafeMountTarget(containerPath: string): void {
+  if (!containerPath.startsWith("/") || containerPath.includes(":")) {
+    throw new Error(
+      `egress profile mount target ${JSON.stringify(containerPath)} rejected (want an absolute path)`,
+    );
+  }
+  const norm = containerPath.replace(/\/+$/u, "") || "/";
+  const covers = (p: string): boolean =>
+    p === "/" ? norm === "/" : norm === p || norm.startsWith(`${p}/`);
+  if (PROTECTED_MOUNT_TARGETS.some(covers)) {
+    throw new Error(
+      `egress profile mount target ${JSON.stringify(containerPath)} would cover a bootstrap path ` +
+        "(entrypoint/tools) — rejected (fail-closed)",
+    );
+  }
+}
+
+/** Render the CAMINO_EGRESS_ALLOWLIST value; fail-closed on malformed entries. */
+export function renderAllowlistEnv(allowlist: EgressAllowlistEntry[]): string {
+  return allowlist
+    .map((e) => {
+      if (!HOST_RE.test(e.host)) {
+        throw new Error(
+          `egress allowlist host ${JSON.stringify(e.host)} rejected — it could corrupt the ` +
+            "space-separated host:port contract (fail-closed)",
+        );
+      }
+      if (!Number.isInteger(e.port) || e.port < 1 || e.port > 65535) {
+        throw new Error(`egress allowlist port ${String(e.port)} out of range (1-65535)`);
+      }
+      return `${e.host}:${e.port}`;
+    })
+    .join(" ");
+}
+
+/**
+ * Full `docker run` argument vector (execFile-style, never a shell string).
+ *
+ * The container parameters (network, mounts, env keys) are Camino-composed, not
+ * worker-supplied — the untrusted workload is the *code* that runs unprivileged
+ * AFTER the rules install. Even so, this composer refuses to build a run whose
+ * parameters could subvert the root bootstrap: an unsafe/shared network, a
+ * mount over a bootstrap path, or a caller env key that shadows the composed
+ * allowlist. (Full privilege separation — a setup sidecar or cap-drop init so
+ * the bootstrap shares nothing with the workload's env/mounts at all — is the
+ * WP-107 productization; here we fail closed on the reachable cases.)
+ */
+export function renderEgressRunArgs(run: EgressProfileRun, cmd: string[]): string[] {
+  assertSafeNetwork(run.network);
+  const args = ["run", "--rm", "--cap-add", "NET_ADMIN", "--network", run.network];
+  if (run.name) args.push("--name", run.name);
+  // Composed FIRST and its key reserved below, so no caller entry can override
+  // it (Docker honours the last -e for a key).
+  args.push("-e", `CAMINO_EGRESS_ALLOWLIST=${renderAllowlistEnv(run.allowlist)}`);
+  for (const [k, v] of Object.entries(run.env ?? {})) {
+    if (!ENV_KEY_RE.test(k))
+      throw new Error(`egress profile env key ${JSON.stringify(k)} rejected`);
+    if (k.startsWith(RESERVED_ENV_PREFIX)) {
+      throw new Error(
+        `egress profile env key ${JSON.stringify(k)} is reserved (composed, not caller-set)`,
+      );
+    }
+    args.push("-e", `${k}=${v}`);
+  }
+  for (const m of run.readonlyMounts ?? []) {
+    assertSafeMountTarget(m.containerPath);
+    args.push("-v", `${m.hostPath}:${m.containerPath}:ro`);
+  }
+  args.push(run.image, ...cmd);
+  return args;
+}
