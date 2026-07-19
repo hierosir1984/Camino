@@ -245,7 +245,10 @@ None blocking. Remaining unknowns are measured by phases (completion rates, atte
 
 ## Appendix A — Normative state machines (mission / issue / attempt)
 
-Transitions not listed are illegal: attempted illegal transitions are rejected and logged (CAM-STATE-05). Every transition emits an event with actor and cause. **State sets:** mission states = {**queued**, draft, planned, approved, executing, awaiting-merge-approval, merging, paused-external, paused-urgent, paused-manual, escalated, blocked} (active) ∪ {complete, complete-with-residue, abandoned, **re-routed** (A.1b only)} (terminal). **Serialization:** at most one mission per repo occupies an *execution-bearing* state (approved through merging); additional missions wait in `queued` — visibly, satisfying CAM-CORE-08 — and activate FIFO when the slot frees (intake/planning states may proceed concurrently since they touch no workspace). Issue active = {waiting-deps, ready, queued-quota, claimed, implementing, validating, merge-pending, blocked, escalated, replanning}; issue terminal = {merged, cancelled} (per-issue *delivered* flags set at mission resolution, CAM-MERGE-12). Attempt active = {running, submitted}; attempt terminal = {succeeded, failed, cancelled, expired, killed-budget, quota-blocked}, each followed by the single archival step (A.4 item 5) → `archived`.
+> Amended 2026-07-19: AMEND-1..5 applied per change control (approved by David; proposals and
+> dispositions recorded in [docs/design/26-appendix-a-audit.md](design/26-appendix-a-audit.md) §3).
+
+Transitions not listed are illegal: attempted illegal transitions are rejected and logged (CAM-STATE-05). Every transition emits an event with actor and cause. **State sets:** mission states = {**queued**, draft, planned, approved, executing, awaiting-merge-approval, merging, paused-external, paused-urgent, paused-manual, escalated, blocked} (active) ∪ {complete, complete-with-residue, abandoned, **re-routed** (A.1b only)} (terminal). **Serialization:** at most one mission per repo occupies an *execution-bearing* state (approved through merging, including interrupt states entered from that span; a manually paused mission holds the slot iff it held it when paused); additional missions wait in `queued` — visibly, satisfying CAM-CORE-08 — and activate FIFO when the slot frees (intake/planning states may proceed concurrently since they touch no workspace). Issue active = {waiting-deps, ready, queued-quota, claimed, implementing, validating, merge-pending, blocked, escalated, replanning}; issue terminal = {merged, cancelled} (per-issue *delivered* flags set at mission resolution, CAM-MERGE-12). Attempt active = {running, submitted}; attempt terminal = {succeeded, failed, cancelled, expired, killed-budget, quota-blocked}, each followed by the single archival step (A.4 item 5) → `archived`.
 
 ### A.1 Mission (integration-branch route)
 
@@ -293,7 +296,8 @@ A.1b inherits A.1's rows for `queued`, plan rejection (`planned → draft`), man
 | `merging` | base moved → rebuild + revalidate | green | `awaiting-merge-approval` (new approval required) |
 | `merging` | rebuilds exhausted (2) | — | `escalated` |
 | `merging` | push confirmed | pushed SHA ≡ approved candidate SHA | `complete` |
-| any active | any CAM-MERGE-01 gate found violated (e.g., diff triggers reclassification) | work summary + branch carried over | **`re-routed` (terminal)** — a new A.1 mission is created referencing this record; the quick task ends before the mission activates, preserving serialization |
+| any active | any CAM-MERGE-01 gate found violated (e.g., diff triggers reclassification) | work summary carried over; branch carried over where the task had entered execution | **`re-routed` (terminal)** — a new A.1 mission is created referencing this record; the quick task ends before the mission activates, preserving serialization |
+| `merging` | rebuilt candidate red | — | `executing` (repair attempt) |
 
 ### A.2 Issue
 
@@ -312,7 +316,7 @@ A.1b inherits A.1's rows for `queued`, plan rejection (`planned → draft`), man
 | `implementing` | attempt quota-blocked | — | `queued-quota` (not a failure) |
 | `implementing` | attempt cancelled by preemption/pause | attempt summary written | `ready` (re-dispatch when the mission resumes `executing`) |
 | `validating` | gates green at candidate | freshness holds | `merge-pending` |
-| `validating` | validation fails | repair policy | `ready` (repair attempt) |
+| `validating` | validation fails | repair policy | `ready` (repair attempt); 4 failures → `escalated` (same recorded failure counter) |
 | `validating` | infra-blocked | — | `blocked` |
 | `merge-pending` | approval (David in training mode, or tier-1 autonomy — **tier-1 applies to mission-branch targets only, never a main candidate**) | base check passes | `merged` (into mission branch; fast subset runs) |
 | `merge-pending` | mission branch advanced since validation | — | `ready` (revalidation) |
@@ -323,6 +327,7 @@ A.1b inherits A.1's rows for `queued`, plan rejection (`planned → draft`), man
 | any active | David cancels | — | `cancelled` |
 | `blocked` | resource restored / question answered | — | `ready` |
 | any active | cleanup failure during teardown | recorded | `blocked` with `cleanup-failed` cause (janitor + escalation) |
+| `merge-pending` | quick-task mission push confirmed (A.1b `merging → complete`) | quick-task issue (target = main candidate) | `merged` |
 
 ### A.3 Attempt
 

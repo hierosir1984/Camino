@@ -1,6 +1,7 @@
 # 26 · Appendix A consistency audit (WP-101)
 
-> **Status: recorded, five amendment proposals pending David.** This is the BUILD.md standing
+> **Status: complete — AMEND-1..5 APPROVED by David 2026-07-19 and applied** (PRD Appendix A
+> amended; corresponding rows, guards, and tests added in the same change). This is the BUILD.md standing
 > obligation: Phase 1 implements the Appendix A state machines as typed code with exhaustive
 > transition tests, then walks a recorded code-vs-appendix diff. Every difference below is resolved
 > by (a) the code encoding the appendix faithfully, with the encoding noted, or (b) a **proposed
@@ -132,8 +133,11 @@ recorded; `#6a/b` validation red → executing until the 4th failure escalates (
 `#7` approval by David (actor-bound) or tier-3 only, bound to the recorded (SHA, packet hash) pair;
 `#8` reject → executing; `#9` rebuild green → awaiting with the new pair (new approval); `#10`
 rebuilds exhausted (2) → escalated; `#11` push confirmed → `complete` with the landed-on-main attestation, refusing any descoped
-residue (fail-closed, F15); `#12` any active + CAM-MERGE-01 gate violated → `re-routed` (terminal),
-work summary + branch carry-over attested, successor mission created via `A.1#1`.
+residue (fail-closed, F15); `#12` (as amended per AMEND-5) any active + CAM-MERGE-01 gate violated
+→ `re-routed` (terminal) — split `12a` (pre-execution sources: work summary only), `12b`
+(execution-entered sources: work summary + branch), `12c` (paused-manual: branch required iff the
+recorded paused-from state had entered execution) — successor mission created via `A.1#1`; `#13`
+(AMEND-3) rebuilt candidate red → executing, mirroring A.1#13.
 
 Route reachability is tested as exact expected gaps: `re-routed` unreachable on the integration
 route; `complete-with-residue`, `paused-external`, `paused-urgent` unreachable on the quick route.
@@ -151,8 +155,8 @@ escalates (recorded counter; family switch after 2 = `retryPolicy` advice to the
 state change); `#10` budget breach + kill-confirm → escalated (kill-and-escalate, no retry row
 exists — CAM-EXEC-03); `#11` attempt quota-blocked → queued-quota; `#12` attempt cancelled — scoped to the appendix's
 preemption/pause causes (a David cancel ends the issue via `#22`; an edit cancel goes through
-`#19` replanning) — summary written → ready; `#13` gates green + freshness → merge-pending; `#14` validation fails (repair
-policy) → ready; `#15` infra-blocked → blocked; `#16` approval + base check → merged, **for
+`#19` replanning) — summary written → ready; `#13` gates green + freshness → merge-pending; `#14` (as amended per AMEND-4) validation fails → `14a` ready while the recorded counter is
+below 4, `14b` escalated at the 4th failure; `#15` infra-blocked → blocked; `#16` approval + base check → merged, **for
 mission-branch targets only, every authority** — the row's own target cell says "(into mission
 branch)", and A.1b denies quick-task (main-candidate) issues any merge row at all, which is
 AMEND-1; David-authority approvals are actor-bound and tier-1 is the only other authority;
@@ -161,7 +165,9 @@ mission-level fast-subset failure → encoded as `#1c` creation (the "further me
 green" clause is WP-119 scheduler policy); `#19` incompatible contract edit (any active) →
 replanning; `#20a/20b` replan complete under contract v(n+1) (attested) → ready / waiting-deps; `#21a/21b` escalation answered →
 ready / cancelled; `#22` David cancels (any active) → cancelled; `#23` block resolved → ready;
-`#24` cleanup failure (any active) → blocked, cause rides the envelope.
+`#24` cleanup failure (any active) → blocked, cause rides the envelope; `#25` (AMEND-1) the
+quick-task issue lands (`merge-pending → merged`) when its mission's push to main is confirmed —
+mission linkage attested per convention 3 until the WP-103/104 linkage model.
 
 ### A.3 attempt + A.4#5 archival (8 rows → 9 code rows)
 
@@ -208,7 +214,15 @@ A.4#4 says approvals bind to **(candidate SHA, packet hash)** on both routes and
 A.4#4 (both members recorded and matched). If David wants the texts aligned, adding "and packet
 hash" to A.1b#7 is editorial.
 
-### Proposed amendments (need David — change control)
+### Amendments (proposed by this audit; ALL APPROVED by David 2026-07-19 and applied)
+
+Application map: AMEND-1 → issue row `A.2#25` (quick-task-mission-landed, attested mission-push +
+main-candidate target); AMEND-2 → the amended preamble parenthetical, implemented by
+`isExecutionBearing(state, pausedFrom)` (unchanged code, flag lifted); AMEND-3 → quick row
+`A.1b#13` (rebuilt candidate red → executing); AMEND-4 → `A.2#14a/14b` guard-split (4th validation
+failure escalates on the same recorded counter); AMEND-5 → `A.1b#12a/12b/12c` split (work summary
+always; branch carried from execution-entered sources; paused-manual resolves by the RECORDED
+paused-from state via enrichment, failing closed when absent).
 
 **AMEND-1 · Quick-task issue has no terminal row.** A.1b says the single issue "executes per A.2 …
 A.2's merge rows do not apply", and issue terminals are only {merged, cancelled}. So a quick task
@@ -399,6 +413,11 @@ item 4 mechanized here; item 1, packet-content immutability (item 4), and enviro
 explicitly deferred to WP-114/115/116 with their notes. Every row is exercised by the mechanical
 coverage harness and anchored structurally and semantically to the PRD's own tables, and the five
 genuine spec defects found by the walk and the review rounds are recorded above as amendment
-proposals. **Appendix A remains authoritative**; on David's disposition of AMEND-1..5 this audit
-is updated, the approved amendments land in the PRD appendix, and the corresponding rows/tests are
-added in the same change.
+proposals. AMEND-1..5 were approved by David on 2026-07-19 and are applied: the PRD appendix carries the
+amended text (with a provenance note), and the machines encode the amended rows with vectors and
+recorder walks. Per the PRD's own supersession clause ("Appendix A remains authoritative until
+superseded by Phase 1's typed state machine and its exhaustive transition-test suite, via a
+recorded consistency audit"), that mechanism has now run to completion: the typed machines, their
+exhaustive tests, and this recorded audit implement the amended appendix row-for-row, and the
+appendix text remains the human-readable normative reference, kept in sync through change
+control.

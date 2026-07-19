@@ -181,8 +181,8 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     }
   });
 
-  it("A.1b: the quick machine encodes the 12 parsed rows plus exactly the inherited A.1 set", () => {
-    expect(A1B).toHaveLength(12);
+  it("A.1b: the quick machine encodes the 13 parsed rows plus exactly the inherited A.1 set", () => {
+    expect(A1B).toHaveLength(13);
     const own = encodedRowGroups(missionQuickTaskMachine, "A.1b");
     expect([...own.keys()].sort((a, b) => a - b)).toEqual(A1B.map((r) => r.number));
     for (const parsed of A1B) {
@@ -204,8 +204,8 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     }
   });
 
-  it("A.2: the issue machine encodes the 24 parsed rows except the mission-level #18, sources matching", () => {
-    expect(A2).toHaveLength(24);
+  it("A.2: the issue machine encodes the 25 parsed rows except the mission-level #18, sources matching", () => {
+    expect(A2).toHaveLength(25);
     const groups = encodedRowGroups(issueMachine, "A.2");
     expect([...groups.keys()].sort((a, b) => a - b)).toEqual(
       A2.map((r) => r.number).filter((n) => n !== 18),

@@ -1313,4 +1313,102 @@ describe("TransitionRecorder", () => {
     expect(() => wrapped()).toThrow(/enclosing transaction/);
     expect(store.read()).toEqual([]);
   });
+  it("walks the approved amendments end to end (AMEND-1/3/4/5 applied 2026-07-19)", () => {
+    const { recorder } = newRecorder();
+    // Quick task to executing.
+    apply(recorder, "mission", "q1", "quick-task-intake", {}, "david");
+    apply(recorder, "mission", "q1", "contract-attached", {
+      miniReviewAttached: true,
+      observabilityAdjudicated: true,
+    });
+    apply(
+      recorder,
+      "mission",
+      "q1",
+      "plan-approved",
+      {
+        dagAcyclic: true,
+        executionSlotFree: true,
+        riskTierLow: true,
+        neutralConcurred: true,
+        singleIssue: true,
+      },
+      "david",
+    );
+    apply(recorder, "mission", "q1", "quick-task-execution-started", {
+      targetIsMainCandidate: true,
+      noIntegrationBranchNoFold: true,
+    });
+    apply(recorder, "mission", "q1", "quick-validation-green", {
+      packetPopulated: true,
+      rollupAndPrPopulated: true,
+      contractChecksGreen: true,
+      repoFastSuiteGreen: true,
+      freshnessVsMainHolds: true,
+      candidateSha: "qcand-1",
+      packetHash: "qpacket-1",
+    });
+    apply(
+      recorder,
+      "mission",
+      "q1",
+      "mission-merge-approved",
+      { authority: "david", candidateSha: "qcand-1", packetHash: "qpacket-1" },
+      "david",
+    );
+    // AMEND-3: a red rebuild inside the retry bound returns to executing.
+    expect(
+      apply(recorder, "mission", "q1", "candidate-rebuilt", {
+        green: false,
+        newCandidateSha: "qcand-2",
+      }),
+    ).toBe("executing");
+    // AMEND-4: the 4th validation failure escalates the issue from validating.
+    apply(recorder, "issue", "i1", "issue-created", {
+      origin: "plan-approval",
+      unmetDependencies: 0,
+    });
+    driveToImplementing(recorder, "i1");
+    apply(recorder, "issue", "i1", "attempt-failed", {});
+    driveToImplementing(recorder, "i1");
+    apply(recorder, "issue", "i1", "attempt-failed", {});
+    driveToImplementing(recorder, "i1");
+    apply(recorder, "issue", "i1", "attempt-failed", {});
+    driveToImplementing(recorder, "i1");
+    apply(recorder, "issue", "i1", "final-head-submitted", { quarantinePassed: true });
+    expect(apply(recorder, "issue", "i1", "validation-failed", { repairPolicyAllows: true })).toBe(
+      "escalated",
+    );
+    // AMEND-1: a quick-task issue in merge-pending lands when the mission push confirms.
+    apply(recorder, "issue", "i2", "issue-created", {
+      origin: "plan-approval",
+      unmetDependencies: 0,
+    });
+    driveToImplementing(recorder, "i2");
+    apply(recorder, "issue", "i2", "final-head-submitted", { quarantinePassed: true });
+    apply(recorder, "issue", "i2", "validation-green", { freshnessHolds: true });
+    expect(
+      apply(recorder, "issue", "i2", "quick-task-mission-landed", {
+        missionPushConfirmed: true,
+        targetMainCandidate: true,
+      }),
+    ).toBe("merged");
+    // AMEND-5: a pre-execution quick task re-routes with the work summary
+    // alone; a paused-manual one resolves by the RECORDED paused-from state.
+    apply(recorder, "mission", "q2", "quick-task-intake", {}, "david");
+    expect(
+      apply(recorder, "mission", "q2", "gate-violation-detected", { workSummaryCarried: true }),
+    ).toBe("re-routed");
+    apply(recorder, "mission", "q3", "quick-task-intake", {}, "david");
+    apply(recorder, "mission", "q3", "mission-paused", { attemptSettled: true }, "david");
+    // Paused from draft: no branch exists, none required (enrichment supplies
+    // the recorded paused-from; the caller's claim is overwritten).
+    expect(
+      apply(recorder, "mission", "q3", "gate-violation-detected", {
+        workSummaryCarried: true,
+        pausedFrom: "executing",
+      }),
+    ).toBe("re-routed");
+    expect(recorder.verify()).toEqual([]);
+  });
 });

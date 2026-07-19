@@ -94,6 +94,12 @@ export type IssueEvent =
   | { type: "issue-cancelled"; actor?: string }
   // A.2#23 — resource restored / question answered
   | { type: "block-resolved" }
+  // A.2#25 (AMEND-1) — quick-task mission push confirmed (A.1b merging → complete)
+  | {
+      type: "quick-task-mission-landed";
+      missionPushConfirmed: boolean;
+      targetMainCandidate: boolean;
+    }
   // A.2#24 — cleanup failure during teardown
   | { type: "cleanup-failed"; recorded: boolean };
 
@@ -319,14 +325,32 @@ const issueRows: readonly IssueRow[] = [
     guard: { name: "freshness-holds", check: (e) => attested(e.freshnessHolds) },
     to: "merge-pending",
   }),
-  // A.2#14 — validating | validation fails | repair policy | ready (repair attempt)
+  // A.2#14 — validating | validation fails | repair policy | ready; 4 failures → escalated (AMEND-4)
   row({
-    ref: "A.2#14",
+    ref: "A.2#14a",
     from: ["validating"],
     event: "validation-failed",
-    guard: { name: "repair-policy-allows", check: (e) => attested(e.repairPolicyAllows) },
+    guard: {
+      name: "repair-policy-retriable-count",
+      check: (e) =>
+        attested(e.repairPolicyAllows) &&
+        Number.isInteger(e.failureCount) &&
+        (e.failureCount as number) >= 1 &&
+        (e.failureCount as number) < 4,
+    },
     to: "ready",
-    note: "Validation failures feed the same recorded failure counter as attempt failures (A.1b#6 'retry policy per A.2'); the appendix names no escalation bound on this row — audit item.",
+    note: "Validation failures feed the same recorded failure counter as attempt failures (A.1b#6 'retry policy per A.2').",
+  }),
+  row({
+    ref: "A.2#14b",
+    from: ["validating"],
+    event: "validation-failed",
+    guard: {
+      name: "validation-failure-count-exhausted",
+      check: (e) => Number.isInteger(e.failureCount) && (e.failureCount as number) >= 4,
+    },
+    to: "escalated",
+    note: "AMEND-4 (approved 2026-07-19): the 4th failure escalates from validating too, on the same recorded counter.",
   }),
   // A.2#15 — validating | infra-blocked | — | blocked
   row({
@@ -440,6 +464,18 @@ const issueRows: readonly IssueRow[] = [
     guard: { name: "failure-recorded", check: (e) => attested(e.recorded) },
     to: "blocked",
     note: "The cleanup-failed cause rides the event envelope's cause field (janitor + escalation are daemon behavior).",
+  }),
+  // A.2#25 (AMEND-1, approved 2026-07-19) — merge-pending | quick-task mission push confirmed | quick-task issue | merged
+  row({
+    ref: "A.2#25",
+    from: ["merge-pending"],
+    event: "quick-task-mission-landed",
+    guard: {
+      name: "quick-task-mission-push-confirmed",
+      check: (e) => attested(e.missionPushConfirmed) && attested(e.targetMainCandidate),
+    },
+    to: "merged",
+    note: "Closes the AMEND-1 gap: the quick-task route's single issue lands when its mission's push to main is confirmed (A.1b merging → complete); the mission linkage is a caller attestation per convention 3 until WP-103/104's linkage model.",
   }),
 ];
 

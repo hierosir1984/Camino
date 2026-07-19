@@ -742,16 +742,45 @@ export const MISSION_QUICK_LEGAL: readonly LegalVector<MissionState, MissionEven
     to: "executing",
   },
   {
-    ref: "A.1b#12",
+    ref: "A.1b#12b",
     from: "executing",
     event: { type: "gate-violation-detected", workSummaryCarried: true, branchCarried: true },
     to: "re-routed",
   },
   {
-    ref: "A.1b#12",
+    ref: "A.1b#12b",
     from: "merging",
     event: { type: "gate-violation-detected", workSummaryCarried: true, branchCarried: true },
     to: "re-routed",
+  },
+  {
+    ref: "A.1b#12a",
+    from: "draft",
+    event: { type: "gate-violation-detected", workSummaryCarried: true },
+    to: "re-routed",
+  },
+  {
+    ref: "A.1b#12c",
+    from: "paused-manual",
+    event: { type: "gate-violation-detected", workSummaryCarried: true, pausedFrom: "draft" },
+    to: "re-routed",
+  },
+  {
+    ref: "A.1b#12c",
+    from: "paused-manual",
+    event: {
+      type: "gate-violation-detected",
+      workSummaryCarried: true,
+      branchCarried: true,
+      pausedFrom: "executing",
+    },
+    to: "re-routed",
+  },
+  {
+    ref: "A.1b#13",
+    from: "merging",
+    event: { type: "candidate-rebuilt", green: false, newCandidateSha: "qcand-2" },
+    to: "executing",
   },
   {
     ref: "A.1#24",
@@ -866,6 +895,18 @@ export const MISSION_QUICK_ILLEGAL: readonly IllegalVector<MissionState, Mission
     from: null,
     event: { type: "mission-created", source: "prd-intake" },
     expect: "illegal-transition",
+  },
+  {
+    name: "re-route from an execution-entered state without carrying the branch (AMEND-5)",
+    from: "executing",
+    event: { type: "gate-violation-detected", workSummaryCarried: true },
+    expect: "guard-rejected",
+  },
+  {
+    name: "re-route from paused-manual whose recorded paused-from was executing, without the branch (AMEND-5)",
+    from: "paused-manual",
+    event: { type: "gate-violation-detected", workSummaryCarried: true, pausedFrom: "executing" },
+    expect: "guard-rejected",
   },
 ];
 
@@ -986,10 +1027,16 @@ export const ISSUE_LEGAL: readonly LegalVector<IssueState, IssueEvent>[] = [
     to: "merge-pending",
   },
   {
-    ref: "A.2#14",
+    ref: "A.2#14a",
     from: "validating",
     event: { type: "validation-failed", repairPolicyAllows: true, failureCount: 1 },
     to: "ready",
+  },
+  {
+    ref: "A.2#14b",
+    from: "validating",
+    event: { type: "validation-failed", repairPolicyAllows: true, failureCount: 4 },
+    to: "escalated",
   },
   { ref: "A.2#15", from: "validating", event: { type: "infra-blocked" }, to: "blocked" },
   {
@@ -1058,6 +1105,16 @@ export const ISSUE_LEGAL: readonly LegalVector<IssueState, IssueEvent>[] = [
     to: "cancelled",
   },
   { ref: "A.2#23", from: "blocked", event: { type: "block-resolved" }, to: "ready" },
+  {
+    ref: "A.2#25",
+    from: "merge-pending",
+    event: {
+      type: "quick-task-mission-landed",
+      missionPushConfirmed: true,
+      targetMainCandidate: true,
+    },
+    to: "merged",
+  },
   {
     ref: "A.2#24",
     from: "validating",
@@ -1208,6 +1265,16 @@ export const ISSUE_ILLEGAL: readonly IllegalVector<IssueState, IssueEvent>[] = [
     name: "replan without the contract-v(n+1) attestation (review r3 finding 2)",
     from: "replanning",
     event: { type: "replan-complete", contractVersionAdvanced: false, unmetDependencies: 0 },
+    expect: "guard-rejected",
+  },
+  {
+    name: "quick-task landing without the confirmed mission push (AMEND-1)",
+    from: "merge-pending",
+    event: {
+      type: "quick-task-mission-landed",
+      missionPushConfirmed: false,
+      targetMainCandidate: true,
+    },
     expect: "guard-rejected",
   },
 ];

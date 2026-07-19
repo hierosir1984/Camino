@@ -47,15 +47,11 @@ export type MissionRoute = "integration" | "quick-task";
  * Serialization (Appendix A preamble): at most one mission per repo occupies
  * an execution-bearing state; additional missions wait in `queued`.
  *
- * The appendix names the span "(approved through merging)". Read as a bare
- * state set that is internally inconsistent with the interrupt rows: the
- * paused/escalated/blocked states are entered from inside the span while the
- * mission still holds branches and workspaces (the preamble's own rationale —
- * intake/planning states "touch no workspace" — puts them on the slot-holding
- * side), yet `paused-manual` is also reachable from draft/planned/queued via
- * the any-active manual-pause row, where no slot is held. So execution-bearing
- * is a function of (state, pausedFrom), not a set — audit item, proposed
- * appendix clarification pending David.
+ * The appendix (as amended per AMEND-2, approved 2026-07-19) defines the span
+ * as "approved through merging, including interrupt states entered from that
+ * span; a manually paused mission holds the slot iff it held it when paused" —
+ * execution-bearing is a function of (state, pausedFrom), which this predicate
+ * implements.
  */
 const EXECUTION_BEARING_BASE: readonly MissionState[] = [
   "approved",
@@ -186,11 +182,12 @@ export type MissionEvent =
   | { type: "rebuilds-exhausted"; rebuildCount: number }
   // A.1#24 — David abandons mission
   | { type: "mission-abandoned"; actor?: string }
-  // A.1b#12 — any CAM-MERGE-01 gate found violated
+  // A.1b#12 — any CAM-MERGE-01 gate found violated (AMEND-5: branch carried where executed)
   | {
       type: "gate-violation-detected";
       workSummaryCarried: boolean;
-      branchCarried: boolean;
+      branchCarried?: boolean;
+      pausedFrom?: MissionState; // recorded context (paused-manual source resolution)
     };
 
 /**
@@ -206,6 +203,7 @@ export const MISSION_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly Enrich
   ],
   "push-confirmed": [{ field: "approvedCandidateSha", source: "approved-candidate-sha" }],
   "quick-validation-red": [{ field: "failureCount", source: "next-mission-failure-count" }],
+  "gate-violation-detected": [{ field: "pausedFrom", source: "paused-from" }],
 };
 
 type MissionRow = TransitionRow<MissionState, MissionEvent>;
@@ -761,23 +759,66 @@ const quickTaskRows: readonly MissionRow[] = [
     to: "complete",
     note: "A.1b has no residue terminal; a non-empty (or malformed) descoped list rejects rather than landing silently.",
   }),
+  // A.1b#13 (AMEND-3, approved 2026-07-19) — merging | rebuilt candidate red | — | executing
+  row({
+    ref: "A.1b#13",
+    from: ["merging"],
+    event: "candidate-rebuilt",
+    guard: { name: "rebuilt-candidate-red", check: (e) => e.green === false },
+    to: "executing",
+    note: "Mirrors A.1#13: a red rebuild inside the retry bound returns to executing for repair.",
+  }),
   manualPause, // A.1b←A.1#16 (inherited)
   manualResume, // A.1b←A.1#17 (inherited)
   escalationRaised, // A.1b←A.1#18 (inherited, per the preamble's escalated/blocked clause)
   blockerHit, // A.1b←A.1#19 (inherited)
   obstacleClearedEscalated, // A.1b←A.1#21a (inherited)
   obstacleClearedBlocked, // A.1b←A.1#21b (inherited)
-  // A.1b#12 — any active | any CAM-MERGE-01 gate found violated | work summary + branch carried over | re-routed
+  // A.1b#12 — any active | gate violated | work summary carried; branch carried where the
+  // task had entered execution (AMEND-5, approved 2026-07-19) | re-routed
   row({
-    ref: "A.1b#12",
-    from: MISSION_ACTIVE_STATES,
+    ref: "A.1b#12a",
+    from: ["queued", "draft", "planned", "approved"],
     event: "gate-violation-detected",
     guard: {
-      name: "work-carried-over",
+      name: "work-summary-carried-pre-execution",
+      check: (e) => attested(e.workSummaryCarried),
+    },
+    to: "re-routed",
+    note: "Pre-execution sources have no branch to carry; only the work summary is required.",
+  }),
+  row({
+    ref: "A.1b#12b",
+    from: [
+      "executing",
+      "awaiting-merge-approval",
+      "merging",
+      "paused-external",
+      "paused-urgent",
+      "escalated",
+      "blocked",
+    ],
+    event: "gate-violation-detected",
+    guard: {
+      name: "work-summary-and-branch-carried",
       check: (e) => attested(e.workSummaryCarried) && attested(e.branchCarried),
     },
     to: "re-routed",
-    note: "Terminal; a successor A.1 mission is created referencing this record (mission-created with source re-routed) after this task ends, preserving serialization.",
+    note: "Execution-entered sources must carry the branch. Terminal; a successor A.1 mission is created referencing this record (mission-created with source re-routed) after this task ends, preserving serialization.",
+  }),
+  row({
+    ref: "A.1b#12c",
+    from: ["paused-manual"],
+    event: "gate-violation-detected",
+    guard: {
+      name: "work-summary-and-branch-if-paused-from-execution",
+      check: (e) =>
+        attested(e.workSummaryCarried) &&
+        (["queued", "draft", "planned", "approved"].includes(e.pausedFrom as string) ||
+          attested(e.branchCarried)),
+    },
+    to: "re-routed",
+    note: "paused-manual resolves by the RECORDED paused-from state (enriched): a task paused before execution needs no branch; otherwise the branch attestation is required (absent recorded context fails closed).",
   }),
   abandoned, // A.1b←A.1#24 (inherited)
 ];
