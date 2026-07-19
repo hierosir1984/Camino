@@ -9,5 +9,8 @@
   },
   "scripts": {
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@camino/shared": "0.0.0"
   }
 }

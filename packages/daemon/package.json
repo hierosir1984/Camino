@@ -9,5 +9,13 @@
   },
   "scripts": {
     "test": "vitest run"
+  },
+  "dependencies": {
+    "@camino/core": "0.0.0",
+    "@camino/shared": "0.0.0",
+    "better-sqlite3": "12.11.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13"
   }
 }

@@ -5,3 +5,14 @@ export {
   formatRequirementId,
 } from "./requirement-id.js";
 export type { RequirementId } from "./requirement-id.js";
+
+export { ENTITY_KINDS } from "./event-log.js";
+export type {
+  EntityKind,
+  EventOutcome,
+  RejectionCode,
+  EventInput,
+  EventRecord,
+  EventFilter,
+  EventStore,
+} from "./event-log.js";

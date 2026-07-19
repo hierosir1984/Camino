@@ -96,6 +96,19 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     file: "__fence_trip__computed.ts",
     source: 'const g = globalThis["process"];\nexport const leak = g["getBuiltinModule"]("fs");\n',
   },
+  // WP-101 acceptance names persistence and sibling packages explicitly:
+  // core must never reach the event store's driver or the daemon.
+  {
+    name: "better-sqlite3 import (WP-101 acceptance vector)",
+    file: "__fence_trip__sqlite.ts",
+    source: 'import Database from "better-sqlite3";\nexport const leak = Database;\n',
+  },
+  {
+    name: "@camino/daemon package import (WP-101 acceptance vector)",
+    file: "__fence_trip__daemon_pkg.ts",
+    source:
+      'import { SqliteEventStore } from "@camino/daemon";\nexport const leak = SqliteEventStore;\n',
+  },
 ];
 
 describe("packages/core import fence", () => {
@@ -113,8 +126,7 @@ describe("packages/core import fence", () => {
     });
   }
 
-  it("accepts the real core sources", () => {
-    expect(eslintExitCode(join(CORE_SRC, "exhaustive.ts"))).toBe(0);
-    expect(eslintExitCode(join(CORE_SRC, "index.ts"))).toBe(0);
+  it("accepts the real core sources (whole directory, so new files stay covered)", () => {
+    expect(eslintExitCode(CORE_SRC)).toBe(0);
   });
 });
