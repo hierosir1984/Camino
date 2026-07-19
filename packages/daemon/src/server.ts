@@ -63,9 +63,10 @@
  * is per-launch). It does NOT evict a worker already registered by a squatter.
  * The complete fix is an origin a squatter cannot pre-seed — an ephemeral
  * per-launch port, or a per-launch path/subdomain nonce — which changes the
- * daemon⇄GUI addressing contract and belongs with the real GUI/launch work
- * (WP-122+). Flagged for David as a parked decision; the placeholder GUI here
- * uses no service worker.
+ * daemon⇄GUI addressing contract. DECISION (David, 2026-07-19): DEFERRED to the
+ * real GUI/launch work (WP-122+), where the addressing contract is designed;
+ * this shell keeps the `worker-src 'none'` partial mitigation and the
+ * placeholder GUI uses no service worker.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
