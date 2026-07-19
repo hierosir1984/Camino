@@ -12,7 +12,7 @@
 //   quota             — emit a rate-limit event and exit nonzero.
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, writeSync } from "node:fs";
+import { existsSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 const mode = process.env.MOCK_MODE ?? "solve";
@@ -38,14 +38,27 @@ if (mode === "hang") {
   // orphan the descendant; correct kill-confirm must SIGKILL the whole group.
   // The descendant uses a shell `trap` — installed synchronously at startup,
   // unlike a node SIGTERM handler that races process boot.
-  spawn("sh", ["-c", 'trap "" TERM; while :; do sleep 1; done'], { stdio: "ignore" });
+  //
+  // Readiness handshake: the descendant writes a marker file only AFTER its
+  // trap is active, and the leader emits nothing until the marker exists. The
+  // test keys its cancel off the first event, so SIGTERM cannot arrive before
+  // the descendant is actually ignoring it. (A fixed pre-event delay lost this
+  // race on a loaded host: sh's fork/exec outran the budget, the descendant
+  // died with the group, and no SIGKILL escalation was observed.)
+  const marker = join(process.cwd(), ".orphan-descendant-ready");
+  spawn("sh", ["-c", `trap "" TERM; : > "${marker}"; while :; do sleep 1; done`], {
+    stdio: "ignore",
+  });
   process.on("SIGTERM", () => process.exit(0)); // leader exits on TERM
-  // Give the descendant a beat to install its trap before work "starts", so a
-  // cancel arriving shortly after the first event hits a ready descendant.
-  setTimeout(() => {
+  const gateStart = Date.now();
+  const gate = setInterval(() => {
+    // Cap the wait so a failed descendant spawn surfaces as a loud assertion
+    // failure (no escalation recorded) instead of a hung dispatch.
+    if (!existsSync(marker) && Date.now() - gateStart < 10_000) return;
+    clearInterval(gate);
     emit("assistant", "spawned a SIGTERM-ignoring descendant");
     setInterval(() => emit("other", "leader alive"), 200);
-  }, 150);
+  }, 10);
 } else if (mode === "grace-descendant") {
   // Cooperative-but-slow descendant: the leader exits immediately on SIGTERM,
   // but a descendant takes ~200ms to shut down. With enough grace, NO SIGKILL
