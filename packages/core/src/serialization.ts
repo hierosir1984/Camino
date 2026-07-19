@@ -57,23 +57,31 @@ export function fifoOrder(
 
 /** An activation that did not go to the FIFO head of its lane at its point in the log. */
 export interface ActivationDeviation {
-  /** Seq of the `execution-slot-freed` record that activated out of order. */
+  /** Seq of the `execution-slot-freed` record that deviated. */
   readonly seq: number;
   /** The mission that was activated. */
   readonly missionId: string;
   readonly lane: "primary" | "urgent";
-  /** The mission that was the lane's FIFO head at that point. */
-  readonly expectedHeadId: string;
+  /**
+   * `jumped-queue`: another mission was the lane's FIFO head.
+   * `never-queued`: the activated mission was not in the lane's queue at
+   * all at that point in the log (r2 finding 10 — such a record cannot come
+   * from an honest recorder, but the audit must not certify it).
+   */
+  readonly reason: "jumped-queue" | "never-queued";
+  /** The mission that was the lane's FIFO head at that point (if the queue was non-empty). */
+  readonly expectedHeadId?: string;
 }
 
 /**
  * Audit every recorded activation against FIFO order (review round 1,
- * finding 4): the Appendix A guard records an ATTESTED `fifoHead` fact, so
- * a false attestation produces an out-of-order activation that replay
- * happily verifies. This audit re-derives, at each applied
+ * finding 4; round 2, finding 10): the Appendix A guard records an ATTESTED
+ * `fifoHead` fact, so a false attestation produces an activation that
+ * replay happily verifies. This audit re-derives, at each applied
  * `execution-slot-freed` record, which mission actually was the lane's
  * FIFO head among the then-queued missions, and reports every activation
- * that disagrees. Pure over the log plus the lane assignment (which is
+ * that disagrees — including an activation for a mission that was not
+ * queued at all. Pure over the log plus the lane assignment (which is
  * domain data — the caller supplies mission id → lane for the repo's
  * missions; ids absent from the map are outside the audit's scope).
  */
@@ -90,15 +98,24 @@ export function auditActivationOrder(
     if (record.toState === "queued" && !firstEntry.has(record.entityId)) {
       firstEntry.set(record.entityId, record.seq);
     }
-    if (record.event === "execution-slot-freed" && record.fromState === "queued") {
+    if (record.event === "execution-slot-freed") {
       const lane = laneOf.get(record.entityId) as "primary" | "urgent";
       const contenders = [...queuedNow].filter((id) => laneOf.get(id) === lane);
       const head = fifoOrder(contenders, firstEntry)[0];
-      if (head !== undefined && head !== record.entityId) {
+      if (!queuedNow.has(record.entityId)) {
         deviations.push({
           seq: record.seq,
           missionId: record.entityId,
           lane,
+          reason: "never-queued",
+          ...(head === undefined ? {} : { expectedHeadId: head }),
+        });
+      } else if (head !== undefined && head !== record.entityId) {
+        deviations.push({
+          seq: record.seq,
+          missionId: record.entityId,
+          lane,
+          reason: "jumped-queue",
           expectedHeadId: head,
         });
       }

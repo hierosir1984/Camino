@@ -17,10 +17,15 @@
  *   policy on the GUI side is still the backstop — recorded as an
  *   obligation for the GUI work packages, not silently assumed here.
  * - Bounded rendering: micromark's resource use is content-dependent and
- *   super-linear on pathological inputs (a 1 MiB bracket run costs ~1.25 GB
- *   RSS). Markdown above RENDER_MAX_INPUT_BYTES renders as an escaped
+ *   quadratic-class on pathological inputs. Measured on the dev machine
+ *   (r2 finding 2): nested-emphasis runs cost 91 ms at 8 KiB, 289 ms at
+ *   16 KiB, 928 ms at 32 KiB, and balanced brackets ~7.9 s at 64 KiB.
+ *   Markdown above RENDER_MAX_INPUT_BYTES renders as an escaped
  *   preformatted block with the reason stated inline — shown, never
- *   truncated, never fed to the markdown parser.
+ *   truncated, never fed to the markdown parser. The escape fallback is a
+ *   single linear pass (22 ms for 1 MiB of worst-expansion input — the
+ *   intake retention bound), so the fallback itself cannot become the
+ *   resource problem.
  *
  * Rendering is a projection of the immutably retained content — it never
  * alters the stored original.
@@ -30,11 +35,13 @@ import type { MissionContentFormat } from "@camino/shared";
 
 /**
  * Upper bound on input handed to the markdown parser (bytes of UTF-8).
- * Chosen against the measured pathological cost (~1.1 KB RSS per input
- * byte on bracket runs → ~70 MB transient at this bound) — far above any
- * real PRD, far below daemon-threatening.
+ * 16 KiB: measured worst-case parse ≈ 290 ms on the dev machine — a
+ * bounded, tolerable stall for a local single-user daemon; real PRDs
+ * above it stay readable via the stated preformatted fallback. Rendering
+ * larger documents as markdown needs isolation (a worker with a deadline),
+ * recorded as a GUI-era work-package concern, not silently assumed here.
  */
-export const RENDER_MAX_INPUT_BYTES = 64 * 1024;
+export const RENDER_MAX_INPUT_BYTES = 16 * 1024;
 
 /** Render retained mission content to HTML for the mission view. */
 export function renderMissionContent(content: string, format: MissionContentFormat): string {
@@ -78,11 +85,15 @@ function neutralizeImages(html: string): string {
   );
 }
 
+const HTML_ESCAPES: Readonly<Record<string, string>> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/** Single pass — five chained replaceAll calls would allocate five intermediate copies (r2 finding 2). */
 function escapeHtml(text: string): string {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+  return text.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] as string);
 }

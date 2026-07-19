@@ -110,7 +110,8 @@ export interface QuickTaskIntakeRequest {
 /** Why an intake request was refused (CAM-CORE-02: stated reason, never a silent truncation). */
 export type IntakeRejectionCode =
   | "unsupported-format" // extension outside the v1 allowlist (.md / .txt)
-  | "not-utf8" // bytes do not decode as strict UTF-8
+  | "not-utf8" // bytes do not decode as strict UTF-8, or text is not well-formed UTF-16
+  | "embedded-nul" // valid text containing U+0000, which SQLite TEXT cannot hold faithfully
   | "content-too-large" // above the intake size bound
   | "empty-content" // nothing to retain
   | "unknown-repo" // repoId matches no repo

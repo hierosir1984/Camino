@@ -191,6 +191,74 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
     expect(store.getProject(projectId)?.name).toBe("camino");
   });
 
+  it("rejects UPDATE OR REPLACE (and plain UPDATE/DELETE) on projects and repos (r2 finding 6)", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    const { projectId, repoId } = seedMission(store);
+    const second = store.createProject("second");
+    const secondRepo = store.createRepo(second.id, "second-repo");
+
+    // UPDATE OR REPLACE resolves a UNIQUE conflict by REPLACE-deleting the
+    // other row — before this fold it renamed p1 and silently deleted p2.
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw.prepare("UPDATE OR REPLACE projects SET name = 'second' WHERE id = ?").run(projectId),
+    ).toThrow(/permanent/);
+    expect(() =>
+      raw
+        .prepare("UPDATE OR REPLACE repos SET name = 'second-repo', project_id = ? WHERE id = ?")
+        .run(second.id, repoId),
+    ).toThrow(/permanent/);
+    expect(() =>
+      raw.prepare("UPDATE projects SET name = 'renamed' WHERE id = ?").run(projectId),
+    ).toThrow(/permanent/);
+    expect(() => raw.prepare("DELETE FROM repos WHERE id = ?").run(secondRepo.id)).toThrow(
+      /permanent/,
+    );
+    // Every row survives.
+    expect(store.listProjects().map((p) => p.name)).toEqual(["camino", "second"]);
+    expect(store.getRepo(secondRepo.id)?.name).toBe("second-repo");
+  });
+
+  it("rejects NULL identities on raw inserts (r2 finding 3)", () => {
+    const path = tempDbPath();
+    newStore(path);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    // A bare TEXT PRIMARY KEY admits multiple NULLs; NOT NULL closes it.
+    expect(() =>
+      raw.prepare("INSERT INTO projects (id, name, created_at) VALUES (NULL, 'p', 'now')").run(),
+    ).toThrow(/NOT NULL/);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO repos (id, project_id, name, origin_url, created_at) VALUES (NULL, 'x', 'r', NULL, 'now')",
+        )
+        .run(),
+    ).toThrow(/NOT NULL/);
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT INTO missions
+             (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+           VALUES (NULL, 'x', 'integration', 0, 't', 'pasted', 'c', ?, 'markdown', NULL, 'now')`,
+        )
+        .run("0".repeat(64)),
+    ).toThrow(/NOT NULL/);
+  });
+
+  it("refuses project/repo metadata that cannot round-trip exactly (r2 finding 8)", () => {
+    const store = newStore();
+    expect(() => store.createProject("bad \uD800 name")).toThrow(/unpaired surrogate/);
+    expect(() => store.createProject("bad \0 name")).toThrow(/embedded NUL/);
+    const project = store.createProject("camino");
+    expect(() => store.createRepo(project.id, "bad \uDC00 repo")).toThrow(/unpaired surrogate/);
+    expect(() => store.createRepo(project.id, "repo", "https://x.invalid/\0")).toThrow(
+      /embedded NUL/,
+    );
+  });
+
   it("schema CHECKs pin the lane rule: urgent is quick-task-only", () => {
     const store = newStore();
     const { repoId } = seedMission(store);
@@ -332,6 +400,50 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
         contentFormat: "text",
       }),
     ).toThrow(/markdown/);
+  });
+
+  it("store and intake agree on filenames: bare dotfiles are rejected at both (r2 finding 11)", () => {
+    const store = newStore();
+    const { repoId } = seedMission(store);
+    for (const filename of [".md", ".txt", ".MD"]) {
+      expect(() =>
+        store.createMission({
+          repoId,
+          route: "integration",
+          urgent: false,
+          title: "t",
+          sourceKind: "file",
+          content: "c",
+          contentFormat: filename.toLowerCase() === ".md" ? "markdown" : "text",
+          filename,
+        }),
+      ).toThrow(/real basename/);
+    }
+  });
+
+  it("schema rejects dotfile filenames and non-hex hashes on raw inserts (r2 findings 11/3)", () => {
+    const path = tempDbPath();
+    const store = newStore(path);
+    const { repoId } = seedMission(store);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    const insert = raw.prepare(
+      `INSERT INTO missions
+         (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+       VALUES (?, ?, 'integration', 0, 't', 'file', 'c', ?, ?, ?, 'now')`,
+    );
+    // Bare dotfiles fail the length floor in the schema CHECK.
+    expect(() => insert.run("d1", repoId, "0".repeat(64), "markdown", ".md")).toThrow(/CHECK/i);
+    expect(() => insert.run("d2", repoId, "0".repeat(64), "text", ".txt")).toThrow(/CHECK/i);
+    // Non-hex and non-text hashes fail the hash CHECK.
+    expect(() => insert.run("d3", repoId, "g".repeat(64), "markdown", "x.md")).toThrow(/CHECK/i);
+    expect(() => insert.run("d4", repoId, "🚀".repeat(32), "markdown", "x.md")).toThrow(/CHECK/i);
+    const blobInsert = raw.prepare(
+      `INSERT INTO missions
+         (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+       VALUES ('d5', ?, 'integration', 0, 't', 'pasted', 'c', zeroblob(64), 'markdown', NULL, 'now')`,
+    );
+    expect(() => blobInsert.run(repoId)).toThrow(/CHECK/i);
   });
 
   it("schema CHECKs enforce the same coherence against raw inserts", () => {

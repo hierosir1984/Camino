@@ -6,29 +6,37 @@
  * mission id. Multi-project from day one (CAM-CORE-06): adding a project or
  * repo is an insert — the schema never changes for it.
  *
- * Mission rows are immutable at the schema level (CAM-CORE-02: original
- * content retained immutably): BEFORE UPDATE / BEFORE DELETE triggers abort
- * mutation on every connection, ours or raw — the same posture as the event
- * log — and BEFORE INSERT conflict guards close the REPLACE class (review
- * round 1, finding 1: `INSERT OR REPLACE` resolves a key conflict by
- * deleting the old row WITHOUT firing DELETE triggers unless the writer
- * opted into recursive triggers; the insert guard aborts before resolution
- * can delete anything). Projects and repos are permanent too in v1 (no
- * update/delete API; the same insert guards cover their UNIQUE conflicts,
- * which REPLACE could otherwise resolve by deletion).
+ * ALL rows are immutable/permanent at the schema level: BEFORE UPDATE /
+ * BEFORE DELETE triggers on every table abort mutation on every connection,
+ * ours or raw (r2 finding 6: projects/repos were mutable via ordinary
+ * `UPDATE OR REPLACE`, which REPLACE-deletes the conflicting row), and
+ * BEFORE INSERT conflict guards close the REPLACE-insert class (r1 finding
+ * 1: `INSERT OR REPLACE` deletes past DELETE triggers unless the writer
+ * opted into recursive triggers). Renaming projects/repos becomes a
+ * deliberate, schema-versioned capability when a WP needs it — not an
+ * UPDATE that happens to work.
  *
- * Cross-field coherence is enforced at the durable boundary itself, not
- * just in intake (round 1, finding 10): route ↔ source kind, source kind ↔
- * content format (file format must agree with the filename extension),
- * non-empty well-formed content. The stored content hash is re-derived from
- * the content by this API; a raw writer inserting a forged hash is the same
- * privileged class as DDL — stated, not defended.
+ * Identity and shape are pinned in the schema too: ids are NOT NULL (a
+ * bare TEXT PRIMARY KEY admits multiple NULLs — r2 finding 3), stored
+ * types are CHECKed (`typeof`), the content hash must be 64 lowercase hex
+ * characters, and cross-field coherence — route ↔ source kind, source ↔
+ * format, file format ↔ extension over a real basename — is enforced at
+ * the durable boundary AND validated in TS for clear errors (r1 finding
+ * 10, r2 finding 11).
  *
- * Same honesty scope as the event store: SQLite cannot stop a privileged
- * writer issuing DDL; the triggers guard against mutation bugs, and opening
- * a database whose user_version claims this schema but whose tables or
- * triggers are missing refuses to start rather than silently recreating an
- * emptied store.
+ * Strings must round-trip exactly: every string field is refused if it is
+ * ill-formed UTF-16 (unpaired surrogates become replacement characters in
+ * SQLite — r1 finding 6, extended to project/repo metadata by r2 finding
+ * 8) or contains U+0000 (SQLite TEXT semantics break on embedded NUL:
+ * `length()` stops there, so a CHECK can reject valid non-empty text — r2
+ * finding 4).
+ *
+ * Honesty scope: SQLite cannot stop a privileged writer issuing DDL, and a
+ * raw writer can supply explicit rowids or a forged (still-hex) hash —
+ * that class is stated, not defended; the API path re-derives hashes and
+ * assigns rowids monotonically. Opening a database whose user_version
+ * claims this schema but whose tables or triggers are missing refuses to
+ * start rather than silently recreating an emptied store.
  */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -46,31 +54,35 @@ const SCHEMA_VERSION = 1;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
-  id         TEXT PRIMARY KEY CHECK (length(id) > 0),
-  name       TEXT NOT NULL UNIQUE CHECK (length(name) > 0),
+  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
+  name       TEXT NOT NULL UNIQUE CHECK (typeof(name) = 'text' AND length(name) > 0),
   created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS repos (
-  id         TEXT PRIMARY KEY CHECK (length(id) > 0),
+  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
   project_id TEXT NOT NULL REFERENCES projects(id),
-  name       TEXT NOT NULL CHECK (length(name) > 0),
+  name       TEXT NOT NULL CHECK (typeof(name) = 'text' AND length(name) > 0),
   origin_url TEXT,
   created_at TEXT NOT NULL,
   UNIQUE (project_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS missions (
-  id             TEXT PRIMARY KEY CHECK (length(id) > 0),
+  id             TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
   repo_id        TEXT NOT NULL REFERENCES repos(id),
   route          TEXT NOT NULL CHECK (route IN ('integration', 'quick-task')),
   urgent         INTEGER NOT NULL CHECK (urgent IN (0, 1)),
-  title          TEXT NOT NULL CHECK (length(title) > 0),
+  title          TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) > 0),
   source_kind    TEXT NOT NULL CHECK (source_kind IN ('pasted', 'file', 'quick-task')),
-  content        TEXT NOT NULL CHECK (length(content) > 0),
-  content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+  content        TEXT NOT NULL CHECK (typeof(content) = 'text' AND length(content) > 0),
+  content_sha256 TEXT NOT NULL CHECK (
+                   typeof(content_sha256) = 'text'
+                   AND length(content_sha256) = 64
+                   AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+                 ),
   content_format TEXT NOT NULL CHECK (content_format IN ('markdown', 'text')),
-  filename       TEXT,
+  filename       TEXT CHECK (filename IS NULL OR typeof(filename) = 'text'),
   created_at     TEXT NOT NULL,
   -- The urgent lane belongs to quick tasks only (CAM-CORE-08).
   CHECK (urgent = 0 OR route = 'quick-task'),
@@ -80,13 +92,21 @@ CREATE TABLE IF NOT EXISTS missions (
   -- integration missions only from pasted text or files (r1 finding 10).
   CHECK ((route = 'quick-task') = (source_kind = 'quick-task')),
   -- Source ↔ format coherence: quick tasks are text, pasted PRD text is
-  -- markdown, and a file's format must agree with its extension.
+  -- markdown, and a file's format must agree with its extension over a real
+  -- basename (a bare dotfile like ".md" is not a name — r2 finding 11) with
+  -- no path separators.
   CHECK (source_kind != 'quick-task' OR content_format = 'text'),
   CHECK (source_kind != 'pasted' OR content_format = 'markdown'),
   CHECK (
     source_kind != 'file'
-    OR (lower(substr(filename, -3)) = '.md' AND content_format = 'markdown')
-    OR (lower(substr(filename, -4)) = '.txt' AND content_format = 'text')
+    OR (
+      instr(filename, '/') = 0
+      AND instr(filename, '\\') = 0
+      AND (
+        (lower(substr(filename, -3)) = '.md' AND length(filename) >= 4 AND content_format = 'markdown')
+        OR (lower(substr(filename, -4)) = '.txt' AND length(filename) >= 5 AND content_format = 'text')
+      )
+    )
   )
 );
 
@@ -102,6 +122,33 @@ CREATE TRIGGER IF NOT EXISTS missions_immutable_delete
 BEFORE DELETE ON missions
 BEGIN
   SELECT RAISE(ABORT, 'mission records are immutable (CAM-CORE-02): DELETE rejected');
+END;
+
+-- Projects and repos are permanent in v1 (r2 finding 6: without these, an
+-- ordinary UPDATE OR REPLACE could REPLACE-delete a conflicting row).
+-- Renaming becomes a deliberate schema-versioned capability when needed.
+CREATE TRIGGER IF NOT EXISTS projects_permanent_update
+BEFORE UPDATE ON projects
+BEGIN
+  SELECT RAISE(ABORT, 'project rows are permanent in v1: UPDATE rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS projects_permanent_delete
+BEFORE DELETE ON projects
+BEGIN
+  SELECT RAISE(ABORT, 'project rows are permanent in v1: DELETE rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS repos_permanent_update
+BEFORE UPDATE ON repos
+BEGIN
+  SELECT RAISE(ABORT, 'repo rows are permanent in v1: UPDATE rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS repos_permanent_delete
+BEFORE DELETE ON repos
+BEGIN
+  SELECT RAISE(ABORT, 'repo rows are permanent in v1: DELETE rejected');
 END;
 
 -- REPLACE-class guard (r1 finding 1): INSERT OR REPLACE resolves a key
@@ -139,7 +186,11 @@ const REQUIRED_OBJECTS = [
   "missions_immutable_update",
   "missions_immutable_delete",
   "missions_immutable_insert_conflict",
+  "projects_permanent_update",
+  "projects_permanent_delete",
   "projects_permanent_insert_conflict",
+  "repos_permanent_update",
+  "repos_permanent_delete",
   "repos_permanent_insert_conflict",
 ] as const;
 
@@ -174,6 +225,24 @@ interface MissionRow {
 /** SHA-256 (hex) of the UTF-8 encoding of `content` — the content identity stored per mission. */
 export function contentSha256(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/**
+ * Refuse strings SQLite cannot hold faithfully: ill-formed UTF-16 becomes
+ * replacement characters (r1 finding 6, r2 finding 8), and embedded U+0000
+ * breaks SQLite TEXT semantics — length()/LIKE stop at the NUL, so CHECKs
+ * misjudge valid text (r2 finding 4). Applied to EVERY string this store
+ * persists.
+ */
+function assertRoundTripExact(field: string, value: string): void {
+  if (!value.isWellFormed()) {
+    throw new TypeError(
+      `${field} contains unpaired surrogate code units and cannot be retained exactly`,
+    );
+  }
+  if (value.includes("\0")) {
+    throw new TypeError(`${field} contains an embedded NUL, which SQLite TEXT cannot hold`);
+  }
 }
 
 export interface SqliteDomainStoreOptions {
@@ -240,6 +309,7 @@ export class SqliteDomainStore {
     if (typeof name !== "string" || name.length === 0) {
       throw new TypeError("project name must be a non-empty string");
     }
+    assertRoundTripExact("project name", name);
     const project: Project = { id: this.newId(), name, createdAt: this.now().toISOString() };
     this.db
       .prepare("INSERT INTO projects (id, name, created_at) VALUES (@id, @name, @createdAt)")
@@ -250,6 +320,13 @@ export class SqliteDomainStore {
   createRepo(projectId: string, name: string, originUrl?: string): Repo {
     if (typeof name !== "string" || name.length === 0) {
       throw new TypeError("repo name must be a non-empty string");
+    }
+    assertRoundTripExact("repo name", name);
+    if (originUrl !== undefined) {
+      if (typeof originUrl !== "string" || originUrl.length === 0) {
+        throw new TypeError("originUrl, when present, must be a non-empty string");
+      }
+      assertRoundTripExact("repo originUrl", originUrl);
     }
     const createdAt = this.now().toISOString();
     const id = this.newId();
@@ -290,20 +367,10 @@ export class SqliteDomainStore {
     if (typeof content !== "string" || content.length === 0) {
       throw new TypeError("mission content must be a non-empty string");
     }
-    // Ill-formed UTF-16 (unpaired surrogates) cannot round-trip through the
-    // store: SQLite would persist replacement characters, silently breaking
-    // both exact retention and hash agreement (r1 finding 6). Refuse instead.
-    for (const [field, value] of [
-      ["content", content],
-      ["title", title],
-      ...(filename === undefined ? [] : ([["filename", filename]] as const)),
-    ] as const) {
-      if (!value.isWellFormed()) {
-        throw new TypeError(
-          `mission ${field} contains unpaired surrogate code units and cannot be retained exactly`,
-        );
-      }
-    }
+    // Every string must round-trip exactly (r1 finding 6, r2 findings 4/8).
+    assertRoundTripExact("mission content", content);
+    assertRoundTripExact("mission title", title);
+    if (filename !== undefined) assertRoundTripExact("mission filename", filename);
     if ((sourceKind === "file") !== (typeof filename === "string" && filename.length > 0)) {
       throw new TypeError("filename must be present exactly for file intake");
     }
@@ -319,15 +386,18 @@ export class SqliteDomainStore {
       throw new TypeError("pasted PRD text is markdown");
     }
     if (sourceKind === "file" && filename !== undefined) {
-      const lower = filename.toLowerCase();
-      const expected = lower.endsWith(".md")
-        ? "markdown"
-        : lower.endsWith(".txt")
-          ? "text"
-          : undefined;
+      // Same rule as intake (r2 finding 11): a real basename before the
+      // extension (bare dotfiles are not names), no path separators.
+      if (/[/\\]/.test(filename)) {
+        throw new TypeError("filename must be a bare name without path separators");
+      }
+      const dot = filename.lastIndexOf(".");
+      const extension = dot > 0 ? filename.slice(dot).toLowerCase() : undefined;
+      const expected = extension === ".md" ? "markdown" : extension === ".txt" ? "text" : undefined;
       if (expected === undefined || expected !== contentFormat) {
         throw new TypeError(
-          `file content format must agree with the filename extension (${filename} vs ${contentFormat})`,
+          `file content format must agree with the filename extension over a real basename ` +
+            `(${JSON.stringify(filename)} vs ${contentFormat})`,
         );
       }
     }
@@ -376,8 +446,10 @@ export class SqliteDomainStore {
   }
 
   listProjects(): Project[] {
-    // rowid is SQLite's monotone insertion counter: exact insertion order,
-    // deterministic under equal timestamps (r1 finding 11).
+    // rowid is assigned monotonically for THIS API's inserts: exact insertion
+    // order, deterministic under equal timestamps (r1 finding 11). A raw
+    // writer supplying explicit rowids is outside the claim (privileged
+    // class, like DDL — r2 finding 12).
     const rows = this.db.prepare("SELECT * FROM projects ORDER BY rowid").all() as ProjectRow[];
     return rows.map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at }));
   }
@@ -400,12 +472,46 @@ export class SqliteDomainStore {
     return row === undefined ? undefined : toMission(row);
   }
 
-  /** All missions of a repo in exact insertion order (rowid) — the scheduler's join surface. */
+  /** All missions of a repo in API insertion order (rowid) — the scheduler's join surface. */
   listMissions(repoId: string): MissionRecord[] {
     const rows = this.db
       .prepare("SELECT * FROM missions WHERE repo_id = ? ORDER BY rowid")
       .all(repoId) as MissionRow[];
     return rows.map(toMission);
+  }
+
+  /**
+   * EVERY mission row, scanned from the table itself — not by walking
+   * projects → repos (r2 finding 9: a hierarchy-traversal misses rows whose
+   * parent is absent). Reconciliation surfaces build on this.
+   */
+  listAllMissions(): MissionRecord[] {
+    const rows = this.db.prepare("SELECT * FROM missions ORDER BY rowid").all() as MissionRow[];
+    return rows.map(toMission);
+  }
+
+  /**
+   * Referential gaps a foreign writer (foreign keys off) can leave behind:
+   * missions whose repo row is missing, repos whose project row is missing.
+   * Both empty on every API-written store (FKs are enforced here).
+   */
+  hierarchyGaps(): { missionIdsWithoutRepo: string[]; repoIdsWithoutProject: string[] } {
+    const missionRows = this.db
+      .prepare(
+        `SELECT m.id AS id FROM missions m LEFT JOIN repos r ON m.repo_id = r.id
+         WHERE r.id IS NULL ORDER BY m.rowid`,
+      )
+      .all() as Array<{ id: string }>;
+    const repoRows = this.db
+      .prepare(
+        `SELECT r.id AS id FROM repos r LEFT JOIN projects p ON r.project_id = p.id
+         WHERE p.id IS NULL ORDER BY r.rowid`,
+      )
+      .all() as Array<{ id: string }>;
+    return {
+      missionIdsWithoutRepo: missionRows.map((row) => row.id),
+      repoIdsWithoutProject: repoRows.map((row) => row.id),
+    };
   }
 
   close(): void {

@@ -43,7 +43,7 @@ function newHarness(): Harness {
     events.close();
   });
   const recorder = new TransitionRecorder(events);
-  const intake = new MissionIntake(domain, recorder);
+  const intake = new MissionIntake(domain, recorder, events);
   const scheduler = new SerializationScheduler(domain, recorder, events);
   const project = domain.createProject("camino");
   const repo = domain.createRepo(project.id, "camino");
@@ -371,6 +371,7 @@ describe("FIFO activation when the slot frees (A.1#5)", () => {
     expect(deviations[0]).toMatchObject({
       missionId: m3,
       lane: "primary",
+      reason: "jumped-queue",
       expectedHeadId: m2,
     });
   });
@@ -485,6 +486,62 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     });
   });
 
+  it("the urgent lane is unavailable while the primary is unparkable — approved has no preemption row (r2 finding 1)", () => {
+    const h = newHarness();
+    // An integration mission APPROVED but not yet executing: execution-
+    // bearing, and no Appendix A row can park it (A.1#15 is from executing).
+    const m1 = intakePrdMission(h, "Approved primary");
+    expect(planAndApprove(h, m1)).toBe("approved");
+
+    // The urgent lane therefore counts as unavailable: the urgent task
+    // queues instead of activating beside an unparkable holder.
+    const qU = intakeQuickTask(h, "Urgent behind approved", true);
+    expect(h.scheduler.executionSlotFreeFor(qU)).toBe(false);
+    expect(planAndApproveQuick(h, qU)).toBe("queued");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([]);
+
+    // The moment the primary starts executing it becomes parkable — the
+    // lane opens and the urgent task activates.
+    startExecution(h, m1);
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "urgent", missionId: qU, to: "approved" },
+    ]);
+    // Honest continuation: park the primary (A.1#15), run the urgent task.
+    apply(h, m1, "urgent-preemption", {}, "camino:scheduler");
+    startQuickExecution(h, qU);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+  });
+
+  it("a forced urgent execution beside an unparked approved primary is a reported violation (r2 finding 1)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Approved primary");
+    expect(planAndApprove(h, m1)).toBe("approved");
+
+    // Force the reviewer's exact sequence with a dishonest slot attestation:
+    // the urgent task approves and starts executing while the primary sits
+    // in `approved`, which nothing can park.
+    const qU = intakeQuickTask(h, "Urgent beside approved", true);
+    apply(h, qU, "contract-attached", {
+      miniReviewAttached: true,
+      observabilityAdjudicated: true,
+    });
+    apply(
+      h,
+      qU,
+      "plan-approved",
+      { riskTierLow: true, neutralConcurred: true, singleIssue: true, executionSlotFree: true },
+      "david",
+    );
+    startQuickExecution(h, qU);
+
+    expect(h.scheduler.serializationViolations(h.repoId)).toContainEqual({
+      kind: "urgent-active-while-primary-unparked",
+      primaryMissionId: m1,
+      primaryState: "approved",
+      urgentMissionId: qU,
+    });
+  });
+
   it("the urgent lane is unavailable while a quick task holds primary — no preemption rows exist for quick tasks (r1 finding 3)", () => {
     const h = newHarness();
     // A non-urgent quick task takes the primary slot and starts executing.
@@ -573,8 +630,9 @@ describe("enforcement boundary (stated, not hidden)", () => {
 
     const violations = h.scheduler.serializationViolations(h.repoId);
     expect(violations).toContainEqual({
-      kind: "concurrent-active-execution",
+      kind: "urgent-active-while-primary-unparked",
       primaryMissionId: q,
+      primaryState: "executing",
       urgentMissionId: qU,
     });
   });

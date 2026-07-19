@@ -12,14 +12,18 @@
  *    sits in `paused-urgent` (A.1#15) and STILL holds the primary slot —
  *    resuming via A.1#20 when the urgent task lands.
  *
- * Quick tasks are not preemptible (review round 1, finding 3): Appendix A
- * gives A.1b no urgent-preemption/interruption-resolved rows, so a quick
- * task holding the primary slot cannot be parked the way an integration
- * mission can. The urgent lane therefore counts as unavailable while a
- * quick task holds primary — an urgent task approved in that window waits
- * in `queued` and activates when the quick task terminates. (Recorded as a
- * spec observation in the PR; an appendix amendment adding quick-task
- * preemption rows would be David's change-control call, not this WP's.)
+ * The urgent lane accepts a mission only when the primary holder (if any)
+ * is PARKED or PARKABLE (r1 finding 3, tightened by r2 finding 1): parked =
+ * paused-urgent / paused-external / paused-manual; parkable = an
+ * integration-route mission in `executing`, the one state A.1#15 preempts
+ * from. Every other primary holder — a quick task in ANY execution-bearing
+ * state (A.1b has no preemption rows at all), or an integration mission in
+ * approved / awaiting-merge-approval / merging / escalated / blocked (no
+ * preemption row from those states either) — cannot be parked, so an
+ * urgent task approved in that window waits in `queued` and activates when
+ * the primary becomes parkable or terminates. (Recorded as a spec
+ * observation in the PR; appendix amendments adding preemption rows would
+ * be David's change-control call, not this WP's.)
  *
  * The scheduler derives everything from the domain store (which mission
  * belongs to which repo, which lane it schedules on) joined with the
@@ -76,6 +80,13 @@ const ACTIVE_EXECUTION_STATES: readonly MissionState[] = [
   "merging",
 ];
 
+/** States in which a primary holder is parked and the urgent lane may run. */
+const PARKED_STATES: readonly MissionState[] = [
+  "paused-urgent",
+  "paused-external",
+  "paused-manual",
+];
+
 export interface LaneHolder {
   readonly missionId: string;
   readonly state: MissionState;
@@ -110,7 +121,7 @@ export interface RepoQueueView {
   readonly concurrent: readonly { missionId: string; title: string; state: MissionState }[];
 }
 
-/** Evidence of a serialization invariant breach (r1 findings 2/3). */
+/** Evidence of a serialization invariant breach (r1 findings 2/3, r2 finding 1). */
 export type SerializationViolation =
   | {
       /** More than one execution-bearing holder in one lane. */
@@ -119,9 +130,15 @@ export type SerializationViolation =
       readonly missionIds: readonly string[];
     }
   | {
-      /** Both lanes actively executing at once — the primary was not parked. */
-      readonly kind: "concurrent-active-execution";
+      /**
+       * The urgent lane is actively executing while the primary holder is
+       * not parked (paused-*) — including a primary sitting in `approved` /
+       * `awaiting-merge-approval` / `merging` / `escalated` / `blocked`,
+       * which no Appendix A row can park (r2 finding 1).
+       */
+      readonly kind: "urgent-active-while-primary-unparked";
       readonly primaryMissionId: string;
+      readonly primaryState: MissionState;
       readonly urgentMissionId: string;
     };
 
@@ -210,19 +227,21 @@ export class SerializationScheduler {
         });
       }
     }
-    // Cross-lane rule (r1 finding 3): while the urgent lane actively
-    // executes, the primary holder must be parked (paused-urgent /
-    // paused-manual) or pre-start — two lanes actively executing at once is
-    // exactly what per-repo serialization exists to prevent.
+    // Cross-lane rule (r1 finding 3, tightened by r2 finding 1): while the
+    // urgent lane actively executes, the primary holder must be PARKED —
+    // "not currently in the ACTIVE set" is not enough, because a primary in
+    // approved/awaiting-merge-approval/merging/escalated/blocked cannot be
+    // parked by any row and stands ready to run beside the urgent task.
     for (const primary of holders.primary) {
       for (const urgent of holders.urgent) {
         if (
-          ACTIVE_EXECUTION_STATES.includes(primary.state) &&
-          ACTIVE_EXECUTION_STATES.includes(urgent.state)
+          ACTIVE_EXECUTION_STATES.includes(urgent.state) &&
+          !PARKED_STATES.includes(primary.state)
         ) {
           violations.push({
-            kind: "concurrent-active-execution",
+            kind: "urgent-active-while-primary-unparked",
             primaryMissionId: primary.missionId,
+            primaryState: primary.state,
             urgentMissionId: urgent.missionId,
           });
         }
@@ -347,16 +366,22 @@ export class SerializationScheduler {
   }
 
   /**
-   * The urgent lane accepts a mission when it has no holder AND the primary
-   * holder (if any) is not a quick task — quick tasks have no preemption
-   * rows, so an urgent task activating beside one could only run
-   * concurrently with it (see the module note and r1 finding 3).
+   * The urgent lane accepts a mission when it has no holder AND every
+   * primary holder is parked or parkable (see the module note; r1 finding
+   * 3, r2 finding 1): parked = paused-*; parkable = an integration-route
+   * mission in `executing` (the only A.1#15 source). Anything else cannot
+   * be parked, so an urgent task activating beside it could only run
+   * concurrently with it.
    */
   private urgentLaneAvailable(holders: { primary: LaneHolder[]; urgent: LaneHolder[] }): boolean {
     if (holders.urgent.length > 0) return false;
-    return !holders.primary.some(
-      (holder) => this.domain.getMission(holder.missionId)?.route === "quick-task",
-    );
+    return holders.primary.every((holder) => {
+      if (PARKED_STATES.includes(holder.state)) return true;
+      return (
+        holder.state === "executing" &&
+        this.domain.getMission(holder.missionId)?.route === "integration"
+      );
+    });
   }
 
   private queuedHead(repoId: string, lane: SchedulingLane): string | undefined {

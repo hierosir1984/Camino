@@ -5,7 +5,9 @@
  * included — is rejected with the stated reason and NOTHING is stored:
  * no domain row, no event, no partial or truncated copy.
  */
-import { readFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -36,11 +38,20 @@ function newHarness(): Harness {
     events.close();
   });
   const recorder = new TransitionRecorder(events);
-  const intake = new MissionIntake(domain, recorder);
+  const intake = new MissionIntake(domain, recorder, events);
   const project = domain.createProject("camino");
   const repo = domain.createRepo(project.id, "camino");
   return { domain, events, recorder, intake, repoId: repo.id };
 }
+
+/** The healthy-state seam report: everything empty. */
+const CLEAN_SEAM = {
+  orphanRows: [],
+  eventOnlyMissionIds: [],
+  routeConflicts: [],
+  contentConflicts: [],
+  hierarchyGaps: { missionIdsWithoutRepo: [], repoIdsWithoutProject: [] },
+};
 
 const DOCX_FIXTURE = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -85,7 +96,12 @@ describe("MissionIntake — pasted PRD text", () => {
     expect(records[0]?.actor).toBe("david");
     expect(records[0]?.fromState).toBeNull();
     expect(records[0]?.toState).toBe("draft");
-    expect(records[0]?.payload).toEqual({ source: "prd-intake" });
+    // The creation event records the retained content's identity (the
+    // persistent cross-store binding — r2 finding 9).
+    expect(records[0]?.payload).toEqual({
+      source: "prd-intake",
+      contentSha256: result.mission.contentSha256,
+    });
     expect(h.recorder.currentState("mission", result.mission.id)).toBe("draft");
   });
 
@@ -306,6 +322,60 @@ describe("MissionIntake — ill-formed text is refused, never lossily stored (r1
     expectNothingStored(h);
   });
 
+  it("rejects valid text with an embedded NUL as a typed rejection, never a raw CHECK crash (r2 finding 4)", () => {
+    const h = newHarness();
+    // "\0hello" is six valid UTF-8 bytes, non-empty and well-formed — but
+    // SQLite TEXT length() stops at the NUL, so before this fold the schema
+    // CHECK crashed intake with a raw exception.
+    const pasted = h.intake.createFromText({
+      repoId: h.repoId,
+      title: "t",
+      content: "\0hello",
+      actor: "david",
+    });
+    expect(pasted).toMatchObject({ ok: false, code: "embedded-nul" });
+    const file = h.intake.createFromFile({
+      repoId: h.repoId,
+      filename: "nul.md",
+      data: new Uint8Array(Buffer.from("\0hello", "utf8")),
+      actor: "david",
+    });
+    expect(file).toMatchObject({ ok: false, code: "embedded-nul" });
+    const quick = h.intake.createQuickTask({
+      repoId: h.repoId,
+      title: "t",
+      description: "\0hello",
+      urgent: false,
+      actor: "david",
+    });
+    expect(quick).toMatchObject({ ok: false, code: "embedded-nul" });
+    const title = h.intake.createFromText({
+      repoId: h.repoId,
+      title: "nul \0 title",
+      content: "fine",
+      actor: "david",
+    });
+    expect(title).toMatchObject({ ok: false, code: "invalid-request" });
+    expectNothingStored(h);
+  });
+
+  it("rejects actors that cannot be recorded exactly (r2 finding 8)", () => {
+    const h = newHarness();
+    for (const actor of ["david\uD800", "david\0"]) {
+      const result = h.intake.createFromText({
+        repoId: h.repoId,
+        title: "t",
+        content: "c",
+        actor,
+      });
+      expect(result, JSON.stringify(actor)).toMatchObject({
+        ok: false,
+        code: "invalid-request",
+      });
+    }
+    expectNothingStored(h);
+  });
+
   it("rejects quick-task descriptions and titles carrying unpaired surrogates", () => {
     const h = newHarness();
     const badDescription = h.intake.createQuickTask({
@@ -360,11 +430,7 @@ describe("MissionIntake — the domain/event seam", () => {
     const h = newHarness();
     h.intake.createFromText({ repoId: h.repoId, title: "t", content: "c", actor: "david" });
     expect(h.intake.intakeOrphans()).toEqual([]);
-    expect(h.intake.seamDivergences()).toEqual({
-      orphanRows: [],
-      eventOnlyMissionIds: [],
-      routeConflicts: [],
-    });
+    expect(h.intake.seamDivergences()).toEqual(CLEAN_SEAM);
   });
 
   it("a domain row without a creation event is visible via intakeOrphans()", () => {
@@ -425,9 +491,10 @@ describe("MissionIntake — the domain/event seam", () => {
     ]);
   });
 
-  it("an id collision at the seam throws with the honest surface pointer (r1 finding 7)", () => {
+  it("an id collision throws AND leaves a persistent contentConflicts signature (r1 f7, r2 f9)", () => {
     // Deterministic ids force the collision the reviewer probed: the event
-    // log already holds a mission with the id intake will generate.
+    // log already holds a mission with the id intake will generate — SAME
+    // route, so route conflicts stay silent; the content hash cannot.
     const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
     const events = new SqliteEventStore(":memory:");
     cleanups.push(() => {
@@ -435,7 +502,7 @@ describe("MissionIntake — the domain/event seam", () => {
       events.close();
     });
     const recorder = new TransitionRecorder(events);
-    const intake = new MissionIntake(domain, recorder);
+    const intake = new MissionIntake(domain, recorder, events);
     recorder.record({
       entityKind: "mission",
       entityId: "dup",
@@ -448,9 +515,82 @@ describe("MissionIntake — the domain/event seam", () => {
     const repo = domain.createRepo(project.id, "camino");
     expect(() =>
       intake.createFromText({ repoId: repo.id, title: "t", content: "c", actor: "david" }),
-    ).toThrow(/already-exists.*NOT an intakeOrphans\(\) entry/s);
-    // And indeed: not an orphan (the id IS recorded), routes agree, so the
-    // thrown error is the primary signal — exactly what it says.
+    ).toThrow(/already-exists.*contentConflicts/s);
+    // Not an orphan (the id IS recorded) — but the divergence is PERSISTENT:
+    // the recorded creation event carries no hash matching this row.
     expect(intake.intakeOrphans()).toEqual([]);
+    const conflicts = intake.seamDivergences().contentConflicts;
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]?.missionId).toBe("dup");
+    expect(conflicts[0]?.recordedContentSha256).toBeUndefined();
+  });
+
+  it("a same-id collision where BOTH creations came through intake still shows a content conflict", () => {
+    // Two intakes with colliding ids and different content: the recorded
+    // creation hash belongs to the FIRST mission's content, the surviving
+    // domain row... cannot exist (the insert-conflict guard refuses the
+    // second row). Verify the guard fires — the collision cannot even reach
+    // the event seam.
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    const first = intake.createFromText({
+      repoId: repo.id,
+      title: "first",
+      content: "first content",
+      actor: "david",
+    });
+    expect(first.ok).toBe(true);
+    expect(() =>
+      intake.createFromText({
+        repoId: repo.id,
+        title: "second",
+        content: "second content",
+        actor: "david",
+      }),
+    ).toThrow(/immutable/);
+    expect(intake.seamDivergences()).toEqual(CLEAN_SEAM);
+  });
+
+  it("hierarchy gaps from a foreign writer are visible (r2 finding 9)", () => {
+    const h = newHarness();
+    // A raw writer with foreign keys off leaves a mission under a missing
+    // repo. Reproduce via a raw connection on a shared file database.
+    const dir = mkdtempSync(join(tmpdir(), "camino-intake-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, "domain.db");
+    const domain = new SqliteDomainStore(path);
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const raw = new Database(path);
+    // A foreign writer that has switched foreign-key enforcement off.
+    raw.pragma("foreign_keys = OFF");
+    raw
+      .prepare(
+        `INSERT INTO missions
+           (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+         VALUES ('foreign-mission', 'no-such-repo', 'integration', 0, 't', 'pasted', 'c', ?, 'markdown', NULL, 'now')`,
+      )
+      .run("0".repeat(64));
+    raw.close();
+    const report = intake.seamDivergences();
+    expect(report.hierarchyGaps.missionIdsWithoutRepo).toEqual(["foreign-mission"]);
+    // The row is ALSO an orphan (no creation event) — table-scanned, so the
+    // broken hierarchy cannot hide it (the r2 receipt showed the old
+    // traversal missing it entirely).
+    expect(report.orphanRows.map((m) => m.id)).toEqual(["foreign-mission"]);
+    expect(h.intake.seamDivergences()).toEqual(CLEAN_SEAM); // unrelated harness unaffected
   });
 });

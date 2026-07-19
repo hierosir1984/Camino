@@ -127,7 +127,21 @@ describe("auditActivationOrder", () => {
       LANES,
     );
     expect(deviations).toEqual([
-      { seq: 3, missionId: "mB", lane: "primary", expectedHeadId: "mA" },
+      { seq: 3, missionId: "mB", lane: "primary", reason: "jumped-queue", expectedHeadId: "mA" },
+    ]);
+  });
+
+  it("reports an activation for a mission that never entered queued (r2 finding 10)", () => {
+    // Empty lane: no honest recorder can produce this record, and the audit
+    // must not certify it either.
+    expect(auditActivationOrder([activation(1, "mA")], LANES)).toEqual([
+      { seq: 1, missionId: "mA", lane: "primary", reason: "never-queued" },
+    ]);
+    // Non-empty lane: the never-queued activation names the true head too.
+    expect(
+      auditActivationOrder([record({ seq: 1, entityId: "mB" }), activation(2, "mA")], LANES),
+    ).toEqual([
+      { seq: 2, missionId: "mA", lane: "primary", reason: "never-queued", expectedHeadId: "mB" },
     ]);
   });
 
