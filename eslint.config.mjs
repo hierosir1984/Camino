@@ -170,7 +170,7 @@ export default tseslint.config(
     allowRegex: CORE_TEST_ALLOWLIST_REGEX,
   }),
   {
-    files: ["scripts/**/*.mjs", "spikes/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "spikes/**/*.mjs", "packages/gui/build.mjs"],
     languageOptions: {
       globals: {
         process: "readonly",
@@ -184,6 +184,19 @@ export default tseslint.config(
     },
     rules: {
       "@typescript-eslint/no-require-imports": "off",
+    },
+  },
+  // The placeholder GUI runs in the browser (WP-102; replaced in WP-122+).
+  {
+    files: ["packages/gui/static/**/*.js"],
+    languageOptions: {
+      globals: {
+        document: "readonly",
+        fetch: "readonly",
+        history: "readonly",
+        location: "readonly",
+        sessionStorage: "readonly",
+      },
     },
   },
 );
