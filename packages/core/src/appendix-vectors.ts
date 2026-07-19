@@ -441,6 +441,18 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     expect: "guard-rejected",
   },
   {
+    name: "queued-path plan approval without checklist approval (review r5: the A.1#3b split needs the same attestation)",
+    from: "planned",
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: false,
+      dagAcyclic: true,
+      executionSlotFree: false,
+    },
+    expect: "guard-rejected",
+  },
+  {
     name: "re-routed creation without a reference to the terminal quick-task record",
     from: null,
     event: { type: "mission-created", source: "re-routed" },

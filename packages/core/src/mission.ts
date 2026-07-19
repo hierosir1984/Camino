@@ -386,11 +386,15 @@ const integrationRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "david-approves-dag-acyclic-slot-taken",
-      check: (e) => e.actor === "david" && attested(e.dagAcyclic) && e.executionSlotFree === false,
+      name: "david-approves-plan-and-checklist-slot-taken",
+      check: (e) =>
+        e.actor === "david" &&
+        attested(e.checklistApproved) &&
+        attested(e.dagAcyclic) &&
+        e.executionSlotFree === false,
     },
     to: "queued",
-    note: "One appendix row, guard-split: 'execution slot free, else queued'. A cyclic DAG matches neither split — rejected.",
+    note: "One appendix row, guard-split: 'execution slot free, else queued'. 'Plan + checklist' holds on BOTH splits; a cyclic DAG matches neither — rejected.",
   }),
   planRejected,
   slotFreed,

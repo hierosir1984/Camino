@@ -380,6 +380,17 @@ confirmed AMEND-1..5 complete. All five folded:
 5. **Type-level `import("node:fs")` passed the fence (low):** `TSImportType` banned in core (the
    dependency fence covers types, not just runtime); probe added.
 
+### Round 5 (convergence check)
+
+Round 5 (same reviewer; raw + dispositions on PR #44) returned **"safe to build on: with
+corrections"** — the first non-"no" verdict — with exactly one finding: the round-4 checklist
+attestation had landed on the slot-free approval split only, leaving the queued split (`A.1#3b`)
+unguarded. Folded: `checklistApproved` is attested on BOTH splits, with the queued-path refusal
+vector the reviewer requested. Every other round-4 fold HOLDS, no fresh in-scope defect survived
+the final sweep, and the reviewer re-confirmed AMEND-1..5 complete. With that single correction
+resolved, the falsification loop is converged: five rounds, 13 → 11 → 10 → 5 → 1 findings, all
+39 confirmed findings folded, raw reviews and dispositions preserved verbatim on the PR.
+
 ## 5. Verdict
 
 With the conventions of §1, the three machines and the A.1b overlay are encoded row-for-row, and
