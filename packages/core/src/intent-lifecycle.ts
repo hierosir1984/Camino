@@ -26,6 +26,7 @@
  */
 import {
   INTENT_EVENTS,
+  INTENT_ID_PATTERN,
   LABEL_DESIRED_STATES,
   OPERATION_CLASSES,
   OPERATION_TARGET_KINDS,
@@ -82,6 +83,20 @@ export const DAVID_ACTOR = "david";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Intent ids obey the closed grammar (round 2 finding 1): the token-
+ * containment proof in @camino/shared external-ops depends on ids never
+ * carrying the delimiter characters, so the grammar is enforced wherever
+ * an id enters the decision path — every append and every replay.
+ */
+function intentIdProblem(value: unknown): string | null {
+  if (typeof value !== "string") return "intentId must be a string";
+  if (!INTENT_ID_PATTERN.test(value)) {
+    return `intentId must match ${INTENT_ID_PATTERN} (Camino-generated ids only — the marker-token containment proof depends on this grammar)`;
+  }
+  return null;
 }
 
 function stringProblem(field: string, value: unknown, requireNonEmpty = true): string | null {
@@ -429,7 +444,7 @@ export function decideIntentAppend(
   view: IntentView,
   input: IntentAppendInput,
 ): IntentAppendDecision {
-  const idProblem = stringProblem("intentId", input.intentId);
+  const idProblem = intentIdProblem(input.intentId);
   if (idProblem !== null) return { ok: false, problem: idProblem };
   const actorProblem = stringProblem("actor", input.actor);
   if (actorProblem !== null) return { ok: false, problem: actorProblem };

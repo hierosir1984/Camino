@@ -162,14 +162,30 @@ export function reconcileIntents(
   const reconciled: ReconciledIntent[] = [];
   const pendingExecution: string[] = [];
   const awaitingHuman: string[] = [];
-  for (const snapshot of journal.nonTerminal()) {
-    // Status-only verdicts first (round-1 finding 8): a provably unsent
-    // intent and a half-appended escalation pair must resolve even when
-    // the external system is unreachable — only the ambiguity window
-    // needs facts, so only it pays for a query.
-    const verdict =
-      statusOnlyVerdict(snapshot) ??
-      decideReconciliation(snapshot, gatherFacts(snapshot.spec, queries));
+  // PASS-WIDE two-phase ordering (round-1 finding 8; made pass-wide by
+  // round-2 finding 3): ALL status-only work — provably unsent intents,
+  // half-appended escalation pairs — resolves before the FIRST external
+  // query, so a query failure on one intent can never block status-only
+  // work on another. Only the ambiguity window pays for queries, and a
+  // query throw still aborts the pass loudly (reconciling an
+  // execution-started intent without facts would be a guess); everything
+  // this pass appended stays idempotent for the retry.
+  const worklist = journal.nonTerminal();
+  const needFacts: IntentSnapshot[] = [];
+  for (const snapshot of worklist) {
+    const verdict = statusOnlyVerdict(snapshot);
+    if (verdict === null) {
+      needFacts.push(snapshot);
+      continue;
+    }
+    applyVerdict(journal, snapshot, verdict, actor, hook, {
+      reconciled,
+      pendingExecution,
+      awaitingHuman,
+    });
+  }
+  for (const snapshot of needFacts) {
+    const verdict = decideReconciliation(snapshot, gatherFacts(snapshot.spec, queries));
     applyVerdict(journal, snapshot, verdict, actor, hook, {
       reconciled,
       pendingExecution,

@@ -786,3 +786,116 @@ describe("round-1 regressions (falsification review findings)", () => {
     expect(second.reconciled[0]!.detail).not.toMatch(/provably never sent/);
   });
 });
+
+describe("round-2 regressions", () => {
+  it("finding 3: status-only work completes even when an EARLIER intent's query fails", () => {
+    const rig = crashedRig("before-effect");
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    // FIRST (journal order): an execution-started intent that needs a query.
+    executor.submit("query-first", {
+      op: "branch-create",
+      repo: "r",
+      branch: "b1",
+      targetSha: SHA_A,
+    });
+    executor.execute("query-first");
+    // LATER: a half-appended escalation pair (status-only work).
+    executor.submit("status-later", { op: "catch-all", description: "parked" });
+    executor.execute("status-later");
+    rig.journal.append({
+      intentId: "status-later",
+      event: "ambiguity-recorded",
+      actor: "camino:recovery",
+      payload: { reason: "recorded before the outage" },
+    });
+    const offline: Parameters<typeof reconcileIntents>[1] = {
+      github: new Proxy({} as never, {
+        get: () => () => {
+          throw new Error("GitHub offline");
+        },
+      }),
+    };
+    // The pass still fails loudly on the query-needing intent...
+    expect(() => reconcileIntents(rig.journal, offline)).toThrow(/GitHub offline/);
+    // ...but the status-only escalation completed FIRST (pass-wide phase).
+    expect(rig.journal.entry("status-later")!.status).toBe("escalated");
+    // And the retry is idempotent: exactly one escalation row survives.
+    const { github } = healthy(rig);
+    reconcileIntents(rig.journal, { github });
+    expect(
+      rig.journal.read({ intentId: "status-later" }).filter((r) => r.event === "escalated"),
+    ).toHaveLength(1);
+  });
+
+  it("finding 2 boundary: only David's explicit retry can duplicate a dispatch, and it stays visible", () => {
+    // The lost-but-landed dispatch: effect applied, response lost.
+    const rig = crashedRig("after-effect");
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    executor.submit("d1", {
+      op: "workflow-dispatch",
+      repo: "r",
+      workflow: "w.yml",
+      ref: "main",
+      correlationId: "d1",
+    });
+    executor.execute("d1");
+    const h = healthy(rig);
+    // Automatic reconciliation CONFIRMS from the correlated run — no retry,
+    // no duplicate (the automatic path is at-most-once).
+    reconcileIntents(rig.journal, { github: h.github });
+    expect(rig.journal.entry("d1")!.status).toBe("confirmed");
+    expect(h.github.findWorkflowRunsByCorrelation("r", "d1")).toHaveLength(1);
+
+    // The genuinely ambiguous variant: dispatch lost BEFORE landing, then
+    // the run materializes AFTER escalation (queue lag) — and David,
+    // seeing the escalation, authorizes a retry anyway. The duplicate is
+    // his informed decision and stays visible via the correlation query.
+    const lag = crashedRig("before-effect");
+    seedRepo(lag.github);
+    const e2 = new IntentExecutor(lag.journal, {
+      github: lag.github,
+      testService: lag.testService,
+      catchAll: lag.catchAll,
+    });
+    e2.submit("d2", {
+      op: "workflow-dispatch",
+      repo: "r",
+      workflow: "w.yml",
+      ref: "main",
+      correlationId: "d2",
+    });
+    e2.execute("d2");
+    const h2 = healthy(lag);
+    reconcileIntents(lag.journal, { github: h2.github });
+    expect(lag.journal.entry("d2")!.status).toBe("escalated");
+    // The lost dispatch lands late (out-of-band materialization).
+    h2.github.dispatchWorkflow({
+      op: "workflow-dispatch",
+      repo: "r",
+      workflow: "w.yml",
+      ref: "main",
+      correlationId: "d2",
+    });
+    lag.journal.append({
+      intentId: "d2",
+      event: "retry-authorized",
+      actor: "david",
+      payload: { reason: "David reviewed the escalation and chose to re-dispatch" },
+    });
+    h2.executor.execute("d2");
+    // Two runs exist — David's knowing duplicate, tolerable per the §4.4
+    // table (advisory-only CI), and VISIBLE: the correlation query returns
+    // both. No automatic path produced this.
+    expect(h2.github.findWorkflowRunsByCorrelation("r", "d2")).toHaveLength(2);
+  });
+});

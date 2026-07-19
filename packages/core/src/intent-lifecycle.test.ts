@@ -4,6 +4,7 @@
  * fail-closed log verification recovery rides on.
  */
 import { describe, expect, it } from "vitest";
+import { INTENT_ID_PATTERN, correlationToken, intentMarkerToken } from "@camino/shared";
 import type { IntentEventRecord } from "@camino/shared";
 import {
   DAVID_ACTOR,
@@ -440,5 +441,47 @@ describe("verifyIntentLog (the fail-closed recovery gate)", () => {
     const divergences = verifyIntentLog(tampered);
     expect(divergences).toHaveLength(1);
     expect(divergences[0]!.problem).toMatch(/David/);
+  });
+});
+
+describe("intent-id grammar and token containment (round 2, finding 1)", () => {
+  it("refuses ids carrying token delimiters or other out-of-grammar characters", () => {
+    for (const bad of [
+      "intent-A]foreign",
+      "bad[id",
+      "a:b",
+      "a b",
+      "",
+      "x".repeat(129),
+      "a\u0000b",
+    ]) {
+      const decision = decideIntentAppend(new Map(), {
+        intentId: bad,
+        event: "recorded",
+        actor: "x",
+        payload: { ...BRANCH_SPEC },
+      });
+      expect(decision.ok, JSON.stringify(bad)).toBe(false);
+    }
+    expect(INTENT_ID_PATTERN.test("intent-A.2_ok")).toBe(true);
+  });
+
+  it("token containment is impossible for distinct grammar-legal ids", () => {
+    // Adversarial pairs: prefixes, suffixes, dotted extensions — under the
+    // grammar no id's token can contain another's.
+    const ids = ["intent-A", "intent-A2", "intent-A.b", "A", "intent", "intent-A-foreign"];
+    for (const a of ids) {
+      for (const b of ids) {
+        if (a === b) continue;
+        expect(
+          intentMarkerToken(b).includes(intentMarkerToken(a)),
+          `${b} token contains ${a} token`,
+        ).toBe(false);
+        expect(
+          correlationToken(b).includes(correlationToken(a)),
+          `${b} correlation contains ${a} correlation`,
+        ).toBe(false);
+      }
+    }
   });
 });

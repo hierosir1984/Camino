@@ -30,6 +30,7 @@ export {
   INTENT_STATUSES,
   DefinitiveRefusalError,
   IndeterminateOutcomeError,
+  INTENT_ID_PATTERN,
   intentMarkerToken,
   correlationToken,
 } from "./external-ops.js";

@@ -275,6 +275,19 @@ describe("IntentJournal durability shell", () => {
 });
 
 describe("round-1 regressions", () => {
+  it("round 2, finding 1: ids carrying token delimiters refuse at the durable boundary", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({
+        intentId: "intent-A]foreign",
+        event: "recorded",
+        actor: "x",
+        payload: { op: "catch-all", description: "d" },
+      }),
+    ).toThrow(/must match/);
+    journal.close();
+  });
+
   it("finding 1: the journal binds marker keys to the intent id at the durable boundary", () => {
     const journal = new IntentJournal(journalPath());
     expect(() =>

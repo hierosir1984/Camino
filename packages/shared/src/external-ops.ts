@@ -19,10 +19,18 @@
  *   label-set              naturally idempotent as (object, label, desired
  *                          state)
  *   comment-post           embedded UUID marker
- *   workflow-dispatch      AT-MOST-ONCE — `camino_intent_id` surfaced via
+ *   workflow-dispatch      AT-MOST-ONCE with respect to every AUTOMATIC
+ *                          path — `camino_intent_id` surfaced via
  *                          run-name is correlation for observability, not
  *                          an idempotency guarantee; on lost-response
- *                          ambiguity there is no automatic retry
+ *                          ambiguity there is no automatic retry. David's
+ *                          explicit retry-authorized may knowingly
+ *                          duplicate a run whose first dispatch was
+ *                          lost-but-landed — the table prices exactly
+ *                          this ("duplicates are tolerable because
+ *                          GitHub CI on worker refs is advisory-only";
+ *                          Camino's own runner gates merges, and the
+ *                          duplicate stays visible via correlatedRuns)
  *   test-service-mutation  environment granularity: reset-before-use makes
  *                          the environment the idempotency unit;
  *                          irreversible effects are recorded as ambiguity,
@@ -73,15 +81,32 @@ export const LABEL_DESIRED_STATES = ["present", "absent"] as const;
 export type LabelDesiredState = (typeof LABEL_DESIRED_STATES)[number];
 
 /**
- * The DELIMITED embedded-marker forms (review round 1, finding 1). A bare
- * id as a substring is prefix-ambiguous — a search for "intent-1" matches
- * a body carrying "intent-10" — so what gets embedded and matched is
- * always the full bracketed token, whose closing delimiter makes prefix
- * collisions impossible. The marker/correlation FIELDS on the specs are
- * additionally validated to equal the intent id exactly (the design's
- * "intent UUID" is the intent's own id, not a caller-chosen string), so
- * the reconciliation key is bound to the journal identity it reconciles.
+ * The DELIMITED embedded-marker forms (round 1 finding 1; delimiter hole
+ * closed by round 2 finding 1). A bare id as a substring is
+ * prefix-ambiguous — a search for "intent-1" matches a body carrying
+ * "intent-10" — so what gets embedded and matched is always the full
+ * bracketed token. The token alone is NOT enough: an id containing "]"
+ * (e.g. "intent-A]foreign") would generate a token CONTAINING the shorter
+ * id's complete token. Therefore intent ids are grammar-pinned at the
+ * journal boundary (INTENT_ID_PATTERN — no "[", "]", or ":" can appear),
+ * and under that grammar token containment is impossible for distinct
+ * ids: any token's only "[" is its first character, so a contained token
+ * must be a prefix, which forces one id to be a prefix of the other
+ * followed by "]" — a character the grammar excludes from ids. The
+ * marker/correlation FIELDS on the specs are additionally validated to
+ * equal the intent id exactly (the design's "intent UUID" is the
+ * intent's own id, not a caller-chosen string), so the reconciliation
+ * key is bound to the journal identity it reconciles.
  */
+
+/**
+ * The closed intent-id grammar (round 2 finding 1): ids are
+ * Camino-generated (UUIDs later), never user text, so a conservative
+ * alphabet costs nothing and makes the token-containment proof above
+ * hold. Enforced by core's decideIntentAppend on every journal write and
+ * on every replay (a raw-written id outside the grammar refuses at open).
+ */
+export const INTENT_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 export function intentMarkerToken(intentId: string): string {
   return `[camino-intent:${intentId}]`;
 }

@@ -8,8 +8,13 @@
  * Mechanism: a dedicated SQLite database whose only job is to be locked.
  * Acquisition opens a connection and holds `BEGIN EXCLUSIVE` for the
  * lifetime of the handle — SQLite's exclusive file lock, enforced by the
- * kernel across processes on every platform SQLite supports. The
- * properties that make this the right primitive:
+ * kernel across processes ON A LOCAL FILESYSTEM WITH WORKING LOCKS (the
+ * platforms Camino targets: macOS/APFS and Linux local filesystems, both
+ * exercised by this suite). SQLite itself documents that network
+ * filesystems — NFS especially — ship broken or missing lock
+ * implementations; a state directory on a network mount is OUT OF
+ * CONTRACT for the whole daemon, not just this lock (round 2, finding
+ * 5). The properties that make this the right primitive:
  *
  *  - **Held = alive.** The lock exists only while the owning process
  *    holds the connection. `kill -9` closes the file descriptors and the

@@ -29,7 +29,7 @@ import { expect } from "vitest";
 import { IntentExecutor } from "../intent-executor.js";
 import { openRecoveredState, reconcileIntents } from "../recovery.js";
 import type { RecoveredState, RecoveryReport } from "../recovery.js";
-import { FakeGitHub } from "./fake-github.js";
+import { FakeGitHub, githubEffectKey } from "./fake-github.js";
 import { FakeCatchAll, FakeTestService } from "./fake-services.js";
 import type { KillPointName } from "./kill-points.js";
 import { FAKE_STATE_FILES } from "./scripts.js";
@@ -257,6 +257,32 @@ export function assertChaosInvariants(
       ["confirmed", "failed", "escalated"].includes(entry.status),
       `manifest intent ${intentId} unsettled: ${entry.status}`,
     ).toBe(true);
+    // A `failed` status is a durable claim that the effect is ABSENT —
+    // cross-check it against the external system's own books so a
+    // terminal lie can never pass the oracle (round 2, finding 4).
+    if (entry.status === "failed") {
+      const spec = entry.spec;
+      if (spec.op === "test-service-mutation") {
+        expect(
+          world.testService.environmentCount(spec.environmentId, spec.mutation),
+          `failed intent ${intentId} but the environment holds its mutation`,
+        ).toBe(0);
+        expect(
+          world.testService.outboxCount(spec.environmentId, spec.mutation),
+          `failed intent ${intentId} but its irreversible effect exists`,
+        ).toBe(0);
+      } else if (spec.op === "catch-all") {
+        expect(
+          world.catchAll.effectCount(spec.description),
+          `failed intent ${intentId} but its catch-all effect exists`,
+        ).toBe(0);
+      } else {
+        expect(
+          world.github.effectCounts().get(githubEffectKey(spec)),
+          `failed intent ${intentId} but its external effect was applied`,
+        ).toBeUndefined();
+      }
+    }
   }
 
   // EXACTLY-ONCE AMBIGUITY + IDEMPOTENT RECOVERY: another pass changes nothing.

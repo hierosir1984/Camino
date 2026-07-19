@@ -8,8 +8,11 @@
  * showed pure wall-clock kills mostly miss the protocol entirely):
  *
  *  1. RANDOM KILL SITE: the child dies at a seeded-random Nth hook
- *     invocation — guaranteed to land INSIDE the durable protocol, at a
- *     gap chosen without anyone naming it.
+ *     invocation. Draws within the hook count land INSIDE the durable
+ *     protocol at a gap nobody named; draws beyond it exercise the
+ *     survival path. This SAMPLES sites — the exhaustive sweep
+ *     (chaos-sweep.test.ts) is what covers every site, and each fixed
+ *     seed is verified to produce at least one genuine kill.
  *  2. RANDOM TIMER: an external SIGKILL after a seeded-random delay —
  *     free to land where no hook exists (inside SQLite commits, fake
  *     state renames, store opening, closing). A kill before or after the
@@ -41,7 +44,7 @@ function mulberry32(seed: number): () => number {
 }
 
 const MIXED_MANIFEST = CHAOS_SCRIPTS["mixed"]!.intents.map((intent) => intent.intentId);
-/** The mixed script fires 15 hook sites; leave headroom so some rounds survive. */
+/** The mixed script fires 15 hook sites; the range leaves headroom so some rounds survive. */
 const NTH_RANGE = 18;
 
 const SEEDS = [104_001, 104_002, 104_003];

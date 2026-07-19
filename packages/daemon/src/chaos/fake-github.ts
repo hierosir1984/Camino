@@ -55,6 +55,39 @@ import type {
 } from "@camino/shared";
 import { loadJsonState, saveJsonState } from "./json-state.js";
 
+/**
+ * The natural-key ledger key for a GitHub-class spec — ONE source shared
+ * by the fake's mutations and the harness's failed-intent cross-check
+ * (round 2, finding 4), so the oracle and the ledger cannot drift.
+ */
+export function githubEffectKey(
+  spec:
+    | BranchCreateSpec
+    | PushSpec
+    | PrCreateSpec
+    | MergeByPushSpec
+    | LabelSetSpec
+    | CommentPostSpec
+    | WorkflowDispatchSpec,
+): string {
+  switch (spec.op) {
+    case "branch-create":
+      return `branch:${spec.repo}:${spec.branch}`;
+    case "push":
+      return `push:${spec.repo}:${spec.ref}:${spec.intendedSha}`;
+    case "pr-create":
+      return `pr:${spec.repo}:${spec.headBranch}:${spec.baseBranch}`;
+    case "merge-by-push":
+      return `merge:${spec.repo}:${spec.targetRef}:${spec.mergeSha}`;
+    case "label-set":
+      return `label:${spec.repo}:${spec.targetKind}#${spec.targetNumber}:${spec.label}:${spec.desired}`;
+    case "comment-post":
+      return `comment:${spec.repo}:${spec.targetKind}#${spec.targetNumber}:${spec.marker}`;
+    case "workflow-dispatch":
+      return `dispatch:${spec.repo}:${spec.correlationId}`;
+  }
+}
+
 export interface FakePullRequest {
   number: number;
   headBranch: string;
@@ -214,7 +247,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           );
         }
         repo.refs[spec.branch] = spec.targetSha;
-        return { op: "branch-create", key: `branch:${spec.repo}:${spec.branch}` };
+        return { op: "branch-create", key: githubEffectKey(spec) };
       },
       () => ({ branch: spec.branch, sha: spec.targetSha }),
     );
@@ -237,7 +270,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           );
         }
         repo.refs[spec.ref] = spec.intendedSha;
-        return { op: "push", key: `push:${spec.repo}:${spec.ref}:${spec.intendedSha}` };
+        return { op: "push", key: githubEffectKey(spec) };
       },
       () => ({ ref: spec.ref, sha: spec.intendedSha }),
     );
@@ -269,7 +302,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           title: spec.title,
           body: spec.body,
         });
-        return { op: "pr-create", key: `pr:${spec.repo}:${spec.headBranch}:${spec.baseBranch}` };
+        return { op: "pr-create", key: githubEffectKey(spec) };
       },
       () => ({ prNumber: allocated ?? -1 }),
     );
@@ -294,10 +327,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           );
         }
         repo.refs[spec.targetRef] = spec.mergeSha;
-        return {
-          op: "merge-by-push",
-          key: `merge:${spec.repo}:${spec.targetRef}:${spec.mergeSha}`,
-        };
+        return { op: "merge-by-push", key: githubEffectKey(spec) };
       },
       () => ({ targetRef: spec.targetRef, mergeSha: spec.mergeSha }),
     );
@@ -317,10 +347,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
         } else {
           repo.labels[key] = repo.labels[key].filter((l) => l !== spec.label);
         }
-        return {
-          op: "label-set",
-          key: `label:${spec.repo}:${key}:${spec.label}:${spec.desired}`,
-        };
+        return { op: "label-set", key: githubEffectKey(spec) };
       },
       () => ({ label: spec.label, desired: spec.desired }),
     );
@@ -342,10 +369,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           targetNumber: spec.targetNumber,
           body: spec.body,
         });
-        return {
-          op: "comment-post",
-          key: `comment:${spec.repo}:${spec.targetKind}#${spec.targetNumber}:${spec.marker}`,
-        };
+        return { op: "comment-post", key: githubEffectKey(spec) };
       },
       () => ({ commentId: allocated ?? -1 }),
     );
@@ -364,7 +388,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           workflow: spec.workflow,
           ref: spec.ref,
         });
-        return { op: "workflow-dispatch", key: `dispatch:${spec.repo}:${spec.correlationId}` };
+        return { op: "workflow-dispatch", key: githubEffectKey(spec) };
       },
       () => ({ dispatched: true }),
     );
