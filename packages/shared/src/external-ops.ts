@@ -73,6 +73,25 @@ export const LABEL_DESIRED_STATES = ["present", "absent"] as const;
 export type LabelDesiredState = (typeof LABEL_DESIRED_STATES)[number];
 
 /**
+ * The DELIMITED embedded-marker forms (review round 1, finding 1). A bare
+ * id as a substring is prefix-ambiguous — a search for "intent-1" matches
+ * a body carrying "intent-10" — so what gets embedded and matched is
+ * always the full bracketed token, whose closing delimiter makes prefix
+ * collisions impossible. The marker/correlation FIELDS on the specs are
+ * additionally validated to equal the intent id exactly (the design's
+ * "intent UUID" is the intent's own id, not a caller-chosen string), so
+ * the reconciliation key is bound to the journal identity it reconciles.
+ */
+export function intentMarkerToken(intentId: string): string {
+  return `[camino-intent:${intentId}]`;
+}
+
+/** The run-name correlation form for workflow dispatch (`camino_intent_id`). */
+export function correlationToken(intentId: string): string {
+  return `[camino_intent_id=${intentId}]`;
+}
+
+/**
  * Per-class intent payloads. Everything reconciliation will ever need is
  * recorded IN the intent before the call: decisions reconcile from the
  * log, never from re-derivation (CAM-STATE-03). `repo` is the owning repo
@@ -110,8 +129,9 @@ export interface PrCreateSpec {
   readonly title: string;
   /**
    * The intent UUID embedded in the PR body at creation (corroboration).
-   * WP-104 uses the intent id itself; recorded explicitly so the marker
-   * a reconciler searches for is a logged decision, not a convention.
+   * MUST equal the intent's own id (validated at the journal boundary),
+   * and the body must embed `intentMarkerToken(bodyMarker)` — the
+   * delimited form is what reconciliation matches.
    */
   readonly bodyMarker: string;
   readonly body: string;
@@ -143,7 +163,10 @@ export interface CommentPostSpec {
   readonly targetKind: OperationTargetKind;
   readonly targetNumber: number;
   readonly body: string;
-  /** The embedded UUID marker (the class's reconciliation key). */
+  /**
+   * The embedded UUID marker (the class's reconciliation key). MUST equal
+   * the intent's own id; the body embeds `intentMarkerToken(marker)`.
+   */
   readonly marker: string;
 }
 
@@ -153,10 +176,11 @@ export interface WorkflowDispatchSpec {
   readonly workflow: string;
   readonly ref: string;
   /**
-   * Surfaced in the run-name as `camino_intent_id` — correlation for
-   * observability only, per the table: a run carrying it proves our
-   * dispatch happened; its ABSENCE proves nothing (queue lag), which is
-   * exactly why this class is at-most-once with no automatic retry.
+   * Surfaced in the run-name as `correlationToken(correlationId)` —
+   * correlation for observability only, per the table: a run carrying it
+   * proves our dispatch happened; its ABSENCE proves nothing (queue
+   * lag), which is exactly why this class is at-most-once with no
+   * automatic retry. MUST equal the intent's own id.
    */
   readonly correlationId: string;
 }
@@ -262,13 +286,31 @@ export interface IntentEventRecord {
 }
 
 /**
- * A transport could not determine whether the effect was applied (timeout,
- * connection lost mid-request). Transports MUST throw this — never a plain
- * error — for indeterminate outcomes: a plain throw means "definitively
- * not applied" and the executor records a clean failure, while this error
- * leaves the intent in its ambiguity window for reconciliation to settle
- * (the §4.4 lost-response path, no crash required).
+ * The transport outcome contract (hardened by review round 1, finding 3):
+ * silence about an error's meaning must never become a claim that the
+ * effect is absent, so the two knowable outcomes are EXPLICIT error
+ * types and everything else is treated as unknown.
+ *
+ *  - return value                → definitive success
+ *  - DefinitiveRefusalError      → definitive non-application (the
+ *    external system refused BEFORE applying anything: a 4xx-class
+ *    response, a validation rejection)
+ *  - IndeterminateOutcomeError   → outcome unknown (timeout, connection
+ *    lost mid-request)
+ *  - ANY OTHER throw             → treated as unknown too. A raw socket
+ *    reset, a JSON parse error, a bug — none of them prove the effect
+ *    absent, and recording `failed` on one would be a durable lie about
+ *    external state. Unknown errors leave the intent in its ambiguity
+ *    window for reconciliation to settle, exactly like a crash.
  */
+export class DefinitiveRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DefinitiveRefusalError";
+  }
+}
+
+/** See the transport outcome contract above: outcome unknown, never a refusal. */
 export class IndeterminateOutcomeError extends Error {
   constructor(message: string) {
     super(message);
@@ -279,12 +321,8 @@ export class IndeterminateOutcomeError extends Error {
 /**
  * MUTATION transports: the calls that change external state. Implemented
  * by WP-104's file-backed fakes now, by the real integrations in
- * WP-114/115/119/120. Every method either returns the class's
- * OperationResult, throws `IndeterminateOutcomeError` (outcome unknown —
- * the intent stays in its ambiguity window), or throws anything else (a
- * DEFINITIVE non-application: the external system refused cleanly, effect
- * known-absent by transport contract). A crash AROUND the call is what
- * the intent journal + recovery handle.
+ * WP-114/115/119/120, all under the transport outcome contract above. A
+ * crash AROUND the call is what the intent journal + recovery handle.
  */
 export interface GitHubMutationTransport {
   createBranch(spec: BranchCreateSpec): OperationResult;
@@ -319,7 +357,18 @@ export interface ObservedPullRequest {
   readonly number: number;
   readonly state: "open" | "closed";
   readonly headBranch: string;
+  /** The base is part of the PR's identity (round-1 finding 2): a PR from
+   * our head into a DIFFERENT base is not our PR. */
+  readonly baseBranch: string;
   readonly body: string;
+}
+
+/** One coherent observation of a ref (round-1 finding 4): the SHA and the
+ * ancestry answer come from a single query, so they can never contradict
+ * each other across a ref move between two calls. */
+export interface ObservedRef {
+  readonly refSha: string | null;
+  readonly atOrPastAncestor: boolean;
 }
 
 /** A workflow run as reconciliation observes it. */
@@ -341,8 +390,12 @@ export interface ObservedWorkflowRun {
 export interface GitHubQueryTransport {
   /** The SHA a ref currently points at, or null if the ref does not exist. */
   getRef(repo: string, ref: string): string | null;
-  /** Is `ancestorSha` equal to or an ancestor of the commit `ref` points at. */
-  isAtOrPast(repo: string, ref: string, ancestorSha: string): boolean;
+  /**
+   * ONE observation answering both "where is the ref" and "is
+   * `ancestorSha` at-or-behind it" coherently (merge-by-push
+   * reconciliation must never act on two mutually contradictory reads).
+   */
+  observeRef(repo: string, ref: string, ancestorSha: string): ObservedRef;
   /** Every PR (open and closed) whose head is the given branch. */
   findPullRequestsByHead(repo: string, headBranch: string): readonly ObservedPullRequest[];
   /** Whether the label is currently present on the target. */

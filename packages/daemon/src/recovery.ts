@@ -39,7 +39,7 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { decideReconciliation } from "@camino/core";
+import { decideReconciliation, statusOnlyVerdict } from "@camino/core";
 import type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "@camino/core";
 import type { ExternalOperationSpec, GitHubQueryTransport } from "@camino/shared";
 import { SqliteEventStore } from "./event-store.js";
@@ -163,8 +163,13 @@ export function reconcileIntents(
   const pendingExecution: string[] = [];
   const awaitingHuman: string[] = [];
   for (const snapshot of journal.nonTerminal()) {
-    const facts = gatherFacts(snapshot.spec, queries);
-    const verdict = decideReconciliation(snapshot, facts);
+    // Status-only verdicts first (round-1 finding 8): a provably unsent
+    // intent and a half-appended escalation pair must resolve even when
+    // the external system is unreachable — only the ambiguity window
+    // needs facts, so only it pays for a query.
+    const verdict =
+      statusOnlyVerdict(snapshot) ??
+      decideReconciliation(snapshot, gatherFacts(snapshot.spec, queries));
     applyVerdict(journal, snapshot, verdict, actor, hook, {
       reconciled,
       pendingExecution,
@@ -186,12 +191,17 @@ function gatherFacts(spec: ExternalOperationSpec, queries: QueryTransports): Obs
         op: spec.op,
         pullRequests: queries.github.findPullRequestsByHead(spec.repo, spec.headBranch),
       };
-    case "merge-by-push":
+    case "merge-by-push": {
+      // ONE observation (round-1 finding 4): the SHA and the ancestry
+      // answer come from the same query, so a ref move between two calls
+      // can never hand the verdict contradictory facts.
+      const observed = queries.github.observeRef(spec.repo, spec.targetRef, spec.mergeSha);
       return {
         op: spec.op,
-        targetAtOrPastMerge: queries.github.isAtOrPast(spec.repo, spec.targetRef, spec.mergeSha),
-        targetSha: queries.github.getRef(spec.repo, spec.targetRef),
+        targetAtOrPastMerge: observed.atOrPastAncestor,
+        targetSha: observed.refSha,
       };
+    }
     case "label-set":
       return {
         op: spec.op,
@@ -242,59 +252,49 @@ function applyVerdict(
   };
   switch (verdict.kind) {
     case "confirmed-external": {
-      journal.append(
-        {
-          intentId,
-          event: "confirmed",
-          actor,
-          payload: { via: "reconciliation", result: verdict.result, note: verdict.note },
-        },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({
+        intentId,
+        event: "confirmed",
+        actor,
+        payload: { via: "reconciliation", result: verdict.result, note: verdict.note },
+      });
       hook("recovery-after-resolution-append");
       record(verdict.note);
       return;
     }
     case "re-arm": {
-      journal.append(
-        {
-          intentId,
-          event: "re-armed",
-          actor,
-          payload: { note: verdict.note, resetBeforeUse: verdict.resetBeforeUse },
-        },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({
+        intentId,
+        event: "re-armed",
+        actor,
+        payload: { note: verdict.note, resetBeforeUse: verdict.resetBeforeUse },
+      });
       hook("recovery-after-resolution-append");
       out.pendingExecution.push(intentId);
       record(verdict.note);
       return;
     }
     case "ambiguous": {
-      journal.append(
-        { intentId, event: "ambiguity-recorded", actor, payload: { reason: verdict.reason } },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({
+        intentId,
+        event: "ambiguity-recorded",
+        actor,
+        payload: { reason: verdict.reason },
+      });
       hook("recovery-between-ambiguity-and-escalation");
-      journal.append(
-        { intentId, event: "escalated", actor, payload: { reason: verdict.reason } },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({ intentId, event: "escalated", actor, payload: { reason: verdict.reason } });
       hook("recovery-after-resolution-append");
       out.awaitingHuman.push(intentId);
       record(verdict.reason);
       return;
     }
     case "failed-terminal": {
-      journal.append(
-        {
-          intentId,
-          event: "failed",
-          actor,
-          payload: { via: "reconciliation", reason: verdict.reason },
-        },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({
+        intentId,
+        event: "failed",
+        actor,
+        payload: { via: "reconciliation", reason: verdict.reason },
+      });
       hook("recovery-after-resolution-append");
       record(verdict.reason);
       return;
@@ -303,10 +303,7 @@ function applyVerdict(
       // A crash landed between the ambiguity row and its escalation row —
       // finish the pair using the recorded reason (the log's decision).
       const reason = journal.entry(intentId)?.ambiguityReason ?? "ambiguity recorded (reason row)";
-      journal.append(
-        { intentId, event: "escalated", actor, payload: { reason } },
-        { expectedLastSeq: journal.lastSeq },
-      );
+      journal.append({ intentId, event: "escalated", actor, payload: { reason } });
       hook("recovery-after-resolution-append");
       out.awaitingHuman.push(intentId);
       record(reason);
@@ -314,7 +311,15 @@ function applyVerdict(
     }
     case "pending-execution": {
       out.pendingExecution.push(intentId);
-      record("recorded, barrier absent — provably never sent; executable as-is");
+      // The detail is audit text — it must reflect the REAL history
+      // (round-1 finding 12): re-armed and retry-authorized intents fold
+      // back to `recorded` but their barrier DID run before.
+      const started = journal.entry(intentId)?.executionStartedCount ?? 0;
+      record(
+        started === 0
+          ? "recorded, barrier absent — provably never sent; executable as-is"
+          : `executable again after reconciliation/authorization (${started} prior execution start(s))`,
+      );
       return;
     }
     case "awaiting-human": {

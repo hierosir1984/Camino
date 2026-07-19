@@ -83,5 +83,9 @@ export type {
   SpecValidation,
 } from "./intent-lifecycle.js";
 
-export { decideReconciliation, ReconcileFactsMismatchError } from "./reconcile.js";
+export {
+  decideReconciliation,
+  statusOnlyVerdict,
+  ReconcileFactsMismatchError,
+} from "./reconcile.js";
 export type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "./reconcile.js";

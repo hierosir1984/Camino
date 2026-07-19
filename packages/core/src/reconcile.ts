@@ -26,6 +26,7 @@
  * daemon (recovery) and in tests share the one path, and nothing here
  * performs I/O.
  */
+import { intentMarkerToken } from "@camino/shared";
 import type {
   ExternalOperationSpec,
   IntentStatus,
@@ -95,17 +96,15 @@ export class ReconcileFactsMismatchError extends Error {
 }
 
 /**
- * The one reconciliation decision. Pure and total: exactly one verdict per
- * (status, spec, facts) input, throwing only on the structural
- * fact-mismatch caller bug.
+ * The verdicts that need NO external facts (review round 1, finding 8):
+ * recovery consults this FIRST and only queries the external system for
+ * intents in the ambiguity window. A `recorded` intent is provably unsent
+ * and an escalation pair needs completing whether or not GitHub is even
+ * reachable — status-only work must never be blocked by a query.
+ * Returns null exactly when the status is `execution-started` (facts
+ * required).
  */
-export function decideReconciliation(
-  intent: IntentSnapshot,
-  facts: ObservedFacts,
-): ReconcileVerdict {
-  if (facts.op !== intent.spec.op) {
-    throw new ReconcileFactsMismatchError(intent.intentId, intent.spec.op, facts.op);
-  }
+export function statusOnlyVerdict(intent: IntentSnapshot): ReconcileVerdict | null {
   switch (intent.status) {
     case "recorded":
       return { kind: "pending-execution" };
@@ -118,8 +117,24 @@ export function decideReconciliation(
     case "abandoned":
       return { kind: "already-resolved" };
     case "execution-started":
-      return decideAmbiguityWindow(intent.intentId, intent.spec, facts);
+      return null;
   }
+}
+
+/**
+ * The one reconciliation decision. Pure and total: exactly one verdict per
+ * (status, spec, facts) input, throwing only on the structural
+ * fact-mismatch caller bug. Status-only statuses resolve through the same
+ * `statusOnlyVerdict` recovery consults directly.
+ */
+export function decideReconciliation(
+  intent: IntentSnapshot,
+  facts: ObservedFacts,
+): ReconcileVerdict {
+  if (facts.op !== intent.spec.op) {
+    throw new ReconcileFactsMismatchError(intent.intentId, intent.spec.op, facts.op);
+  }
+  return statusOnlyVerdict(intent) ?? decideAmbiguityWindow(intent.intentId, intent.spec, facts);
 }
 
 /**
@@ -182,49 +197,62 @@ function decideAmbiguityWindow(
     }
     case "pr-create": {
       if (spec.op !== facts.op) throw new ReconcileFactsMismatchError(intentId, spec.op, facts.op);
-      const closed = facts.pullRequests.filter((pr) => pr.state === "closed");
-      if (closed.length > 0) {
+      // A PR's identity is (head, base) — a PR from our head branch into a
+      // DIFFERENT base is not this intent's PR (round-1 finding 2). Closed
+      // PRs and foreign-base open PRs are both reuse evidence: the
+      // closed/reused-branch ambiguity class escalates rather than
+      // guessing whose PR this branch now names.
+      const candidates = facts.pullRequests.filter(
+        (pr) => pr.state === "open" && pr.baseBranch === spec.baseBranch,
+      );
+      const foreign = facts.pullRequests.filter(
+        (pr) => pr.state === "closed" || pr.baseBranch !== spec.baseBranch,
+      );
+      if (foreign.length > 0) {
         return {
           kind: "ambiguous",
           reason:
-            `head branch ${spec.headBranch} carries ${closed.length} closed PR(s) ` +
-            `(#${closed.map((pr) => pr.number).join(", #")}) — the closed/reused-branch ambiguity ` +
-            "class escalates rather than guessing whose PR this branch now names",
+            `head branch ${spec.headBranch} carries reuse evidence: ` +
+            foreign.map((pr) => `#${pr.number} (${pr.state}, into ${pr.baseBranch})`).join(", ") +
+            " — the closed/reused-branch ambiguity class escalates rather than guessing",
         };
       }
-      const open = facts.pullRequests.filter((pr) => pr.state === "open");
-      const corroborated = open.filter((pr) => pr.body.includes(spec.bodyMarker));
+      // Corroboration matches the DELIMITED token, never a bare substring
+      // (round-1 finding 1: prefix collisions).
+      const token = intentMarkerToken(spec.bodyMarker);
+      const corroborated = candidates.filter((pr) => pr.body.includes(token));
       if (corroborated.length === 1) {
         const pr = corroborated[0]!;
         return {
           kind: "confirmed-external",
           result: { prNumber: pr.number, corroborated: true },
-          note: "open PR on the head branch carries the embedded intent UUID",
+          note: "open PR on the head/base pair carries the embedded intent UUID token",
         };
       }
-      if (corroborated.length === 0 && open.length === 1) {
+      if (corroborated.length === 0 && candidates.length === 1) {
         // Bodies are mutable — the branch key is primary, the UUID only
-        // corroborates. One open PR on our branch with no marker is ours
-        // with an edited body; the resolution records the missing
-        // corroboration for observability.
+        // corroborates. One open PR on our (head, base) pair with no
+        // marker is ours with an edited body; the resolution records the
+        // missing corroboration for observability.
         return {
           kind: "confirmed-external",
-          result: { prNumber: open[0]!.number, corroborated: false },
-          note: "open PR on the head branch; body no longer carries the marker (bodies are mutable)",
+          result: { prNumber: candidates[0]!.number, corroborated: false },
+          note: "open PR on the head/base pair; body no longer carries the marker (bodies are mutable)",
         };
       }
-      if (open.length === 0) {
+      if (candidates.length === 0) {
         return {
           kind: "re-arm",
           resetBeforeUse: false,
-          note: "no PR exists for the head branch — creation did not land",
+          note: "no PR exists for the head/base pair — creation did not land",
         };
       }
       return {
         kind: "ambiguous",
         reason:
-          `head branch ${spec.headBranch} carries ${open.length} open PRs and the embedded UUID ` +
-          "does not single one out — escalating rather than claiming one",
+          `head branch ${spec.headBranch} carries ${candidates.length} open PRs into ` +
+          `${spec.baseBranch} and the embedded UUID token does not single one out — ` +
+          "escalating rather than claiming one",
       };
     }
     case "merge-by-push": {

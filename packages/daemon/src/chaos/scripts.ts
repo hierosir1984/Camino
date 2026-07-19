@@ -12,6 +12,7 @@
  * recorder-driven mission event with intents from three classes to prove
  * the whole daemon state (event log + intent journal) resumes together.
  */
+import { intentMarkerToken } from "@camino/shared";
 import type { ExternalOperationSpec } from "@camino/shared";
 import type { TransitionRecorder } from "../transition-recorder.js";
 import type { FakeGitHub } from "./fake-github.js";
@@ -88,7 +89,8 @@ const push: ChaosScript = {
   ],
 };
 
-export const PR_MARKER = "camino-intent:intent-pr-1";
+/** Markers equal the intent id (bound at the journal boundary); bodies embed the token form. */
+export const PR_MARKER = "intent-pr-1";
 
 const prCreate: ChaosScript = {
   name: "pr-create",
@@ -106,7 +108,7 @@ const prCreate: ChaosScript = {
         baseBranch: "main",
         title: "Issue 1",
         bodyMarker: PR_MARKER,
-        body: `Implements issue 1.\n\n<!-- ${PR_MARKER} -->`,
+        body: `Implements issue 1.\n\n${intentMarkerToken(PR_MARKER)}`,
       },
     },
   ],
@@ -147,7 +149,7 @@ const labelSet: ChaosScript = {
   ],
 };
 
-export const COMMENT_MARKER = "camino-intent:intent-comment-1";
+export const COMMENT_MARKER = "intent-comment-1";
 
 const commentPost: ChaosScript = {
   name: "comment-post",
@@ -160,7 +162,7 @@ const commentPost: ChaosScript = {
         repo: REPO,
         targetKind: "issue",
         targetNumber: 7,
-        body: `Attempt started.\n\n<!-- ${COMMENT_MARKER} -->`,
+        body: `Attempt started.\n\n${intentMarkerToken(COMMENT_MARKER)}`,
         marker: COMMENT_MARKER,
       },
     },

@@ -22,6 +22,8 @@ import {
 import type { ChaosWorld } from "./harness.js";
 import { CHAOS_SCRIPTS } from "./scripts.js";
 
+const MIXED_MANIFEST = CHAOS_SCRIPTS["mixed"]!.intents.map((intent) => intent.intentId);
+
 const SWEEP_CAP = 40;
 
 let worlds: ChaosWorld[] = [];
@@ -50,7 +52,7 @@ describe("exhaustive Nth-hook sweep over the mixed workload", () => {
       const recovered = recoverAndComplete(world);
       try {
         // Whatever gap N landed in: nothing duplicated, nothing lost.
-        assertChaosInvariants(world, recovered);
+        assertChaosInvariants(world, recovered, MIXED_MANIFEST);
         // The mixed workload's specific exactly-once ledger:
         expect(
           world.github.effectCounts().get("branch:fixture-repo:camino/issue-2") ?? 0,

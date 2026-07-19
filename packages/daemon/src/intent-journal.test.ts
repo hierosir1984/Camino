@@ -5,7 +5,7 @@
  * journal.
  */
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -168,17 +168,21 @@ describe("IntentJournal basics", () => {
     journal.close();
   });
 
-  it("CAS: a stale expectedLastSeq refuses without writing", () => {
-    const journal = new IntentJournal(journalPath());
-    journal.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+  it("CAS is unconditional: a second writer instance's interleave refuses without writing", () => {
+    const path = journalPath();
+    const first = new IntentJournal(path);
+    first.append({ intentId: "i1", event: "recorded", actor: "x", payload: BRANCH_SPEC });
+    // A second instance over the same file advances the store...
+    const second = new IntentJournal(path);
+    second.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} });
+    second.close();
+    // ...so the FIRST instance's next append must refuse — no opt-out
+    // exists for any caller (the CAS runs on every append).
     expect(() =>
-      journal.append(
-        { intentId: "i1", event: "execution-started", actor: "x", payload: {} },
-        { expectedLastSeq: 0 },
-      ),
+      first.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} }),
     ).toThrow(/advanced beyond/);
-    expect(journal.read()).toHaveLength(1);
-    journal.close();
+    expect(first.read()).toHaveLength(2);
+    first.close();
   });
 
   it("nonTerminal lists exactly the unresolved statuses", () => {
@@ -267,5 +271,63 @@ describe("IntentJournal durability shell", () => {
       journal.append({ intentId: "i1", event: "execution-started", actor: "x", payload: {} }),
     ).toThrow(/without the writer lock held/);
     journal.close();
+  });
+});
+
+describe("round-1 regressions", () => {
+  it("finding 1: the journal binds marker keys to the intent id at the durable boundary", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({
+        intentId: "intent-1",
+        event: "recorded",
+        actor: "x",
+        payload: {
+          op: "comment-post",
+          repo: "r",
+          targetKind: "issue",
+          targetNumber: 1,
+          body: "b [camino-intent:some-other-id]",
+          marker: "some-other-id",
+        },
+      }),
+    ).toThrow(/marker must equal the intent id/);
+    expect(() =>
+      journal.append({
+        intentId: "intent-1",
+        event: "recorded",
+        actor: "x",
+        payload: {
+          op: "workflow-dispatch",
+          repo: "r",
+          workflow: "w.yml",
+          ref: "main",
+          correlationId: "intent-2",
+        },
+      }),
+    ).toThrow(/correlationId must equal the intent id/);
+    journal.close();
+  });
+
+  it("finding 10: refused adoptions close the native handle (no fd leak)", () => {
+    const path = journalPath();
+    new IntentJournal(path).close();
+    const raw = new Database(path);
+    raw
+      .prepare(
+        `INSERT INTO intent_events (intent_id, event, actor, payload, recorded_at)
+         VALUES ('forged', 'confirmed', 'x', '{"via":"response","result":{},"note":"n"}', '2026-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    raw.close();
+    const fdDir = "/dev/fd";
+    const before = readdirSync(fdDir).length;
+    for (let i = 0; i < 100; i += 1) {
+      expect(() => new IntentJournal(path)).toThrow(/fails lifecycle verification/);
+    }
+    const after = readdirSync(fdDir).length;
+    // 100 refused opens must not retain 100 handles; small slack for
+    // unrelated runtime churn.
+    expect(after - before).toBeLessThan(10);
   });
 });

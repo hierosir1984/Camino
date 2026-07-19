@@ -28,7 +28,10 @@ export {
   LABEL_DESIRED_STATES,
   INTENT_EVENTS,
   INTENT_STATUSES,
+  DefinitiveRefusalError,
   IndeterminateOutcomeError,
+  intentMarkerToken,
+  correlationToken,
 } from "./external-ops.js";
 export type {
   OperationClass,
@@ -53,6 +56,7 @@ export type {
   CatchAllMutationTransport,
   MutationTransports,
   ObservedPullRequest,
+  ObservedRef,
   ObservedWorkflowRun,
   GitHubQueryTransport,
 } from "./external-ops.js";

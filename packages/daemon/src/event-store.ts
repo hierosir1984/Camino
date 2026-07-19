@@ -130,45 +130,57 @@ export class SqliteEventStore implements EventStore {
     this.now = options.now ?? (() => new Date());
     this.writerLock = options.writerLock;
     this.db = new Database(path);
-    // WAL for durable concurrent reads on file databases (PRD §6); SQLite
-    // keeps ":memory:" databases on the "memory" journal, which is fine.
-    this.db.pragma("journal_mode = WAL");
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version === 0) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-    } else if (version !== SCHEMA_VERSION) {
-      throw new Error(
-        `events database ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
-      );
-    } else {
-      // Tamper evidence: a database claiming this schema version must still
-      // carry the events table and both append-only triggers. Recreating a
-      // missing object here would silently accept a rewritten or emptied
-      // log — refuse instead.
-      const objects = this.db
-        .prepare(
-          `SELECT name FROM sqlite_master
-           WHERE (type = 'table' AND name = 'events')
-              OR (type = 'trigger' AND name IN ('events_append_only_update', 'events_append_only_delete'))`,
-        )
-        .all() as Array<{ name: string }>;
-      const names = new Set(objects.map((o) => o.name));
-      for (const required of ["events", "events_append_only_update", "events_append_only_delete"]) {
-        if (!names.has(required)) {
-          throw new Error(
-            `events database ${path} claims schema version ${version} but is missing ${required} — ` +
-              "refusing to open a possibly tampered or truncated log",
-          );
+    // Every refusal below must close the native handle rather than leak
+    // it until GC (WP-104 review round 1, finding 10 — the journal had
+    // the same class of leak; fixed in both for parity).
+    try {
+      // WAL for durable concurrent reads on file databases (PRD §6); SQLite
+      // keeps ":memory:" databases on the "memory" journal, which is fine.
+      this.db.pragma("journal_mode = WAL");
+      const version = this.db.pragma("user_version", { simple: true }) as number;
+      if (version === 0) {
+        this.db.exec(SCHEMA);
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      } else if (version !== SCHEMA_VERSION) {
+        throw new Error(
+          `events database ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
+        );
+      } else {
+        // Tamper evidence: a database claiming this schema version must still
+        // carry the events table and both append-only triggers. Recreating a
+        // missing object here would silently accept a rewritten or emptied
+        // log — refuse instead.
+        const objects = this.db
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE (type = 'table' AND name = 'events')
+                OR (type = 'trigger' AND name IN ('events_append_only_update', 'events_append_only_delete'))`,
+          )
+          .all() as Array<{ name: string }>;
+        const names = new Set(objects.map((o) => o.name));
+        for (const required of [
+          "events",
+          "events_append_only_update",
+          "events_append_only_delete",
+        ]) {
+          if (!names.has(required)) {
+            throw new Error(
+              `events database ${path} claims schema version ${version} but is missing ${required} — ` +
+                "refusing to open a possibly tampered or truncated log",
+            );
+          }
         }
       }
+      this.insert = this.db.prepare(
+        `INSERT INTO events
+           (entity_kind, entity_id, event, actor, cause, payload, from_state, to_state, outcome, rejection_code, recorded_at)
+         VALUES
+           (@entityKind, @entityId, @event, @actor, @cause, @payload, @fromState, @toState, @outcome, @rejectionCode, @recordedAt)`,
+      );
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
-    this.insert = this.db.prepare(
-      `INSERT INTO events
-         (entity_kind, entity_id, event, actor, cause, payload, from_state, to_state, outcome, rejection_code, recorded_at)
-       VALUES
-         (@entityKind, @entityId, @event, @actor, @cause, @payload, @fromState, @toState, @outcome, @rejectionCode, @recordedAt)`,
-    );
   }
 
   append(input: EventInput, options: AppendOptions = {}): EventRecord {

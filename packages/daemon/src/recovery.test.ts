@@ -6,6 +6,7 @@
  * idempotent re-reconciliation, and the queries-only property.
  */
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { intentMarkerToken } from "@camino/shared";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -253,7 +254,7 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
   });
 
   it("pr-create: open PR with marker → confirmed corroborated; body stripped → confirmed uncorroborated", () => {
-    const marker = "camino-intent:pr1";
+    const marker = "pr1"; // the intent id — the binding the journal enforces
     const spec = {
       op: "pr-create",
       repo: "r",
@@ -261,7 +262,7 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
       baseBranch: "main",
       title: "t",
       bodyMarker: marker,
-      body: `text <!-- ${marker} -->`,
+      body: `text ${intentMarkerToken(marker)}`,
     } as const;
 
     const corroborated = crashedRig("after-effect");
@@ -295,7 +296,7 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
   });
 
   it("pr-create: a closed PR on the head branch → escalated (closed/reused-branch class)", () => {
-    const marker = "camino-intent:pr2";
+    const marker = "pr2";
     const rig = crashedRig("before-effect");
     seedRepo(rig.github);
     rig.github.seedPullRequest("r", {
@@ -317,7 +318,7 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
       baseBranch: "main",
       title: "t",
       bodyMarker: marker,
-      body: `x ${marker}`,
+      body: `x ${intentMarkerToken(marker)}`,
     });
     executor.execute("pr2");
     reconcileIntents(rig.journal, { github: healthy(rig).github });
@@ -401,15 +402,15 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
   });
 
   it("comment-post: marker found → confirmed with the comment id; absent → re-arm posts once", () => {
-    const marker = "camino-intent:c1";
-    const spec = {
-      op: "comment-post",
-      repo: "r",
-      targetKind: "issue",
-      targetNumber: 7,
-      body: `hello <!-- ${marker} -->`,
-      marker,
-    } as const;
+    const commentSpec = (intentId: string) =>
+      ({
+        op: "comment-post",
+        repo: "r",
+        targetKind: "issue",
+        targetNumber: 7,
+        body: `hello ${intentMarkerToken(intentId)}`,
+        marker: intentId,
+      }) as const;
 
     const found = crashedRig("after-effect");
     seedRepo(found.github);
@@ -418,7 +419,7 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
       testService: found.testService,
       catchAll: found.catchAll,
     });
-    e1.submit("c1", spec);
+    e1.submit("c1", commentSpec("c1"));
     e1.execute("c1");
     reconcileIntents(found.journal, { github: healthy(found).github });
     const entry = found.journal.entry("c1")!;
@@ -432,12 +433,12 @@ describe("reconciliation verdicts per §4.4 class (lost-response states)", () =>
       testService: absent.testService,
       catchAll: absent.catchAll,
     });
-    e2.submit("c2", spec);
+    e2.submit("c2", commentSpec("c2"));
     e2.execute("c2");
     const h = healthy(absent);
     reconcileIntents(absent.journal, { github: h.github });
     h.executor.execute("c2");
-    expect(h.github.effectCounts().get(`comment:r:issue#7:${marker}`)).toBe(1);
+    expect(h.github.effectCounts().get("comment:r:issue#7:c2")).toBe(1);
   });
 
   it("workflow-dispatch: correlated run present → confirmed; absent → ONE ambiguity, escalated, never auto-retried", () => {
@@ -662,5 +663,126 @@ describe("reconciliation properties", () => {
     });
     const confirmed = rig.journal.read({ intentId: "p1" }).find((r) => r.event === "confirmed")!;
     expect(confirmed.payload["result"]).toMatchObject({ sha: SHA_B });
+  });
+});
+
+describe("round-1 regressions (falsification review findings)", () => {
+  it("finding 1: a FOREIGN intent's marker token never confirms ours (comments)", () => {
+    const rig = crashedRig("before-effect");
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    executor.submit("intent-c-1", {
+      op: "comment-post",
+      repo: "r",
+      targetKind: "issue",
+      targetNumber: 7,
+      body: `mine ${intentMarkerToken("intent-c-1")}`,
+      marker: "intent-c-1",
+    });
+    executor.execute("intent-c-1");
+    const h = healthy(rig);
+    // A DIFFERENT intent's comment exists — its id ("intent-c-10") even
+    // contains ours as a prefix. It must not confirm us.
+    h.github.postComment({
+      op: "comment-post",
+      repo: "r",
+      targetKind: "issue",
+      targetNumber: 7,
+      body: `someone else's ${intentMarkerToken("intent-c-10")}`,
+      marker: "intent-c-10",
+    });
+    const report = reconcileIntents(rig.journal, { github: h.github });
+    expect(report.reconciled[0]!.verdict).toBe("re-arm"); // NOT confirmed-external
+    h.executor.execute("intent-c-1");
+    expect(h.github.effectCounts().get("comment:r:issue#7:intent-c-1")).toBe(1);
+  });
+
+  it("finding 1: a FOREIGN correlated run never confirms our dispatch (prefix ids)", () => {
+    const rig = crashedRig("before-effect");
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    executor.submit("intent-d-1", {
+      op: "workflow-dispatch",
+      repo: "r",
+      workflow: "w.yml",
+      ref: "main",
+      correlationId: "intent-d-1",
+    });
+    executor.execute("intent-d-1");
+    const h = healthy(rig);
+    // Another intent's run exists whose id carries ours as a prefix.
+    h.github.dispatchWorkflow({
+      op: "workflow-dispatch",
+      repo: "r",
+      workflow: "w.yml",
+      ref: "main",
+      correlationId: "intent-d-10",
+    });
+    reconcileIntents(rig.journal, { github: h.github });
+    // Ours is still unknown → ONE ambiguity + escalation, never a false confirm.
+    const entry = rig.journal.entry("intent-d-1")!;
+    expect(entry.status).toBe("escalated");
+    expect(entry.executionStartedCount).toBe(1);
+  });
+
+  it("finding 8: status-only recovery proceeds with the external system UNREACHABLE", () => {
+    const rig = crashedRig("before-effect");
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    // recorded (never executed), plus a half-appended escalation pair.
+    rig.journal.append({
+      intentId: "never-sent",
+      event: "recorded",
+      actor: "x",
+      payload: { op: "catch-all", description: "pending work" },
+    });
+    executor.submit("parked", { op: "catch-all", description: "parked work" });
+    executor.execute("parked");
+    rig.journal.append({
+      intentId: "parked",
+      event: "ambiguity-recorded",
+      actor: "camino:recovery",
+      payload: { reason: "recorded before the outage" },
+    });
+    const offline: Parameters<typeof reconcileIntents>[1] = {
+      github: new Proxy({} as never, {
+        get: () => () => {
+          throw new Error("GitHub offline");
+        },
+      }),
+    };
+    const report = reconcileIntents(rig.journal, offline);
+    expect(report.pendingExecution).toEqual(["never-sent"]);
+    expect(report.awaitingHuman).toEqual(["parked"]);
+    expect(rig.journal.entry("parked")!.status).toBe("escalated");
+  });
+
+  it("finding 12: the pending-execution detail reflects real history after a re-arm", () => {
+    const rig = crashedRig("before-effect");
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    executor.submit("i1", { op: "branch-create", repo: "r", branch: "b1", targetSha: SHA_A });
+    executor.execute("i1");
+    const { github } = healthy(rig);
+    reconcileIntents(rig.journal, { github }); // re-arms
+    const second = reconcileIntents(rig.journal, { github }); // status-only now
+    expect(second.reconciled[0]!.verdict).toBe("pending-execution");
+    expect(second.reconciled[0]!.detail).toMatch(/executable again after reconciliation/);
+    expect(second.reconciled[0]!.detail).not.toMatch(/provably never sent/);
   });
 });

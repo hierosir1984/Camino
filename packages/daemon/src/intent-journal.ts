@@ -95,11 +95,6 @@ export interface IntentJournalOptions {
   readonly writerLock?: HeldWriterLock;
 }
 
-export interface IntentAppendOptions {
-  /** Optimistic CAS: append only if the store's highest seq still equals this. */
-  readonly expectedLastSeq?: number;
-}
-
 export interface IntentReadFilter {
   readonly intentId?: string;
   readonly afterSeq?: number;
@@ -117,69 +112,73 @@ export class IntentJournal {
     this.now = options.now ?? (() => new Date());
     this.writerLock = options.writerLock;
     this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    const encoding = this.db.pragma("encoding", { simple: true }) as string;
-    if (encoding !== "UTF-8") {
-      this.db.close();
-      throw new Error(
-        `intent journal ${path} uses encoding ${encoding}; the byte-level NUL constraints ` +
-          "assume UTF-8 — refusing to open (WP-103 precedent)",
-      );
-    }
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version === 0) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-    } else if (version !== SCHEMA_VERSION) {
-      this.db.close();
-      throw new Error(
-        `intent journal ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
-      );
-    } else {
-      const objects = this.db
-        .prepare(
-          `SELECT name FROM sqlite_master
-           WHERE (type = 'table' AND name = 'intent_events')
-              OR (type = 'trigger' AND name IN ('intent_events_append_only_update', 'intent_events_append_only_delete'))`,
-        )
-        .all() as Array<{ name: string }>;
-      const names = new Set(objects.map((o) => o.name));
-      for (const required of [
-        "intent_events",
-        "intent_events_append_only_update",
-        "intent_events_append_only_delete",
-      ]) {
-        if (!names.has(required)) {
-          this.db.close();
-          throw new Error(
-            `intent journal ${path} claims schema version ${version} but is missing ${required} — ` +
-              "refusing to open a possibly tampered or truncated journal",
-          );
+    // EVERY refusal path below must close the native handle — a caller
+    // retry-looping on a refused journal must not leak file descriptors
+    // until GC gets around to it (review round 1, finding 10).
+    try {
+      this.db.pragma("journal_mode = WAL");
+      const encoding = this.db.pragma("encoding", { simple: true }) as string;
+      if (encoding !== "UTF-8") {
+        throw new Error(
+          `intent journal ${path} uses encoding ${encoding}; the byte-level NUL constraints ` +
+            "assume UTF-8 — refusing to open (WP-103 precedent)",
+        );
+      }
+      const version = this.db.pragma("user_version", { simple: true }) as number;
+      if (version === 0) {
+        this.db.exec(SCHEMA);
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      } else if (version !== SCHEMA_VERSION) {
+        throw new Error(
+          `intent journal ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
+        );
+      } else {
+        const objects = this.db
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE (type = 'table' AND name = 'intent_events')
+                OR (type = 'trigger' AND name IN ('intent_events_append_only_update', 'intent_events_append_only_delete'))`,
+          )
+          .all() as Array<{ name: string }>;
+        const names = new Set(objects.map((o) => o.name));
+        for (const required of [
+          "intent_events",
+          "intent_events_append_only_update",
+          "intent_events_append_only_delete",
+        ]) {
+          if (!names.has(required)) {
+            throw new Error(
+              `intent journal ${path} claims schema version ${version} but is missing ${required} — ` +
+                "refusing to open a possibly tampered or truncated journal",
+            );
+          }
         }
       }
-    }
-    this.insert = this.db.prepare(
-      `INSERT INTO intent_events (intent_id, event, actor, payload, recorded_at)
-       VALUES (@intentId, @event, @actor, @payload, @recordedAt)`,
-    );
-    // Fail-closed adoption: refuse a journal whose history the lifecycle
-    // decision path disagrees with (mirrors the recorder's replay-verified
-    // recovery).
-    const records = this.readAll();
-    const divergences = verifyIntentLog(records);
-    if (divergences.length > 0) {
-      const detail = divergences
-        .slice(0, 5)
-        .map((d) => `seq ${d.seq}: ${d.problem}`)
-        .join("; ");
-      this.db.close();
-      throw new Error(
-        `intent journal fails lifecycle verification (${divergences.length} divergence(s)) — ` +
-          `refusing to adopt it: ${detail}`,
+      this.insert = this.db.prepare(
+        `INSERT INTO intent_events (intent_id, event, actor, payload, recorded_at)
+         VALUES (@intentId, @event, @actor, @payload, @recordedAt)`,
       );
+      // Fail-closed adoption: refuse a journal whose history the lifecycle
+      // decision path disagrees with (mirrors the recorder's replay-verified
+      // recovery).
+      const records = this.readAll();
+      const divergences = verifyIntentLog(records);
+      if (divergences.length > 0) {
+        const detail = divergences
+          .slice(0, 5)
+          .map((d) => `seq ${d.seq}: ${d.problem}`)
+          .join("; ");
+        throw new Error(
+          `intent journal fails lifecycle verification (${divergences.length} divergence(s)) — ` +
+            `refusing to adopt it: ${detail}`,
+        );
+      }
+      this.view = foldIntentView(records);
+      this.cachedLastSeq = records.at(-1)?.seq ?? 0;
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
-    this.view = foldIntentView(records);
-    this.cachedLastSeq = records.at(-1)?.seq ?? 0;
   }
 
   get lastSeq(): number {
@@ -192,8 +191,14 @@ export class IntentJournal {
    * illegal append throws (daemon bug — see module header). The payload is
    * observed exactly once by JSON serialization; the parsed canonical form
    * is what gets validated, folded, and returned.
+   *
+   * The CAS is UNCONDITIONAL (review round 1, finding 11): every append
+   * verifies the store's highest seq still equals this instance's own
+   * view of it, atomically with the insert. There is no opt-out for any
+   * caller — a second writer instance (or a raw write behind this one's
+   * back) refuses instead of interleaving.
    */
-  append(input: IntentAppendInput, options: IntentAppendOptions = {}): IntentEventRecord {
+  append(input: IntentAppendInput): IntentEventRecord {
     this.writerLock?.assertHeld("intent journal append");
     const intentId = input.intentId;
     const event = input.event;
@@ -227,19 +232,17 @@ export class IntentJournal {
     if (!decision.ok) {
       throw new Error(`illegal intent journal append: ${decision.problem}`);
     }
-    const expectedLastSeq = options.expectedLastSeq;
+    const expectedLastSeq = this.cachedLastSeq;
     const recordedAt = this.now().toISOString();
     const runAppend = this.db.transaction((): number => {
-      if (expectedLastSeq !== undefined) {
-        const lastSeq = this.db
-          .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM intent_events")
-          .get() as { last: number };
-        if (lastSeq.last !== expectedLastSeq) {
-          throw new Error(
-            `intent journal advanced beyond the writer's view (seq ${lastSeq.last} != ${expectedLastSeq}): ` +
-              "a second writer violated the single-writer contract (CAM-STATE-03)",
-          );
-        }
+      const lastSeq = this.db
+        .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM intent_events")
+        .get() as { last: number };
+      if (lastSeq.last !== expectedLastSeq) {
+        throw new Error(
+          `intent journal advanced beyond the writer's view (seq ${lastSeq.last} != ${expectedLastSeq}): ` +
+            "a second writer violated the single-writer contract (CAM-STATE-03)",
+        );
       }
       const result = this.insert.run({
         intentId,

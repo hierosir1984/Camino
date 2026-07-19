@@ -7,6 +7,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { DefinitiveRefusalError } from "@camino/shared";
+import type { GitHubMutationTransport } from "@camino/shared";
 import { FakeGitHub } from "./chaos/fake-github.js";
 import { FakeCatchAll, FakeTestService } from "./chaos/fake-services.js";
 import { IntentExecutor } from "./intent-executor.js";
@@ -218,5 +220,47 @@ describe("test-service mutations", () => {
     testService.resetEnvironment("env-1");
     expect(testService.outboxCount("env-1", "send-email")).toBe(1);
     expect(testService.environmentCount("env-1", "send-email")).toBe(0);
+  });
+});
+
+describe("round-1 finding 3: the transport outcome contract is fail-safe", () => {
+  it("a PLAIN throw after the external commit becomes indeterminate, and reconciliation confirms", async () => {
+    const dir = tempDir();
+    const journal = new IntentJournal(join(dir, "intents.sqlite"));
+    const github = new FakeGitHub(join(dir, "github.json"));
+    github.seedCommit("r", SHA_A);
+    // A transport whose response path dies AFTER the upstream applied the
+    // effect — the exact adapter behavior a socket reset produces.
+    const flaky: GitHubMutationTransport = Object.create(github) as GitHubMutationTransport;
+    flaky.createBranch = (spec) => {
+      github.createBranch(spec);
+      throw new Error("socket reset after upstream committed");
+    };
+    const testService = new FakeTestService(join(dir, "ts.json"));
+    const catchAll = new FakeCatchAll(join(dir, "ca.json"));
+    const executor = new IntentExecutor(journal, { github: flaky, testService, catchAll });
+    executor.submit("i1", { op: "branch-create", repo: "r", branch: "b1", targetSha: SHA_A });
+    const outcome = executor.execute("i1");
+    // NOT failed: nothing proved the effect absent.
+    expect(outcome.kind).toBe("indeterminate");
+    expect(journal.entry("i1")!.status).toBe("execution-started");
+    // Reconciliation settles it from the external truth: the effect IS there.
+    const { reconcileIntents } = await import("./recovery.js");
+    reconcileIntents(journal, { github });
+    expect(journal.entry("i1")!.status).toBe("confirmed");
+    expect(github.effectCounts().get("branch:r:b1")).toBe(1);
+    journal.close();
+  });
+
+  it("only DefinitiveRefusalError records failed", () => {
+    const { journal, executor, github } = rig();
+    seedRepo(github);
+    github.seedRef("r", "b1", SHA_B); // collision → the fake throws DefinitiveRefusalError
+    executor.submit("i1", { op: "branch-create", repo: "r", branch: "b1", targetSha: SHA_A });
+    const outcome = executor.execute("i1");
+    expect(outcome.kind).toBe("failed");
+    expect(journal.entry("i1")!.status).toBe("failed");
+    // And the class is exported for real adapters to use:
+    expect(new DefinitiveRefusalError("x")).toBeInstanceOf(Error);
   });
 });

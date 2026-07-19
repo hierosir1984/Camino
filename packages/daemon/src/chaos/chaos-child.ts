@@ -66,10 +66,13 @@ function main(): void {
     } else if (mode !== "recover") {
       throw new Error(`unknown chaos mode ${mode}`);
     }
-    console.log("CHAOS-CHILD-COMPLETE");
   } finally {
     state.close();
   }
+  // Printed strictly AFTER close (round-1 finding 6): "completed" must
+  // mean the stores and the lock were released cleanly, so a kill landing
+  // during close can never masquerade as a completed run.
+  console.log("CHAOS-CHILD-COMPLETE");
 }
 
 // Run only when spawned as a process — importing this module (e.g. for

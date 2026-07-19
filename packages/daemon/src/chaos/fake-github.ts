@@ -31,7 +31,12 @@
  * "in-transport-after-effect") — the two halves of the lost-response
  * window the chaos suite kills in.
  */
-import { IndeterminateOutcomeError } from "@camino/shared";
+import {
+  DefinitiveRefusalError,
+  IndeterminateOutcomeError,
+  correlationToken,
+  intentMarkerToken,
+} from "@camino/shared";
 import type {
   BranchCreateSpec,
   CommentPostSpec,
@@ -40,6 +45,7 @@ import type {
   LabelSetSpec,
   MergeByPushSpec,
   ObservedPullRequest,
+  ObservedRef,
   ObservedWorkflowRun,
   OperationResult,
   OperationTargetKind,
@@ -198,12 +204,14 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
         const existing = repo.refs[spec.branch];
         if (existing !== undefined) {
           if (existing === spec.targetSha) return null; // idempotent: already as intended
-          throw new Error(
+          throw new DefinitiveRefusalError(
             `branch ${spec.branch} already exists at ${existing} (wanted ${spec.targetSha})`,
           );
         }
         if (repo.commits[spec.targetSha] === undefined) {
-          throw new Error(`target commit ${spec.targetSha} does not exist in ${spec.repo}`);
+          throw new DefinitiveRefusalError(
+            `target commit ${spec.targetSha} does not exist in ${spec.repo}`,
+          );
         }
         repo.refs[spec.branch] = spec.targetSha;
         return { op: "branch-create", key: `branch:${spec.repo}:${spec.branch}` };
@@ -219,12 +227,14 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
         const current = repo.refs[spec.ref];
         if (current === spec.intendedSha) return null; // idempotent: already there
         if (current !== spec.expectedBaseSha) {
-          throw new Error(
+          throw new DefinitiveRefusalError(
             `non-fast-forward: ${spec.ref} is at ${current ?? "(absent)"}, expected base ${spec.expectedBaseSha}`,
           );
         }
         if (repo.commits[spec.intendedSha] === undefined) {
-          throw new Error(`intended commit ${spec.intendedSha} does not exist in ${spec.repo}`);
+          throw new DefinitiveRefusalError(
+            `intended commit ${spec.intendedSha} does not exist in ${spec.repo}`,
+          );
         }
         repo.refs[spec.ref] = spec.intendedSha;
         return { op: "push", key: `push:${spec.repo}:${spec.ref}:${spec.intendedSha}` };
@@ -245,7 +255,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
             pr.baseBranch === spec.baseBranch,
         );
         if (openSame !== undefined) {
-          throw new Error(
+          throw new DefinitiveRefusalError(
             `a pull request for ${spec.headBranch} into ${spec.baseBranch} already exists (#${openSame.number})`,
           );
         }
@@ -274,12 +284,14 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
         }
         const current = repo.refs[spec.targetRef];
         if (current !== spec.expectedBaseSha) {
-          throw new Error(
+          throw new DefinitiveRefusalError(
             `non-fast-forward: ${spec.targetRef} is at ${current ?? "(absent)"}, expected base ${spec.expectedBaseSha}`,
           );
         }
         if (repo.commits[spec.mergeSha] === undefined) {
-          throw new Error(`merge commit ${spec.mergeSha} does not exist in ${spec.repo}`);
+          throw new DefinitiveRefusalError(
+            `merge commit ${spec.mergeSha} does not exist in ${spec.repo}`,
+          );
         }
         repo.refs[spec.targetRef] = spec.mergeSha;
         return {
@@ -347,8 +359,8 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
         state.nextRunId += 1;
         repo.workflowRuns.push({
           runId,
-          // Correlation for observability: the intent id rides the run-name.
-          runName: `${spec.workflow} [camino_intent_id=${spec.correlationId}]`,
+          // Correlation for observability: the delimited token rides the run-name.
+          runName: `${spec.workflow} ${correlationToken(spec.correlationId)}`,
           workflow: spec.workflow,
           ref: spec.ref,
         });
@@ -371,11 +383,17 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
     return this.query((state) => state.repos[repo]?.refs[ref] ?? null);
   }
 
-  isAtOrPast(repo: string, ref: string, ancestorSha: string): boolean {
+  observeRef(repo: string, ref: string, ancestorSha: string): ObservedRef {
+    // ONE state load answers both questions — the observation can never
+    // contradict itself across a concurrent ref move (round-1 finding 4).
     return this.query((state) => {
       const repoState = state.repos[repo];
-      if (repoState === undefined) return false;
-      return this.shaAtOrPast(repoState, repoState.refs[ref], ancestorSha);
+      const refSha = repoState?.refs[ref] ?? null;
+      return {
+        refSha,
+        atOrPastAncestor:
+          repoState !== undefined && this.shaAtOrPast(repoState, refSha ?? undefined, ancestorSha),
+      };
     });
   }
 
@@ -387,6 +405,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
           number: pr.number,
           state: pr.state,
           headBranch: pr.headBranch,
+          baseBranch: pr.baseBranch,
           body: pr.body,
         })),
     );
@@ -411,9 +430,10 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
     marker: string,
   ): { readonly commentId: number } | null {
     return this.query((state) => {
+      const token = intentMarkerToken(marker);
       const found = (state.repos[repo]?.comments ?? []).find(
         (c) =>
-          c.targetKind === targetKind && c.targetNumber === targetNumber && c.body.includes(marker),
+          c.targetKind === targetKind && c.targetNumber === targetNumber && c.body.includes(token),
       );
       return found === undefined ? null : { commentId: found.commentId };
     });
@@ -425,7 +445,7 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
   ): readonly ObservedWorkflowRun[] {
     return this.query((state) =>
       (state.repos[repo]?.workflowRuns ?? [])
-        .filter((run) => run.runName.includes(`camino_intent_id=${correlationId}`))
+        .filter((run) => run.runName.includes(correlationToken(correlationId)))
         .map((run) => ({ runId: run.runId, runName: run.runName })),
     );
   }

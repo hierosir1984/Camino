@@ -9,7 +9,12 @@
  *    irreversible outbox never exceeds one per mutation without a human
  *    retry authorization.
  *  - ZERO LOST STATE: after recovery plus completion, every intent is
- *    terminal or parked on a human (escalated) — nothing silently stuck.
+ *    terminal or parked on a human (escalated) — nothing silently stuck —
+ *    AND the journal is checked against the SCRIPT'S OWN MANIFEST
+ *    (round-1 finding 5): present intents must be settled, and because
+ *    the executor is strictly sequential, the set of present intents must
+ *    be a PREFIX of the script order — an intent missing from the middle
+ *    would mean durably recorded work vanished.
  *  - EXACTLY-ONCE AMBIGUITY: repeated recovery never duplicates an
  *    ambiguity or escalation row.
  *  - CO-RECOVERY: the event log (WP-101 recorder) replays and verifies
@@ -185,8 +190,13 @@ export function eventCount(state: RecoveredState, intentId: string, event: strin
 /**
  * The universal invariants (see module header). Every chaos run — whatever
  * the kill point — must pass all of them after recovery + completion.
+ * `manifest` is the script's intent ids in submission order.
  */
-export function assertChaosInvariants(world: ChaosWorld, recovered: RecoveredWorld): void {
+export function assertChaosInvariants(
+  world: ChaosWorld,
+  recovered: RecoveredWorld,
+  manifest: readonly string[],
+): void {
   // ZERO DUPLICATES — the fakes' own books, not the daemon's beliefs.
   for (const [key, count] of world.github.effectCounts()) {
     expect(count, `duplicate external effect ${key}`).toBeLessThanOrEqual(1);
@@ -227,6 +237,26 @@ export function assertChaosInvariants(world: ChaosWorld, recovered: RecoveredWor
       snapshot.status,
       `intent ${snapshot.intentId} silently stuck in ${snapshot.status}`,
     ).toBe("escalated");
+  }
+  // ...checked against the script's own manifest: presence must be a
+  // prefix of the script order (sequential executor — a durably recorded
+  // intent cannot vanish while a LATER one exists), and every present
+  // intent must be settled.
+  let absentSeen = false;
+  for (const intentId of manifest) {
+    const entry = recovered.state.journal.entry(intentId);
+    if (entry === undefined) {
+      absentSeen = true;
+      continue;
+    }
+    expect(
+      absentSeen,
+      `intent ${intentId} exists but an EARLIER manifest intent is absent — recorded work vanished`,
+    ).toBe(false);
+    expect(
+      ["confirmed", "failed", "escalated"].includes(entry.status),
+      `manifest intent ${intentId} unsettled: ${entry.status}`,
+    ).toBe(true);
   }
 
   // EXACTLY-ONCE AMBIGUITY + IDEMPOTENT RECOVERY: another pass changes nothing.

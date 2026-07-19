@@ -18,18 +18,21 @@
  * intent in `execution-started` REFUSES: only reconciliation (recovery)
  * may move an intent out of its ambiguity window.
  *
- * Transport outcome contract (see @camino/shared): a returned result is a
- * definitive success; `IndeterminateOutcomeError` means the outcome is
- * unknown (lost response while alive) and the intent is deliberately left
- * in `execution-started` for the same reconciliation path a crash uses;
- * any other throw is a definitive clean refusal recorded as `failed`.
+ * Transport outcome contract (see @camino/shared, hardened by review
+ * round 1 finding 3): a returned result is a definitive success; ONLY
+ * `DefinitiveRefusalError` records `failed` (effect known-absent);
+ * `IndeterminateOutcomeError` AND every other throw leave the intent in
+ * `execution-started` for the same reconciliation path a crash uses. A
+ * raw error proves nothing about external state — treating it as a clean
+ * refusal would write a durable lie the moment a real adapter's socket
+ * reset arrives after the upstream commit.
  *
  * Test-service mutations run reset-before-use unconditionally: the reset
  * is the hygiene primary that makes the ENVIRONMENT the idempotency unit
  * (§4.4). The irreversible flag changes nothing at execution time — it is
  * recovery that must never auto-retry an unconfirmed irreversible effect.
  */
-import { IndeterminateOutcomeError } from "@camino/shared";
+import { DefinitiveRefusalError } from "@camino/shared";
 import type { ExternalOperationSpec, MutationTransports, OperationResult } from "@camino/shared";
 import type { IntentViewEntry } from "@camino/core";
 import type { IntentJournal } from "./intent-journal.js";
@@ -54,7 +57,8 @@ export type ExecutionOutcome =
   | { readonly kind: "failed"; readonly reason: string }
   | {
       /**
-       * Outcome unknown (transport lost the response). The intent remains
+       * Outcome unknown — the transport lost the response OR threw
+       * something that is not a definitive refusal. The intent remains
        * in `execution-started`; reconciliation settles it.
        */
       readonly kind: "indeterminate";
@@ -85,15 +89,12 @@ export class IntentExecutor {
    * ids are unique forever).
    */
   submit(intentId: string, spec: ExternalOperationSpec): void {
-    this.journal.append(
-      {
-        intentId,
-        event: "recorded",
-        actor: this.actor,
-        payload: spec as unknown as Readonly<Record<string, unknown>>,
-      },
-      { expectedLastSeq: this.journal.lastSeq },
-    );
+    this.journal.append({
+      intentId,
+      event: "recorded",
+      actor: this.actor,
+      payload: spec as unknown as Readonly<Record<string, unknown>>,
+    });
   }
 
   /**
@@ -128,42 +129,37 @@ export class IntentExecutor {
         break;
     }
     // The pre-execution barrier: durable before ANY transport code runs.
-    this.journal.append(
-      { intentId, event: "execution-started", actor: this.actor, payload: {} },
-      { expectedLastSeq: this.journal.lastSeq },
-    );
+    this.journal.append({ intentId, event: "execution-started", actor: this.actor, payload: {} });
     this.hook("after-execution-started");
     let result: OperationResult;
     try {
       result = this.perform(entry);
     } catch (error) {
-      if (error instanceof IndeterminateOutcomeError) {
-        // Outcome unknown: leave the ambiguity window intact for
-        // reconciliation — recording anything else here would be a guess.
-        return { kind: "indeterminate", reason: error.message };
-      }
-      const reason = error instanceof Error ? error.message : String(error);
-      this.journal.append(
-        {
+      if (error instanceof DefinitiveRefusalError) {
+        // The ONLY throw allowed to become a durable "failed": the
+        // transport itself vouched the effect was never applied.
+        this.journal.append({
           intentId,
           event: "failed",
           actor: this.actor,
-          payload: { via: "response", reason },
-        },
-        { expectedLastSeq: this.journal.lastSeq },
-      );
-      return { kind: "failed", reason };
+          payload: { via: "response", reason: error.message },
+        });
+        return { kind: "failed", reason: error.message };
+      }
+      // IndeterminateOutcomeError and every UNKNOWN throw: outcome
+      // unknown. Leave the ambiguity window intact for reconciliation —
+      // recording `failed` here would be a durable claim about external
+      // state that nothing supports (round-1 finding 3).
+      const reason = error instanceof Error ? error.message : String(error);
+      return { kind: "indeterminate", reason };
     }
     this.hook("after-external-call");
-    this.journal.append(
-      {
-        intentId,
-        event: "confirmed",
-        actor: this.actor,
-        payload: { via: "response", result, note: "transport reported definitive success" },
-      },
-      { expectedLastSeq: this.journal.lastSeq },
-    );
+    this.journal.append({
+      intentId,
+      event: "confirmed",
+      actor: this.actor,
+      payload: { via: "response", result, note: "transport reported definitive success" },
+    });
     return { kind: "confirmed", result, alreadyComplete: false };
   }
 

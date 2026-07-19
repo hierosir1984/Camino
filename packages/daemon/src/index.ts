@@ -19,11 +19,7 @@ export type { RecordOutcome, RecordRequest } from "./transition-recorder.js";
 export { WriterLock, WriterLockHeldError } from "./writer-lock.js";
 export type { HeldWriterLock } from "./writer-lock.js";
 export { IntentJournal } from "./intent-journal.js";
-export type {
-  IntentAppendOptions,
-  IntentJournalOptions,
-  IntentReadFilter,
-} from "./intent-journal.js";
+export type { IntentJournalOptions, IntentReadFilter } from "./intent-journal.js";
 export { IntentExecutor } from "./intent-executor.js";
 export type { ExecutionOutcome, IntentExecutorOptions, ProtocolHook } from "./intent-executor.js";
 export { openRecoveredState, reconcileIntents, STATE_FILES } from "./recovery.js";

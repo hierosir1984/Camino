@@ -29,6 +29,7 @@ import {
   LABEL_DESIRED_STATES,
   OPERATION_CLASSES,
   OPERATION_TARGET_KINDS,
+  intentMarkerToken,
 } from "@camino/shared";
 import type {
   ExternalOperationSpec,
@@ -135,8 +136,14 @@ export type SpecValidation =
  * Validate an unknown value as a complete §4.4 operation spec. Field-level
  * string discipline matches the WP-103 durable boundary (well-formed
  * UTF-16, no embedded NUL) so every recorded decision round-trips exactly.
+ *
+ * When `intentId` is supplied (the journal's recorded-row path always
+ * supplies it), the marker-keyed classes are BOUND to it: bodyMarker /
+ * marker / correlationId must equal the intent's own id, and marked
+ * bodies must embed the DELIMITED token form. An unbound marker is how a
+ * reconciler confirms someone else's effect (review round 1, finding 1).
  */
-export function validateOperationSpec(value: unknown): SpecValidation {
+export function validateOperationSpec(value: unknown, intentId?: string): SpecValidation {
   if (!isPlainObject(value)) {
     return { ok: false, problem: "operation spec must be a plain object" };
   }
@@ -147,11 +154,55 @@ export function validateOperationSpec(value: unknown): SpecValidation {
       problem: `op must be one of the §4.4 operation classes, got ${JSON.stringify(op)}`,
     };
   }
-  const problem = specFieldsProblem(value, op as ExternalOperationSpec["op"]);
+  const problem =
+    specFieldsProblem(value, op as ExternalOperationSpec["op"]) ??
+    (intentId === undefined
+      ? null
+      : intentBindingProblem(value, op as ExternalOperationSpec["op"], intentId));
   if (problem !== null) {
     return { ok: false, problem: `${op}: ${problem}` };
   }
   return { ok: true, spec: value as unknown as ExternalOperationSpec };
+}
+
+/**
+ * The reconciliation keys that claim to be "the intent UUID" must BE the
+ * intent's id, and marked bodies must carry the delimited token (prefix-
+ * collision-proof) rather than a bare substring.
+ */
+function intentBindingProblem(
+  value: Record<string, unknown>,
+  op: ExternalOperationSpec["op"],
+  intentId: string,
+): string | null {
+  switch (op) {
+    case "pr-create": {
+      if (value["bodyMarker"] !== intentId) {
+        return `bodyMarker must equal the intent id ${JSON.stringify(intentId)} (the marker IS the intent UUID)`;
+      }
+      if (!(value["body"] as string).includes(intentMarkerToken(intentId))) {
+        return `body must embed the delimited marker token ${intentMarkerToken(intentId)}`;
+      }
+      return null;
+    }
+    case "comment-post": {
+      if (value["marker"] !== intentId) {
+        return `marker must equal the intent id ${JSON.stringify(intentId)} (the marker IS the intent UUID)`;
+      }
+      if (!(value["body"] as string).includes(intentMarkerToken(intentId))) {
+        return `body must embed the delimited marker token ${intentMarkerToken(intentId)}`;
+      }
+      return null;
+    }
+    case "workflow-dispatch": {
+      if (value["correlationId"] !== intentId) {
+        return `correlationId must equal the intent id ${JSON.stringify(intentId)} (camino_intent_id is the intent's own id)`;
+      }
+      return null;
+    }
+    default:
+      return null;
+  }
 }
 
 function specFieldsProblem(
@@ -307,10 +358,11 @@ function routeProblem(value: unknown): string | null {
 function eventPayloadProblem(
   event: IntentEventName,
   payload: Record<string, unknown>,
+  intentId: string,
 ): string | null {
   switch (event) {
     case "recorded": {
-      const validation = validateOperationSpec(payload);
+      const validation = validateOperationSpec(payload, intentId);
       return validation.ok ? null : validation.problem;
     }
     case "execution-started": {
@@ -387,7 +439,7 @@ export function decideIntentAppend(
   if (!isPlainObject(input.payload)) {
     return { ok: false, problem: "payload must be a plain object" };
   }
-  const payloadProblem = eventPayloadProblem(input.event, input.payload);
+  const payloadProblem = eventPayloadProblem(input.event, input.payload, input.intentId);
   if (payloadProblem !== null) {
     return { ok: false, problem: `${input.event} payload: ${payloadProblem}` };
   }
@@ -453,7 +505,7 @@ function statusAfter(event: IntentEventName): IntentStatus {
  */
 export function applyIntentRecord(view: IntentView, record: IntentEventRecord): void {
   if (record.event === "recorded") {
-    const validation = validateOperationSpec(record.payload);
+    const validation = validateOperationSpec(record.payload, record.intentId);
     if (!validation.ok) {
       // decideIntentAppend admitted the row, so this cannot happen; refuse
       // loudly rather than fold a spec-less intent.

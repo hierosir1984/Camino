@@ -15,7 +15,8 @@
  *    holds the connection. `kill -9` closes the file descriptors and the
  *    kernel releases the lock — there is no stale-lockfile state, no PID
  *    file, no mtime staleness heuristic to get wrong. A crashed daemon
- *    never blocks its successor; a LIVE daemon always does.
+ *    never blocks its successor; a live daemon blocks every COOPERATING
+ *    acquirer (the integration constraint below bounds "always").
  *  - **Fail-closed, instant refusal.** Acquisition sets busy_timeout to 0
  *    before `BEGIN EXCLUSIVE`: a held lock refuses immediately with a
  *    message naming the file. A held lock means another daemon process is
@@ -29,6 +30,20 @@
  * that opens the SQLite stores directly bypasses any advisory lock — that
  * is the same single-OS-user trust boundary the state directory's 0700
  * mode names (WP-102), not something a lock file can add to.
+ *
+ * INTEGRATION CONSTRAINT (review round 1, finding 9 — the POSIX advisory
+ * lock hazards SQLite itself documents): the guarantee holds only while
+ * every process touches the lock FILE exclusively through this class.
+ * Two same-user misuse patterns void it silently: (a) opening and then
+ * closing ANY other file descriptor on the lock file's inode from the
+ * holder's own process (POSIX drops all of that process's locks on the
+ * inode at that close — SQLite guards its own connections, not foreign
+ * ones), and (b) unlinking/renaming the lock file (a later acquirer
+ * locks a NEW inode and both "hold the lock"). No Camino code opens,
+ * unlinks, or renames this path outside WriterLock, and the state
+ * directory is not a shared scratch area — the constraint is named here
+ * (WP-003 boundary-naming precedent) so later WPs never add such code,
+ * rather than chased with unwinnable inode self-checks.
  *
  * Recovery and every store write run under this lock: the daemon's
  * composition path (recovery.ts) acquires it before opening the event

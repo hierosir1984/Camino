@@ -36,6 +36,10 @@ import type { ChaosWorld, RecoveredWorld } from "./harness.js";
 import type { KillPointName } from "./kill-points.js";
 import { CHAOS_SCRIPTS, OTHER_SHA } from "./scripts.js";
 
+function manifestOf(script: string): string[] {
+  return CHAOS_SCRIPTS[script]!.intents.map((intent) => intent.intentId);
+}
+
 let worlds: ChaosWorld[] = [];
 function world(script?: string): ChaosWorld {
   const w = prepareWorld(script === undefined ? undefined : CHAOS_SCRIPTS[script]);
@@ -81,14 +85,21 @@ const effectNever =
     expect(w.github.effectCounts().get(key), `effect ${key}`).toBeUndefined();
   };
 
-/** The three canonical kill points for one class, with per-window outcomes. */
+/**
+ * All FIVE named kill points for one class (round-1 finding 7 extended
+ * the original three): `after-execution-started` is recovery-equivalent
+ * to `in-transport-before-effect` (barrier durable, effect absent) and
+ * `in-transport-after-effect` to `after-external-call` (effect durable,
+ * confirmation absent) — asserting each pair separately pins the
+ * equivalence per class instead of assuming it.
+ */
 function classRows(
   script: string,
   intentId: string,
   outcomes: {
-    /** K2: what the barrier-window kill recovers to (before any effect landed). */
+    /** Barrier-window kills (before any effect landed). */
     readonly beforeEffect: MatrixExpect;
-    /** K3: what the post-effect kill recovers to. */
+    /** Post-effect kills (effect landed, confirmation absent). */
     readonly afterEffect: MatrixExpect;
     /** K1 effect assertion (completion applies the effect exactly once). */
     assertK1Effects(world: ChaosWorld): void;
@@ -106,7 +117,9 @@ function classRows(
         assertEffects: outcomes.assertK1Effects,
       },
     },
+    { script, intentId, killPoint: "after-execution-started", expect: outcomes.beforeEffect },
     { script, intentId, killPoint: "in-transport-before-effect", expect: outcomes.beforeEffect },
+    { script, intentId, killPoint: "in-transport-after-effect", expect: outcomes.afterEffect },
     { script, intentId, killPoint: "after-external-call", expect: outcomes.afterEffect },
   ];
 }
@@ -140,11 +153,7 @@ const MATRIX: MatrixRow[] = [
     "intent-label-1",
     "label:fixture-repo:issue#7:camino:executing:present",
   ),
-  ...decidable(
-    "comment-post",
-    "intent-comment-1",
-    "comment:fixture-repo:issue#7:camino-intent:intent-comment-1",
-  ),
+  ...decidable("comment-post", "intent-comment-1", "comment:fixture-repo:issue#7:intent-comment-1"),
 
   // workflow-dispatch: at-most-once. K2 = lost response, NO correlated run
   // → one durable ambiguity, escalation, zero dispatches, no auto-retry.
@@ -362,7 +371,7 @@ describe("deterministic kill-point matrix (every §4.4 class, both sides of the 
             row.expect.ambiguityRows,
           );
           row.expect.assertEffects(w);
-          assertChaosInvariants(w, recovered);
+          assertChaosInvariants(w, recovered, manifestOf(row.script));
         } finally {
           recovered.state.close();
         }
@@ -393,7 +402,7 @@ describe("kills inside recovery itself (reconciliation must be idempotent mid-cr
       expect(recovered.state.journal.entry("intent-dispatch-1")!.status).toBe("escalated");
       expect(eventCount(recovered.state, "intent-dispatch-1", "ambiguity-recorded")).toBe(1);
       expect(eventCount(recovered.state, "intent-dispatch-1", "escalated")).toBe(1);
-      assertChaosInvariants(w, recovered);
+      assertChaosInvariants(w, recovered, manifestOf("workflow-dispatch"));
     } finally {
       recovered.state.close();
     }
@@ -419,7 +428,7 @@ describe("kills inside recovery itself (reconciliation must be idempotent mid-cr
       expect(entry.status).toBe("confirmed");
       expect(eventCount(recovered.state, "intent-branch-1", "re-armed")).toBe(1);
       expect(w.github.effectCounts().get("branch:fixture-repo:camino/issue-1")).toBe(1);
-      assertChaosInvariants(w, recovered);
+      assertChaosInvariants(w, recovered, manifestOf("branch-create"));
     } finally {
       recovered.state.close();
     }
@@ -436,7 +445,7 @@ describe("the composite daemon-resume story (mixed script)", () => {
     try {
       expect(recovered.report.reconciled).toEqual([]);
       expect(recovered.state.recorder.currentState("mission", "mission-chaos")).toBe("draft");
-      assertChaosInvariants(w, recovered);
+      assertChaosInvariants(w, recovered, manifestOf("mixed"));
     } finally {
       recovered.state.close();
     }
@@ -464,7 +473,7 @@ describe("the composite daemon-resume story (mixed script)", () => {
       expect(recovered.state.journal.entry("intent-mixed-test")!.status).toBe("confirmed");
       expect(recovered.completed).toEqual(["intent-mixed-test"]);
       expect(w.testService.environmentCount("env-mixed", "seed-database")).toBe(1);
-      assertChaosInvariants(w, recovered);
+      assertChaosInvariants(w, recovered, manifestOf("mixed"));
     } finally {
       recovered.state.close();
     }

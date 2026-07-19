@@ -4,6 +4,7 @@
  * and the chaos suite ride these same branches through I/O.
  */
 import { describe, expect, it } from "vitest";
+import { intentMarkerToken } from "@camino/shared";
 import type { ExternalOperationSpec, IntentStatus, ObservedPullRequest } from "@camino/shared";
 import { decideReconciliation, ReconcileFactsMismatchError } from "./reconcile.js";
 import type { IntentSnapshot } from "./reconcile.js";
@@ -130,8 +131,9 @@ describe("push (intended SHA in the intent event)", () => {
   });
 });
 
-describe("pr-create (branch key primary, UUID corroborates)", () => {
-  const marker = "camino-intent:intent-1";
+describe("pr-create (branch key primary, UUID corroborates, base is identity)", () => {
+  const marker = "intent-1";
+  const token = intentMarkerToken(marker);
   const prSpec: ExternalOperationSpec = {
     op: "pr-create",
     repo: "r",
@@ -139,19 +141,25 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
     baseBranch: "main",
     title: "t",
     bodyMarker: marker,
-    body: `body ${marker}`,
+    body: `body ${token}`,
   };
-  const pr = (number: number, state: "open" | "closed", body: string): ObservedPullRequest => ({
+  const pr = (
+    number: number,
+    state: "open" | "closed",
+    body: string,
+    baseBranch = "main",
+  ): ObservedPullRequest => ({
     number,
     state,
     headBranch: "camino/issue-1",
+    baseBranch,
     body,
   });
 
-  it("one open PR carrying the marker → confirmed, corroborated", () => {
+  it("one open PR on the head/base pair carrying the marker token → confirmed, corroborated", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
-      pullRequests: [pr(5, "open", `hello ${marker}`)],
+      pullRequests: [pr(5, "open", `hello ${token}`)],
     });
     expect(verdict).toMatchObject({
       kind: "confirmed-external",
@@ -159,7 +167,7 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
     });
   });
 
-  it("one open PR without the marker → confirmed, uncorroborated (bodies are mutable)", () => {
+  it("one open PR on the pair without the marker → confirmed, uncorroborated (bodies are mutable)", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
       pullRequests: [pr(5, "open", "body was edited")],
@@ -170,15 +178,28 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
     });
   });
 
-  it("marker singles one out among several open PRs → confirmed", () => {
+  it("the marker token singles one out among several open PRs on the pair → confirmed", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
-      pullRequests: [pr(5, "open", "other"), pr(6, "open", `mine ${marker}`)],
+      pullRequests: [pr(5, "open", "other"), pr(6, "open", `mine ${token}`)],
     });
     expect(verdict).toMatchObject({
       kind: "confirmed-external",
       result: { prNumber: 6, corroborated: true },
     });
+  });
+
+  it("a BARE-ID substring does not corroborate — only the delimited token does (prefix collisions)", () => {
+    // The body carries intent-10's token; a naive substring search for
+    // "intent-1" would match it. The token match must not.
+    const verdict = decideReconciliation(snapshot(prSpec), {
+      op: "pr-create",
+      pullRequests: [
+        pr(5, "open", `someone else's ${intentMarkerToken("intent-10")}`),
+        pr(6, "open", "nothing"),
+      ],
+    });
+    expect(verdict.kind).toBe("ambiguous"); // two uncorroborated candidates
   });
 
   it("no PRs at all → re-arm", () => {
@@ -189,10 +210,18 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
     expect(verdict).toMatchObject({ kind: "re-arm" });
   });
 
+  it("an open PR from our head into a DIFFERENT base is NOT ours — reuse evidence, ambiguous", () => {
+    const verdict = decideReconciliation(snapshot(prSpec), {
+      op: "pr-create",
+      pullRequests: [pr(5, "open", "unrelated body", "develop")],
+    });
+    expect(verdict.kind).toBe("ambiguous");
+  });
+
   it("ANY closed PR on the head branch → ambiguous (closed/reused-branch escalation class)", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
-      pullRequests: [pr(3, "closed", `even carrying ${marker}`)],
+      pullRequests: [pr(3, "closed", `even carrying ${token}`)],
     });
     expect(verdict.kind).toBe("ambiguous");
   });
@@ -200,12 +229,12 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
   it("a closed PR escalates even beside a marker-carrying open PR", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
-      pullRequests: [pr(3, "closed", "old"), pr(5, "open", `mine ${marker}`)],
+      pullRequests: [pr(3, "closed", "old"), pr(5, "open", `mine ${token}`)],
     });
     expect(verdict.kind).toBe("ambiguous");
   });
 
-  it("several open PRs, marker in none → ambiguous", () => {
+  it("several open PRs on the pair, token in none → ambiguous", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
       pullRequests: [pr(5, "open", "a"), pr(6, "open", "b")],
@@ -213,10 +242,10 @@ describe("pr-create (branch key primary, UUID corroborates)", () => {
     expect(verdict.kind).toBe("ambiguous");
   });
 
-  it("several open PRs, marker in more than one → ambiguous", () => {
+  it("several open PRs on the pair, token in more than one → ambiguous", () => {
     const verdict = decideReconciliation(snapshot(prSpec), {
       op: "pr-create",
-      pullRequests: [pr(5, "open", marker), pr(6, "open", marker)],
+      pullRequests: [pr(5, "open", token), pr(6, "open", token)],
     });
     expect(verdict.kind).toBe("ambiguous");
   });

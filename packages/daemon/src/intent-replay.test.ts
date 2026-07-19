@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { intentMarkerToken } from "@camino/shared";
 import type { ExternalOperationSpec } from "@camino/shared";
 import { FakeGitHub } from "./chaos/fake-github.js";
 import { FakeCatchAll, FakeTestService } from "./chaos/fake-services.js";
@@ -88,8 +89,8 @@ const FIXTURES: Array<{
       headBranch: "feature",
       baseBranch: "main",
       title: "t",
-      bodyMarker: "camino-intent:pr",
-      body: "b camino-intent:pr",
+      bodyMarker: "intent-1",
+      body: `b ${intentMarkerToken("intent-1")}`,
     },
     assertOnce: (r) => {
       expect(r.github.effectCounts().get("pr:r:feature:main")).toBe(1);
@@ -132,11 +133,10 @@ const FIXTURES: Array<{
       repo: "r",
       targetKind: "issue",
       targetNumber: 7,
-      body: "b camino-intent:c",
-      marker: "camino-intent:c",
+      body: `b ${intentMarkerToken("intent-1")}`,
+      marker: "intent-1",
     },
-    assertOnce: (r) =>
-      expect(r.github.effectCounts().get("comment:r:issue#7:camino-intent:c")).toBe(1),
+    assertOnce: (r) => expect(r.github.effectCounts().get("comment:r:issue#7:intent-1")).toBe(1),
   },
   {
     name: "workflow-dispatch",
@@ -145,11 +145,11 @@ const FIXTURES: Array<{
       repo: "r",
       workflow: "w.yml",
       ref: "main",
-      correlationId: "d1",
+      correlationId: "intent-1",
     },
     assertOnce: (r) => {
-      expect(r.github.effectCounts().get("dispatch:r:d1")).toBe(1);
-      expect(r.github.findWorkflowRunsByCorrelation("r", "d1")).toHaveLength(1);
+      expect(r.github.effectCounts().get("dispatch:r:intent-1")).toBe(1);
+      expect(r.github.findWorkflowRunsByCorrelation("r", "intent-1")).toHaveLength(1);
     },
   },
   {
