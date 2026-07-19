@@ -430,13 +430,17 @@ export interface GitHubQueryTransport {
     targetNumber: number,
     label: string,
   ): boolean;
-  /** The comment carrying the marker, or null. */
-  findCommentByMarker(
+  /**
+   * EVERY comment carrying the marker token. More than one is possible
+   * only through an out-of-band actor (Camino validation reserves the
+   * namespace) — the verdict treats it as ambiguity, never first-match.
+   */
+  findCommentsByMarker(
     repo: string,
     targetKind: OperationTargetKind,
     targetNumber: number,
     marker: string,
-  ): { readonly commentId: number } | null;
+  ): ReadonlyArray<{ readonly commentId: number }>;
   /** Runs whose run-name carries the correlation id (observability surface). */
   findWorkflowRunsByCorrelation(
     repo: string,

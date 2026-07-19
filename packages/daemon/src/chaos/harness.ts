@@ -238,6 +238,33 @@ export function assertChaosInvariants(
       `intent ${snapshot.intentId} silently stuck in ${snapshot.status}`,
     ).toBe("escalated");
   }
+  // The failed-intent cross-check below attributes effects by natural
+  // key, which is only sound when the script gives every intent a
+  // DISTINCT effect identity (round 3 on round-2 finding 4): two intents
+  // sharing a key would let one's applied effect be blamed on (or excuse)
+  // the other, and a shared test-service environment lets one intent's
+  // reset erase another's evidence. Assert the precondition instead of
+  // assuming it.
+  {
+    const seenKeys = new Map<string, string>();
+    for (const intentId of manifest) {
+      const entry = recovered.state.journal.entry(intentId);
+      if (entry === undefined) continue;
+      const spec = entry.spec;
+      const identity =
+        spec.op === "test-service-mutation"
+          ? `test-env:${spec.environmentId}`
+          : spec.op === "catch-all"
+            ? `catch-all:${spec.description}`
+            : githubEffectKey(spec);
+      const holder = seenKeys.get(identity);
+      expect(
+        holder,
+        `script gives ${intentId} and ${holder} the same effect identity ${identity} — the failed-intent oracle cannot attribute`,
+      ).toBeUndefined();
+      seenKeys.set(identity, intentId);
+    }
+  }
   // ...checked against the script's own manifest: presence must be a
   // prefix of the script order (sequential executor — a durably recorded
   // intent cannot vanish while a LATER one exists), and every present

@@ -183,8 +183,26 @@ export function validateOperationSpec(value: unknown, intentId?: string): SpecVa
 /**
  * The reconciliation keys that claim to be "the intent UUID" must BE the
  * intent's id, and marked bodies must carry the delimited token (prefix-
- * collision-proof) rather than a bare substring.
+ * collision-proof) rather than a bare substring. The token NAMESPACE is
+ * additionally reserved (round 3, finding 1): a marked body may contain
+ * NO marker-token prefix beyond its own token — otherwise any
+ * Camino-authored artifact could embed a foreign intent's token and
+ * false-confirm it during that intent's reconciliation. Non-Camino
+ * actors forging tokens on the real backend are the §4.5 out-of-band
+ * class — outside this journal boundary and stated in external-ops.
  */
+function markedBodyProblem(body: string, intentId: string): string | null {
+  const token = intentMarkerToken(intentId);
+  if (!body.includes(token)) {
+    return `body must embed the delimited marker token ${token}`;
+  }
+  const foreignResidue = body.split(token).join("");
+  if (foreignResidue.includes("[camino-intent:")) {
+    return "body must not embed any OTHER intent's marker token (the token namespace is reserved)";
+  }
+  return null;
+}
+
 function intentBindingProblem(
   value: Record<string, unknown>,
   op: ExternalOperationSpec["op"],
@@ -195,19 +213,13 @@ function intentBindingProblem(
       if (value["bodyMarker"] !== intentId) {
         return `bodyMarker must equal the intent id ${JSON.stringify(intentId)} (the marker IS the intent UUID)`;
       }
-      if (!(value["body"] as string).includes(intentMarkerToken(intentId))) {
-        return `body must embed the delimited marker token ${intentMarkerToken(intentId)}`;
-      }
-      return null;
+      return markedBodyProblem(value["body"] as string, intentId);
     }
     case "comment-post": {
       if (value["marker"] !== intentId) {
         return `marker must equal the intent id ${JSON.stringify(intentId)} (the marker IS the intent UUID)`;
       }
-      if (!(value["body"] as string).includes(intentMarkerToken(intentId))) {
-        return `body must embed the delimited marker token ${intentMarkerToken(intentId)}`;
-      }
-      return null;
+      return markedBodyProblem(value["body"] as string, intentId);
     }
     case "workflow-dispatch": {
       if (value["correlationId"] !== intentId) {
@@ -531,7 +543,12 @@ export function applyIntentRecord(view: IntentView, record: IntentEventRecord): 
     view.set(record.intentId, {
       intentId: record.intentId,
       status: "recorded",
-      spec: validation.spec,
+      // The fold OWNS its spec: cloning severs the alias to the caller's
+      // record object, whose mutation must never move the live view
+      // (round 3, finding 2). Payloads are canonical JSON by journal
+      // construction, so a JSON round-trip is an exact clone (core's
+      // purity fence excludes runtime globals like structuredClone).
+      spec: JSON.parse(JSON.stringify(validation.spec)) as ExternalOperationSpec,
       executionStartedCount: 0,
       result: null,
       confirmedVia: null,
@@ -550,7 +567,7 @@ export function applyIntentRecord(view: IntentView, record: IntentEventRecord): 
     entry.executionStartedCount += 1;
   }
   if (record.event === "confirmed") {
-    entry.result = record.payload["result"] as OperationResult;
+    entry.result = JSON.parse(JSON.stringify(record.payload["result"])) as OperationResult;
     entry.confirmedVia = record.payload["via"] as IntentResolutionRoute;
   }
   if (record.event === "ambiguity-recorded") {

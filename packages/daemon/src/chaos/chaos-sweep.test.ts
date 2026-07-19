@@ -65,10 +65,11 @@ describe("exhaustive Nth-hook sweep over the mixed workload", () => {
       }
     }
     // The sweep must actually terminate by surviving, and only after
-    // covering a meaningful number of gaps (the mixed script has 15
-    // instrumented sites; a much smaller count means instrumentation
-    // silently vanished).
+    // covering EVERY instrumented gap: the mixed script has 15 hook
+    // sites, so the FIRST survivable N is 16 — a >= 15 guard would
+    // accept a script that silently lost a site (round 2 finding 6; the
+    // round-2 fold of this line failed to land and round 3 caught it).
     expect(completedAt, `no run survived within ${SWEEP_CAP} iterations`).not.toBeNull();
-    expect(completedAt!).toBeGreaterThanOrEqual(15);
+    expect(completedAt!).toBeGreaterThanOrEqual(16);
   }, 300_000);
 });

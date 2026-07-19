@@ -72,31 +72,39 @@ describe("WriterLock (cross-process, the CAM-STATE-03 property)", () => {
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
-    await new Promise<void>((resolve, reject) => {
-      let out = "";
-      const timer = setTimeout(
-        () => reject(new Error(`hold-child never reported LOCK-HELD; stderr: ${stderr}`)),
-        15_000,
-      );
-      child.stdout.on("data", (chunk: Buffer) => {
-        out += chunk.toString();
-        if (out.includes("LOCK-HELD")) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let out = "";
+        const timer = setTimeout(
+          () => reject(new Error(`hold-child never reported LOCK-HELD; stderr: ${stderr}`)),
+          15_000,
+        );
+        child.stdout.on("data", (chunk: Buffer) => {
+          out += chunk.toString();
+          if (out.includes("LOCK-HELD")) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        child.on("exit", () => {
           clearTimeout(timer);
-          resolve();
-        }
+          reject(new Error(`hold-child exited early; stderr: ${stderr}`));
+        });
       });
-      child.on("exit", () => {
-        clearTimeout(timer);
-        reject(new Error(`hold-child exited early; stderr: ${stderr}`));
-      });
+
+      // Another PROCESS holds it: acquisition here must refuse.
+      expect(() => WriterLock.acquire(path)).toThrow(WriterLockHeldError);
+    } finally {
+      // kill -9 on EVERY path — a failed readiness wait must not leave a
+      // live lock-holding child behind (round 3, finding 3). This is also
+      // the test's real payload: no signal handler, no cleanup path,
+      // nothing runs in the child.
+      child.kill("SIGKILL");
+    }
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+      else child.on("exit", () => resolve());
     });
-
-    // Another PROCESS holds it: acquisition here must refuse.
-    expect(() => WriterLock.acquire(path)).toThrow(WriterLockHeldError);
-
-    // kill -9 — no signal handler, no cleanup path, nothing runs in the child.
-    child.kill("SIGKILL");
-    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
 
     // The kernel released the lock with the process; the successor acquires.
     const lock = WriterLock.acquire(path);

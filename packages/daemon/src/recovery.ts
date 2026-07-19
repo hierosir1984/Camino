@@ -231,7 +231,7 @@ function gatherFacts(spec: ExternalOperationSpec, queries: QueryTransports): Obs
     case "comment-post":
       return {
         op: spec.op,
-        comment: queries.github.findCommentByMarker(
+        comments: queries.github.findCommentsByMarker(
           spec.repo,
           spec.targetKind,
           spec.targetNumber,

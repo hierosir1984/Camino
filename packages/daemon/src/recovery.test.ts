@@ -886,6 +886,15 @@ describe("round-2 regressions", () => {
       ref: "main",
       correlationId: "d2",
     });
+    // No automatic actor can authorize the retry — the row is David-bound.
+    expect(() =>
+      lag.journal.append({
+        intentId: "d2",
+        event: "retry-authorized",
+        actor: "camino:recovery",
+        payload: { reason: "automation must never do this" },
+      }),
+    ).toThrow(/David/);
     lag.journal.append({
       intentId: "d2",
       event: "retry-authorized",
@@ -897,5 +906,78 @@ describe("round-2 regressions", () => {
     // table (advisory-only CI), and VISIBLE: the correlation query returns
     // both. No automatic path produced this.
     expect(h2.github.findWorkflowRunsByCorrelation("r", "d2")).toHaveLength(2);
+  });
+});
+
+describe("round-3 regressions", () => {
+  it("finding 1: a Camino intent cannot embed a FOREIGN intent's token (namespace reserved)", () => {
+    const rig = crashedRig("before-effect");
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    expect(() =>
+      executor.submit("attacker-B", {
+        op: "comment-post",
+        repo: "r",
+        targetKind: "issue",
+        targetNumber: 7,
+        body: `mine ${intentMarkerToken("attacker-B")} plus ${intentMarkerToken("victim-A")}`,
+        marker: "attacker-B",
+      }),
+    ).toThrow(/namespace is reserved/);
+  });
+
+  it("finding 1: several token-bearing comments (out-of-band forgery) → ambiguity, never first-match", () => {
+    const rig = crashedRig("after-effect"); // our comment LANDED, response lost
+    seedRepo(rig.github);
+    const executor = new IntentExecutor(rig.journal, {
+      github: rig.github,
+      testService: rig.testService,
+      catchAll: rig.catchAll,
+    });
+    executor.submit("victim-A", {
+      op: "comment-post",
+      repo: "r",
+      targetKind: "issue",
+      targetNumber: 7,
+      body: `mine ${intentMarkerToken("victim-A")}`,
+      marker: "victim-A",
+    });
+    executor.execute("victim-A");
+    const h = healthy(rig);
+    // An out-of-band actor posts a SECOND comment carrying our token
+    // (unconstructible through Camino's own journal — simulated raw).
+    h.github.postComment({
+      op: "comment-post",
+      repo: "r",
+      targetKind: "issue",
+      targetNumber: 7,
+      body: `forged copy ${intentMarkerToken("victim-A")}`,
+      marker: "victim-A",
+    });
+    reconcileIntents(rig.journal, { github: h.github });
+    expect(rig.journal.entry("victim-A")!.status).toBe("escalated");
+    expect(rig.journal.entry("victim-A")!.ambiguityReason).toMatch(/out-of-band/);
+  });
+
+  it("finding 2: mutating the append-returned record cannot move the live fold", () => {
+    const rig = crashedRig("before-effect");
+    seedRepo(rig.github);
+    const record = rig.journal.append({
+      intentId: "i1",
+      event: "recorded",
+      actor: "x",
+      payload: { op: "branch-create", repo: "r", branch: "original", targetSha: SHA_A },
+    });
+    (record.payload as Record<string, unknown>)["branch"] = "mutated";
+    const entry = rig.journal.entry("i1")!;
+    expect(entry.spec).toMatchObject({ branch: "original" });
+    // The executor acts on the fold's owned copy, not the alias.
+    const h = healthy(rig);
+    h.executor.execute("i1");
+    expect(h.github.effectCounts().get("branch:r:original")).toBe(1);
+    expect(h.github.effectCounts().get("branch:r:mutated")).toBeUndefined();
   });
 });

@@ -56,10 +56,11 @@ afterEach(() => {
   worlds = [];
 });
 
-describe("seeded random kill sites (guaranteed to land inside the protocol)", () => {
+describe("seeded random kill sites (samples protocol gaps; the sweep is the exhaustive cover)", () => {
   for (const seed of SEEDS) {
     it(`seed ${seed}: random Nth-hook kills leave the invariants intact`, () => {
       const random = mulberry32(seed);
+      let kills = 0;
       for (let round = 0; round < ROUNDS_PER_SEED; round += 1) {
         const world = prepareWorld(CHAOS_SCRIPTS["mixed"]);
         worlds.push(world);
@@ -67,6 +68,7 @@ describe("seeded random kill sites (guaranteed to land inside the protocol)", ()
         const result = runChaosChild(world, { mode: "run", script: "mixed", killNth: nth });
         if (!result.completed) {
           expect(result.signal, `nth=${nth} stderr: ${result.stderr}`).toBe("SIGKILL");
+          kills += 1;
         }
         const recovered = recoverAndComplete(world);
         try {
@@ -75,6 +77,11 @@ describe("seeded random kill sites (guaranteed to land inside the protocol)", ()
           recovered.state.close();
         }
       }
+      // The fixed seeds must actually kill: a seed whose every draw
+      // survives would be sampling nothing (round 2 finding 7; the
+      // round-2 fold of this assertion failed to land — round 3 caught
+      // it).
+      expect(kills).toBeGreaterThanOrEqual(1);
     }, 120_000);
   }
 });

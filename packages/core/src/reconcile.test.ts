@@ -340,18 +340,26 @@ describe("comment-post (embedded UUID marker)", () => {
     marker: "camino-intent:intent-1",
   };
 
-  it("marker found → confirmed-external with the comment id", () => {
+  it("exactly one marker-bearing comment → confirmed-external with the comment id", () => {
     const verdict = decideReconciliation(snapshot(commentSpec), {
       op: "comment-post",
-      comment: { commentId: 42 },
+      comments: [{ commentId: 42 }],
     });
     expect(verdict).toMatchObject({ kind: "confirmed-external", result: { commentId: 42 } });
   });
 
   it("marker absent → re-arm", () => {
     expect(
-      decideReconciliation(snapshot(commentSpec), { op: "comment-post", comment: null }),
+      decideReconciliation(snapshot(commentSpec), { op: "comment-post", comments: [] }),
     ).toMatchObject({ kind: "re-arm" });
+  });
+
+  it("SEVERAL marker-bearing comments → ambiguous, never first-match (round 3, finding 1)", () => {
+    const verdict = decideReconciliation(snapshot(commentSpec), {
+      op: "comment-post",
+      comments: [{ commentId: 42 }, { commentId: 43 }],
+    });
+    expect(verdict.kind).toBe("ambiguous");
   });
 });
 

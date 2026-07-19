@@ -51,7 +51,10 @@ export type ObservedFacts =
       readonly targetSha: string | null;
     }
   | { readonly op: "label-set"; readonly labelPresent: boolean }
-  | { readonly op: "comment-post"; readonly comment: { readonly commentId: number } | null }
+  | {
+      readonly op: "comment-post";
+      readonly comments: ReadonlyArray<{ readonly commentId: number }>;
+    }
   | { readonly op: "workflow-dispatch"; readonly runs: readonly ObservedWorkflowRun[] }
   | { readonly op: "test-service-mutation" }
   | { readonly op: "catch-all" };
@@ -296,17 +299,29 @@ function decideAmbiguityWindow(
     }
     case "comment-post": {
       if (spec.op !== facts.op) throw new ReconcileFactsMismatchError(intentId, spec.op, facts.op);
-      if (facts.comment !== null) {
+      if (facts.comments.length === 1) {
         return {
           kind: "confirmed-external",
-          result: { commentId: facts.comment.commentId },
-          note: "comment carrying the embedded UUID marker found",
+          result: { commentId: facts.comments[0]!.commentId },
+          note: "exactly one comment carries the embedded UUID marker token",
         };
       }
+      if (facts.comments.length === 0) {
+        return {
+          kind: "re-arm",
+          resetBeforeUse: false,
+          note: "no comment carries the marker — the post did not land; the embedded UUID keeps any residual duplicate detectable",
+        };
+      }
+      // Camino validation reserves the token namespace, so several
+      // token-bearing comments mean an out-of-band actor is involved
+      // (§4.5) — escalate, never pick one (round 3, finding 1).
       return {
-        kind: "re-arm",
-        resetBeforeUse: false,
-        note: "no comment carries the marker — the post did not land; the embedded UUID keeps any residual duplicate detectable",
+        kind: "ambiguous",
+        reason:
+          `${facts.comments.length} comments carry this intent's marker token ` +
+          `(#${facts.comments.map((c) => c.commentId).join(", #")}) — an out-of-band actor ` +
+          "duplicated or forged the marker; escalating rather than claiming one",
       };
     }
     case "workflow-dispatch": {

@@ -447,19 +447,22 @@ export class FakeGitHub implements GitHubMutationTransport, GitHubQueryTransport
     );
   }
 
-  findCommentByMarker(
+  findCommentsByMarker(
     repo: string,
     targetKind: OperationTargetKind,
     targetNumber: number,
     marker: string,
-  ): { readonly commentId: number } | null {
+  ): ReadonlyArray<{ readonly commentId: number }> {
     return this.query((state) => {
       const token = intentMarkerToken(marker);
-      const found = (state.repos[repo]?.comments ?? []).find(
-        (c) =>
-          c.targetKind === targetKind && c.targetNumber === targetNumber && c.body.includes(token),
-      );
-      return found === undefined ? null : { commentId: found.commentId };
+      return (state.repos[repo]?.comments ?? [])
+        .filter(
+          (c) =>
+            c.targetKind === targetKind &&
+            c.targetNumber === targetNumber &&
+            c.body.includes(token),
+        )
+        .map((c) => ({ commentId: c.commentId }));
     });
   }
 
