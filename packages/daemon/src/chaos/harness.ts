@@ -284,9 +284,84 @@ export function assertChaosInvariants(
       ["confirmed", "failed", "escalated"].includes(entry.status),
       `manifest intent ${intentId} unsettled: ${entry.status}`,
     ).toBe(true);
-    // A `failed` status is a durable claim that the effect is ABSENT —
-    // cross-check it against the external system's own books so a
-    // terminal lie can never pass the oracle (round 2, finding 4).
+    // A `confirmed` status is a durable claim that the effect EXISTS —
+    // verify it against observed external truth (round 4, finding 2:
+    // "zero lost state" must reject a confirmed intent whose effect is
+    // nowhere), and a `failed` status claims the effect is ABSENT —
+    // cross-checked below (round 2, finding 4).
+    if (entry.status === "confirmed") {
+      const spec = entry.spec;
+      switch (spec.op) {
+        case "branch-create":
+          expect(
+            world.github.getRef(spec.repo, spec.branch),
+            `confirmed ${intentId} but the branch is not at the intended SHA`,
+          ).toBe(spec.targetSha);
+          break;
+        case "push":
+          expect(
+            world.github.getRef(spec.repo, spec.ref),
+            `confirmed ${intentId} but the ref is not at the intended SHA`,
+          ).toBe(spec.intendedSha);
+          break;
+        case "pr-create":
+          expect(
+            world.github
+              .findPullRequestsByHead(spec.repo, spec.headBranch)
+              .filter((pr) => pr.state === "open" && pr.baseBranch === spec.baseBranch).length,
+            `confirmed ${intentId} but no open PR exists on the head/base pair`,
+          ).toBe(1);
+          break;
+        case "merge-by-push":
+          expect(
+            world.github.observeRef(spec.repo, spec.targetRef, spec.mergeSha).atOrPastAncestor,
+            `confirmed ${intentId} but the target is not at/past the merge commit`,
+          ).toBe(true);
+          break;
+        case "label-set":
+          expect(
+            world.github.isLabelPresent(spec.repo, spec.targetKind, spec.targetNumber, spec.label),
+            `confirmed ${intentId} but the label state is not the desired state`,
+          ).toBe(spec.desired === "present");
+          break;
+        case "comment-post":
+          expect(
+            world.github.findCommentsByMarker(
+              spec.repo,
+              spec.targetKind,
+              spec.targetNumber,
+              spec.marker,
+            ).length,
+            `confirmed ${intentId} but no comment carries its marker token`,
+          ).toBe(1);
+          break;
+        case "workflow-dispatch":
+          expect(
+            world.github.findWorkflowRunsByCorrelation(spec.repo, spec.correlationId).length,
+            `confirmed ${intentId} but no run carries its correlation token`,
+          ).toBeGreaterThanOrEqual(1);
+          break;
+        case "test-service-mutation":
+          if (spec.irreversible) {
+            expect(
+              world.testService.outboxCount(spec.environmentId, spec.mutation),
+              `confirmed ${intentId} but its irreversible effect is absent`,
+            ).toBe(1);
+          } else {
+            expect(
+              world.testService.environmentCount(spec.environmentId, spec.mutation),
+              `confirmed ${intentId} but the environment does not hold its mutation exactly once`,
+            ).toBe(1);
+          }
+          break;
+        case "catch-all":
+          expect(
+            world.catchAll.effectCount(spec.description),
+            `confirmed ${intentId} but its effect is absent`,
+          ).toBe(1);
+          break;
+      }
+    }
     if (entry.status === "failed") {
       const spec = entry.spec;
       if (spec.op === "test-service-mutation") {

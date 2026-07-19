@@ -225,6 +225,16 @@ function intentBindingProblem(
       if (value["correlationId"] !== intentId) {
         return `correlationId must equal the intent id ${JSON.stringify(intentId)} (camino_intent_id is the intent's own id)`;
       }
+      // The correlation namespace is reserved exactly like the marker
+      // namespace (round 4, finding 1): run-names are built from the
+      // workflow field plus the transport-appended token, so free text
+      // carrying the token prefix could plant a FOREIGN intent's
+      // correlation inside a legitimate run-name.
+      for (const field of ["workflow", "ref"] as const) {
+        if ((value[field] as string).includes("[camino_intent_id=")) {
+          return `${field} must not embed a correlation token (the [camino_intent_id= namespace is reserved for the transport)`;
+        }
+      }
       return null;
     }
     default:

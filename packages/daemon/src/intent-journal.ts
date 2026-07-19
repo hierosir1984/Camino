@@ -336,12 +336,21 @@ export class IntentJournal {
   }
 
   private toRecord(row: IntentEventRow): IntentEventRecord {
+    // Canonical-form read (round 4 on round-3 finding 2): a raw writer
+    // can persist JSON text whose parse differs from its re-serialized
+    // form (literal -0 parses to -0 but stringifies to "0"). Reading
+    // through a stringify/parse round-trip makes every observer — read(),
+    // the fold, replay — see ONE canonical value, the same form append
+    // produces (single-observation philosophy: canonical JSON is the
+    // sole authority).
+    const parsed: unknown = JSON.parse(row.payload);
+    const canonical: unknown = JSON.parse(JSON.stringify(parsed));
     return {
       seq: row.seq,
       intentId: row.intent_id,
       event: row.event as IntentEventName,
       actor: row.actor,
-      payload: JSON.parse(row.payload) as IntentEventRecord["payload"],
+      payload: canonical as IntentEventRecord["payload"],
       recordedAt: row.recorded_at,
     };
   }

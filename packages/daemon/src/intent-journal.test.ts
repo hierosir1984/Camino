@@ -344,3 +344,55 @@ describe("round-1 regressions", () => {
     expect(after - before).toBeLessThan(10);
   });
 });
+
+describe("round-4 regressions", () => {
+  it("finding 1: free-text dispatch fields cannot embed a correlation token", () => {
+    const journal = new IntentJournal(journalPath());
+    expect(() =>
+      journal.append({
+        intentId: "attacker-B",
+        event: "recorded",
+        actor: "x",
+        payload: {
+          op: "workflow-dispatch",
+          repo: "r",
+          workflow: "attacker.yml [camino_intent_id=victim-A]",
+          ref: "main",
+          correlationId: "attacker-B",
+        },
+      }),
+    ).toThrow(/namespace is reserved for the transport/);
+    journal.close();
+  });
+
+  it("regression on r3 finding 2: raw-persisted JSON -0 reads and folds as canonical 0 everywhere", () => {
+    const path = journalPath();
+    new IntentJournal(path).close();
+    const raw = new Database(path);
+    // A raw writer persists a lifecycle-legal history whose result text
+    // carries a literal -0 (the append path would have canonicalized it).
+    const spec = JSON.stringify({ op: "catch-all", description: "d" });
+    raw
+      .prepare(
+        `INSERT INTO intent_events (intent_id, event, actor, payload, recorded_at) VALUES
+         ('i1', 'recorded', 'x', ?, '2026-01-01T00:00:00.000Z'),
+         ('i1', 'execution-started', 'x', '{}', '2026-01-01T00:00:01.000Z'),
+         ('i1', 'confirmed', 'x', '{"via":"response","result":{"delta":-0},"note":"n"}', '2026-01-01T00:00:02.000Z')`,
+      )
+      .run(spec);
+    raw.close();
+    const journal = new IntentJournal(path);
+    const readResult = (
+      journal.read({ intentId: "i1" }).find((r) => r.event === "confirmed")!.payload[
+        "result"
+      ] as Record<string, unknown>
+    )["delta"];
+    const foldedResult = (journal.entry("i1")!.result as Record<string, unknown>)["delta"];
+    // ONE canonical observation: read() and the fold agree, and neither is -0.
+    expect(Object.is(readResult, -0)).toBe(false);
+    expect(Object.is(foldedResult, -0)).toBe(false);
+    expect(readResult).toBe(0);
+    expect(foldedResult).toBe(0);
+    journal.close();
+  });
+});
