@@ -3,16 +3,35 @@
  *
  * The token lives in a single file under `~/.camino` with owner-only
  * permissions. Startup is fail-closed: an existing file that is a symlink,
- * not a regular file, owned by another user, readable by group/other, or
- * whose content is not a plausible token REFUSES startup with a precise
- * remediation message — it is never silently repaired or regenerated,
- * because "the file changed shape" is exactly the signal a user should see.
- * Only a genuinely absent file is created (0600, enforced with fchmod so an
- * unusual umask cannot widen it).
+ * not a regular file, owned by another user, readable by group/other by mode
+ * bits OR by an extended ACL, or whose content is not a plausible token
+ * REFUSES startup with a precise remediation message — it is never silently
+ * repaired or regenerated, because "the file changed shape" is exactly the
+ * signal a user should see. Only a genuinely absent file is created (0600,
+ * enforced with fchmod so an unusual umask cannot widen it, and with any
+ * inherited ACL stripped so a directory ACL cannot widen it either).
+ *
+ * Hardening folded from round 1:
+ *  - the existing-file open is non-blocking, so a FIFO or device left at the
+ *    token path is refused instead of hanging startup on the open (finding 4);
+ *  - a new token is written to a unique temp file and published into place with
+ *    an atomic link(), so the `auth-token` pathname is never observable in a
+ *    half-written state by a concurrent first run (finding 5);
+ *  - mode bits alone do not prove owner-only on macOS, where an ACL grants
+ *    access independently; the ACL is checked (and, on our created files,
+ *    stripped) on darwin. On other POSIX platforms mode + ownership are
+ *    enforced and ACL-based widening is a documented residual (finding 2).
+ *
+ * Verification binds to the OPENED INODE: the file is fstat-checked and read
+ * through the same fd, so a concurrent swap of the directory entry cannot
+ * substitute a different token into the running daemon. The on-disk path
+ * naming a different file afterwards does not affect the loaded token
+ * (finding 8 is scoped to that, not a compromise of the token in use).
  *
  * POSIX semantics (mode bits, uid, O_NOFOLLOW) are assumed; the walking
  * skeleton targets macOS and Linux (build plan §1.2 posture).
  */
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -21,9 +40,12 @@ import {
   existsSync,
   fchmodSync,
   fstatSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import type { Stats } from "node:fs";
@@ -39,6 +61,41 @@ const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,512}$/;
 /** 32 random bytes → 43 base64url chars (~256 bits). */
 export function generateToken(): string {
   return randomBytes(32).toString("base64url");
+}
+
+/**
+ * True if `path` carries an extended ACL that could grant access beyond its
+ * mode bits. Implemented on darwin (POSIX `ls -le` lists ACL entries after the
+ * mode line); returns false elsewhere — where mode + ownership are enforced and
+ * ACL detection is a documented residual (round 1, finding 2). Any exec failure
+ * is treated as "cannot prove clean" only on darwin, where it refuses.
+ */
+export function hasExtendedAcl(path: string): boolean {
+  if (process.platform !== "darwin") return false;
+  let output: string;
+  try {
+    output = execFileSync("/bin/ls", ["-lde", path], {
+      encoding: "utf8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    // On darwin we cannot confirm the file is ACL-free — fail closed.
+    return true;
+  }
+  // ACL entries are numbered lines ("0: group:everyone allow read") after the
+  // long-listing line; their presence is the signal.
+  return output.split("\n").some((line) => /^\s*\d+:\s/.test(line));
+}
+
+/** Best-effort strip of any inherited ACL from a file/dir we created (darwin). */
+function stripInheritedAcl(path: string): void {
+  if (process.platform !== "darwin") return;
+  try {
+    execFileSync("/bin/chmod", ["-N", path], { timeout: 5000, stdio: "ignore" });
+  } catch {
+    // Non-fatal: the verification step re-checks and refuses if an ACL remains.
+  }
 }
 
 /**
@@ -104,6 +161,13 @@ function verifyExistingToken(fd: number, path: string): LoadedToken {
         `Delete it to have the daemon generate a fresh token.`,
     );
   }
+  if (hasExtendedAcl(path)) {
+    throw new TokenError(
+      `Refusing to start: token file ${path} carries an extended ACL that can ` +
+        `grant access beyond its 0600 mode. Clear it with: chmod -N ${JSON.stringify(path)} ` +
+        `(and check the containing directory), or delete the file to regenerate a fresh token.`,
+    );
+  }
   const raw = readAllFromFd(fd, stat.size);
   const token = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
   if (!TOKEN_PATTERN.test(token)) {
@@ -128,65 +192,101 @@ export function loadOrCreateToken(env: NodeJS.ProcessEnv = process.env): LoadedT
   if (!existsSync(home)) {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     chmodSync(home, 0o700); // mkdir's mode is umask-masked; force owner-only
+    stripInheritedAcl(home); // a directory ACL must not widen what we create
   }
 
-  const openExisting = (): number | undefined => {
+  const existing = openExistingToken(path);
+  if (existing !== undefined) {
     try {
-      return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return undefined;
-      if (code === "ELOOP" || code === "EMLINK") {
-        throw new TokenError(
-          `Refusing to start: token file ${path} is a symbolic link. ` +
-            `Replace it with a regular file (chmod 600) or delete it.`,
-        );
-      }
-      throw new TokenError(`Refusing to start: cannot open token file ${path}: ${String(error)}`);
-    }
-  };
-
-  const existingFd = openExisting();
-  if (existingFd !== undefined) {
-    try {
-      return verifyExistingToken(existingFd, path);
+      return verifyExistingToken(existing, path);
     } finally {
-      closeSync(existingFd);
+      closeSync(existing);
     }
   }
 
-  const token = generateToken();
-  let fd: number;
+  return createTokenAtomically(path);
+}
+
+/**
+ * Open an existing token file for reading, non-blocking (O_NONBLOCK), so a FIFO
+ * or device at the path returns a fd immediately instead of blocking the open —
+ * the fstat check then refuses it as non-regular (round 1, finding 4). Returns
+ * undefined if the file is absent; a symlink is refused outright.
+ */
+function openExistingToken(path: string): number | undefined {
   try {
-    fd = openSync(
-      path,
+    return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return undefined;
+    if (code === "ELOOP" || code === "EMLINK") {
+      throw new TokenError(
+        `Refusing to start: token file ${path} is a symbolic link. ` +
+          `Replace it with a regular file (chmod 600) or delete it.`,
+      );
+    }
+    throw new TokenError(`Refusing to start: cannot open token file ${path}: ${String(error)}`);
+  }
+}
+
+/**
+ * Write a fresh token to a unique temp file, then publish it atomically with
+ * link() so the visible `auth-token` path never exists half-written. If another
+ * first run published first (link → EEXIST), read and return theirs.
+ */
+function createTokenAtomically(path: string): LoadedToken {
+  const token = generateToken();
+  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  let tmpFd: number;
+  try {
+    tmpFd = openSync(
+      tmpPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      // Concurrent first run: the other process created it; verify and use theirs.
-      const fdAfterRace = openExisting();
-      if (fdAfterRace === undefined) {
-        throw new TokenError(`Refusing to start: token file ${path} appeared and vanished.`);
-      }
-      try {
-        return verifyExistingToken(fdAfterRace, path);
-      } finally {
-        closeSync(fdAfterRace);
-      }
-    }
-    throw new TokenError(`Refusing to start: cannot create token file ${path}: ${String(error)}`);
+    throw new TokenError(
+      `Refusing to start: cannot create temporary token file ${tmpPath}: ${String(error)}`,
+    );
   }
   try {
-    fchmodSync(fd, 0o600); // umask-independent: the mode passed to open() is masked, this is not
+    fchmodSync(tmpFd, 0o600); // umask-independent: open()'s mode is masked, this is not
     const payload = Buffer.from(`${token}\n`, "utf8");
     let offset = 0;
     while (offset < payload.length) {
-      offset += writeSync(fd, payload, offset, payload.length - offset);
+      offset += writeSync(tmpFd, payload, offset, payload.length - offset);
     }
-    return { token, path, created: true };
+    fsyncSync(tmpFd);
   } finally {
-    closeSync(fd);
+    closeSync(tmpFd);
+  }
+  stripInheritedAcl(tmpPath); // strip before publish so the linked inode is clean
+
+  try {
+    linkSync(tmpPath, path); // atomic publish; EEXIST means another run won
+  } catch (error) {
+    safeUnlink(tmpPath);
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const raced = openExistingToken(path);
+      if (raced === undefined) {
+        throw new TokenError(`Refusing to start: token file ${path} appeared and vanished.`);
+      }
+      try {
+        return verifyExistingToken(raced, path);
+      } finally {
+        closeSync(raced);
+      }
+    }
+    throw new TokenError(`Refusing to start: cannot publish token file ${path}: ${String(error)}`);
+  }
+  safeUnlink(tmpPath); // the published path now holds the inode; drop the temp name
+  return { token, path, created: true };
+}
+
+function safeUnlink(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch {
+    // A leftover temp file is harmless (0600, never read); nothing to do.
   }
 }

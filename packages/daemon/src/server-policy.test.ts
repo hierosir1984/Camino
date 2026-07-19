@@ -7,12 +7,17 @@
  * Pinned properties:
  *  - /api requests without (or with a wrong) token are rejected;
  *  - state-changing requests without the CSRF token are rejected, INCLUDING
- *    on unrouted paths — enforcement runs before route matching, so a future
- *    route cannot forget to opt in;
+ *    on unrouted paths — the global hook fires for matched and unmatched
+ *    routes alike, so a future route cannot forget to opt in;
  *  - cross-origin state-changing requests are rejected outright;
  *  - requests carrying a foreign Host authority are rejected;
  *  - no CORS grant is ever emitted.
+ *
+ * The `round 1 regressions` block pins the falsification-review findings:
+ * absolute-form target auth bypass (1), host/origin pair binding (6), and
+ * duplicate security-header smuggling (7).
  */
+import { connect } from "node:net";
 import { request as httpRequest } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -344,5 +349,121 @@ describe("fail-closed off-listener behaviour", () => {
     const response = await app.inject({ method: "GET", url: "/api/health" });
     expect(response.statusCode).toBe(403);
     await app.close();
+  });
+});
+
+/**
+ * Round-1 falsification-review regressions. These require control over the raw
+ * request LINE (absolute-form target) and repeated header occurrences, which
+ * node:http's request() cannot express — so they write the bytes onto a socket.
+ */
+describe("round 1 regressions", () => {
+  function rawLine(
+    port: number,
+    requestLine: string,
+    headerLines: string[],
+  ): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const parse = (buf: string): { status: number; body: string } => {
+        const statusLine = buf.split("\r\n", 1)[0] ?? "";
+        return {
+          status: Number(statusLine.split(" ")[1] ?? 0),
+          body: buf.slice(buf.indexOf("\r\n\r\n") + 4),
+        };
+      };
+      // Connection: close makes the server end the socket after the response,
+      // so "end" fires promptly instead of the connection lingering keep-alive.
+      const socket = connect({ host: "127.0.0.1", port }, () => {
+        socket.write(
+          `${requestLine}\r\n${[...headerLines, "Connection: close"].join("\r\n")}\r\n\r\n`,
+        );
+      });
+      let buf = "";
+      socket.on("data", (chunk: Buffer) => (buf += chunk.toString("utf8")));
+      socket.on("end", () => resolve(parse(buf)));
+      socket.on("error", reject);
+      setTimeout(() => {
+        socket.destroy();
+        resolve(parse(buf));
+      }, 4000);
+    });
+  }
+
+  it("finding 1: an absolute-form /api target cannot bypass the token check", async () => {
+    // GET http://evil.example/api/csrf HTTP/1.1 previously classified as
+    // non-API (raw target didn't start with /api) yet routed to /api/csrf.
+    const response = await rawLine(daemon.port, "GET http://evil.example/api/csrf HTTP/1.1", [
+      `Host: 127.0.0.1:${daemon.port}`,
+    ]);
+    expect(response.status).not.toBe(200);
+    expect(response.body).not.toContain("csrfToken");
+  });
+
+  it("finding 1: an absolute-form tokenless shutdown is refused", async () => {
+    const response = await rawLine(daemon.port, "POST http://evil.example/api/shutdown HTTP/1.1", [
+      `Host: 127.0.0.1:${daemon.port}`,
+    ]);
+    expect(response.status).not.toBe(200);
+    expect(response.body).not.toContain("stopping");
+  });
+
+  it("finding 1: an asterisk-form target is refused", async () => {
+    const response = await rawLine(daemon.port, "OPTIONS * HTTP/1.1", [
+      `Host: 127.0.0.1:${daemon.port}`,
+    ]);
+    expect(response.status).not.toBe(200);
+  });
+
+  it("finding 6: a Host/Origin pair that mismatches is rejected even though both are allowlisted", async () => {
+    const csrf = await fetchCsrfToken();
+    const response = await rawLine(daemon.port, "POST /api/health HTTP/1.1", [
+      `Host: localhost:${daemon.port}`,
+      `Origin: http://127.0.0.1:${daemon.port}`,
+      `Authorization: Bearer ${TOKEN}`,
+      `X-Camino-Csrf: ${csrf}`,
+    ]);
+    expect(response.status).toBe(403);
+    expect(response.body).toContain("origin");
+  });
+
+  it("finding 6: a matching Host/Origin pair passes the pairing check", async () => {
+    const response = await rawLine(daemon.port, "GET /api/health HTTP/1.1", [
+      `Host: localhost:${daemon.port}`,
+      `Origin: http://localhost:${daemon.port}`,
+      `Authorization: Bearer ${TOKEN}`,
+    ]);
+    expect(response.status).toBe(200);
+  });
+
+  it("finding 7: a duplicate Host header is rejected regardless of order (no smuggling)", async () => {
+    for (const order of [
+      [`Host: 127.0.0.1:${daemon.port}`, "Host: evil.example"],
+      ["Host: evil.example", `Host: 127.0.0.1:${daemon.port}`],
+    ]) {
+      const response = await rawLine(daemon.port, "GET /api/health HTTP/1.1", [
+        ...order,
+        `Authorization: Bearer ${TOKEN}`,
+      ]);
+      expect(response.status, order.join(" | ")).toBe(400);
+      expect(response.body).toContain("duplicate-header");
+    }
+  });
+
+  it("finding 7: duplicate Authorization / Origin / CSRF headers are rejected", async () => {
+    for (const dup of [
+      [`Authorization: Bearer ${TOKEN}`, `Authorization: Bearer ${TOKEN}`],
+      [
+        `Origin: http://127.0.0.1:${daemon.port}`,
+        `Origin: http://127.0.0.1:${daemon.port}`,
+        `Authorization: Bearer ${TOKEN}`,
+      ],
+      ["X-Camino-Csrf: a", "X-Camino-Csrf: b", `Authorization: Bearer ${TOKEN}`],
+    ]) {
+      const response = await rawLine(daemon.port, "GET /api/health HTTP/1.1", [
+        `Host: 127.0.0.1:${daemon.port}`,
+        ...dup,
+      ]);
+      expect(response.status, dup.join(" | ")).toBe(400);
+    }
   });
 });

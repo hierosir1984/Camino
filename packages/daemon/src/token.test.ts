@@ -4,10 +4,12 @@
  * is one of the acceptance clauses ("token-file permissions verified at
  * startup; refuse to start otherwise").
  */
+import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   statSync,
   symlinkSync,
@@ -17,7 +19,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { generateToken, loadOrCreateToken, TokenError, tokenStatRefusal } from "./token.js";
+import {
+  generateToken,
+  hasExtendedAcl,
+  loadOrCreateToken,
+  TokenError,
+  tokenStatRefusal,
+} from "./token.js";
 
 function scratchHome(): { env: NodeJS.ProcessEnv; home: string; tokenPath: string } {
   const home = join(mkdtempSync(join(tmpdir(), "camino-token-")), "camino-home");
@@ -110,6 +118,91 @@ describe("loadOrCreateToken", () => {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     writeFileSync(tokenPath, "A".repeat(8192), { mode: 0o600 });
     expect(() => loadOrCreateToken(env)).toThrow(/bytes/);
+  });
+
+  it("finding 5: publishes the created token atomically, leaving no temp file", () => {
+    const { env, home } = scratchHome();
+    const loaded = loadOrCreateToken(env);
+    const entries = readdirSync(home);
+    expect(entries).toEqual(["auth-token"]); // the .tmp.* file is gone
+    expect(readFileSync(join(home, "auth-token"), "utf8")).toBe(`${loaded.token}\n`);
+  });
+});
+
+/**
+ * Finding 4: a FIFO (or any file whose open blocks) at the token path must be
+ * refused, not hang startup. Run in a CHILD process with a hard timeout: if a
+ * regression drops O_NONBLOCK the open blocks the event loop synchronously (a
+ * vitest timeout could not interrupt it), so the child is killed and the test
+ * fails cleanly instead of wedging the suite.
+ */
+describe("finding 4: non-blocking open of the existing token file", () => {
+  const CHILD = `
+    const [, , tokenModule, home] = process.argv;
+    import(tokenModule)
+      .then((m) => { m.loadOrCreateToken({ CAMINO_HOME: home }); process.exit(0); })
+      .catch(() => process.exit(3));
+  `;
+
+  it("refuses a FIFO at the token path within the timeout", () => {
+    const home = join(mkdtempSync(join(tmpdir(), "camino-fifo-")), "camino-home");
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    execFileSync("mkfifo", [join(home, "auth-token")]);
+    chmodSync(join(home, "auth-token"), 0o600);
+
+    const childPath = join(home, "child.mjs");
+    writeFileSync(childPath, CHILD);
+    const tokenModule = new URL("./token.ts", import.meta.url).href;
+
+    let status: number | undefined;
+    let timedOut = false;
+    try {
+      execFileSync(process.execPath, ["--import", "tsx", childPath, tokenModule, home], {
+        timeout: 8000,
+        stdio: "ignore",
+      });
+      status = 0;
+    } catch (error) {
+      const err = error as { status?: number; killed?: boolean; signal?: string };
+      timedOut = err.killed === true || err.signal === "SIGTERM";
+      status = err.status;
+    }
+    expect(timedOut, "startup hung on the FIFO open").toBe(false);
+    expect(status, "expected a refusal exit (3)").toBe(3);
+  }, 15000);
+});
+
+describe("finding 2: extended-ACL detection (darwin)", () => {
+  it.skipIf(process.platform !== "darwin")(
+    "refuses a 0600 token file widened by an everyone-read ACL",
+    () => {
+      const { env, home, tokenPath } = scratchHome();
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      writeFileSync(tokenPath, `${generateToken()}\n`, { mode: 0o600 });
+      execFileSync("/bin/chmod", ["+a", "everyone allow read", tokenPath]);
+
+      expect(hasExtendedAcl(tokenPath)).toBe(true);
+      expect(() => loadOrCreateToken(env)).toThrow(/ACL/);
+    },
+  );
+
+  it.skipIf(process.platform !== "darwin")("creates a token file free of inherited ACLs", () => {
+    const { env, home, tokenPath } = scratchHome();
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    // A directory ACL with file_inherit would propagate to a naively-created file.
+    execFileSync("/bin/chmod", ["+a", "everyone allow read,file_inherit", home]);
+    const loaded = loadOrCreateToken(env);
+    expect(loaded.created).toBe(true);
+    expect(hasExtendedAcl(tokenPath)).toBe(false);
+    // And a second startup accepts the file it just created.
+    expect(loadOrCreateToken(env).token).toBe(loaded.token);
+  });
+
+  it("reports no ACL on non-darwin platforms (documented residual)", () => {
+    if (process.platform === "darwin") return;
+    const { env, tokenPath } = scratchHome();
+    loadOrCreateToken(env);
+    expect(hasExtendedAcl(tokenPath)).toBe(false);
   });
 });
 

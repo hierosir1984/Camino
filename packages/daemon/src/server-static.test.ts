@@ -5,7 +5,7 @@
  * directory, and serves the REAL @camino/gui build output end-to-end.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -99,6 +99,29 @@ describe("GUI serving", () => {
       "/assets/..%2f..%2foutside.txt",
     ]) {
       expect(await rawGet(path), path).not.toContain(sentinelBody);
+    }
+  });
+
+  it("finding 3: does not disclose a file reached by a symlink out of the build dir", async () => {
+    // @fastify/static follows symlinks; the allowedPath realpath check must
+    // refuse a link that resolves outside the build root.
+    const linked = mkdtempSync(join(tmpdir(), "camino-symlink-"));
+    const linkedGui = join(linked, "dist");
+    mkdirSync(linkedGui);
+    writeFileSync(join(linkedGui, "index.html"), "<title>linked shell</title>");
+    const secret = `symlink-secret-${generateToken()}`;
+    writeFileSync(join(linked, "outside.txt"), secret);
+    symlinkSync(join(linked, "outside.txt"), join(linkedGui, "leak.txt"));
+    symlinkSync(join(linked, "outside.txt"), join(linkedGui, "leak.html"));
+
+    const linkedDaemon = await startDaemonServer({ token: TOKEN, guiRoot: linkedGui, port: 0 });
+    try {
+      for (const path of ["/leak.txt", "/leak.html"]) {
+        const response = await fetch(`${linkedDaemon.url}${path}`);
+        expect(await response.text(), path).not.toContain(secret);
+      }
+    } finally {
+      await linkedDaemon.app.close();
     }
   });
 

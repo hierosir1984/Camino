@@ -3,24 +3,37 @@
  * serves the GUI build and enforces the request policy for every route that
  * exists now or is added by later work packages.
  *
- * Enforcement is layered, and deliberately runs in a single global onRequest
- * hook so it applies BEFORE route matching — a future route cannot forget to
- * opt in, and unrouted paths get the same refusals (a pinned test property):
+ * Enforcement runs in a single global onRequest hook. Fastify's lifecycle is
+ * Routing → onRequest (the hook fires AFTER the route is matched), and a
+ * global onRequest hook fires for every request including ones that match no
+ * route (they reach the not-found handler through the same hook chain). So a
+ * future route — or an unrouted path — is covered by construction: the policy
+ * does not depend on any per-route opt-in. Because the hook sees the matched
+ * request, path classification must derive the path the way the router did
+ * (URL pathname, not a substring of the raw target); an earlier version read
+ * the raw target and let an absolute-form request target dodge the token
+ * check (round 1, finding 1).
  *
+ * Layers, in order:
  *   0. listener binds 127.0.0.1 only (startDaemonServer) — remote connection
  *      attempts fail at the TCP layer;
- *   1. Host header must be the daemon's own authority (127.0.0.1:port or
- *      localhost:port) — refuses requests routed here under a foreign name
- *      (browser-resolved hostnames pointing at loopback);
- *   2. Origin header, when present, must be the daemon's own origin — a
- *      cross-origin browser request is refused regardless of method;
- *   3. every /api request must carry the GUI token as `Authorization:
+ *   1. request target must be origin-form (`/path`); absolute-form and
+ *      asterisk-form targets have no legitimate use from the GUI and are
+ *      refused, closing the classification-divergence class outright;
+ *   2. a security-relevant header (Host, Origin, Authorization, X-Camino-Csrf)
+ *      appearing more than once is refused — no first-wins header smuggling
+ *      (round 1, finding 7);
+ *   3. Host header must be one of the daemon's own authorities (127.0.0.1:port
+ *      or localhost:port); the Origin header, when present, must be the origin
+ *      OF THAT SAME host — the two are bound as a pair, not checked against
+ *      independent allowlists (round 1, finding 6);
+ *   4. every /api request must carry the GUI token as `Authorization:
  *      Bearer <token>` (the static GUI shell itself is public code and is
  *      served without the token — it has to load before it can hold one);
- *   4. every state-changing request (any method outside GET/HEAD/OPTIONS)
+ *   5. every state-changing request (any method outside GET/HEAD/OPTIONS)
  *      must carry the per-process CSRF token in `X-Camino-Csrf`.
  *
- * Layers 2 and 4 are each sufficient against cross-site request forgery on
+ * Layers 3 and 5 are each sufficient against cross-site request forgery on
  * their own (the token in a custom header already forces a CORS preflight we
  * never grant); they are kept separate and explicit per CAM-CORE-01, so the
  * property survives any one layer being weakened by a future change.
@@ -32,7 +45,8 @@
  * daemon, so the tight policy is free.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { resolve, sep } from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import Fastify from "fastify";
@@ -67,27 +81,65 @@ function timingSafeStringEqual(presented: string, expected: string): boolean {
   return timingSafeEqual(sha256(presented), sha256(expected));
 }
 
+/**
+ * True iff `pathName` (a request path) resolves to a file within `realRoot`,
+ * following symlinks. Used to keep static serving inside the GUI build dir.
+ */
+function staticPathContained(realRoot: string, pathName: string): boolean {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathName);
+  } catch {
+    return false;
+  }
+  if (decoded.includes("\0")) return false;
+  const candidate = resolve(realRoot, `.${decoded.startsWith("/") ? decoded : `/${decoded}`}`);
+  const within = (p: string): boolean => p === realRoot || p.startsWith(realRoot + sep);
+  try {
+    return within(realpathSync(candidate));
+  } catch {
+    // Non-existent target: let the static handler 404 normally, but only if the
+    // lexical path is still inside root (a broken symlink must not escape).
+    return within(candidate);
+  }
+}
+
+/** Security-relevant headers that must appear at most once (no smuggling). */
+const SINGLE_VALUE_HEADERS = ["host", "origin", "authorization", "x-camino-csrf"];
+
 function isApiPath(path: string): boolean {
   return path === "/api" || path.startsWith("/api/");
 }
 
 /**
- * Path classification for the auth layer. Query/fragment stripped; a path is
- * treated as /api if either its raw or percent-decoded form says so, so an
- * encoded spelling cannot slip past the prefix check. Malformed encodings and
- * backslashes have no legitimate use and are refused outright.
+ * Classify a request target for the auth layer. The target must be origin-form
+ * (`/path…`); an absolute-form target (`http://host/api/…`) or asterisk-form
+ * (`*`) is refused, because Fastify routes by the URL path while a naive
+ * substring check on the raw target would classify it as non-API — the exact
+ * divergence that let an absolute-form request reach `/api` tokenlessly (round
+ * 1, finding 1). Within origin-form, the path is treated as /api if either its
+ * raw or percent-decoded pathname says so; malformed encodings and backslashes
+ * are refused.
  */
 function classifyPath(rawUrl: string): { api: boolean } | { malformed: true } {
-  const raw = rawUrl.split("?", 1)[0]!.split("#", 1)[0]!;
-  if (raw.includes("\\")) return { malformed: true };
+  if (!rawUrl.startsWith("/")) return { malformed: true }; // not origin-form
+  // Parse against a fixed base so the pathname is exactly what the router used;
+  // query/fragment fall away. A parse failure is a refusal, not a guess.
+  let pathname: string;
+  try {
+    pathname = new URL(rawUrl, "http://localhost").pathname;
+  } catch {
+    return { malformed: true };
+  }
+  if (pathname.includes("\\")) return { malformed: true };
   let decoded: string;
   try {
-    decoded = decodeURIComponent(raw);
+    decoded = decodeURIComponent(pathname);
   } catch {
     return { malformed: true };
   }
   if (decoded.includes("\\")) return { malformed: true };
-  return { api: isApiPath(raw) || isApiPath(decoded) };
+  return { api: isApiPath(pathname) || isApiPath(decoded) };
 }
 
 export function buildServer(options: BuildServerOptions): FastifyInstance {
@@ -102,37 +154,52 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   const guiRoot = options.guiRoot;
   const guiAvailable = guiRoot !== undefined && existsSync(guiRoot);
 
-  /** Authorities/origins the daemon answers as; computed from the bound port. */
-  function selfAuthorities(): { hosts: Set<string>; origins: Set<string> } | undefined {
+  /** The `host:port` authorities the daemon answers as, from the bound port. */
+  function selfHosts(): Set<string> | undefined {
     const address = app.server.address();
     if (address === null || typeof address === "string") return undefined;
-    const port = address.port;
-    return {
-      hosts: new Set([`127.0.0.1:${port}`, `localhost:${port}`]),
-      origins: new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]),
-    };
+    return new Set([`127.0.0.1:${address.port}`, `localhost:${address.port}`]);
   }
 
   app.addHook("onRequest", async (request: FastifyRequest, reply: FastifyReply) => {
-    const authorities = selfAuthorities();
-    if (authorities === undefined) {
+    const hosts = selfHosts();
+    if (hosts === undefined) {
       // Not answering over a bound TCP listener (e.g. inject()) — fail closed.
       return reply.code(403).send({ error: "listener-not-bound" });
     }
 
-    const host = request.headers.host?.trim().toLowerCase();
-    if (host === undefined || !authorities.hosts.has(host)) {
-      return reply.code(403).send({ error: "host-not-allowed" });
+    // A security-relevant header appearing more than once is rejected: Node
+    // collapses duplicates in `request.headers` to a single (first-seen for
+    // Host) value, so a smuggled second Host/Origin/Authorization/CSRF would
+    // otherwise ride along invisibly (round 1, finding 7). rawHeaders is the
+    // flat [k, v, k, v, …] list that preserves every occurrence.
+    const rawHeaders = request.raw.rawHeaders;
+    const seen = new Map<string, number>();
+    for (let i = 0; i < rawHeaders.length; i += 2) {
+      const name = rawHeaders[i]!.toLowerCase();
+      if (SINGLE_VALUE_HEADERS.includes(name)) {
+        const count = (seen.get(name) ?? 0) + 1;
+        if (count > 1) return reply.code(400).send({ error: "duplicate-header", header: name });
+        seen.set(name, count);
+      }
     }
 
-    const origin = request.headers.origin?.trim().toLowerCase();
-    if (origin !== undefined && !authorities.origins.has(origin)) {
-      return reply.code(403).send({ error: "origin-not-allowed" });
-    }
-
+    // Origin-form target only; absolute/asterisk forms are refused (finding 1).
     const path = classifyPath(request.url);
     if ("malformed" in path) {
       return reply.code(400).send({ error: "malformed-path" });
+    }
+
+    // Host must be one of our authorities; the Origin, when present, must be
+    // the origin of THAT SAME host — the pair is bound, not two independent
+    // allowlists (round 1, finding 6).
+    const host = request.headers.host?.trim().toLowerCase();
+    if (host === undefined || !hosts.has(host)) {
+      return reply.code(403).send({ error: "host-not-allowed" });
+    }
+    const origin = request.headers.origin?.trim().toLowerCase();
+    if (origin !== undefined && origin !== `http://${host}`) {
+      return reply.code(403).send({ error: "origin-not-allowed" });
     }
 
     if (path.api) {
@@ -191,7 +258,18 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
   });
 
   if (guiAvailable) {
-    void app.register(fastifyStatic, { root: guiRoot!, prefix: "/" });
+    // @fastify/static (via @fastify/send) follows symlinks, so a symlink
+    // planted in the build directory could disclose a file outside it (round
+    // 1, finding 3). We fully own the build dir, but the claim must hold: an
+    // allowedPath hook realpath-resolves each candidate and refuses anything
+    // that resolves outside the real build root. realpath on both sides also
+    // handles a symlinked root (e.g. macOS /tmp → /private/tmp).
+    const realGuiRoot = realpathSync(guiRoot!);
+    void app.register(fastifyStatic, {
+      root: guiRoot!,
+      prefix: "/",
+      allowedPath: (pathName) => staticPathContained(realGuiRoot, pathName),
+    });
   }
 
   app.setNotFoundHandler((request, reply) => {
