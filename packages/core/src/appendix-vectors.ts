@@ -55,13 +55,25 @@ export const MISSION_INTEGRATION_LEGAL: readonly LegalVector<MissionState, Missi
   {
     ref: "A.1#3a",
     from: "planned",
-    event: { type: "plan-approved", actor: "david", dagAcyclic: true, executionSlotFree: true },
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: true,
+      dagAcyclic: true,
+      executionSlotFree: true,
+    },
     to: "approved",
   },
   {
     ref: "A.1#3b",
     from: "planned",
-    event: { type: "plan-approved", actor: "david", dagAcyclic: true, executionSlotFree: false },
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: true,
+      dagAcyclic: true,
+      executionSlotFree: false,
+    },
     to: "queued",
   },
   { ref: "A.1#4", from: "planned", event: { type: "plan-rejected", actor: "david" }, to: "draft" },
@@ -281,7 +293,13 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
   {
     name: "terminal states are absorbing: approve after abandonment",
     from: "abandoned",
-    event: { type: "plan-approved", dagAcyclic: true, executionSlotFree: true },
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: true,
+      dagAcyclic: true,
+      executionSlotFree: true,
+    },
     expect: "illegal-transition",
   },
   {
@@ -389,13 +407,37 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
   {
     name: "plan approval with a cyclic dependency DAG",
     from: "planned",
-    event: { type: "plan-approved", actor: "david", dagAcyclic: false, executionSlotFree: true },
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: true,
+      dagAcyclic: false,
+      executionSlotFree: true,
+    },
     expect: "guard-rejected",
   },
   {
     name: "plan approval by a non-David actor (the appendix row is 'David approves')",
     from: "planned",
-    event: { type: "plan-approved", actor: "mallory", dagAcyclic: true, executionSlotFree: true },
+    event: {
+      type: "plan-approved",
+      actor: "mallory",
+      checklistApproved: true,
+      dagAcyclic: true,
+      executionSlotFree: true,
+    },
+    expect: "guard-rejected",
+  },
+  {
+    name: "plan approval without the checklist half of 'plan + checklist' (review r4 finding 1)",
+    from: "planned",
+    event: {
+      type: "plan-approved",
+      actor: "david",
+      checklistApproved: false,
+      dagAcyclic: true,
+      executionSlotFree: true,
+    },
     expect: "guard-rejected",
   },
   {

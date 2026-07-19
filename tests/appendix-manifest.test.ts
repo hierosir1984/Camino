@@ -143,19 +143,24 @@ function expectFromCellMatches(
   table: string,
   parsed: ParsedRow,
   group: RowGroup,
-  anyActive: { size: number; text: string },
+  anyActive: { states: readonly string[]; text: string },
 ): void {
   const label = `${table}#${parsed.number} from-cell ${JSON.stringify(parsed.fromCell)}`;
   if (group.from === null) {
     expect(parsed.fromCell, `${label} must be a creation row`).toBe("—");
     return;
   }
-  if (group.from.length >= anyActive.size) {
-    expect(parsed.fromCell, `${label} must say "${anyActive.text}"`).toContain(anyActive.text);
+  const unique = [...new Set(group.from)].sort();
+  const fullSet = [...anyActive.states].sort();
+  if (parsed.fromCell.includes(anyActive.text)) {
+    // "any active"/"any terminal": the code sources must be EXACTLY the full
+    // set — unique, none missing, none extra (cardinality alone would let a
+    // duplicated-entry row hide a missing state; review round 4).
+    expect(unique, `${label} must cover exactly the ${anyActive.text} set`).toEqual(fullSet);
     return;
   }
   const cellTokens = [...parsed.fromCell.matchAll(/`([^`]+)`/g)].map((m) => m[1] as string).sort();
-  expect(cellTokens, `${label} must name exactly the code sources`).toEqual([...group.from].sort());
+  expect(cellTokens, `${label} must name exactly the code sources`).toEqual(unique);
 }
 
 describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
@@ -170,7 +175,7 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     expect([...groups.keys()].sort((a, b) => a - b)).toEqual(A1.map((r) => r.number));
     for (const parsed of A1) {
       expectFromCellMatches("A.1", parsed, groups.get(parsed.number) as RowGroup, {
-        size: MISSION_ACTIVE_STATES.length,
+        states: MISSION_ACTIVE_STATES,
         text: "any active",
       });
     }
@@ -182,7 +187,7 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     expect([...own.keys()].sort((a, b) => a - b)).toEqual(A1B.map((r) => r.number));
     for (const parsed of A1B) {
       expectFromCellMatches("A.1b", parsed, own.get(parsed.number) as RowGroup, {
-        size: MISSION_ACTIVE_STATES.length,
+        states: MISSION_ACTIVE_STATES,
         text: "any active",
       });
     }
@@ -193,7 +198,7 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     expect([...inherited.keys()].sort((a, b) => a - b)).toEqual([4, 5, 16, 17, 18, 19, 21, 24]);
     for (const [number, group] of inherited) {
       expectFromCellMatches("A.1", A1[number - 1] as ParsedRow, group, {
-        size: MISSION_ACTIVE_STATES.length,
+        states: MISSION_ACTIVE_STATES,
         text: "any active",
       });
     }
@@ -214,7 +219,7 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     for (const parsed of A2) {
       if (parsed.number === 18) continue;
       expectFromCellMatches("A.2", parsed, groups.get(parsed.number) as RowGroup, {
-        size: ISSUE_ACTIVE_STATES.length,
+        states: ISSUE_ACTIVE_STATES,
         text: "any active",
       });
     }
@@ -226,7 +231,7 @@ describe("Appendix A manifest (structurally parsed from docs/PRD.md)", () => {
     expect([...groups.keys()].sort((a, b) => a - b)).toEqual(A3.map((r) => r.number));
     for (const parsed of A3) {
       expectFromCellMatches("A.3", parsed, groups.get(parsed.number) as RowGroup, {
-        size: ATTEMPT_TERMINAL_STATES.length,
+        states: ATTEMPT_TERMINAL_STATES,
         text: "any terminal",
       });
     }

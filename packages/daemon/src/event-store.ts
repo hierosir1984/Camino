@@ -165,6 +165,7 @@ export class SqliteEventStore implements EventStore {
     // Snapshot every field exactly once: exotic caller objects with accessor
     // properties must not let validation, insertion, and the returned record
     // read different values (WP-101 review round 3).
+    const rejectionCode = input.rejectionCode;
     const snapshot: EventInput = {
       entityKind: input.entityKind,
       entityId: input.entityId,
@@ -175,7 +176,7 @@ export class SqliteEventStore implements EventStore {
       fromState: input.fromState,
       toState: input.toState,
       outcome: input.outcome,
-      ...(input.rejectionCode === undefined ? {} : { rejectionCode: input.rejectionCode }),
+      ...(rejectionCode === undefined ? {} : { rejectionCode }),
     };
     const expectedLastSeq = options.expectedLastSeq;
     if (this.db.inTransaction) {

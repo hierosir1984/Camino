@@ -159,6 +159,11 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     file: "__fence_trip__gchain.ts",
     source: 'export const leak = globalThis.globalThis.fetch("https://example.invalid");\n',
   },
+  {
+    name: "type-level import() of a banned module (review r4 vector)",
+    file: "__fence_trip__typeimport.ts",
+    source: 'export type FilesystemLeak = import("node:fs").Stats;\n',
+  },
 ];
 
 describe("packages/core import fence", () => {

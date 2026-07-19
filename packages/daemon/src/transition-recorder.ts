@@ -25,13 +25,7 @@
  * WP-104 (CAM-STATE-03).
  */
 import type { EntityKind, EventRecord, EventStore, RejectionCode } from "@camino/shared";
-import {
-  decideTransition,
-  foldView,
-  applyRecord,
-  verifyReplay,
-  RESERVED_PAYLOAD_FIELDS,
-} from "@camino/core";
+import { decideTransition, foldView, applyRecord, verifyReplay } from "@camino/core";
 import type { ReplayDivergence, StateView } from "@camino/core";
 
 export interface RecordRequest {
@@ -171,25 +165,25 @@ const UNREPRESENTABLE_PAYLOAD: Readonly<Record<string, unknown>> = {
 };
 
 /**
- * JSON round-trip so the decision runs on exactly what will be persisted
- * (drops undefined-valued fields, turns non-finite numbers into null).
- * Reserved keys present on the RAW payload are preserved (as null when
- * JSON would drop them) so the reserved-field refusal cannot be dodged
- * with an undefined value; payloads JSON cannot represent at all become
- * UNREPRESENTABLE_PAYLOAD, which the decision path refuses and logs.
+ * SINGLE-OBSERVATION canonicalization: the caller's object is observed
+ * exactly once, by JSON serialization, and everything downstream — the
+ * reserved-field refusal, the guards, the persisted row, every future
+ * replay — derives from that one canonical form. A time-varying object
+ * (accessors, Proxies) can make multi-read protocols disagree with
+ * themselves by construction; with one observation there is no second read
+ * to diverge from. Consequences, stated plainly: a reserved key is refused
+ * exactly when it appears in the canonical form (a key an exotic object
+ * hides from serialization is absent from what is decided AND persisted, so
+ * it cannot redirect anything); undefined-valued fields drop; non-finite
+ * numbers become null. Payloads JSON cannot hold as a plain object — or
+ * whose traps throw during the observation — become UNREPRESENTABLE_PAYLOAD,
+ * which the decision path refuses and logs.
  */
 function canonicalize(payload: Readonly<Record<string, unknown>>): Record<string, unknown> {
-  // Every interaction with the caller's object can hit a trap (accessors
-  // that delete themselves, Proxy handlers that throw): capture reserved-key
-  // presence FIRST, and treat any exception anywhere as an unrepresentable
-  // payload — refused and logged, never thrown past.
   try {
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
       return { ...UNREPRESENTABLE_PAYLOAD };
     }
-    const reservedPresent = RESERVED_PAYLOAD_FIELDS.filter((key) =>
-      Object.prototype.hasOwnProperty.call(payload, key),
-    );
     const json = JSON.stringify(payload);
     if (json === undefined) {
       return { ...UNREPRESENTABLE_PAYLOAD };
@@ -198,11 +192,7 @@ function canonicalize(payload: Readonly<Record<string, unknown>>): Record<string
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ...UNREPRESENTABLE_PAYLOAD };
     }
-    const canonical = parsed as Record<string, unknown>;
-    for (const reserved of reservedPresent) {
-      canonical[reserved] = canonical[reserved] ?? null;
-    }
-    return canonical;
+    return parsed as Record<string, unknown>;
   } catch {
     return { ...UNREPRESENTABLE_PAYLOAD };
   }

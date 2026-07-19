@@ -96,6 +96,9 @@ for (const { machine, legal, illegal, expectedUnreachable, terminalExitRefs } of
       expect(new Set(refs).size, "row refs must be unique").toBe(refs.length);
       for (const row of machine.rows) {
         if (row.from !== null) {
+          expect(new Set(row.from).size, `row ${row.ref} from-set must be duplicate-free`).toBe(
+            row.from.length,
+          );
           for (const from of row.from) expect(machine.states).toContain(from);
         }
         if (typeof row.to === "string") expect(machine.states).toContain(row.to);

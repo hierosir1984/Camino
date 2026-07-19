@@ -92,6 +92,7 @@ export type MissionEvent =
   | {
       type: "plan-approved";
       actor?: string;
+      checklistApproved?: boolean; // A.1#3 "plan + checklist" (integration route)
       dagAcyclic: boolean;
       executionSlotFree: boolean;
       riskTierLow?: boolean; // A.1b gates
@@ -371,8 +372,12 @@ const integrationRows: readonly MissionRow[] = [
     from: ["planned"],
     event: "plan-approved",
     guard: {
-      name: "david-approves-dag-acyclic-slot-free",
-      check: (e) => e.actor === "david" && attested(e.dagAcyclic) && attested(e.executionSlotFree),
+      name: "david-approves-plan-and-checklist-slot-free",
+      check: (e) =>
+        e.actor === "david" &&
+        attested(e.checklistApproved) &&
+        attested(e.dagAcyclic) &&
+        attested(e.executionSlotFree),
     },
     to: "approved",
   }),

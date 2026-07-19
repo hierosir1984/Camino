@@ -51,19 +51,24 @@ Encoding conventions, applied uniformly (items 5–7 were hardened by review rou
    The plan's note that "event types" sit in `shared` is satisfied by the envelope record type; the
    domain event unions sit with the machines in `core`, which WP-101's own text specifies.
 5. **Reserved payload fields; David rows bind to the envelope actor.** "type" and "actor" belong to
-   the decision layer: a caller payload carrying either is refused as `malformed-payload` (logged).
-   The envelope actor is injected into the machine event, and every row whose appendix event column
-   names David ("David approves/rejects/pauses/resumes/answers/cancels/abandons", David-authority
-   approvals, David-reason attempt cancels) guards `actor === "david"`.
+   the decision layer: a payload whose CANONICAL form carries either is refused as
+   `malformed-payload` (logged). The canonical form is the single authority — see item 7; a key an
+   exotic object hides from the one observation is absent from what is decided and persisted, so it
+   cannot redirect anything. The envelope actor is injected into the machine event, and every row
+   whose appendix event column names David ("David approves/rejects/pauses/resumes/answers/cancels/
+   abandons", David-authority approvals, David-reason attempt cancels) guards `actor === "david"`.
 6. **One decision path.** `decideTransition(view, input)` is the only place a request becomes an
    outcome; the recorder appends what it decides, and `verifyReplay` re-derives every recorded row
    through the same function — comparing outcome, target, source state, rejection code, and the
    recorded payload (enrichment included) — so recorder and verifier cannot drift.
-7. **Guards evaluate the persisted representation.** The recorder snapshots the request once and
-   canonicalizes the payload through a JSON round-trip before deciding, so what a guard saw and
-   what the log holds are the same bytes; a payload JSON cannot hold as a plain object at all
-   becomes a reserved-key stand-in that the decision path refuses and logs (replay-stable by
-   construction). Numeric guard inputs are integer-validated (no coercion).
+7. **Guards evaluate the persisted representation — one observation.** The recorder snapshots the
+   request once and observes the caller's payload object exactly once, by JSON serialization;
+   everything downstream (reserved-field refusal, guards, the persisted row, every replay) derives
+   from that canonical form. A time-varying object can make any multi-read protocol disagree with
+   itself; with a single observation there is no second read to diverge from. A payload JSON
+   cannot hold as a plain object — or whose traps throw during the observation — becomes a
+   reserved-key stand-in that the decision path refuses and logs (replay-stable by construction).
+   Numeric guard inputs are integer-validated (no coercion).
 8. **Atomic single-writer append.** The store's append is a compare-and-swap: inside one
    `BEGIN IMMEDIATE` transaction it verifies the highest seq still equals the writer's known value
    and inserts, so a second writer cannot interleave between check and append. Detection with a
@@ -78,8 +83,9 @@ with codes, asserted in "rejects AND logs…". Exhaustive legal rows incl. `queu
 `re-routed`, budget-breach, pre-start recovery, A.4 archival — the coverage harness, the
 PRD-parsing manifest anchor (`tests/appendix-manifest.test.ts`), and dedicated recorder walks. Core
 dependency fence live in CI with trip fixtures — `tests/core-fence.test.ts`, including
-`better-sqlite3`, `@camino/daemon`, ambient-global (fetch/WebSocket/timers), and parent-traversal
-probes.
+`better-sqlite3`, `@camino/daemon`, ambient-global (fetch/WebSocket/timers), global-object-alias,
+parent-traversal, and type-level `import()` probes (the dependency fence covers type-only imports
+too).
 
 ## 2. Row-by-row walk
 
@@ -89,7 +95,7 @@ probes.
 |---|---|---|
 | #1 creation (PRD intake / re-routed per A.1b) | `A.1#1` | `source` payload; a re-routed successor must carry `reroutedFrom` (guarded). Repeating the reference in the envelope cause is convention, not enforced. |
 | #2 plan constructed + review | `A.1#2` | Review attachment + checklist rendered both attested. |
-| #3 approve → approved / queued | `A.1#3a`/`3b` | Guard split; a cyclic DAG matches neither split → refused (WP-110 rejects pre-approval). |
+| #3 approve → approved / queued | `A.1#3a`/`3b` | "Plan + checklist": checklist approval attested alongside the DAG check; guard split on the slot; a cyclic DAG matches neither split → refused (WP-110 rejects pre-approval). |
 | #4 reject/edit → draft | `A.1#4` | Shared verbatim with A.1b (same row object). |
 | #5 queued → approved (FIFO) | `A.1#5` | `fifoHead` attested; FIFO ordering itself is the WP-103 scheduler's. |
 | #6 branch+PR → executing | `A.1#6` | Branch created + mission PR created + onboarding checks all attested. |
@@ -353,6 +359,26 @@ Round 3 (same reviewer; raw review + dispositions on PR #44) returned "safe to b
    set equality; escaped pipes handled. Which SPLIT of a multi-source row owns which source is
    pinned by the per-split vectors (not derivable from the table text) — stated in the test.
 10. **AMEND set incomplete:** the A.1b#12 branch-carry-over inconsistency is recorded as AMEND-5.
+
+### Round 4 (verify + fresh hunt)
+
+Round 4 (same reviewer; raw + dispositions on PR #44) returned "safe to build on: no" with 5
+findings — convergence is visible (13 → 11 → 10 → 5; no criticals since round 1) and the reviewer
+confirmed AMEND-1..5 complete. All five folded:
+
+1. **A.1#3's "+ checklist" was unattested (high):** `checklistApproved` is now an attested guard
+   input on both integration approval splits.
+2. **Time-varying Proxy vs reserved keys (medium):** the two-phase capture round 3 introduced was
+   itself exploitable (no multi-read protocol over an exotic object can be stable). Replaced by
+   the SINGLE-OBSERVATION protocol of §1 item 7: the canonical form is the sole authority, which
+   also supersedes round 2 finding 4's plain-`undefined` dodge — a key absent from the one
+   observation is absent from what is decided and persisted, and cannot redirect anything.
+3. **`rejectionCode` read twice in the store snapshot (low):** single local read.
+4. **"Any active/terminal" manifest anchoring was cardinality-based (low):** those rows now
+   compare the code's from-set as an exact unique set against the full active/terminal set, and
+   the structural harness requires duplicate-free from-sets.
+5. **Type-level `import("node:fs")` passed the fence (low):** `TSImportType` banned in core (the
+   dependency fence covers types, not just runtime); probe added.
 
 ## 5. Verdict
 

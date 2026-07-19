@@ -81,6 +81,7 @@ describe("TransitionRecorder", () => {
         "m1",
         "plan-approved",
         {
+          checklistApproved: true,
           dagAcyclic: true,
           executionSlotFree: true,
         },
@@ -204,7 +205,7 @@ describe("TransitionRecorder", () => {
       event: "plan-approved",
       actor: "david",
       cause: "cyclic plan",
-      payload: { dagAcyclic: false, executionSlotFree: true },
+      payload: { checklistApproved: true, dagAcyclic: false, executionSlotFree: true },
     });
     expect(guardRejected).toMatchObject({ ok: false, code: "guard-rejected" });
 
@@ -310,7 +311,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -557,7 +558,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -667,7 +668,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -740,7 +741,12 @@ describe("TransitionRecorder", () => {
       event: "plan-approved",
       actor: "camino:scheduler",
       cause: "payload attempts to claim David as actor",
-      payload: { actor: "david", dagAcyclic: true, executionSlotFree: true },
+      payload: {
+        actor: "david",
+        checklistApproved: true,
+        dagAcyclic: true,
+        executionSlotFree: true,
+      },
     });
     expect(forgedActor).toMatchObject({ ok: false, code: "malformed-payload" });
 
@@ -765,7 +771,7 @@ describe("TransitionRecorder", () => {
       event: "plan-approved",
       actor: "mallory",
       cause: "approval without David as the envelope actor",
-      payload: { dagAcyclic: true, executionSlotFree: true },
+      payload: { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
     });
     expect(impersonated).toMatchObject({ ok: false, code: "guard-rejected" });
     expect(recorder.currentState("mission", "m1")).toBe("planned");
@@ -775,7 +781,7 @@ describe("TransitionRecorder", () => {
         "mission",
         "m1",
         "plan-approved",
-        { dagAcyclic: true, executionSlotFree: true },
+        { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
         "david",
       ),
     ).toBe("approved");
@@ -845,24 +851,39 @@ describe("TransitionRecorder", () => {
     expect(recorder.verify()).toEqual([]);
   });
 
-  it("refuses a reserved field even when its value is undefined (review r2 finding 4)", () => {
+  it("single-observation canonicalization: the canonical form is the sole authority for reserved keys (r2 f4 superseded by r4 f2)", () => {
     const { store, recorder } = newRecorder();
     apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
     apply(recorder, "mission", "m1", "plan-constructed", {
       reviewAttached: true,
       checklistRendered: true,
     });
-    const outcome = recorder.record({
+    // A reserved key with a REPRESENTABLE value appears in the canonical
+    // form and is refused.
+    const carried = recorder.record({
       entityKind: "mission",
       entityId: "m1",
       event: "plan-rejected",
       actor: "david",
-      cause: "reserved key with undefined value",
+      cause: "reserved key in the canonical form",
+      payload: { type: "plan-constructed" },
+    });
+    expect(carried).toMatchObject({ ok: false, code: "malformed-payload" });
+    // An undefined-valued reserved key is absent from the single observation
+    // (JSON drops it), so it is absent from what is decided AND persisted —
+    // it cannot redirect anything, and the transition proceeds on the
+    // declared event. There is no second read for a time-varying object to
+    // diverge from.
+    const dropped = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-rejected",
+      actor: "david",
+      cause: "undefined-valued reserved key drops out of the observation",
       payload: { type: undefined } as unknown as Record<string, unknown>,
     });
-    expect(outcome).toMatchObject({ ok: false, code: "malformed-payload" });
-    expect(store.read().at(-1)?.payload["type"]).toBeNull();
-    expect(recorder.currentState("mission", "m1")).toBe("planned");
+    expect(dropped).toMatchObject({ ok: true, to: "draft" });
+    expect(store.read().at(-1)?.payload).toEqual({});
     expect(recorder.verify()).toEqual([]);
   });
 
@@ -878,7 +899,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -939,7 +960,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -1084,7 +1105,7 @@ describe("TransitionRecorder", () => {
       "mission",
       "m1",
       "plan-approved",
-      { dagAcyclic: true, executionSlotFree: true },
+      { checklistApproved: true, dagAcyclic: true, executionSlotFree: true },
       "david",
     );
     apply(recorder, "mission", "m1", "integration-branch-created", {
@@ -1173,7 +1194,8 @@ describe("TransitionRecorder", () => {
       checklistRendered: true,
     });
     // A reserved key whose getter deletes itself during serialization: the
-    // pre-serialization capture still refuses it.
+    // single observation still captures its value into the canonical form,
+    // which is refused.
     const selfDeleting: Record<string, unknown> = { dagAcyclic: true, executionSlotFree: true };
     Object.defineProperty(selfDeleting, "type", {
       configurable: true,
@@ -1192,12 +1214,13 @@ describe("TransitionRecorder", () => {
       payload: selfDeleting,
     });
     expect(dodged).toMatchObject({ ok: false, code: "malformed-payload" });
-    // A Proxy whose property enumeration throws: refused and logged, not thrown.
+    // A Proxy whose trap throws DURING the single observation: refused and
+    // logged as unrepresentable, never thrown past.
     const trapped = new Proxy(
-      {},
+      { dagAcyclic: true },
       {
-        getOwnPropertyDescriptor() {
-          throw new Error("descriptor trap");
+        get() {
+          throw new Error("value trap");
         },
       },
     ) as Record<string, unknown>;
@@ -1210,8 +1233,31 @@ describe("TransitionRecorder", () => {
       payload: trapped,
     });
     expect(trappedOutcome).toMatchObject({ ok: false, code: "malformed-payload" });
-    const rejected = store.read().filter((r) => r.rejectionCode === "malformed-payload");
-    expect(rejected).toHaveLength(2);
+    // A trap the observation never touches (empty own keys) canonicalizes to
+    // {} — refused by the guards and logged, just under a different code.
+    const dormant = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("descriptor trap");
+        },
+      },
+    ) as Record<string, unknown>;
+    const dormantOutcome = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-approved",
+      actor: "david",
+      cause: "dormant property trap",
+      payload: dormant,
+    });
+    expect(dormantOutcome).toMatchObject({ ok: false, code: "guard-rejected" });
+    const rejected = store.read().filter((r) => r.outcome === "rejected");
+    expect(rejected.map((r) => r.rejectionCode)).toEqual([
+      "malformed-payload",
+      "malformed-payload",
+      "guard-rejected",
+    ]);
     expect(recorder.currentState("mission", "m1")).toBe("planned");
     expect(recorder.verify()).toEqual([]);
   });

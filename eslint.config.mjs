@@ -78,6 +78,13 @@ const CORE_SYNTAX_BANS = [
     selector: "TSExternalModuleReference",
     message: "import-require syntax is banned in packages/core (purity fence, build plan §1.1).",
   },
+  // Type-level import("...") bypasses the specifier allowlist even though it
+  // erases at runtime — the DEPENDENCY fence covers types too (review r4).
+  {
+    selector: "TSImportType",
+    message:
+      "type-level import() is banned in packages/core — use a static import from an allowed specifier (purity fence, build plan §1.1).",
+  },
   // getBuiltinModule — dot and computed-string-literal forms both banned.
   {
     selector: "MemberExpression[property.name='getBuiltinModule']",
