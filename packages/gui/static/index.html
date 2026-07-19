@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  Placeholder GUI shell (WP-102). Proves the daemon-served GUI contract
+  end-to-end: token handoff, authenticated API calls, CSRF header on
+  state-changing calls. The React + Vite application replaces this in
+  WP-122/123/124; the daemon serving path and auth flow stay the same.
+  CSP is self-only, so all script/style lives in separate files.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Camino</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Camino</h1>
+      <p class="tagline">Local mission control — daemon shell (WP-102 placeholder GUI)</p>
+
+      <section id="connect" hidden>
+        <h2>Connect</h2>
+        <p>
+          Paste the GUI token from <code id="token-path">~/.camino/auth-token</code> (or open this
+          page with <code>#token=…</code> in the URL).
+        </p>
+        <form id="token-form">
+          <input
+            id="token-input"
+            type="password"
+            autocomplete="off"
+            placeholder="GUI token"
+            required
+          />
+          <button type="submit">Connect</button>
+        </form>
+      </section>
+
+      <section id="status" hidden>
+        <h2>Daemon</h2>
+        <dl>
+          <dt>Health</dt>
+          <dd id="health">—</dd>
+          <dt>Origin</dt>
+          <dd id="origin">—</dd>
+        </dl>
+        <button id="shutdown">Stop daemon</button>
+        <button id="disconnect" class="secondary">Forget token</button>
+      </section>
+
+      <p id="message" role="status"></p>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
