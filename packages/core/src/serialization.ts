@@ -3,9 +3,11 @@
  *
  * The Appendix A preamble's serialization rule: at most one mission per repo
  * occupies an execution-bearing state (isExecutionBearing in mission.ts,
- * ratified as AMEND-2); additional missions wait in `queued` and activate
- * FIFO when the slot frees. This module derives the FIFO order from the
- * event log alone, consistent with every other derived view (CAM-STATE-01).
+ * ratified as AMEND-2), plus at most one urgent quick task on the urgent
+ * lane (AMEND-6, approved 2026-07-19); additional missions wait in `queued`
+ * and activate FIFO when the slot frees. This module derives the FIFO order
+ * from the event log alone, consistent with every other derived view
+ * (CAM-STATE-01).
  *
  * FIFO position is the seq of the mission's FIRST applied transition into
  * `queued`: a mission that is paused while queued and later resumed re-enters
