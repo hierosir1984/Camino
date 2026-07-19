@@ -622,9 +622,58 @@ describe("MissionIntake — the domain/event seam", () => {
       intake.createFromText({ repoId: repo.id, title: "t", content: "c", actor: "david" }),
     ).toThrow(/already-exists/);
     // The domain row has NO filename; the recorded event has a malformed
-    // PRESENT one — that difference must not vanish into "both absent".
+    // PRESENT one — that difference must not vanish into "both absent",
+    // and malformed-ness is a TAG, not an in-band string (r6 finding 2).
     expect(intake.seamDivergences().creationConflicts).toEqual([
-      { missionId: "dup", field: "filename", recordedValue: "(malformed binding)" },
+      { missionId: "dup", field: "filename", recordedMalformed: true },
+    ]);
+  });
+
+  it("a domain value equal to any sentinel-looking string still conflicts with a malformed binding (r6 finding 2)", () => {
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    // A legitimate title that happens to read like a sentinel, against a
+    // recorded MALFORMED (object-valued) title: with an in-band sentinel
+    // these compared equal and the conflict vanished.
+    recorder.record({
+      entityKind: "mission",
+      entityId: "dup",
+      event: "mission-created",
+      actor: "prior",
+      cause: "intake.test: malformed object title binding",
+      payload: {
+        source: "prd-intake",
+        contentSha256: contentSha256("c"),
+        repoId: repo.id,
+        title: { malformed: true },
+        urgent: false,
+        sourceKind: "pasted",
+        contentFormat: "markdown",
+      },
+    });
+    expect(() =>
+      intake.createFromText({
+        repoId: repo.id,
+        title: "(malformed binding)",
+        content: "c",
+        actor: "david",
+      }),
+    ).toThrow(/already-exists/);
+    expect(intake.seamDivergences().creationConflicts).toEqual([
+      {
+        missionId: "dup",
+        field: "title",
+        domainValue: "(malformed binding)",
+        recordedMalformed: true,
+      },
     ]);
   });
 

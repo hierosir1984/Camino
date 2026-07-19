@@ -89,6 +89,13 @@ export interface CreationConflict {
   readonly domainValue?: string;
   /** The creation event's recorded value; undefined when the event carries none. */
   readonly recordedValue?: string;
+  /**
+   * True when the field is PRESENT on the creation event but not the
+   * expected primitive type. Carried OUT OF BAND (r6 finding 2): an
+   * in-band sentinel string could equal a legitimate domain value and
+   * vanish from the report.
+   */
+  readonly recordedMalformed?: true;
 }
 
 /** Bidirectional domain/event seam report — see `MissionIntake.seamDivergences`. */
@@ -103,6 +110,9 @@ export interface SeamDivergences {
     readonly repoIdsWithoutProject: readonly string[];
   };
 }
+
+/** A creation-payload binding as recorded: a string value, or present-but-malformed. */
+type RecordedBinding = { kind: "value"; value: string } | { kind: "malformed" };
 
 function reject(code: IntakeRejectionCode, reason: string): IntakeRejection {
   return { ok: false, code, reason };
@@ -334,11 +344,13 @@ export class MissionIntake {
    * - `eventOnlyMissionIds`: recorded missions with no domain row — state
    *   without retained content (foreign write or partial restore);
    * - `routeConflicts`: domain route vs recorded creation route;
-   * - `creationConflicts`: the retained record's bound fields (content
-   *   hash, repo binding, title — intake stamps all three into every
-   *   creation payload) vs what the creation event recorded — the
-   *   persistent signature of an id collision or a foreign creation, even
-   *   when routes agree and content matches (r3 finding 2);
+   * - `creationConflicts`: the retained record's SEVEN bound fields
+   *   (content hash, repo binding, title, urgent flag, source kind,
+   *   content format, filename — intake stamps all of them into every
+   *   creation payload it authors) vs what the creation event recorded —
+   *   the persistent signature of an id collision or a foreign creation,
+   *   even when routes agree and content matches (r3 f2, r4 f2; wording
+   *   per r6 finding 5);
    * - `hierarchyGaps`: missions without a repo row, repos without a project
    *   row (foreign writers with foreign keys off).
    * Empty across the board in healthy operation; WP-104's recovery contract
@@ -367,7 +379,7 @@ export class MissionIntake {
       }
       const binding = creationBindings.get(mission.id) ?? {};
       const comparisons: ReadonlyArray<
-        [CreationConflict["field"], string | undefined, string | undefined]
+        [CreationConflict["field"], string | undefined, RecordedBinding | undefined]
       > = [
         ["contentSha256", mission.contentSha256, binding["contentSha256"]],
         ["repoId", mission.repoId, binding["repoId"]],
@@ -377,13 +389,25 @@ export class MissionIntake {
         ["contentFormat", mission.contentFormat, binding["contentFormat"]],
         ["filename", mission.filename, binding["filename"]],
       ];
-      for (const [field, domainValue, recordedValue] of comparisons) {
-        if (recordedValue !== domainValue) {
+      for (const [field, domainValue, recorded] of comparisons) {
+        // Tagged comparison (r6 finding 2): a malformed-present binding is a
+        // conflict REGARDLESS of the domain value; absence and value carry
+        // their own rules. No in-band sentinel exists to collide with.
+        const agrees =
+          recorded === undefined
+            ? domainValue === undefined
+            : recorded.kind === "value" && recorded.value === domainValue;
+        if (!agrees) {
           creationConflicts.push({
             missionId: mission.id,
             field,
             ...(domainValue === undefined ? {} : { domainValue }),
-            ...(recordedValue === undefined ? {} : { recordedValue }),
+            ...(recorded !== undefined && recorded.kind === "value"
+              ? { recordedValue: recorded.value }
+              : {}),
+            ...(recorded !== undefined && recorded.kind === "malformed"
+              ? { recordedMalformed: true as const }
+              : {}),
           });
         }
       }
@@ -408,22 +432,26 @@ export class MissionIntake {
    * creation without bindings shows every field as a conflict once a domain
    * row exists for the id.
    */
-  private recordedCreationBindings(): Map<string, Record<string, string | undefined>> {
-    const bindings = new Map<string, Record<string, string | undefined>>();
+  private recordedCreationBindings(): Map<string, Record<string, RecordedBinding | undefined>> {
+    const bindings = new Map<string, Record<string, RecordedBinding | undefined>>();
     for (const record of this.store.read({ entityKind: "mission" })) {
       if (record.outcome !== "applied" || record.fromState !== null) continue;
-      const normalized: Record<string, string | undefined> = {};
-      // Absence and malformed presence are DIFFERENT facts (r5 finding 2):
-      // a present non-string value must not vanish into "absent" — it
-      // normalizes to a sentinel no real value can equal, so it always
-      // conflicts and is reported as malformed.
-      const normalize = (field: string, expect: "string" | "boolean"): string | undefined => {
+      const normalized: Record<string, RecordedBinding | undefined> = {};
+      // Absence and malformed presence are DIFFERENT facts (r5 finding 2),
+      // and malformed-ness is carried as a TAG, not an in-band sentinel a
+      // legitimate value could equal (r6 finding 2).
+      const normalize = (
+        field: string,
+        expect: "string" | "boolean",
+      ): RecordedBinding | undefined => {
         if (!Object.prototype.hasOwnProperty.call(record.payload, field)) return undefined;
         const value = record.payload[field];
         if (expect === "boolean") {
-          return typeof value === "boolean" ? String(value) : "(malformed binding)";
+          return typeof value === "boolean"
+            ? { kind: "value", value: String(value) }
+            : { kind: "malformed" };
         }
-        return typeof value === "string" ? value : "(malformed binding)";
+        return typeof value === "string" ? { kind: "value", value } : { kind: "malformed" };
       };
       for (const field of [
         "contentSha256",

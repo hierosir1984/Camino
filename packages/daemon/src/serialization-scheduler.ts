@@ -212,19 +212,36 @@ export class SerializationScheduler {
     facts: IntegrationApprovalFacts | QuickTaskApprovalFacts,
   ): RecordOutcome {
     const mission = this.requireMission(missionId);
-    if (mission.route === "integration" && !("checklistApproved" in facts)) {
-      throw new TypeError("integration-route approval requires IntegrationApprovalFacts");
+    // Snapshot the caller's facts into PRIMITIVE booleans FIRST (r6 finding
+    // 1): spreading the caller's object into the payload would carry any
+    // enumerable toJSON/getter into the recorder's canonicalization, which
+    // runs AFTER the slot check — an exotic facts object could re-enter
+    // this method there and double-book the slot. Reading named fields into
+    // locals here means any getter side effect runs BEFORE the slot check
+    // below, and nothing exotic ever reaches the recorder.
+    const payload: Record<string, boolean> = {};
+    const requiredFields =
+      mission.route === "integration"
+        ? (["checklistApproved", "dagAcyclic"] as const)
+        : (["riskTierLow", "neutralConcurred", "singleIssue"] as const);
+    for (const field of requiredFields) {
+      const value = (facts as unknown as Record<string, unknown>)[field];
+      if (value !== true && value !== false) {
+        throw new TypeError(
+          `${mission.route}-route approval requires plain boolean ${field} ` +
+            "(IntegrationApprovalFacts / QuickTaskApprovalFacts)",
+        );
+      }
+      payload[field] = value;
     }
-    if (mission.route === "quick-task" && !("riskTierLow" in facts)) {
-      throw new TypeError("quick-task approval requires QuickTaskApprovalFacts");
-    }
+    payload["executionSlotFree"] = this.executionSlotFreeFor(missionId);
     return this.recorder.record({
       entityKind: "mission",
       entityId: missionId,
       event: "plan-approved",
       actor,
       cause: `plan approval with scheduler-computed slot fact (repo ${mission.repoId})`,
-      payload: { ...facts, executionSlotFree: this.executionSlotFreeFor(missionId) },
+      payload,
     });
   }
 

@@ -247,8 +247,48 @@ describe("CAM-CORE-08 — a second mission on the same repo waits visibly in `qu
         riskTierLow: true,
         neutralConcurred: true,
         singleIssue: true,
-      }),
+      } as unknown as Parameters<typeof h.scheduler.approvePlan>[2]),
     ).toThrow(/IntegrationApprovalFacts/);
+  });
+
+  it("approvePlan snapshots facts into primitives: an exotic facts object cannot re-enter mid-frame (r6 finding 1)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "First");
+    const m2 = intakePrdMission(h, "Second");
+    apply(h, m1, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+    apply(h, m2, "plan-constructed", { reviewAttached: true, checklistRendered: true });
+
+    // The reviewer's vector: an enumerable toJSON on the facts object ran
+    // during recorder canonicalization — AFTER the slot check — and
+    // recursively approved the second mission, double-booking the slot.
+    // With primitive snapshotting the toJSON never reaches the recorder.
+    let toJsonRan = false;
+    const exoticFacts = {
+      checklistApproved: true,
+      dagAcyclic: true,
+      toJSON: () => {
+        toJsonRan = true;
+        h.scheduler.approvePlan(m2, "david", { checklistApproved: true, dagAcyclic: true });
+        return { checklistApproved: true, dagAcyclic: true, executionSlotFree: true };
+      },
+    };
+    const outcome = h.scheduler.approvePlan(m1, "david", exoticFacts);
+    expect(outcome.ok && outcome.to).toBe("approved");
+    expect(toJsonRan).toBe(false); // the exotic object never reached canonicalization
+    // The second mission approves through its own honest call — and queues.
+    const second = h.scheduler.approvePlan(m2, "david", {
+      checklistApproved: true,
+      dagAcyclic: true,
+    });
+    expect(second.ok && second.to).toBe("queued");
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+    // Non-boolean facts (getters returning junk included) are refused.
+    expect(() =>
+      h.scheduler.approvePlan(m1, "david", {
+        checklistApproved: "yes",
+        dagAcyclic: true,
+      } as unknown as Parameters<typeof h.scheduler.approvePlan>[2]),
+    ).toThrow(/plain boolean/);
   });
 
   it("intake and planning proceed concurrently while the slot is held", () => {
