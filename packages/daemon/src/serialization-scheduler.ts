@@ -8,9 +8,11 @@
  *    execution-bearing state (core's isExecutionBearing over the recorded
  *    view — Appendix A serialization rule as amended per AMEND-2);
  *  - the URGENT lane, held by an urgent quick task in an execution-bearing
- *    state. While the lane is occupied an integration-route primary holder
- *    sits in `paused-urgent` (A.1#15) and STILL holds the primary slot —
- *    resuming via A.1#20 when the urgent task lands.
+ *    state. While the urgent task ACTIVELY executes, an integration-route
+ *    primary holder sits in `paused-urgent` (A.1#15) and STILL holds the
+ *    primary slot — resuming via A.1#20 when the urgent task lands. (In the
+ *    honest pre-park window the urgent task is merely `approved` beside the
+ *    still-executing primary — r3/r4 wording precision.)
  *
  * The urgent lane accepts a mission only when the primary holder (if any)
  * is PARKED or PARKABLE (r1 f3, r2 f1, wording per r3 f8): parked =
@@ -45,10 +47,14 @@
  * module's answers is a daemon bug, not a schema the machine can refuse —
  * the recorded view carries no repo binding, so recorded-context
  * enrichment cannot overwrite these facts today. What the module ships
- * instead is complete visibility: `serializationViolations` surfaces
- * double-occupancy AND concurrent active execution across lanes, and
+ * instead is visibility for an ENUMERATED invariant set (r4 finding 7 —
+ * not "complete"): `serializationViolations` surfaces per-lane
+ * double-occupancy, an urgent holder beside an unadmittable primary, and
+ * active urgent execution beside an unparked-but-parkable primary;
  * `auditActivations` re-derives every recorded activation against FIFO
- * order (r1 findings 2/3/4).
+ * order. Recorded missions WITHOUT a domain row are outside lane
+ * accounting entirely (they have no repo); `MissionIntake.seamDivergences`
+ * reports them (`eventOnlyMissionIds`), not this module.
  *
  * The urgent preemption WORKFLOW — checkpoint-cancel of the running
  * attempt, urgent lands on main first, mission branch merges main back in
@@ -276,17 +282,20 @@ export class SerializationScheduler {
    * The slot-free fact for THIS mission's plan approval (A.1#3 / A.1b#3
    * `executionSlotFree`): whether the lane the mission schedules on —
    * primary normally, the urgent lane for an urgent quick task — can accept
-   * it. The urgent lane additionally counts as unavailable while a quick
-   * task holds primary (no preemption rows exist for quick tasks — see the
-   * module note). Exposed for inspection/display; approval itself must go
-   * through `approvePlan`, which computes this fact in the same synchronous
-   * frame as the record (r1 finding 2).
+   * it. Admission is SYMMETRIC (r4 finding 1): the urgent lane requires the
+   * primary parked or parkable, and the primary slot requires the urgent
+   * lane EMPTY — otherwise honest urgent-first scheduling would admit a
+   * primary into `approved` beside a running urgent task, a pairing nothing
+   * can park (the exact wedged state the violation surface reports).
+   * Exposed for inspection/display; approval itself must go through
+   * `approvePlan`, which computes this fact in the same synchronous frame
+   * as the record (r1 finding 2).
    */
   executionSlotFreeFor(missionId: string): boolean {
     const mission = this.requireMission(missionId);
     const holders = this.laneHolders(mission.repoId);
     if (mission.urgent) return this.urgentLaneAvailable(holders);
-    return holders.primary.length === 0;
+    return holders.primary.length === 0 && holders.urgent.length === 0;
   }
 
   /** The visible per-repo queue (CAM-CORE-08: a waiting mission waits VISIBLY). */
@@ -349,8 +358,11 @@ export class SerializationScheduler {
     const outcomes: ActivationOutcome[] = [];
     for (const lane of ["primary", "urgent"] as const) {
       const holders = this.laneHolders(repoId);
+      // Same symmetric admission rule as executionSlotFreeFor (r4 finding 1).
       const available =
-        lane === "urgent" ? this.urgentLaneAvailable(holders) : holders.primary.length === 0;
+        lane === "urgent"
+          ? this.urgentLaneAvailable(holders)
+          : holders.primary.length === 0 && holders.urgent.length === 0;
       if (!available) continue;
       const head = this.queuedHead(repoId, lane);
       if (head === undefined) continue;

@@ -421,6 +421,72 @@ describe("SqliteDomainStore — mission immutability (CAM-CORE-02)", () => {
     }
   });
 
+  it("validates caller-supplied foreign ids (r4 finding 3)", () => {
+    const store = newStore();
+    const project = store.createProject("camino");
+    // A numeric projectId would be affinity-converted on storage while the
+    // returned object kept the number — refused instead.
+    expect(() => store.createRepo(42 as unknown as string, "repo")).toThrow(/non-empty string/);
+    const repo = store.createRepo(project.id, "repo");
+    expect(() =>
+      store.createMission({
+        repoId: 43 as unknown as string,
+        route: "integration",
+        urgent: false,
+        title: "t",
+        sourceKind: "pasted",
+        content: "c",
+        contentFormat: "markdown",
+      }),
+    ).toThrow(/non-empty string/);
+    expect(() => store.createRepo(`${project.id}\0`, "repo2")).toThrow(/embedded NUL/);
+    expect(repo.projectId).toBe(project.id);
+  });
+
+  it("schema rejects embedded NUL and BLOBs in every text column on raw inserts (r4 finding 4)", () => {
+    const path = tempDbPath();
+    newStore(path);
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    raw.pragma("foreign_keys = OFF");
+    // Mid-string NUL — text functions see only the prefix; the blob-cast
+    // instr CHECK sees the byte.
+    expect(() =>
+      raw
+        .prepare("INSERT INTO projects (id, name, created_at) VALUES ('p1', ?, 'now')")
+        .run("na\0me"),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO repos (id, project_id, name, origin_url, created_at) VALUES ('r1', 'p', 'r', ?, 'now')",
+        )
+        .run("https://x.invalid/\0"),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      raw
+        .prepare(
+          `INSERT INTO missions
+             (id, repo_id, route, urgent, title, source_kind, content, content_sha256, content_format, filename, created_at)
+           VALUES ('m1', 'r', 'integration', 0, 't', 'pasted', ?, ?, 'markdown', NULL, 'now')`,
+        )
+        .run("con\0tent", "0".repeat(64)),
+    ).toThrow(/CHECK/i);
+    // BLOBs in previously unconstrained columns.
+    expect(() =>
+      raw
+        .prepare("INSERT INTO projects (id, name, created_at) VALUES ('p2', 'n2', zeroblob(3))")
+        .run(),
+    ).toThrow(/CHECK/i);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO repos (id, project_id, name, origin_url, created_at) VALUES ('r2', 'p', 'r2', zeroblob(3), 'now')",
+        )
+        .run(),
+    ).toThrow(/CHECK/i);
+  });
+
   it("validates its own id source: numeric or NUL-carrying generated ids are refused (r3 finding 4)", () => {
     const numeric = new SqliteDomainStore(":memory:", {
       newId: () => 42 as unknown as string,

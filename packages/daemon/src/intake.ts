@@ -70,18 +70,23 @@ export interface RouteConflict {
 
 /**
  * A mission id whose retained record disagrees with its recorded creation
- * event on one of the bound fields (content hash, repo binding, title) —
- * the persistent signature of an id-collision or a foreign creation write
- * (r2 finding 9, extended per r3 finding 2: content alone was too narrow —
- * a same-content collision under a different repo or title must still
- * leave evidence). A collision identical in ALL THREE bound fields is
- * observationally identical to the recorded mission; the intake error
- * thrown at the seam remains its only signal, stated plainly.
+ * event on one of the BOUND fields — every observable creation-time fact:
+ * content hash, repo binding, title, urgent flag, source kind, content
+ * format, filename (r2 f9; widened by r3 f2 and again by r4 f2 — content/
+ * repo/title alone let an urgent-flag or source divergence hide). The
+ * persistent signature of an id-collision or a foreign creation write. A
+ * collision identical in ALL bound fields (plus route, which the creation
+ * event type itself encodes) is observationally identical to the recorded
+ * mission apart from its timestamps; the intake error thrown at the seam
+ * remains its only signal, stated plainly. Values are reported as strings
+ * (`urgent` as "true"/"false").
  */
 export interface CreationConflict {
   readonly missionId: string;
-  readonly field: "contentSha256" | "repoId" | "title";
-  readonly domainValue: string;
+  readonly field:
+    "contentSha256" | "repoId" | "title" | "urgent" | "sourceKind" | "contentFormat" | "filename";
+  /** Absent when the domain side has no value (e.g. filename on non-file intake). */
+  readonly domainValue?: string;
   /** The creation event's recorded value; undefined when the event carries none. */
   readonly recordedValue?: string;
 }
@@ -357,18 +362,24 @@ export class MissionIntake {
           recordedRoute: snapshot.route,
         });
       }
-      const binding = creationBindings.get(mission.id);
-      const comparisons: ReadonlyArray<[CreationConflict["field"], string, string | undefined]> = [
-        ["contentSha256", mission.contentSha256, binding?.contentSha256],
-        ["repoId", mission.repoId, binding?.repoId],
-        ["title", mission.title, binding?.title],
+      const binding = creationBindings.get(mission.id) ?? {};
+      const comparisons: ReadonlyArray<
+        [CreationConflict["field"], string | undefined, string | undefined]
+      > = [
+        ["contentSha256", mission.contentSha256, binding["contentSha256"]],
+        ["repoId", mission.repoId, binding["repoId"]],
+        ["title", mission.title, binding["title"]],
+        ["urgent", String(mission.urgent), binding["urgent"]],
+        ["sourceKind", mission.sourceKind, binding["sourceKind"]],
+        ["contentFormat", mission.contentFormat, binding["contentFormat"]],
+        ["filename", mission.filename, binding["filename"]],
       ];
       for (const [field, domainValue, recordedValue] of comparisons) {
         if (recordedValue !== domainValue) {
           creationConflicts.push({
             missionId: mission.id,
             field,
-            domainValue,
+            ...(domainValue === undefined ? {} : { domainValue }),
             ...(recordedValue === undefined ? {} : { recordedValue }),
           });
         }
@@ -387,23 +398,32 @@ export class MissionIntake {
     };
   }
 
-  /** The bound fields each recorded mission's APPLIED creation event carries (if any). */
-  private recordedCreationBindings(): Map<
-    string,
-    { contentSha256?: string; repoId?: string; title?: string }
-  > {
-    const bindings = new Map<string, { contentSha256?: string; repoId?: string; title?: string }>();
+  /**
+   * The bound fields each recorded mission's APPLIED creation event carries
+   * (if any), normalized to strings for comparison. Only creations authored
+   * by THIS module are guaranteed to carry them (r4 finding 5) — a foreign
+   * creation without bindings shows every field as a conflict once a domain
+   * row exists for the id.
+   */
+  private recordedCreationBindings(): Map<string, Record<string, string | undefined>> {
+    const bindings = new Map<string, Record<string, string | undefined>>();
     for (const record of this.store.read({ entityKind: "mission" })) {
       if (record.outcome !== "applied" || record.fromState !== null) continue;
-      const pick = (field: string): string | undefined => {
+      const normalized: Record<string, string | undefined> = {};
+      for (const field of [
+        "contentSha256",
+        "repoId",
+        "title",
+        "sourceKind",
+        "contentFormat",
+        "filename",
+      ]) {
         const value = record.payload[field];
-        return typeof value === "string" ? value : undefined;
-      };
-      bindings.set(record.entityId, {
-        ...(pick("contentSha256") === undefined ? {} : { contentSha256: pick("contentSha256") }),
-        ...(pick("repoId") === undefined ? {} : { repoId: pick("repoId") }),
-        ...(pick("title") === undefined ? {} : { title: pick("title") }),
-      });
+        normalized[field] = typeof value === "string" ? value : undefined;
+      }
+      const urgent = record.payload["urgent"];
+      normalized["urgent"] = typeof urgent === "boolean" ? String(urgent) : undefined;
+      bindings.set(record.entityId, normalized);
     }
     return bindings;
   }
@@ -481,14 +501,18 @@ export class MissionIntake {
       event: args.creationEvent,
       actor: args.actor,
       cause: args.cause,
-      // The creation event records the retained record's bound identity —
-      // content hash, repo binding, and title — the persistent cross-store
-      // binding seamDivergences() audits (r2 f9, r3 f2).
+      // The creation event records the retained record's FULL bound
+      // identity — every observable creation-time fact — the persistent
+      // cross-store binding seamDivergences() audits (r2 f9, r3 f2, r4 f2).
       payload: {
         ...args.creationPayload,
         contentSha256: mission.contentSha256,
         repoId: mission.repoId,
         title: mission.title,
+        urgent: mission.urgent,
+        sourceKind: mission.sourceKind,
+        contentFormat: mission.contentFormat,
+        ...(mission.filename === undefined ? {} : { filename: mission.filename }),
       },
     });
     if (!outcome.ok) {

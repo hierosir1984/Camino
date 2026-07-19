@@ -96,13 +96,16 @@ describe("MissionIntake — pasted PRD text", () => {
     expect(records[0]?.actor).toBe("david");
     expect(records[0]?.fromState).toBeNull();
     expect(records[0]?.toState).toBe("draft");
-    // The creation event records the retained record's bound identity — the
-    // persistent cross-store binding (r2 finding 9, r3 finding 2).
+    // The creation event records the retained record's FULL bound identity —
+    // the persistent cross-store binding (r2 f9, r3 f2, r4 f2).
     expect(records[0]?.payload).toEqual({
       source: "prd-intake",
       contentSha256: result.mission.contentSha256,
       repoId: h.repoId,
       title: "Evidence viewer v0",
+      urgent: false,
+      sourceKind: "pasted",
+      contentFormat: "markdown",
     });
     expect(h.recorder.currentState("mission", result.mission.id)).toBe("draft");
   });
@@ -520,9 +523,17 @@ describe("MissionIntake — the domain/event seam", () => {
     ).toThrow(/already-exists.*creationConflicts/s);
     // Not an orphan (the id IS recorded) — but the divergence is PERSISTENT:
     // the recorded creation event carries none of this row's bound fields.
+    // (filename is absent on both sides, so it does not conflict.)
     expect(intake.intakeOrphans()).toEqual([]);
     const conflicts = intake.seamDivergences().creationConflicts;
-    expect(conflicts.map((c) => c.field).sort()).toEqual(["contentSha256", "repoId", "title"]);
+    expect(conflicts.map((c) => c.field).sort()).toEqual([
+      "contentFormat",
+      "contentSha256",
+      "repoId",
+      "sourceKind",
+      "title",
+      "urgent",
+    ]);
     expect(conflicts.every((c) => c.missionId === "dup")).toBe(true);
     expect(conflicts.every((c) => c.recordedValue === undefined)).toBe(true);
   });
@@ -565,9 +576,58 @@ describe("MissionIntake — the domain/event seam", () => {
       }),
     ).toThrow(/already-exists/);
     const conflicts = intake.seamDivergences().creationConflicts;
-    // Content hashes match — repo binding and title still diverge.
-    expect(conflicts.map((c) => c.field).sort()).toEqual(["repoId", "title"]);
+    // Content hashes match — repo binding and title still diverge, and the
+    // prior event carried no urgent/source/format bindings.
+    expect(conflicts.map((c) => c.field).sort()).toEqual([
+      "contentFormat",
+      "repoId",
+      "sourceKind",
+      "title",
+      "urgent",
+    ]);
     expect(conflicts.find((c) => c.field === "repoId")?.recordedValue).toBe("some-other-repo");
+  });
+
+  it("an urgent-flag divergence between the retained row and its creation event is visible (r4 finding 2)", () => {
+    // The reviewer's shape: content, repo, title (and route) all agree —
+    // only the urgency differs. Before r4 this was invisible.
+    const domain = new SqliteDomainStore(":memory:", { newId: () => "dup" });
+    const events = new SqliteEventStore(":memory:");
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const project = domain.createProject("camino");
+    const repo = domain.createRepo(project.id, "camino");
+    recorder.record({
+      entityKind: "mission",
+      entityId: "dup",
+      event: "quick-task-intake",
+      actor: "prior",
+      cause: "intake.test: prior quick-task creation, non-urgent",
+      payload: {
+        contentSha256: contentSha256("same description"),
+        repoId: repo.id,
+        title: "same",
+        urgent: false,
+        sourceKind: "quick-task",
+        contentFormat: "text",
+      },
+    });
+    expect(() =>
+      intake.createQuickTask({
+        repoId: repo.id,
+        title: "same",
+        description: "same description",
+        urgent: true,
+        actor: "david",
+      }),
+    ).toThrow(/already-exists/);
+    expect(intake.seamDivergences().creationConflicts).toEqual([
+      { missionId: "dup", field: "urgent", domainValue: "true", recordedValue: "false" },
+    ]);
   });
 
   it("a same-id collision where BOTH creations came through intake still shows a content conflict", () => {

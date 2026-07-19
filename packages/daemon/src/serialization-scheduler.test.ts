@@ -572,6 +572,31 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     });
   });
 
+  it("admission is symmetric: a primary approval while the urgent lane is occupied queues (r4 finding 1)", () => {
+    const h = newHarness();
+    // Urgent-first: an urgent quick task alone on the repo takes the lane
+    // and executes.
+    const qU = intakeQuickTask(h, "Urgent first", true);
+    expect(planAndApproveQuick(h, qU)).toBe("approved");
+    startQuickExecution(h, qU);
+
+    // A normal mission approved NOW must not land beside it in `approved`
+    // (nothing could ever park it) — it queues instead.
+    const m1 = intakePrdMission(h, "Primary while urgent runs");
+    expect(h.scheduler.executionSlotFreeFor(m1)).toBe(false);
+    expect(planAndApprove(h, m1)).toBe("queued");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([]); // still occupied
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+
+    // The urgent task lands → the primary activates.
+    completeQuickTask(h, qU, "urgent-first-sha");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "primary", missionId: m1, to: "approved" },
+    ]);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
+  });
+
   it("skipping the A.1#15 preemption step is a reported violation (parkable but unparked)", () => {
     const h = newHarness();
     const m1 = intakePrdMission(h, "Executing primary");

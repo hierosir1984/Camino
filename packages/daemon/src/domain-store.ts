@@ -31,17 +31,19 @@
  * `length()` stops there, so a CHECK can reject valid non-empty text — r2
  * finding 4).
  *
- * Honesty scope: SQLite cannot stop a privileged writer issuing DDL, and a
- * raw writer can supply explicit rowids, a forged (still-hex) hash, or —
- * because SQLite text functions stop at NUL — TEXT values carrying hidden
- * NUL suffixes in columns other than the hash (whose CHECK pins byte
- * length; generic NUL detection in SQL is not reliably expressible, so for
- * other columns the guarantee is API-side only — r3 finding 3). That class
- * is stated, not defended; the API path re-derives hashes, validates every
- * string (generated ids included — r3 finding 4), and assigns rowids
- * monotonically. Opening a database whose user_version claims this schema
- * but whose tables or triggers are missing refuses to start rather than
- * silently recreating an emptied store.
+ * Honesty scope: embedded NUL is excluded SCHEMA-WIDE via
+ * `instr(CAST(col AS BLOB), x'00') = 0` — a byte-level search that does not
+ * stop at the NUL the way text functions do (r4 finding 4 corrected r3's
+ * "not expressible" claim; the hash column additionally pins byte length).
+ * What a privileged raw writer can still do: issue DDL, supply explicit
+ * rowids, store a forged-but-valid-hex hash, or store TEXT that is not
+ * valid UTF-8 (encoding validation is not expressible in SQLite SQL) —
+ * stated, not defended. The API path re-derives hashes, validates every
+ * string it persists (generated ids AND caller-supplied foreign ids
+ * included — r3 f4, r4 f3), and assigns rowids monotonically. Opening a
+ * database whose user_version claims this schema but whose tables or
+ * triggers are missing refuses to start rather than silently recreating an
+ * emptied store.
  */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -59,28 +61,28 @@ const SCHEMA_VERSION = 1;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
-  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
-  name       TEXT NOT NULL UNIQUE CHECK (typeof(name) = 'text' AND length(name) > 0),
-  created_at TEXT NOT NULL
+  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0 AND instr(CAST(id AS BLOB), x'00') = 0),
+  name       TEXT NOT NULL UNIQUE CHECK (typeof(name) = 'text' AND length(name) > 0 AND instr(CAST(name AS BLOB), x'00') = 0),
+  created_at TEXT NOT NULL CHECK (typeof(created_at) = 'text' AND instr(CAST(created_at AS BLOB), x'00') = 0)
 );
 
 CREATE TABLE IF NOT EXISTS repos (
-  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
-  project_id TEXT NOT NULL REFERENCES projects(id) CHECK (typeof(project_id) = 'text'),
-  name       TEXT NOT NULL CHECK (typeof(name) = 'text' AND length(name) > 0),
-  origin_url TEXT,
-  created_at TEXT NOT NULL,
+  id         TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0 AND instr(CAST(id AS BLOB), x'00') = 0),
+  project_id TEXT NOT NULL REFERENCES projects(id) CHECK (typeof(project_id) = 'text' AND instr(CAST(project_id AS BLOB), x'00') = 0),
+  name       TEXT NOT NULL CHECK (typeof(name) = 'text' AND length(name) > 0 AND instr(CAST(name AS BLOB), x'00') = 0),
+  origin_url TEXT CHECK (origin_url IS NULL OR (typeof(origin_url) = 'text' AND instr(CAST(origin_url AS BLOB), x'00') = 0)),
+  created_at TEXT NOT NULL CHECK (typeof(created_at) = 'text' AND instr(CAST(created_at AS BLOB), x'00') = 0),
   UNIQUE (project_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS missions (
-  id             TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0),
-  repo_id        TEXT NOT NULL REFERENCES repos(id) CHECK (typeof(repo_id) = 'text'),
+  id             TEXT PRIMARY KEY NOT NULL CHECK (typeof(id) = 'text' AND length(id) > 0 AND instr(CAST(id AS BLOB), x'00') = 0),
+  repo_id        TEXT NOT NULL REFERENCES repos(id) CHECK (typeof(repo_id) = 'text' AND instr(CAST(repo_id AS BLOB), x'00') = 0),
   route          TEXT NOT NULL CHECK (route IN ('integration', 'quick-task')),
   urgent         INTEGER NOT NULL CHECK (urgent IN (0, 1)),
-  title          TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) > 0),
+  title          TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) > 0 AND instr(CAST(title AS BLOB), x'00') = 0),
   source_kind    TEXT NOT NULL CHECK (source_kind IN ('pasted', 'file', 'quick-task')),
-  content        TEXT NOT NULL CHECK (typeof(content) = 'text' AND length(content) > 0),
+  content        TEXT NOT NULL CHECK (typeof(content) = 'text' AND length(content) > 0 AND instr(CAST(content AS BLOB), x'00') = 0),
   content_sha256 TEXT NOT NULL CHECK (
                    typeof(content_sha256) = 'text'
                    AND length(content_sha256) = 64
@@ -92,8 +94,8 @@ CREATE TABLE IF NOT EXISTS missions (
                    AND content_sha256 NOT GLOB '*[^0-9a-f]*'
                  ),
   content_format TEXT NOT NULL CHECK (content_format IN ('markdown', 'text')),
-  filename       TEXT CHECK (filename IS NULL OR typeof(filename) = 'text'),
-  created_at     TEXT NOT NULL,
+  filename       TEXT CHECK (filename IS NULL OR (typeof(filename) = 'text' AND instr(CAST(filename AS BLOB), x'00') = 0)),
+  created_at     TEXT NOT NULL CHECK (typeof(created_at) = 'text' AND instr(CAST(created_at AS BLOB), x'00') = 0),
   -- The urgent lane belongs to quick tasks only (CAM-CORE-08).
   CHECK (urgent = 0 OR route = 'quick-task'),
   -- A filename is present exactly for file intake.
@@ -346,6 +348,14 @@ export class SqliteDomainStore {
   }
 
   createRepo(projectId: string, name: string, originUrl?: string): Repo {
+    // Caller-supplied foreign ids are validated like every other string: a
+    // numeric value would be affinity-converted on storage ("42" → "42.0")
+    // while the returned object kept the number — silently divergent
+    // identities (r4 finding 3).
+    if (typeof projectId !== "string" || projectId.length === 0) {
+      throw new TypeError("projectId must be a non-empty string");
+    }
+    assertRoundTripExact("projectId", projectId);
     if (typeof name !== "string" || name.length === 0) {
       throw new TypeError("repo name must be a non-empty string");
     }
@@ -377,6 +387,10 @@ export class SqliteDomainStore {
     // Snapshot every field exactly once (exotic caller objects must not let
     // validation and insertion read different values — WP-101 posture).
     const { repoId, route, urgent, title, sourceKind, content, contentFormat, filename } = input;
+    if (typeof repoId !== "string" || repoId.length === 0) {
+      throw new TypeError("repoId must be a non-empty string");
+    }
+    assertRoundTripExact("repoId", repoId);
     if (!MISSION_ROUTES.includes(route)) {
       throw new TypeError(`unknown mission route: ${JSON.stringify(route)}`);
     }
