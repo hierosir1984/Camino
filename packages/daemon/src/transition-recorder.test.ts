@@ -770,17 +770,74 @@ describe("TransitionRecorder", () => {
     expect(outcome).toMatchObject({ ok: false, code: "guard-rejected" });
     expect(store.read().at(-1)?.payload["unmetDependencies"]).toBeNull();
     expect(recorder.verify()).toEqual([]);
-    // A payload JSON cannot represent at all throws before anything is logged.
-    expect(() =>
-      recorder.record({
-        entityKind: "issue",
-        entityId: "i1",
-        event: "issue-created",
-        actor: "camino:planner",
-        cause: "unserializable payload",
-        payload: { origin: "plan-approval", unmetDependencies: 1n as unknown as number },
-      }),
-    ).toThrow(/JSON-serializable/);
+    // A payload JSON cannot represent at all is refused AND logged (round 2):
+    // the stand-in payload carries a reserved key, so replay re-derives the
+    // same malformed-payload refusal.
+    const unserializable = recorder.record({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "issue-created",
+      actor: "camino:planner",
+      cause: "unserializable payload",
+      payload: { origin: "plan-approval", unmetDependencies: 1n as unknown as number },
+    });
+    expect(unserializable).toMatchObject({ ok: false, code: "malformed-payload" });
+    const arrayish = recorder.record({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "issue-created",
+      actor: "camino:planner",
+      cause: "payload whose toJSON yields an array",
+      payload: { toJSON: () => [] } as unknown as Record<string, unknown>,
+    });
+    expect(arrayish).toMatchObject({ ok: false, code: "malformed-payload" });
+    const rejected = store.read().filter((r) => r.rejectionCode === "malformed-payload");
+    expect(rejected).toHaveLength(2);
+    expect(recorder.verify()).toEqual([]);
+  });
+
+  it("snapshots the request once — accessor games cannot desync decision and record (review r2 finding 1)", () => {
+    const { store, recorder } = newRecorder();
+    let reads = 0;
+    const request = {
+      entityKind: "mission" as const,
+      entityId: "m1",
+      get event() {
+        reads += 1;
+        return reads === 1 ? "mission-created" : "quick-task-intake";
+      },
+      actor: "david",
+      cause: "accessor probe",
+      payload: { source: "prd-intake" },
+    };
+    const outcome = recorder.record(request);
+    expect(outcome).toMatchObject({ ok: true, ref: "A.1#1" });
+    // The durable record carries the event the decision used, so the route
+    // derived on replay matches the live one.
+    expect(store.read()[0]?.event).toBe("mission-created");
+    expect(recorder.currentView.missions.get("m1")?.route).toBe("integration");
+    expect(recorder.verify()).toEqual([]);
+  });
+
+  it("refuses a reserved field even when its value is undefined (review r2 finding 4)", () => {
+    const { store, recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    const outcome = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "plan-rejected",
+      actor: "david",
+      cause: "reserved key with undefined value",
+      payload: { type: undefined } as unknown as Record<string, unknown>,
+    });
+    expect(outcome).toMatchObject({ ok: false, code: "malformed-payload" });
+    expect(store.read().at(-1)?.payload["type"]).toBeNull();
+    expect(recorder.currentState("mission", "m1")).toBe("planned");
+    expect(recorder.verify()).toEqual([]);
   });
 
   it("guards refuse (and the log records) a malformed shape instead of throwing (review r1 finding 4)", () => {
@@ -960,9 +1017,74 @@ describe("TransitionRecorder", () => {
       outcome: "rejected",
       rejectionCode: "unknown-entity",
     });
+    // A rejected row whose recorded enrichment was forged (review r2
+    // finding 5): re-derivation computes failureCount 1, not 999.
+    store.append({
+      entityKind: "issue",
+      entityId: "i1",
+      event: "attempt-failed",
+      actor: "camino:scheduler",
+      cause: "forged rejected-row enrichment",
+      payload: { failureCount: 999 },
+      fromState: "ready",
+      toState: null,
+      outcome: "rejected",
+      rejectionCode: "guard-rejected",
+    });
     const problems = recorder.verify();
-    expect(problems.length).toBeGreaterThanOrEqual(2);
+    expect(problems.length).toBeGreaterThanOrEqual(3);
     expect(problems.some((d) => /fromState/.test(d.problem))).toBe(true);
     expect(problems.some((d) => /now applies/.test(d.problem))).toBe(true);
+    expect(problems.some((d) => /rejection payload diverges/.test(d.problem))).toBe(true);
+  });
+
+  it("binds escalation answers to David while blocked recoveries stay open (A.1#21 split, review r2 finding 3)", () => {
+    const { recorder } = newRecorder();
+    apply(recorder, "mission", "m1", "mission-created", { source: "prd-intake" });
+    apply(recorder, "mission", "m1", "plan-constructed", {
+      reviewAttached: true,
+      checklistRendered: true,
+    });
+    apply(
+      recorder,
+      "mission",
+      "m1",
+      "plan-approved",
+      { dagAcyclic: true, executionSlotFree: true },
+      "david",
+    );
+    apply(recorder, "mission", "m1", "integration-branch-created", { onboardingChecksGreen: true });
+    apply(recorder, "mission", "m1", "escalation-raised", {});
+    const nonDavid = recorder.record({
+      entityKind: "mission",
+      entityId: "m1",
+      event: "obstacle-cleared",
+      actor: "camino:scheduler",
+      cause: "non-David escalation answer",
+      payload: { affectedIssuesTransitioned: true },
+    });
+    expect(nonDavid).toMatchObject({ ok: false, code: "guard-rejected" });
+    expect(
+      apply(
+        recorder,
+        "mission",
+        "m1",
+        "obstacle-cleared",
+        { affectedIssuesTransitioned: true },
+        "david",
+      ),
+    ).toBe("executing");
+    // Blocked recoveries are obstacle-driven, not David-bound.
+    apply(recorder, "mission", "m1", "blocker-hit", {});
+    expect(
+      apply(
+        recorder,
+        "mission",
+        "m1",
+        "obstacle-cleared",
+        { affectedIssuesTransitioned: true },
+        "camino:poller",
+      ),
+    ).toBe("executing");
   });
 });

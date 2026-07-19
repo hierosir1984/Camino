@@ -170,19 +170,28 @@ export function verifyReplay(records: readonly EventRecord[]): ReplayDivergence[
         seq: record.seq,
         problem: `rejected (${record.rejectionCode}) but the decision now applies to ${decision.to}`,
       });
-    } else if (decision.code !== record.rejectionCode) {
-      divergences.push({
-        seq: record.seq,
-        problem: `rejected as ${record.rejectionCode} but the decision now rejects as ${decision.code}`,
-      });
+    } else {
+      if (decision.code !== record.rejectionCode) {
+        divergences.push({
+          seq: record.seq,
+          problem: `rejected as ${record.rejectionCode} but the decision now rejects as ${decision.code}`,
+        });
+      }
+      if (!jsonEqual(decision.payload, record.payload)) {
+        divergences.push({
+          seq: record.seq,
+          problem: "recorded rejection payload diverges from re-derived recorded context",
+        });
+      }
     }
   }
   return divergences;
 }
 
-/** Structural equality over JSON-canonical values. */
+/** Structural equality over JSON-canonical values (arrays never equal objects). */
 function jsonEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((item, i) => jsonEqual(item, b[i]));
   }

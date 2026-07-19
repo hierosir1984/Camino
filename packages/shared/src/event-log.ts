@@ -61,13 +61,22 @@ export interface EventFilter {
   readonly afterSeq?: number;
 }
 
+export interface AppendOptions {
+  /**
+   * Optimistic single-writer guard: the append succeeds only if the store's
+   * highest seq still equals this value (checked atomically with the
+   * insert). A mismatch throws without writing.
+   */
+  readonly expectedLastSeq?: number;
+}
+
 /**
  * The store contract the daemon's SQLite log implements (WP-101) and every
  * derived view consumes. Append-only: there is deliberately no update or
  * delete surface.
  */
 export interface EventStore {
-  append(input: EventInput): EventRecord;
+  append(input: EventInput, options?: AppendOptions): EventRecord;
   /** All matching rows in ascending `seq` order. */
   read(filter?: EventFilter): EventRecord[];
 }

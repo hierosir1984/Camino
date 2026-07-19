@@ -59,8 +59,15 @@ Encoding conventions, applied uniformly (items 5–7 were hardened by review rou
    outcome; the recorder appends what it decides, and `verifyReplay` re-derives every recorded row
    through the same function — comparing outcome, target, source state, rejection code, and the
    recorded payload (enrichment included) — so recorder and verifier cannot drift.
-7. **Guards evaluate the persisted representation.** The recorder canonicalizes payloads through a
-   JSON round-trip before deciding, so what a guard saw and what the log holds are the same bytes.
+7. **Guards evaluate the persisted representation.** The recorder snapshots the request once and
+   canonicalizes the payload through a JSON round-trip before deciding, so what a guard saw and
+   what the log holds are the same bytes; a payload JSON cannot hold as a plain object at all
+   becomes a reserved-key stand-in that the decision path refuses and logs (replay-stable by
+   construction). Numeric guard inputs are integer-validated (no coercion).
+8. **Atomic single-writer append.** The store's append is a compare-and-swap: inside one
+   `BEGIN IMMEDIATE` transaction it verifies the highest seq still equals the writer's known value
+   and inserts, so a second writer cannot interleave between check and append. Detection with a
+   hard refusal; the durable cross-process recovery lock remains WP-104 (CAM-STATE-03).
 
 Acceptance mapping: every state transition is an event with actor/cause/payload and derived views
 rebuild from the log alone — `views.ts` folds + `transition-recorder.test.ts` ("rebuilds the
@@ -80,7 +87,7 @@ probes.
 
 | Appendix row | Code | Note |
 |---|---|---|
-| #1 creation (PRD intake / re-routed per A.1b) | `A.1#1` | `source` payload; a re-routed successor must carry `reroutedFrom` (guarded) + envelope cause referencing the quick-task record. |
+| #1 creation (PRD intake / re-routed per A.1b) | `A.1#1` | `source` payload; a re-routed successor must carry `reroutedFrom` (guarded). Repeating the reference in the envelope cause is convention, not enforced. |
 | #2 plan constructed + review | `A.1#2` | Review attachment + checklist rendered both attested. |
 | #3 approve → approved / queued | `A.1#3a`/`3b` | Guard split; a cyclic DAG matches neither split → refused (WP-110 rejects pre-approval). |
 | #4 reject/edit → draft | `A.1#4` | Shared verbatim with A.1b (same row object). |
@@ -98,7 +105,7 @@ probes.
 | #18 escalation → escalated | `A.1#18` | — |
 | #19 blocker → blocked | `A.1#19` | — |
 | #20 pause resolved → executing | `A.1#20` | One row for both real-world variants, as in the appendix. |
-| #21 answered/cleared → executing | `A.1#21` | — |
+| #21 answered/cleared → executing | `A.1#21a`/`21b` | Disjunctive event column split onto its two sources (as A.2#21 vs #23): an escalation is answered BY DAVID (actor-bound); a blocker clears by the obstacle going away, any observer. |
 | #22 push confirmed → complete(/with-residue) | `A.1#22a`/`22b` | Split on the descoped list (validated as a string array); pushed SHA must equal the **recorded** approved SHA. |
 | #23 rebuilds exhausted → escalated | `A.1#23` | Bound = 2 (registry item 1). |
 | #24 abandon → abandoned | `A.1#24` | "Intent ledger untouched" is structural in core (no ledger surface); CAM-CANON-01 enforcement is WP-109. |
@@ -136,8 +143,9 @@ valid) → implementing; `#7a/7b` pre-start attempt terminal → ready, or queue
 final head + quarantine pass → validating; `#9a/9b` attempt fails → ready until the 4th failure
 escalates (recorded counter; family switch after 2 = `retryPolicy` advice to the scheduler, not a
 state change); `#10` budget breach + kill-confirm → escalated (kill-and-escalate, no retry row
-exists — CAM-EXEC-03); `#11` attempt quota-blocked → queued-quota; `#12` attempt cancelled (summary
-written) → ready; `#13` gates green + freshness → merge-pending; `#14` validation fails (repair
+exists — CAM-EXEC-03); `#11` attempt quota-blocked → queued-quota; `#12` attempt cancelled — scoped to the appendix's
+preemption/pause causes (a David cancel ends the issue via `#22`; an edit cancel goes through
+`#19` replanning) — summary written → ready; `#13` gates green + freshness → merge-pending; `#14` validation fails (repair
 policy) → ready; `#15` infra-blocked → blocked; `#16` approval + base check → merged, **for
 mission-branch targets only, every authority** — the row's own target cell says "(into mission
 branch)", and A.1b denies quick-task (main-candidate) issues any merge row at all, which is
@@ -275,11 +283,46 @@ PR #44) returned "safe to build on: no" with 13 findings; all were confirmed and
     single allowed A.2#18 gap); multi-source expansion now asserts target and ref.
 13. **`seq` "gap-free" claim corrected** to strictly-increasing/never-reused.
 
+### Round 2 (verify + fresh hunt)
+
+Round 2 (same reviewer; raw review + dispositions on PR #44) returned "safe to build on: no" with
+11 findings — six round-1 folds incomplete plus fresh defects; all confirmed and folded:
+
+1. **Request accessor desync (critical):** an exotic request object with accessor properties could
+   let the decision read one event name and the durable record another. The recorder now snapshots
+   the request into locals exactly once.
+2. **Check/append race:** the round-1 staleness check was not atomic with the insert. Replaced by
+   compare-and-swap append (§1 item 8).
+3. **A.1#21 not actor-bound:** split into `#21a` (escalated — David answers, actor-bound) and
+   `#21b` (blocked — obstacle cleared, any observer), mirroring A.2#21/#23.
+4. **Reserved/malformed escapes:** reserved keys with `undefined` values are preserved as `null`
+   through canonicalization so the refusal cannot be dodged; payloads JSON cannot hold as a plain
+   object (BigInt, toJSON tricks, non-objects) are refused AND logged via a reserved-key stand-in
+   (§1 item 7); the store additionally validates the SERIALIZED payload form.
+5. **Replay ignored rejected-row payloads:** `verifyReplay` now compares re-derived payloads on
+   rejected rows too (forged rejected-row enrichment is reported).
+6. **`jsonEqual` equated `[]` with `{}`:** array-ness must match.
+7. **Numeric coercion:** `unmetDependencies` and `rebuildCount` guards integer-validate
+   (failure counts already did).
+8. **A.2#12 lost its causes:** the row now requires the appendix's preemption/pause reasons.
+9. **Fence property/traversal escapes:** `globalThis.<io-global>` banned via AST selectors (dot
+   and computed-literal forms, matching the existing getBuiltinModule pattern); every specifier
+   containing a `..` segment banned (incl. `./../`); probes added. Reflected computed keys remain
+   the documented lint-invisible residual.
+10. **Manifest was a pipe counter:** replaced by a structural parser — contiguous table with
+    validated four-column header/separator/rows — plus semantic pinning of every row's From column
+    against the code row's source set (creation "—", named states, "any active"/"any terminal").
+11. **Audit overstatements corrected:** A.1#1's cause claim narrowed to convention; the verdict
+    below scopes the A.4 statement by §2's own deferrals.
+
 ## 5. Verdict
 
-With the conventions of §1, the three machines, the A.1b overlay, and the A.4 guarantees are
-encoded row-for-row, every row is exercised by the mechanical coverage harness and anchored to the
-PRD's own tables, and the four genuine spec defects found by the walk are recorded above as
-amendment proposals. **Appendix A remains authoritative**; on David's disposition of AMEND-1..4
-this audit is updated, the approved amendments land in the PRD appendix, and the corresponding
-rows/tests are added in the same change.
+With the conventions of §1, the three machines and the A.1b overlay are encoded row-for-row, and
+the A.4 guarantees are encoded to the extent §2 records — items 2/3/5 and the binding half of
+item 4 mechanized here; item 1, packet-content immutability (item 4), and environment ownership
+explicitly deferred to WP-114/115/116 with their notes. Every row is exercised by the mechanical
+coverage harness and anchored structurally and semantically to the PRD's own tables, and the four
+genuine spec defects found by the walk are recorded above as amendment proposals. **Appendix A
+remains authoritative**; on David's disposition of AMEND-1..4 this audit is updated, the approved
+amendments land in the PRD appendix, and the corresponding rows/tests are added in the same
+change.

@@ -8,6 +8,7 @@ export type { RequirementId } from "./requirement-id.js";
 
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
+  AppendOptions,
   EntityKind,
   EventOutcome,
   RejectionCode,

@@ -200,13 +200,13 @@ export const MISSION_INTEGRATION_LEGAL: readonly LegalVector<MissionState, Missi
     to: "executing",
   },
   {
-    ref: "A.1#21",
+    ref: "A.1#21a",
     from: "escalated",
-    event: { type: "obstacle-cleared", affectedIssuesTransitioned: true },
+    event: { type: "obstacle-cleared", actor: "david", affectedIssuesTransitioned: true },
     to: "executing",
   },
   {
-    ref: "A.1#21",
+    ref: "A.1#21b",
     from: "blocked",
     event: { type: "obstacle-cleared", affectedIssuesTransitioned: true },
     to: "executing",
@@ -470,6 +470,18 @@ export const MISSION_INTEGRATION_ILLEGAL: readonly IllegalVector<MissionState, M
     event: { type: "mission-paused", actor: "david", attemptSettled: false },
     expect: "guard-rejected",
   },
+  {
+    name: "escalation answered by a non-David actor (A.1#21a; review r2 finding 3)",
+    from: "escalated",
+    event: { type: "obstacle-cleared", actor: "mallory", affectedIssuesTransitioned: true },
+    expect: "guard-rejected",
+  },
+  {
+    name: "rebuild-exhaustion count smuggled as a string (coercion; review r2 finding 7)",
+    from: "merging",
+    event: { type: "rebuilds-exhausted", rebuildCount: "3" } as unknown as MissionEvent,
+    expect: "guard-rejected",
+  },
 ];
 
 // --------------------------------------------------------------- mission A.1b
@@ -626,8 +638,14 @@ export const MISSION_QUICK_LEGAL: readonly LegalVector<MissionState, MissionEven
   { ref: "A.1#18", from: "executing", event: { type: "escalation-raised" }, to: "escalated" },
   { ref: "A.1#19", from: "executing", event: { type: "blocker-hit" }, to: "blocked" },
   {
-    ref: "A.1#21",
+    ref: "A.1#21a",
     from: "escalated",
+    event: { type: "obstacle-cleared", actor: "david", affectedIssuesTransitioned: true },
+    to: "executing",
+  },
+  {
+    ref: "A.1#21b",
+    from: "blocked",
     event: { type: "obstacle-cleared", affectedIssuesTransitioned: true },
     to: "executing",
   },
@@ -855,7 +873,13 @@ export const ISSUE_LEGAL: readonly LegalVector<IssueState, IssueEvent>[] = [
   {
     ref: "A.2#12",
     from: "implementing",
-    event: { type: "attempt-cancelled", summaryWritten: true },
+    event: { type: "attempt-cancelled", reason: "pause", summaryWritten: true },
+    to: "ready",
+  },
+  {
+    ref: "A.2#12",
+    from: "implementing",
+    event: { type: "attempt-cancelled", reason: "urgent-preemption", summaryWritten: true },
     to: "ready",
   },
   {
@@ -1051,6 +1075,32 @@ export const ISSUE_ILLEGAL: readonly IllegalVector<IssueState, IssueEvent>[] = [
     name: "quarantine failure cannot enter validating",
     from: "implementing",
     event: { type: "final-head-submitted", quarantinePassed: false },
+    expect: "guard-rejected",
+  },
+  {
+    name: "attempt cancellation for a contract edit is not the preemption/pause row (A.2#12; review r2 finding 8)",
+    from: "implementing",
+    event: {
+      type: "attempt-cancelled",
+      reason: "edit",
+      summaryWritten: true,
+    } as unknown as IssueEvent,
+    expect: "guard-rejected",
+  },
+  {
+    name: "unmet-dependency count smuggled as a string (coercion; review r2 finding 7)",
+    from: null,
+    event: {
+      type: "issue-created",
+      origin: "plan-approval",
+      unmetDependencies: "1",
+    } as unknown as IssueEvent,
+    expect: "guard-rejected",
+  },
+  {
+    name: "replan dependency count smuggled as an array (coercion; review r2 finding 7)",
+    from: "replanning",
+    event: { type: "replan-complete", unmetDependencies: [1] } as unknown as IssueEvent,
     expect: "guard-rejected",
   },
 ];

@@ -24,7 +24,13 @@
  * lock is WP-104 (CAM-STATE-03).
  */
 import type { EntityKind, EventRecord, EventStore, RejectionCode } from "@camino/shared";
-import { decideTransition, foldView, applyRecord, verifyReplay } from "@camino/core";
+import {
+  decideTransition,
+  foldView,
+  applyRecord,
+  verifyReplay,
+  RESERVED_PAYLOAD_FIELDS,
+} from "@camino/core";
 import type { ReplayDivergence, StateView } from "@camino/core";
 
 export interface RecordRequest {
@@ -75,29 +81,40 @@ export class TransitionRecorder {
   /**
    * Decide one transition through core and record the outcome. Applied and
    * rejected attempts both land in the log; only applied ones change the
-   * view.
+   * view. Malformed payloads — reserved fields, shapes JSON cannot hold as
+   * a plain object — are refused AND logged, never thrown past silently.
    */
   record(request: RecordRequest): RecordOutcome {
-    this.assertStoreNotAdvanced();
+    // Snapshot the request exactly once: exotic caller objects (accessor
+    // properties returning different values per read) must not let the
+    // decision see one request and the durable record another.
+    const { entityKind, entityId, event, actor, cause } = request;
+    const payload = canonicalize(request.payload ?? {});
     const decision = decideTransition(this.view, {
-      entityKind: request.entityKind,
-      entityId: request.entityId,
-      event: request.event,
-      actor: request.actor,
-      payload: canonicalize(request.payload ?? {}),
+      entityKind,
+      entityId,
+      event,
+      actor,
+      payload,
     });
-    const record = this.store.append({
-      entityKind: request.entityKind,
-      entityId: request.entityId,
-      event: request.event,
-      actor: request.actor,
-      cause: request.cause,
-      payload: decision.payload,
-      fromState: decision.fromState,
-      toState: decision.ok ? decision.to : null,
-      outcome: decision.ok ? "applied" : "rejected",
-      ...(decision.ok ? {} : { rejectionCode: decision.code }),
-    });
+    // Atomic single-writer append: the store checks-and-inserts in one
+    // transaction against the recorder's known last seq (CAM-STATE-03;
+    // the durable cross-process recovery lock lands with WP-104).
+    const record = this.store.append(
+      {
+        entityKind,
+        entityId,
+        event,
+        actor,
+        cause,
+        payload: decision.payload,
+        fromState: decision.fromState,
+        toState: decision.ok ? decision.to : null,
+        outcome: decision.ok ? "applied" : "rejected",
+        ...(decision.ok ? {} : { rejectionCode: decision.code }),
+      },
+      { expectedLastSeq: this.lastSeq },
+    );
     this.lastSeq = record.seq;
     if (decision.ok) {
       applyRecord(this.view, record);
@@ -118,36 +135,50 @@ export class TransitionRecorder {
   verify(): ReplayDivergence[] {
     return verifyReplay(this.store.read());
   }
-
-  private assertStoreNotAdvanced(): void {
-    const newer = this.store.read({ afterSeq: this.lastSeq });
-    if (newer.length > 0) {
-      throw new Error(
-        `event store advanced beyond this recorder's view (seq ${newer.at(-1)?.seq} > ${this.lastSeq}): ` +
-          "a second writer violated the single-writer contract (CAM-STATE-03; the durable recovery lock lands with WP-104). " +
-          "Rebuild before recording.",
-      );
-    }
-  }
 }
 
 /**
+ * A stand-in payload for requests whose payload JSON cannot hold as a plain
+ * object at all (BigInt values, toJSON returning a non-object, non-object
+ * inputs). It deliberately carries a reserved key so the decision path —
+ * today and on every future replay of the record — lands on the same
+ * `malformed-payload` refusal (replay-stable by construction).
+ */
+const UNREPRESENTABLE_PAYLOAD: Readonly<Record<string, unknown>> = {
+  type: null,
+  malformedPayload: "payload was not representable as a plain JSON object",
+};
+
+/**
  * JSON round-trip so the decision runs on exactly what will be persisted
- * (drops undefined-valued fields, turns non-finite numbers into null,
- * rejects payloads JSON cannot represent).
+ * (drops undefined-valued fields, turns non-finite numbers into null).
+ * Reserved keys present on the RAW payload are preserved (as null when
+ * JSON would drop them) so the reserved-field refusal cannot be dodged
+ * with an undefined value; payloads JSON cannot represent at all become
+ * UNREPRESENTABLE_PAYLOAD, which the decision path refuses and logs.
  */
 function canonicalize(payload: Readonly<Record<string, unknown>>): Record<string, unknown> {
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new TypeError("Event payload must be a plain object");
+    return { ...UNREPRESENTABLE_PAYLOAD };
   }
   let json: string | undefined;
   try {
     json = JSON.stringify(payload);
-  } catch (error) {
-    throw new TypeError(`Event payload must be JSON-serializable: ${(error as Error).message}`);
+  } catch {
+    return { ...UNREPRESENTABLE_PAYLOAD };
   }
   if (json === undefined) {
-    throw new TypeError("Event payload must be JSON-serializable");
+    return { ...UNREPRESENTABLE_PAYLOAD };
   }
-  return JSON.parse(json) as Record<string, unknown>;
+  const parsed: unknown = JSON.parse(json);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ...UNREPRESENTABLE_PAYLOAD };
+  }
+  const canonical = parsed as Record<string, unknown>;
+  for (const reserved of RESERVED_PAYLOAD_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(payload, reserved)) {
+      canonical[reserved] = canonical[reserved] ?? null;
+    }
+  }
+  return canonical;
 }

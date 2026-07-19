@@ -24,6 +24,9 @@ const CORE_TEST_ALLOWLIST_REGEX = "^(?!(\\.{1,2}(/|$)|@camino/shared(/|$)|vitest
 // grows subdirectories, this rule must be revisited deliberately.
 const CAMINO_PACKAGE_ESCAPES = [
   "../**",
+  "./../**", // "./.." spelling of the same traversal
+  "**/../**", // any ".." segment anywhere in the specifier
+  "**/..",
   "**/daemon/**",
   "**/gui/**",
   "**/shared/src/**",
@@ -84,6 +87,22 @@ const CORE_SYNTAX_BANS = [
   {
     selector: "MemberExpression[object.name='globalThis'][computed=true][property.value='process']",
     message: 'globalThis["process"] is banned in packages/core (purity fence, build plan §1.1).',
+  },
+  // The ambient I/O globals, reached as globalThis properties (dot and
+  // computed-string-literal forms) — no-restricted-globals only sees bare
+  // identifiers (WP-101 review round 2). Reflected/concatenated computed
+  // keys remain the documented lint-invisible residual.
+  {
+    selector:
+      "MemberExpression[object.name='globalThis'][property.name=/^(fetch|WebSocket|XMLHttpRequest|EventSource|setTimeout|setInterval|setImmediate|clearTimeout|clearInterval|clearImmediate)$/]",
+    message:
+      "globalThis I/O and scheduling access is banned in packages/core (purity fence, build plan §1.1).",
+  },
+  {
+    selector:
+      "MemberExpression[object.name='globalThis'][computed=true][property.value=/^(fetch|WebSocket|XMLHttpRequest|EventSource|setTimeout|setInterval|setImmediate|clearTimeout|clearInterval|clearImmediate)$/]",
+    message:
+      'globalThis["…"] I/O and scheduling access is banned in packages/core (purity fence, build plan §1.1).',
   },
 ];
 

@@ -163,7 +163,7 @@ export type MissionEvent =
   // A.1#20 — impact assessment complete / urgent landed + resync
   | { type: "interruption-resolved"; affectedIssuesHandled: boolean }
   // A.1#21 — David answers / obstacle cleared
-  | { type: "obstacle-cleared"; affectedIssuesTransitioned: boolean }
+  | { type: "obstacle-cleared"; actor?: string; affectedIssuesTransitioned: boolean }
   // A.1#22 / A.1b#11 — merge-by-push lands, push confirmed
   | {
       type: "push-confirmed";
@@ -294,9 +294,22 @@ const blockerHit = row({
 });
 
 // A.1#21 — escalated / blocked | David answers / obstacle cleared | affected issues transitioned per answer | executing
-const obstacleCleared = row({
-  ref: "A.1#21",
-  from: ["escalated", "blocked"],
+// The event column is disjunctive and maps onto the two source states (as in
+// A.2#21 vs A.2#23): an escalation is answered BY DAVID; a blocker clears by
+// the obstacle going away, whoever observes it. Guard-split accordingly.
+const obstacleClearedEscalated = row({
+  ref: "A.1#21a",
+  from: ["escalated"],
+  event: "obstacle-cleared",
+  guard: {
+    name: "david-answers-and-issues-transitioned",
+    check: (e) => e.actor === "david" && attested(e.affectedIssuesTransitioned),
+  },
+  to: "executing",
+});
+const obstacleClearedBlocked = row({
+  ref: "A.1#21b",
+  from: ["blocked"],
   event: "obstacle-cleared",
   guard: {
     name: "affected-issues-transitioned",
@@ -496,7 +509,8 @@ const integrationRows: readonly MissionRow[] = [
     },
     to: "executing",
   }),
-  obstacleCleared,
+  obstacleClearedEscalated,
+  obstacleClearedBlocked,
   // A.1#22 — merging | push confirmed | pushed SHA ≡ approved candidate SHA | complete / complete-with-residue
   row({
     ref: "A.1#22a",
@@ -532,7 +546,10 @@ const integrationRows: readonly MissionRow[] = [
     ref: "A.1#23",
     from: ["merging"],
     event: "rebuilds-exhausted",
-    guard: { name: "two-rebuilds-exhausted", check: (e) => e.rebuildCount >= 2 },
+    guard: {
+      name: "two-rebuilds-exhausted",
+      check: (e) => Number.isInteger(e.rebuildCount) && e.rebuildCount >= 2,
+    },
     to: "escalated",
     note: "Registry item 1: 2 automatic rebuild-and-revalidate cycles per candidate, then escalate.",
   }),
@@ -690,7 +707,10 @@ const quickTaskRows: readonly MissionRow[] = [
     ref: "A.1b#10",
     from: ["merging"],
     event: "rebuilds-exhausted",
-    guard: { name: "two-rebuilds-exhausted", check: (e) => e.rebuildCount >= 2 },
+    guard: {
+      name: "two-rebuilds-exhausted",
+      check: (e) => Number.isInteger(e.rebuildCount) && e.rebuildCount >= 2,
+    },
     to: "escalated",
   }),
   // A.1b#11 — merging | push confirmed | pushed SHA ≡ approved candidate SHA | complete
@@ -713,7 +733,8 @@ const quickTaskRows: readonly MissionRow[] = [
   manualResume, // A.1b←A.1#17 (inherited)
   escalationRaised, // A.1b←A.1#18 (inherited, per the preamble's escalated/blocked clause)
   blockerHit, // A.1b←A.1#19 (inherited)
-  obstacleCleared, // A.1b←A.1#21 (inherited)
+  obstacleClearedEscalated, // A.1b←A.1#21a (inherited)
+  obstacleClearedBlocked, // A.1b←A.1#21b (inherited)
   // A.1b#12 — any active | any CAM-MERGE-01 gate found violated | work summary + branch carried over | re-routed
   row({
     ref: "A.1b#12",

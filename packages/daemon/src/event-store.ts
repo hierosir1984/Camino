@@ -18,6 +18,7 @@
 import Database from "better-sqlite3";
 import { ENTITY_KINDS } from "@camino/shared";
 import type {
+  AppendOptions,
   EntityKind,
   EventFilter,
   EventInput,
@@ -160,7 +161,7 @@ export class SqliteEventStore implements EventStore {
     );
   }
 
-  append(input: EventInput): EventRecord {
+  append(input: EventInput, options: AppendOptions = {}): EventRecord {
     validateInput(input);
     let payloadJson: string;
     try {
@@ -171,24 +172,49 @@ export class SqliteEventStore implements EventStore {
     if (payloadJson === undefined) {
       throw new TypeError("Event payload must be JSON-serializable");
     }
+    // Validate the SERIALIZED form: an exotic object (e.g. one whose toJSON
+    // returns an array or null) can pass the pre-stringification shape check
+    // yet persist as a non-object. The log stores plain JSON objects only.
+    const roundTrip: unknown = JSON.parse(payloadJson);
+    if (roundTrip === null || typeof roundTrip !== "object" || Array.isArray(roundTrip)) {
+      throw new TypeError("Event payload must serialize to a plain JSON object");
+    }
     const recordedAt = this.now().toISOString();
-    const result = this.insert.run({
-      entityKind: input.entityKind,
-      entityId: input.entityId,
-      event: input.event,
-      actor: input.actor,
-      cause: input.cause,
-      payload: payloadJson,
-      fromState: input.fromState,
-      toState: input.toState,
-      outcome: input.outcome,
-      rejectionCode: input.rejectionCode ?? null,
-      recordedAt,
+    // BEGIN IMMEDIATE makes the single-writer check and the insert one
+    // atomic unit against every other connection (compare-and-swap on the
+    // store's highest seq).
+    const runAppend = this.db.transaction((): number => {
+      if (options.expectedLastSeq !== undefined) {
+        const lastSeq = this.db
+          .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM events")
+          .get() as { last: number };
+        if (lastSeq.last !== options.expectedLastSeq) {
+          throw new Error(
+            `event store advanced beyond the writer's view (seq ${lastSeq.last} > ${options.expectedLastSeq}): ` +
+              "a second writer violated the single-writer contract (CAM-STATE-03; the durable recovery lock lands with WP-104)",
+          );
+        }
+      }
+      const result = this.insert.run({
+        entityKind: input.entityKind,
+        entityId: input.entityId,
+        event: input.event,
+        actor: input.actor,
+        cause: input.cause,
+        payload: payloadJson,
+        fromState: input.fromState,
+        toState: input.toState,
+        outcome: input.outcome,
+        rejectionCode: input.rejectionCode ?? null,
+        recordedAt,
+      });
+      return Number(result.lastInsertRowid);
     });
+    const seq = runAppend.immediate();
     return {
       ...input,
-      payload: JSON.parse(payloadJson) as EventRecord["payload"],
-      seq: Number(result.lastInsertRowid),
+      payload: roundTrip as EventRecord["payload"],
+      seq,
       recordedAt,
     };
   }

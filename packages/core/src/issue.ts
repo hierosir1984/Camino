@@ -67,7 +67,7 @@ export type IssueEvent =
   // A.2#11 — attempt quota-blocked
   | { type: "attempt-quota-blocked" }
   // A.2#12 — attempt cancelled by preemption/pause
-  | { type: "attempt-cancelled"; summaryWritten: boolean }
+  | { type: "attempt-cancelled"; reason: "urgent-preemption" | "pause"; summaryWritten: boolean }
   // A.2#13 — gates green at candidate
   | { type: "validation-green"; freshnessHolds: boolean }
   // A.2#14 — validation fails (failureCount is recorded context; see retry-policy audit note)
@@ -146,7 +146,10 @@ const issueRows: readonly IssueRow[] = [
     event: "issue-created",
     guard: {
       name: "plan-approval-no-unmet-deps",
-      check: (e) => e.origin === "plan-approval" && e.unmetDependencies === 0,
+      check: (e) =>
+        e.origin === "plan-approval" &&
+        Number.isInteger(e.unmetDependencies) &&
+        e.unmetDependencies === 0,
     },
     to: "ready",
   }),
@@ -156,7 +159,10 @@ const issueRows: readonly IssueRow[] = [
     event: "issue-created",
     guard: {
       name: "plan-approval-unmet-deps",
-      check: (e) => e.origin === "plan-approval" && e.unmetDependencies > 0,
+      check: (e) =>
+        e.origin === "plan-approval" &&
+        Number.isInteger(e.unmetDependencies) &&
+        e.unmetDependencies > 0,
     },
     to: "waiting-deps",
     note: "One appendix row, guard-split on unmet dependencies.",
@@ -168,7 +174,8 @@ const issueRows: readonly IssueRow[] = [
     event: "issue-created",
     guard: {
       name: "repair-created-ready",
-      check: (e) => e.origin === "repair" && e.unmetDependencies === 0,
+      check: (e) =>
+        e.origin === "repair" && Number.isInteger(e.unmetDependencies) && e.unmetDependencies === 0,
     },
     to: "ready",
     note: "Creation row for the repair issues named by A.1#8/A.1#11 and the A.2 mission-level fast-subset row (A.2#18); repair issues are created ready, so unmet dependencies reject.",
@@ -296,9 +303,13 @@ const issueRows: readonly IssueRow[] = [
     ref: "A.2#12",
     from: ["implementing"],
     event: "attempt-cancelled",
-    guard: { name: "summary-written", check: (e) => attested(e.summaryWritten) },
+    guard: {
+      name: "preemption-or-pause-and-summary-written",
+      check: (e) =>
+        (e.reason === "urgent-preemption" || e.reason === "pause") && attested(e.summaryWritten),
+    },
     to: "ready",
-    note: "Re-dispatch happens when the mission resumes executing (A.2#3's mission-executing guard).",
+    note: "The appendix scopes this row to preemption/pause cancellations: a David cancel ends the issue via A.2#22 and an edit cancel goes through A.2#19 replanning. Re-dispatch happens when the mission resumes executing (A.2#3's mission-executing guard).",
   }),
   // A.2#13 — validating | gates green at candidate | freshness holds | merge-pending
   row({
@@ -361,14 +372,20 @@ const issueRows: readonly IssueRow[] = [
     ref: "A.2#20a",
     from: ["replanning"],
     event: "replan-complete",
-    guard: { name: "replan-no-unmet-deps", check: (e) => e.unmetDependencies === 0 },
+    guard: {
+      name: "replan-no-unmet-deps",
+      check: (e) => Number.isInteger(e.unmetDependencies) && e.unmetDependencies === 0,
+    },
     to: "ready",
   }),
   row({
     ref: "A.2#20b",
     from: ["replanning"],
     event: "replan-complete",
-    guard: { name: "replan-unmet-deps", check: (e) => e.unmetDependencies > 0 },
+    guard: {
+      name: "replan-unmet-deps",
+      check: (e) => Number.isInteger(e.unmetDependencies) && e.unmetDependencies > 0,
+    },
     to: "waiting-deps",
     note: "One appendix row, guard-split on re-checked dependency readiness.",
   }),
