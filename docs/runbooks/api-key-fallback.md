@@ -47,10 +47,12 @@ that adapter only (spends one trivial solve on the API account):
 node --run dispatch:smoke -- --only=claude   # or codex / grok
 ```
 
-Confirm in the printed report line: `outcome=succeeded`, a `committed=` SHA,
-and `Env: GH creds = none ✓`. Then check the provider's console shows the
-usage landed on the **API account** (that is the proof the fallback path, not
-the subscription, served the dispatch).
+Confirm on the printed console line: `outcome=succeeded` and a `committed=`
+SHA. The env posture (`githubCredentialKeys: []`, git neutralized) is written
+to `packages/daemon/dispatch-smoke/REPORT.md` and `summary.json` — check the
+`Env: GH creds` column there reads `none ✓`. Then check the provider's console
+shows the usage landed on the **API account** (that is the proof the fallback
+path, not the subscription, served the dispatch).
 
 ---
 
@@ -83,14 +85,26 @@ setting — nothing Camino-visible changes.
    confirm usage in the Anthropic Console.
 
 4. **Revert** (back to subscription): remove the `apiKeyHelper` entry from
-   `~/.claude/settings.json`. Subscription auth (from `claude auth login` /
-   `claude setup-token`) resumes. Optionally delete the keychain item:
+   `~/.claude/settings.json`. Subscription auth stored under `HOME` by
+   `claude auth login` resumes (the CLI reads its own stored credential — the
+   sanctioned path). **Note:** `claude setup-token` is a *different* mechanism —
+   it prints a long-lived token the caller must supply as the
+   `CLAUDE_CODE_OAUTH_TOKEN` environment variable, and Camino's worker-env
+   composer deliberately STRIPS that (it is `TOKEN`-shaped), so a setup-token
+   credential does not reach a dispatched worker. Use `claude auth login`
+   (stored under HOME) for a subscription that must survive a dispatch, not
+   `setup-token`. Optionally delete the keychain item:
    `security delete-generic-password -a "$USER" -s anthropic-fallback`.
 
 ## OpenAI — Codex CLI re-authenticated with an API key
 
 Codex stores auth in its own state under `~/.codex/`; the login subcommand has
 a first-class API-key mode that reads the key from stdin (never argv).
+
+Codex stores auth under `CODEX_HOME` (default `~/.codex/`); its storage mode
+is configurable (`file` → `~/.codex/auth.json`, `keyring`, or `auto`), so do
+not assume a specific file — treat `codex login status` as the source of truth
+for which mode/identity is active.
 
 1. **Prepare the key** (funded Platform account, WP-000 attestation): create an
    API key in the OpenAI console, store it in the keychain as above
@@ -107,28 +121,34 @@ a first-class API-key mode that reads the key from stdin (never argv).
    in the OpenAI console.
 
 4. **Revert**: `codex logout && codex login` (browser flow restores
-   subscription auth in `~/.codex/auth.json`). Confirm with
+   subscription auth in Codex's own auth store). Confirm with
    `codex login status`.
 
-## xAI — Grok Build CLI (recorded limitation)
+## xAI — Grok Build CLI
 
-Grok Build's official API-key mode is the `XAI_API_KEY` environment variable
-(per the accepted sanctioned-path memo,
-`docs/plan/xai-sanctioned-path-research.md`); the CLI's stored login
-(`grok login`, cached under `~/.grok/`) is the **subscription** flow, and no
-stored API-key login exists in the current CLI (v0.2 line).
+Grok Build supports two API-key mechanisms: the `XAI_API_KEY` environment
+variable, and a persistent `model.api_key` setting in its own config file
+`~/.grok/config.toml` (per xAI's documented configuration; the config-file key
+takes precedence over session auth). Its stored login (`grok login`, cached
+under `~/.grok/`) is the **subscription** flow.
 
-- Because Camino's worker env deliberately strips ambient credential-shaped
-  vars, `XAI_API_KEY` from your shell does **not** reach a dispatched worker.
-  A grok API-key fallback **through Camino dispatch** therefore requires the
-  `[F]` declared-passthrough composer (the exact clause the API-key adapter
-  interface documents: named env vars passed through from host state at spawn
-  time). That is future work by design, not an accident.
-- xAI is **not** in CAM-ROUTE-08's critical set (its Accept names Anthropic
-  and OpenAI), so Phase 2's exercise does not depend on this.
-- If xAI must be exercised outside Camino in the meantime:
-  `XAI_API_KEY=… grok -p "…"` in a plain shell uses the API key natively —
-  same official CLI, zero Camino involvement.
+- **Fallback that works through Camino dispatch:** set the API key in grok's
+  own config file under `HOME` (`~/.grok/config.toml`, `model.api_key`, per
+  xAI's current docs). This is the same custody model as the other two
+  providers — the vendor's own CLI reading its own config under `HOME`, the
+  sanctioned path (CAM-SEC-06). Because `HOME` is preserved for the worker, the
+  official CLI loads that config; Camino never reads or proxies the key.
+- **The env-var route does not reach a worker:** Camino's worker-env composer
+  deliberately strips `XAI_API_KEY` (and every credential-shaped var), so
+  exporting it in your shell has no effect on a dispatch. Use the config-file
+  route above for a grok API-key fallback through Camino. (A future [F] API-key
+  adapter could instead declare `XAI_API_KEY` as a passed-through credential
+  var; the config-file route needs no such adapter.)
+- **Revert:** remove `model.api_key` from `~/.grok/config.toml`; the stored
+  `grok login` subscription resumes.
+- xAI is **not** in CAM-ROUTE-08's critical set (its Accept names Anthropic and
+  OpenAI), so Phase 2's exercise does not depend on this — it is documented
+  here for completeness.
 
 ## Failure notes
 

@@ -13,9 +13,8 @@
 // Credential custody (CAM-SEC-06 discipline extended to API keys):
 //
 //   - An API-key adapter DECLARES the env var NAMES its CLI reads
-//     (`credentialEnvVars`). It never receives, reads, or embeds values —
-//     the interface has no parameter through which a credential value can
-//     reach adapter code.
+//     (`credentialEnvVars`). The interface has no PARAMETER through which a
+//     credential value reaches adapter code.
 //   - The future composer (the [F] implementation) copies the declared names
 //     from HOST env state into the worker env at spawn time: composition
 //     references host credential state; Camino never persists, logs, records,
@@ -24,15 +23,25 @@
 //     on shared systems), in stdin prompts, in SpawnPlan env values, or in
 //     any Camino store or evidence artifact.
 //
-// The checks below are the conformance-test skeleton: pure, framework-free
-// functions a future implementation's test suite invokes (they return
-// violations rather than asserting, so any test framework can adopt them).
-// They are executable TODAY against any ApiKeyAdapterSpec value — which is
-// how packages/shared/src/api-key-adapter.test.ts proves the skeleton
-// discriminates — while no product ApiKeyAdapterSpec ships in WP-105.
+// SCOPE OF THE GUARANTEE (round-1 review finding 5 — do not overstate it):
+// "no credential parameter" bounds the INTERFACE, not adapter behavior.
+// `plan()`/`parseLine()` are arbitrary functions; adapter code can read
+// process.env or a global and transform a value (e.g. base64) beyond any
+// substring screen. The static + plan-level checks below are therefore a
+// NECESSARY screen, not a sufficient proof of custody. Sufficiency comes from
+// the dispatch-level obligations (run against a fake, zero quota) that the
+// [F] implementation's own conformance suite MUST add — see
+// API_KEY_ADAPTER_DISPATCH_OBLIGATIONS. The checks are pure, framework-free
+// (they return violations rather than asserting), executable TODAY against any
+// ApiKeyAdapterSpec — which is how packages/shared/src/api-key-adapter.test.ts
+// proves they discriminate — while no product ApiKeyAdapterSpec ships in WP-105.
 
 import type { AdapterContext, AdapterSpec, SpawnPlan } from "./adapter.js";
-import { isGithubCredentialShapedKey } from "./adapter.js";
+import {
+  isGithubCredentialShapedKey,
+  isGitOrSshChannelEnvKey,
+  isWorkerEnvAllowlistKey,
+} from "./adapter.js";
 
 /**
  * POSIX-portable env var name grammar. Uppercase-only by policy: every real
@@ -112,6 +121,27 @@ export function checkApiKeyAdapterSpec(spec: ApiKeyAdapterSpec): ConformanceViol
         detail: `"${name}" is GitHub-credential-shaped — the GitHub credential channel is closed to workers (CAM-SEC-06/CAM-EXEC-02) and may not be re-opened via a credential declaration`,
       });
     }
+    // A credential declaration must not alias a host-inherited allowlist key
+    // (round-1 review finding 5): declaring HOME/PATH/… as your "credential
+    // var" would have the composer overwrite the sanctioned host value.
+    if (isWorkerEnvAllowlistKey(name)) {
+      violations.push({
+        check: "credential-env-vars",
+        detail: `"${name}" is a host-inherited allowlist key — it may not be declared as a credential var (it would clobber the sanctioned host value, CAM-SEC-06)`,
+      });
+    }
+    // …nor may it re-open a git config/redirect or SSH-agent CAPABILITY
+    // channel the composer strips: an API-key adapter must not smuggle
+    // SSH_AUTH_SOCK or a GIT_CONFIG override past the composer by calling it a
+    // "credential var" (round-1 review finding 5). This is deliberately the
+    // capability-channel predicate, NOT the credential-shaped one — a genuine
+    // credential var (GLM_API_KEY) is credential-shaped and must be allowed.
+    if (isGitOrSshChannelEnvKey(name)) {
+      violations.push({
+        check: "credential-env-vars",
+        detail: `"${name}" is a git config/redirect or SSH-agent channel the worker-env composer strips — it may not be re-opened via a credential declaration (CAM-SEC-06/CAM-EXEC-02)`,
+      });
+    }
   }
   return violations;
 }
@@ -179,7 +209,7 @@ export function checkAdapterPlanCustody(
  * the template).
  */
 export const API_KEY_ADAPTER_DISPATCH_OBLIGATIONS: readonly string[] = [
-  "kill-confirm sequence on the shared lifecycle: SIGTERM → grace → SIGKILL → tree-gone → lease release (PRD §5 registry item 4)",
+  "kill-confirm sequence on the shared lifecycle: SIGTERM → grace → SIGKILL → group-gone → lease release (PRD §5 registry item 4)",
   "rate-limit classification through the shared quota classifier: quota-blocked, never requirement-failed (CAM-EXEC-06)",
   "worker env composed by the shared composer with the declared credential vars passed through by NAME from host env state only (CAM-SEC-06 discipline)",
   "credential values absent from every posture record, transcript, evidence artifact, and log the dispatch produces",

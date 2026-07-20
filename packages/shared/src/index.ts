@@ -63,7 +63,17 @@ export type {
 } from "./external-ops.js";
 
 // WP-105: the worker-adapter dispatch contract (CAM-EXEC-01/06, CAM-SEC-06).
-export { GITHUB_CREDENTIAL_MARKERS, isGithubCredentialShapedKey } from "./adapter.js";
+export {
+  GITHUB_CREDENTIAL_MARKERS,
+  isGithubCredentialShapedKey,
+  CREDENTIAL_SHAPED_PATTERN,
+  STRIPPED_ENV_EXACT,
+  STRIPPED_ENV_PREFIXES,
+  WORKER_ENV_ALLOWLIST,
+  isStrippedWorkerEnvKey,
+  isGitOrSshChannelEnvKey,
+  isWorkerEnvAllowlistKey,
+} from "./adapter.js";
 export type {
   StreamEvent,
   DispatchOutcome,

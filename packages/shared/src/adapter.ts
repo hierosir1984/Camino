@@ -84,42 +84,59 @@ export interface AdapterSpec {
 
 /**
  * Kill-confirm evidence (CAM-EXEC-06; PRD §5 registry item 4):
- * SIGTERM → grace → SIGKILL iff any group member survives → tree-gone
- * verification. Lease release is sequenced strictly AFTER `treeGone` is
+ * SIGTERM → grace → SIGKILL iff any group member survives → group-gone
+ * verification. Lease release is sequenced strictly AFTER `groupGone` is
  * confirmed (see LeaseHandle).
+ *
+ * Containment boundary (round-1 review finding 1): "gone" here means the
+ * worker's process GROUP is gone. A descendant that deliberately detaches
+ * into its OWN session/group (setsid / double-fork, reparented to init)
+ * escapes both the group signal and the group-liveness probe — no
+ * signal-based mechanism on this layer can contain that. Complete
+ * process-tree containment is the container's job: WP-107 runs each worker
+ * in a PID namespace where killing the container reaps every pid regardless
+ * of session. At THIS layer the fencing guarantee is scoped to the process
+ * group, and that scope is stated, not overclaimed.
  */
 export interface KillConfirmRecord {
   requested: boolean;
-  /** True if SIGTERM alone did not stop the tree and SIGKILL was needed. */
+  /** True if SIGTERM alone did not stop the group and SIGKILL was needed. */
   escalatedToSigkill: boolean;
-  /** True once the whole process group is confirmed gone. */
-  treeGone: boolean;
+  /** True once the worker's process GROUP is confirmed gone (see boundary note above). */
+  groupGone: boolean;
   elapsedMs: number;
 }
 
-/** Worker env posture evidence (CAM-SEC-06 / CAM-EXEC-02). Key NAMES only — values are never recorded. */
+/** Worker env posture evidence (CAM-SEC-06 / CAM-EXEC-02). Key NAMES only — the env VALUES bound to them are never recorded. */
 export interface EnvPostureRecord {
-  /** Env keys handed to the worker (values redacted). */
+  /** Env key NAMES handed to the worker (the values bound to them are never recorded). */
   keys: string[];
   /** GitHub-credential-shaped keys present (empty by construction). */
   githubCredentialKeys: string[];
   /** Whether git's global/system config was neutralized for the worker. */
   gitGlobalNeutralized: boolean;
   /**
-   * Key names removed by enforcement (credential-shaped keys, git-config
-   * override channels, agent sockets) — observability for the posture the
-   * composer enforced. Names only, never values.
+   * Key NAMES removed by enforcement (credential-shaped keys, git-config
+   * override + redirect channels, agent sockets) — observability for the
+   * posture the composer enforced. This field records the NAMES of keys, i.e.
+   * the same identifying information the `keys` field carries; it never
+   * records the env VALUE that was bound to a stripped key. (A caller that
+   * hides a secret inside an env-var NAME rather than its value has leaked
+   * its own secret to its own process listing; that is not a channel this
+   * record opens.)
    */
   strippedKeys: string[];
 }
 
 /**
- * The context passed to a lease release. `treeGone` is always literally true:
+ * The context passed to a lease release. `groupGone` is always literally true:
  * the lifecycle only ever invokes release AFTER the worker process group is
- * confirmed gone (or was never spawned), never before.
+ * confirmed gone (or was never spawned), never before. (See the containment
+ * boundary on KillConfirmRecord: "gone" is scoped to the process group; a
+ * deliberate session escapee is contained by WP-107's container.)
  */
 export interface LeaseReleaseContext {
-  treeGone: true;
+  groupGone: true;
   outcome: DispatchOutcome;
 }
 
@@ -129,13 +146,21 @@ export interface LeaseReleaseContext {
  * lifecycle guarantees:
  *
  *   - `release` is invoked AT MOST ONCE per dispatch;
- *   - only after the worker process group is confirmed gone (natural exit with
- *     the group swept, kill-confirm with treeGone, or a spawn that never
+ *   - only after the worker process GROUP is confirmed gone (natural exit with
+ *     the group swept, kill-confirm with groupGone, or a spawn that never
  *     produced a process);
- *   - NEVER when the tree could not be confirmed gone — the lease is then
+ *   - NEVER when the group could not be confirmed gone — the lease is then
  *     deliberately held and the DispatchRecord says so, because releasing a
  *     lease while a worker may still be running would permit two owners of one
- *     environment (the fencing invariant CAM-STATE-04 exists to prevent).
+ *     environment (the fencing invariant CAM-STATE-04 exists to prevent);
+ *   - even when the dispatch body throws unexpectedly: settlement runs in a
+ *     finally, so a thrown dispatch never silently strands a lease.
+ *
+ * Group scope, not full-tree (round-1 review finding 1): a descendant that
+ * detaches into its own session escapes group containment; the environment's
+ * true single-owner guarantee is completed by WP-107's container (kill the
+ * container → every namespaced pid dies). WP-105 owns the ordering guarantee
+ * at the group boundary.
  *
  * The handle's owner (the attempt runner, WP-114) decides what release()
  * actually does — it may collect evidence before releasing the underlying
@@ -148,7 +173,7 @@ export interface LeaseHandle {
 /** What happened to the lease handed to a dispatch (present iff one was provided). */
 export type LeaseDisposition =
   | { released: true }
-  | { released: false; heldReason: "process-tree-unconfirmed" }
+  | { released: false; heldReason: "process-group-unconfirmed" }
   | { released: false; heldReason: "release-threw"; releaseError: string };
 
 /** The full evidence record of one dispatch. */
@@ -166,6 +191,12 @@ export interface DispatchRecord {
    * had to be swept (same kill-confirm sequence, run as post-exit cleanup).
    */
   postExitCleanup?: KillConfirmRecord;
+  /**
+   * Present when the dispatch body threw unexpectedly (e.g. a broken transcript
+   * sink). The dispatch still cleans up and settles the lease; this records
+   * that the terminal outcome came from an error path, not a normal one.
+   */
+  unexpectedError?: string;
   envPosture: EnvPostureRecord;
   exitCode: number | null;
   durationMs: number;
@@ -194,4 +225,105 @@ export const GITHUB_CREDENTIAL_MARKERS = [
 export function isGithubCredentialShapedKey(key: string): boolean {
   const upper = key.toUpperCase();
   return GITHUB_CREDENTIAL_MARKERS.some((marker) => upper.includes(marker));
+}
+
+/**
+ * Credential-shaped key-name fragments (beyond the GitHub markers) a worker
+ * must never carry: loose API keys / secrets that would let a subscription
+ * dispatch authenticate as something Camino never intended (e.g. a provider
+ * API key silently re-billing the dispatch to an API account). Matched
+ * case-insensitively as a substring pattern.
+ */
+export const CREDENTIAL_SHAPED_PATTERN =
+  /API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|SECRET|TOKEN|CREDENTIAL|PASSWORD|PASSPHRASE/i;
+
+/**
+ * The env key names / prefixes the worker-env composer STRIPS as a class,
+ * because each is an authentication or git-redirect capability a worker must
+ * not inherit (CAM-SEC-06 / CAM-EXEC-02). One source of truth: the daemon's
+ * composer strips these, AND the API-key adapter contract refuses to let an
+ * adapter re-open any of them by declaring it as a "credential env var".
+ *
+ *   - git config injection: GIT_CONFIG / GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n /
+ *     GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS bypass the /dev/null
+ *     global+system neutralization entirely (credential.helper, core.sshCommand);
+ *   - git repo/exec redirect: GIT_DIR / GIT_WORK_TREE / GIT_OBJECT_DIRECTORY /
+ *     GIT_ALTERNATE_OBJECT_DIRECTORIES / GIT_INDEX_FILE / GIT_NAMESPACE /
+ *     GIT_COMMON_DIR / GIT_EXEC_PATH point git at attacker-chosen state or
+ *     helper binaries (round-1 review finding 4);
+ *   - transport / agent: GIT_SSH / GIT_SSH_COMMAND / GIT_PROXY_COMMAND /
+ *     SSH_AUTH_SOCK / SSH_ASKPASS hand out arbitrary transport commands and
+ *     the user's SSH agent.
+ */
+export const STRIPPED_ENV_EXACT = [
+  "GIT_CONFIG",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_COMMON_DIR",
+  "GIT_EXEC_PATH",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_PROXY_COMMAND",
+  "SSH_AUTH_SOCK",
+  "SSH_ASKPASS",
+] as const;
+
+export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"] as const;
+
+/**
+ * The host-inherited allowlist: the ONLY host env keys a worker inherits. HOME
+ * is included on purpose — the official vendor CLIs read their OWN
+ * subscription auth from under it (the sanctioned path, CAM-SEC-06). Shared so
+ * the composer inherits exactly these and the API-key contract refuses to let
+ * an adapter alias a credential onto one of them.
+ */
+export const WORKER_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+] as const;
+
+/**
+ * Is this key one of the git config/redirect or SSH-agent CAPABILITY channels
+ * the composer strips? Distinct from the credential-shaped pattern: a
+ * legitimate API-key credential var IS credential-shaped (e.g. GLM_API_KEY),
+ * so the API-key contract check rejects an aliased CAPABILITY channel (this
+ * predicate) but not a genuine credential var.
+ */
+export function isGitOrSshChannelEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return (
+    (STRIPPED_ENV_EXACT as readonly string[]).includes(upper) ||
+    (STRIPPED_ENV_PREFIXES as readonly string[]).some((p) => upper.startsWith(p))
+  );
+}
+
+/**
+ * Does the worker-env composer strip this key name (credential-shaped, a git
+ * config/redirect channel, or an SSH agent reference)? The composer's full
+ * strip predicate.
+ */
+export function isStrippedWorkerEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return (
+    isGithubCredentialShapedKey(upper) ||
+    CREDENTIAL_SHAPED_PATTERN.test(upper) ||
+    isGitOrSshChannelEnvKey(upper)
+  );
+}
+
+/** Is this key one of the host-inherited allowlist names? */
+export function isWorkerEnvAllowlistKey(key: string): boolean {
+  return (WORKER_ENV_ALLOWLIST as readonly string[]).includes(key.toUpperCase());
 }

@@ -82,20 +82,22 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     expect(reg.find((a) => a.name === "codex-cli")!.enabled).toBe(true);
   });
 
-  it("grok is disabled when the record exists but is not accepted (or malformed)", () => {
-    for (const content of [
-      JSON.stringify({ xaiSanctionedPath: { status: "pending" } }),
-      JSON.stringify({ somethingElse: true }),
-      "not json at all",
-    ]) {
+  it("grok is disabled with a PRECISE reason per malformation class (round-1 finding 8)", () => {
+    const cases: Array<{ content: string; reason: RegExp }> = [
+      {
+        content: JSON.stringify({ xaiSanctionedPath: { status: "pending" } }),
+        reason: /is "pending", not "accepted"/,
+      },
+      { content: JSON.stringify({ somethingElse: true }), reason: /status absent from record/ },
+      { content: "not json at all", reason: /malformed \(not valid JSON\)/ },
+    ];
+    for (const { content, reason } of cases) {
       const file = tmpAttestations(content);
       try {
         const reg = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file });
         const grok = reg.find((a) => a.name === "grok-build")!;
         expect(grok.enabled, content).toBe(false);
-        expect(grok.disabledReason, content).toBe(
-          "xAI sanctioned-path not recorded accepted (WP-000 gate)",
-        );
+        expect(grok.disabledReason, content).toMatch(reason);
       } finally {
         rmSync(file, { force: true });
       }
@@ -133,6 +135,19 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     expect(reg.find((a) => a.name === "claude-code")!.enabled).toBe(true);
     expect(reg.find((a) => a.name === "codex-cli")!.enabled).toBe(false);
   });
+
+  it("EVERY provider routes through the CLI-presence + recorded sanctioned-path gate (round-1 finding 8)", () => {
+    // Present-but-... : claude/codex are enabled by their recorded (accepted)
+    // sanctioned-path constant, grok by the attestation record — none is
+    // presence-only. Absence disables each with the presence reason.
+    const present = buildRegistry({ cliPresent: ALL_PRESENT });
+    expect(present.every((a) => a.enabled)).toBe(true);
+
+    const absent = buildRegistry({ cliPresent: () => false });
+    expect(
+      absent.every((a) => !a.enabled && /CLI not found on PATH$/.test(a.disabledReason!)),
+    ).toBe(true);
+  });
 });
 
 describe("cliOnPath", () => {
@@ -153,6 +168,25 @@ describe("cliOnPath", () => {
       expect(cliOnPath("fake-cli", "")).toBe(false);
       expect(cliOnPath("", dir)).toBe(false); // empty name never matches
       expect(cliOnPath("sub/fake-cli", dir)).toBe(false); // path-ish names refused
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("deliberately IGNORES empty and relative PATH entries (round-1 finding 9)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "camino-clipath2-"));
+    try {
+      const exe = join(dir, "fake-cli");
+      writeFileSync(exe, "#!/bin/sh\nexit 0\n");
+      chmodSync(exe, 0o755);
+      // An empty PATH slot (=cwd to execvp) and a relative entry must not be
+      // honored — a CLI reachable only that way is not a stable install, and
+      // resolving it from the daemon cwd would diverge from the worker cwd.
+      expect(cliOnPath("fake-cli", `:${dir}`)).toBe(true); // absolute entry still found
+      expect(cliOnPath("fake-cli", "")).toBe(false);
+      expect(cliOnPath("fake-cli", ":")).toBe(false); // only empty slots
+      expect(cliOnPath("fake-cli", "relative/dir")).toBe(false); // relative ignored
+      expect(cliOnPath("fake-cli", ".")).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

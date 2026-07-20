@@ -84,6 +84,39 @@ describe("checkApiKeyAdapterSpec (static declaration conformance)", () => {
       ).toBe(true);
     }
   });
+
+  it("REFUSES declaring a host-allowlist key as a credential var (round-1 finding 5)", () => {
+    for (const k of ["HOME", "PATH", "USER", "TMPDIR"]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(
+        v.some((x) => x.detail.includes("host-inherited allowlist key")),
+        k,
+      ).toBe(true);
+    }
+  });
+
+  it("REFUSES declaring a stripped git/SSH capability channel as a credential var (round-1 finding 5)", () => {
+    for (const k of [
+      "GIT_CONFIG_COUNT",
+      "GIT_SSH_COMMAND",
+      "SSH_AUTH_SOCK",
+      "GIT_DIR",
+      "GIT_CONFIG_KEY_0",
+    ]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(
+        v.some((x) => x.detail.includes("git config/redirect or SSH-agent channel")),
+        k,
+      ).toBe(true);
+    }
+  });
+
+  it("ALLOWS a genuine credential-shaped var (it is supposed to be a key)", () => {
+    for (const k of ["GLM_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_TOKEN"]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(v, k).toEqual([]); // credential-shaped is expected, not a violation
+    }
+  });
 });
 
 describe("checkPlanCredentialCustody (values never reach the plan)", () => {
@@ -131,11 +164,36 @@ describe("checkPlanCredentialCustody (values never reach the plan)", () => {
   });
 });
 
+describe("the static custody check is a screen, not a proof (round-1 finding 5)", () => {
+  it("a transform-and-leak spec passes the SUBSTRING check — which is why dispatch-level obligations exist", () => {
+    // An adapter that reads a global and base64-encodes it into an innocuous
+    // env value slips past substring detection. The static check cannot catch
+    // this by construction (plan() is arbitrary code); custody sufficiency
+    // comes from the dispatch-level behavioral obligations run against a fake.
+    // This test PINS that limitation honestly rather than overclaiming.
+    const transformer = conformantFake({
+      plan: () => {
+        const planted = "synthetic-credential-value-1";
+        // Any reversible transform defeats a raw-substring screen — here a
+        // simple reversal stands in for base64/xor/etc. (no Node types needed).
+        const smuggled = planted.split("").reverse().join("");
+        return { file: "example-cli", args: [], env: { INNOCENT_LOOKING: smuggled } };
+      },
+    });
+    const v = checkAdapterPlanCustody(transformer, CTX, ["synthetic-credential-value-1"]);
+    expect(v).toEqual([]); // substring screen does NOT catch the base64 transform
+    // The dispatch-level obligation that WOULD catch it is documented:
+    expect(API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.join("\n")).toContain(
+      "absent from every posture record, transcript, evidence artifact, and log",
+    );
+  });
+});
+
 describe("dispatch-level obligations (documented for the [F] implementation)", () => {
   it("names the kill-confirm sequence and the quota classification contract", () => {
     const text = API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.join("\n");
     expect(API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.length).toBeGreaterThan(0);
-    expect(text).toContain("SIGTERM → grace → SIGKILL → tree-gone → lease release");
+    expect(text).toContain("SIGTERM → grace → SIGKILL → group-gone → lease release");
     expect(text).toContain("quota-blocked, never requirement-failed");
     expect(text).toContain("host env state");
   });

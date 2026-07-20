@@ -64,6 +64,30 @@ describe("per-provider quota classification", () => {
       expect(classifyByQuotaSignal(bad), bad).toBe(true);
     }
   });
+
+  it("does NOT flag a benign 429 issue reference or retry-after documentation (round-1 finding 6)", () => {
+    for (const benign of [
+      "Resolved GitHub issue #429 about caching",
+      "issue 429 was closed",
+      "the 429th commit landed",
+      "Implemented Retry-After header parsing",
+      "Fixed bug in retry-after config docs",
+    ]) {
+      expect(classifyByQuotaSignal(benign), benign).toBe(false);
+    }
+  });
+
+  it("DOES flag the providers' current exhaustion strings (round-1 finding 6)", () => {
+    for (const real of [
+      "You've hit your usage limit.", // installed Codex CLI
+      "Credit balance is too low", // Anthropic spent-balance block
+      "HTTP 429 Too Many Requests",
+      "status 429",
+      "Error: 429",
+    ]) {
+      expect(classifyByQuotaSignal(real), real).toBe(true);
+    }
+  });
 });
 
 // Parser robustness: syntactically valid events with malformed shapes, and

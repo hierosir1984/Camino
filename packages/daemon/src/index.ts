@@ -64,7 +64,7 @@ export type {
 export {
   dispatch,
   killConfirm,
-  processTreeConfirmedGone,
+  processGroupConfirmedGone,
   DisabledAdapterError,
   PRODUCTION_KILL_CONFIRM,
 } from "./dispatch/lifecycle.js";

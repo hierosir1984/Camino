@@ -176,7 +176,7 @@ async function main() {
     );
     if (entry.cancel) {
       console.log(
-        `[${adapter.name}] cancel outcome=${entry.cancel.outcome} escalated=${entry.cancel.killConfirm?.escalatedToSigkill} treeGone=${entry.cancel.killConfirm?.treeGone}`,
+        `[${adapter.name}] cancel outcome=${entry.cancel.outcome} escalated=${entry.cancel.killConfirm?.escalatedToSigkill} groupGone=${entry.cancel.killConfirm?.groupGone}`,
       );
     }
     evidence.push(entry);
@@ -213,7 +213,7 @@ export function renderReport(evidence: AdapterEvidence[], didCancel: boolean): s
     const c = e.cancel;
     const cancelOut = c ? c.outcome : didCancel ? "?" : "not run";
     const kc = c?.killConfirm
-      ? `treeGone=${c.killConfirm.treeGone}${c.killConfirm.escalatedToSigkill ? " (SIGKILL)" : ""}`
+      ? `groupGone=${c.killConfirm.groupGone}${c.killConfirm.escalatedToSigkill ? " (SIGKILL)" : ""}`
       : "—";
     lines.push(
       `| ${e.adapter} | yes | ${s?.outcome ?? "?"} | ${s?.streamedEvents ?? 0} | ${commit} | ${ghCreds} | ${cancelOut} | ${kc} |`,

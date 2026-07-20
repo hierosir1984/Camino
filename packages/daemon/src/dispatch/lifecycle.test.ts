@@ -1,22 +1,28 @@
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { LeaseHandle, LeaseReleaseContext } from "@camino/shared";
+import type { AdapterSpec, LeaseHandle, LeaseReleaseContext } from "@camino/shared";
 import {
   dispatch,
   DisabledAdapterError,
   PRODUCTION_KILL_CONFIRM,
-  processTreeConfirmedGone,
+  processGroupConfirmedGone,
 } from "./lifecycle.js";
 import { mockAdapter } from "./adapters/mock.js";
+import { claudeAdapter } from "./adapters/claude.js";
+import { codexAdapter } from "./adapters/codex.js";
+import { grokAdapter } from "./adapters/grok.js";
 import { classifyByQuotaSignal } from "./quota.js";
 import { makeWorkspace, headSha, committedSince } from "./workspace.js";
 
 // Every mechanic of the dispatch lifecycle proven against the fake CLI —
 // ZERO subscription quota. This is the WP-001 dispatch suite promoted to run
 // against PRODUCT adapter code in CI (WP-105 acceptance), plus the product
-// additions: disabled-adapter refusal, AbortSignal cancellation, post-exit
-// group sweep, and lease settlement sequenced after tree-gone.
+// additions and round-1 review folds: disabled-adapter refusal, AbortSignal
+// cancellation (incl. abort during the plan/spawn window), post-exit group
+// sweep, lease settlement sequenced after group-gone, and guaranteed cleanup +
+// settlement even when a callback / stdin / plan throws.
 
 const FAST_KILL = { graceMs: 400, sigkillWaitMs: 2000 };
 
@@ -83,7 +89,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("mid-run cancel executes kill-confirm and the whole process TREE is gone (leader ignores SIGTERM)", async () => {
+  it("mid-run cancel executes kill-confirm and the whole process GROUP is gone (leader ignores SIGTERM)", async () => {
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(
@@ -93,7 +99,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       );
       expect(rec.outcome).toBe("cancelled");
       expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // SIGTERM ignored → SIGKILL
-      expect(rec.killConfirm?.treeGone).toBe(true); // group verified gone
+      expect(rec.killConfirm?.groupGone).toBe(true); // group verified gone
       expect(anyGroupAlive(mockPid(ws))).toBe(false); // independent corroboration
     } finally {
       rmSync(ws, { recursive: true, force: true });
@@ -112,7 +118,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       setTimeout(() => ac.abort(), 300);
       const rec = await pending;
       expect(rec.outcome).toBe("cancelled"); // not "killed": abort is a cancel
-      expect(rec.killConfirm?.treeGone).toBe(true);
+      expect(rec.killConfirm?.groupGone).toBe(true);
       expect(anyGroupAlive(mockPid(ws))).toBe(false);
     } finally {
       rmSync(ws, { recursive: true, force: true });
@@ -147,7 +153,36 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("orphan case: leader exits on SIGTERM but a descendant ignores it — SIGKILL still reaps the tree", async () => {
+  it("an abort during the plan()/spawn window is NOT lost — the worker is cancelled (round-1 finding 3)", async () => {
+    const ws = makeWorkspace();
+    try {
+      const ac = new AbortController();
+      // The abort fires INSIDE plan(), before the child exists. A naive
+      // implementation that only checks the signal at entry (already past) and
+      // attaches its listener after spawn would miss this and run to success.
+      const abortingAdapter: AdapterSpec = {
+        ...mockAdapter("hang"),
+        plan: (ctx) => {
+          ac.abort();
+          return mockAdapter("hang").plan(ctx);
+        },
+      };
+      const rec = await dispatch(
+        abortingAdapter,
+        { workdir: ws, prompt: "run forever" },
+        { signal: ac.signal, killConfirm: FAST_KILL, timeoutMs: 30_000 },
+      );
+      // The window-abort was honored: cancelled fast, not a 30s run-to-timeout.
+      // (No .mock-pid corroboration here — the kill can beat the mock's first
+      // line; outcome + groupGone are the proof that matters.)
+      expect(rec.outcome).toBe("cancelled");
+      expect(rec.killConfirm?.groupGone).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("orphan case: leader exits on SIGTERM but a descendant ignores it — SIGKILL still reaps the group", async () => {
     // WP-001 review #1: a leader-only wait would skip SIGKILL and orphan the
     // SIGTERM-ignoring descendant. Correct kill-confirm SIGKILLs the whole group.
     const ws = makeWorkspace();
@@ -159,7 +194,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       );
       expect(rec.outcome).toBe("cancelled"); // interrupted a live group
       expect(rec.killConfirm?.escalatedToSigkill).toBe(true); // descendant forced SIGKILL
-      expect(rec.killConfirm?.treeGone).toBe(true); // no orphan survives
+      expect(rec.killConfirm?.groupGone).toBe(true); // no orphan survives
       expect(anyGroupAlive(mockPid(ws))).toBe(false);
     } finally {
       rmSync(ws, { recursive: true, force: true });
@@ -168,8 +203,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
 
   it("a cooperative descendant gets the FULL grace window (no premature SIGKILL)", async () => {
     // WP-001 review #1-new: escalation must wait for the whole GROUP through the
-    // grace period, not SIGKILL the instant the leader exits. A descendant that
-    // needs ~200ms to shut down, given a 1500ms grace, must not be SIGKILLed.
+    // grace period, not SIGKILL the instant the leader exits.
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(
@@ -179,14 +213,14 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       );
       expect(rec.outcome).toBe("cancelled");
       expect(rec.killConfirm?.escalatedToSigkill).toBe(false); // exited within grace
-      expect(rec.killConfirm?.treeGone).toBe(true);
+      expect(rec.killConfirm?.groupGone).toBe(true);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
   });
 
   it("post-exit sweep: a leader that exits 0 leaving a live descendant does not leak the group", async () => {
-    // WP-105: natural success is not tree-gone. Without the sweep, the
+    // WP-105: natural success is not group-gone. Without the sweep, the
     // descendant outlives the dispatch and a released lease would have two
     // effective owners of one environment.
     const ws = makeWorkspace();
@@ -204,7 +238,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       );
       expect(rec.outcome).toBe("succeeded"); // the worker's own work completed
       expect(rec.killConfirm).toBeUndefined(); // no cancel/timeout ran
-      expect(rec.postExitCleanup?.treeGone).toBe(true); // sweep confirmed the group gone
+      expect(rec.postExitCleanup?.groupGone).toBe(true); // sweep confirmed the group gone
       expect(rec.postExitCleanup?.escalatedToSigkill).toBe(false); // descendant honored SIGTERM
       expect(rec.lease).toEqual({ released: true });
       expect(groupGoneAtRelease).toBe(true); // release fired only after the sweep
@@ -214,7 +248,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("lease release is sequenced strictly AFTER tree-gone on the cancel path (registry item 4)", async () => {
+  it("lease release is sequenced strictly AFTER group-gone on the cancel path (registry item 4)", async () => {
     const ws = makeWorkspace();
     try {
       let releaseCount = 0;
@@ -233,9 +267,9 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
         { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL, lease },
       );
       expect(rec.outcome).toBe("cancelled");
-      expect(rec.killConfirm?.treeGone).toBe(true);
+      expect(rec.killConfirm?.groupGone).toBe(true);
       expect(releaseCount).toBe(1); // at most once
-      expect(ctxSeen!.treeGone).toBe(true);
+      expect(ctxSeen!.groupGone).toBe(true);
       expect(ctxSeen!.outcome).toBe("cancelled");
       expect(groupGoneAtRelease).toBe(true); // the WHOLE group was dead before release
       expect(rec.lease).toEqual({ released: true });
@@ -287,23 +321,100 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("processTreeConfirmedGone: the lease-hold decision is fail-closed on any unconfirmed record", () => {
-    const gone = { requested: true, escalatedToSigkill: true, treeGone: true, elapsedMs: 1 };
-    const alive = { requested: true, escalatedToSigkill: true, treeGone: false, elapsedMs: 1 };
+  it("a throwing transcript sink cannot crash the dispatch; cleanup + lease still run (round-1 finding 2)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const rec = await dispatch(
+        mockAdapter(),
+        { workdir: ws, prompt: "x" },
+        {
+          lease,
+          onLine: () => {
+            throw new Error("transcript sink failed");
+          },
+        },
+      );
+      expect(rec.spawned).toBe(true);
+      expect(rec.outcome).toBe("succeeded"); // the worker still exited 0
+      expect(released).toBe(1); // settlement ran despite the throwing sink
+      expect(rec.lease).toEqual({ released: true });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a plan() that throws is a requirement-failed record with the lease settled (round-1 finding 2)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const throwingPlan: AdapterSpec = {
+        ...mockAdapter(),
+        plan: () => {
+          throw new Error("plan failed");
+        },
+      };
+      const rec = await dispatch(throwingPlan, { workdir: ws, prompt: "x" }, { lease });
+      expect(rec.spawned).toBe(false);
+      expect(rec.outcome).toBe("requirement-failed"); // broken adapter, not a leaked throw
+      expect(rec.unexpectedError).toContain("plan() threw");
+      expect(released).toBe(1); // nothing spawned → lease releasable
+      expect(rec.lease).toEqual({ released: true });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a worker that closes stdin early does not crash the dispatch (EPIPE handled)", async () => {
+    // The shared contract supports stdin delivery; a worker that exits before
+    // reading stdin makes the write EPIPE, which must not crash the dispatch.
+    const ws = makeWorkspace();
+    const script = join(ws, "early-exit.mjs");
+    writeFileSync(
+      script,
+      'process.stdout.write(\'{"type":"result","text":"done"}\\n\');process.exit(0);',
+    );
+    try {
+      const stdinAdapter: AdapterSpec = {
+        name: "mock:stdin",
+        enabled: true,
+        plan: () => ({ file: process.execPath, args: [script], stdin: "x".repeat(2_000_000) }),
+        parseLine: (l) => {
+          try {
+            const o = JSON.parse(l.trim()) as { text?: string };
+            return { kind: "result", text: String(o.text ?? "") };
+          } catch {
+            return null;
+          }
+        },
+      };
+      const rec = await dispatch(stdinAdapter, { workdir: ws, prompt: "x" });
+      expect(rec.spawned).toBe(true);
+      expect(rec.outcome).toBe("succeeded"); // EPIPE swallowed, worker's exit 0 stands
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("processGroupConfirmedGone: the lease-hold decision is fail-closed on any unconfirmed record", () => {
+    const gone = { requested: true, escalatedToSigkill: true, groupGone: true, elapsedMs: 1 };
+    const alive = { requested: true, escalatedToSigkill: true, groupGone: false, elapsedMs: 1 };
     // Never spawned → nothing to confirm.
-    expect(processTreeConfirmedGone({ spawned: false })).toBe(true);
+    expect(processGroupConfirmedGone({ spawned: false })).toBe(true);
     // Natural exit with the post-exit probe finding the group empty (no records).
-    expect(processTreeConfirmedGone({ spawned: true })).toBe(true);
+    expect(processGroupConfirmedGone({ spawned: true })).toBe(true);
     // Kill-confirm verified the group gone.
-    expect(processTreeConfirmedGone({ spawned: true, killConfirm: gone })).toBe(true);
+    expect(processGroupConfirmedGone({ spawned: true, killConfirm: gone })).toBe(true);
     // Kill-confirm could NOT verify → hold (a worker may still be running).
-    expect(processTreeConfirmedGone({ spawned: true, killConfirm: alive })).toBe(false);
+    expect(processGroupConfirmedGone({ spawned: true, killConfirm: alive })).toBe(false);
     // Post-exit sweep could not verify → hold.
-    expect(processTreeConfirmedGone({ spawned: true, postExitCleanup: alive })).toBe(false);
-    expect(processTreeConfirmedGone({ spawned: true, postExitCleanup: gone })).toBe(true);
+    expect(processGroupConfirmedGone({ spawned: true, postExitCleanup: alive })).toBe(false);
+    expect(processGroupConfirmedGone({ spawned: true, postExitCleanup: gone })).toBe(true);
     // Either record unconfirmed poisons the whole determination.
     expect(
-      processTreeConfirmedGone({ spawned: true, killConfirm: gone, postExitCleanup: alive }),
+      processGroupConfirmedGone({ spawned: true, killConfirm: gone, postExitCleanup: alive }),
     ).toBe(false);
   });
 
@@ -316,7 +427,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
         { cancelAfterFirstEventMs: 50, killConfirm: FAST_KILL },
       );
       expect(rec.outcome).toBe("cancelled");
-      expect(rec.killConfirm?.treeGone).toBe(true);
+      expect(rec.killConfirm?.groupGone).toBe(true);
       expect(rec.killConfirm?.escalatedToSigkill).toBe(false); // exited on SIGTERM
     } finally {
       rmSync(ws, { recursive: true, force: true });
@@ -333,7 +444,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
         { timeoutMs: 150, killConfirm: FAST_KILL },
       );
       expect(rec.outcome).toBe("killed"); // not "cancelled"
-      expect(rec.killConfirm?.treeGone).toBe(true);
+      expect(rec.killConfirm?.groupGone).toBe(true);
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -352,9 +463,6 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
   });
 
   it("catches a quota signal on a dropped non-JSON raw line", async () => {
-    // The raw scan must catch a rate-limit signal even when the parser drops the
-    // line. (Cross-line joining is deliberately not done — it false-positives on
-    // benign text — so a real single-line signal is the contract; WP-001 #4-r4.)
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(mockAdapter("quota-raw"), { workdir: ws, prompt: "x" });
@@ -366,16 +474,12 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
   });
 
   it("does NOT false-flag benign multi-line text as quota", () => {
-    // The removed rolling window matched "success rate\nLimited…"; per-line
-    // scanning must not (WP-001 review #4-r4).
     for (const benign of ["success rate", "Limited evidence remains", "capacity is fine"]) {
       expect(classifyByQuotaSignal(benign), benign).toBe(false);
     }
   });
 
   it("bounds retained events but reports the true total count", async () => {
-    // WP-001 review #4: a flood of events must not grow retention without bound;
-    // the true count is still reported and the trailing result is preserved.
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(mockAdapter("flood"), { workdir: ws, prompt: "flood" });
@@ -408,7 +512,6 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
   });
 
   it("a parser that throws does not crash the dispatch", async () => {
-    // The harness must survive a buggy adapter parser (WP-001 review #5).
     const ws = makeWorkspace();
     try {
       const throwing = {
@@ -424,6 +527,83 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       rmSync(ws, { recursive: true, force: true });
     }
   });
+});
+
+// Round-1 finding 10: drive each PROVIDER adapter's real plan()+parseLine
+// through the full lifecycle in CI, zero quota — the provider's own stream
+// schema, spawned by a fake CLI that emits it, so parsing + classification +
+// kill-confirm run against product provider code, not just unit-tested parsers.
+describe("provider adapters through the real lifecycle (zero quota)", () => {
+  const PROVIDER_LINES: Record<string, { solve: string[]; quota: string }> = {
+    "claude-code": {
+      solve: [
+        '{"type":"system","subtype":"init"}',
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}',
+        '{"type":"result","subtype":"success","result":"done"}',
+      ],
+      quota:
+        '{"type":"result","subtype":"error","is_error":true,"result":"429 rate_limit_error: usage limit reached"}',
+    },
+    "codex-cli": {
+      solve: [
+        '{"type":"thread.started"}',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}',
+        '{"type":"turn.completed"}',
+      ],
+      quota:
+        '{"type":"item.completed","item":{"type":"error","message":"429 Too Many Requests; retry-after 30"}}',
+    },
+    "grok-build": {
+      solve: [
+        '{"type":"text","data":"do"}',
+        '{"type":"text","data":"ne"}',
+        '{"type":"end","data":"done"}',
+      ],
+      quota: '{"type":"text","data":"error: rate_limit_exceeded — please retry_after 10s"}',
+    },
+  };
+
+  function schemaEmittingAdapter(name: string, lines: string[], exitCode: number): AdapterSpec {
+    // Reuse the PRODUCT parser for `name`, but make plan() run a fake CLI that
+    // emits that provider's schema — so parseLine runs inside the real dispatch.
+    const real = {
+      "claude-code": claudeAdapter,
+      "codex-cli": codexAdapter,
+      "grok-build": grokAdapter,
+    }[name]!();
+    const script = `const lines=${JSON.stringify(lines)};for(const l of lines)process.stdout.write(l+"\\n");process.exit(${exitCode});`;
+    return { ...real, plan: () => ({ file: process.execPath, args: ["-e", script] }) };
+  }
+
+  for (const [name, fixtures] of Object.entries(PROVIDER_LINES)) {
+    it(`${name}: solve stream parses through the lifecycle → succeeded`, async () => {
+      const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+      try {
+        const rec = await dispatch(schemaEmittingAdapter(name, fixtures.solve, 0), {
+          workdir: ws,
+          prompt: "x",
+        });
+        expect(rec.outcome).toBe("succeeded");
+        expect(rec.streamedEvents).toBeGreaterThan(0);
+        expect(rec.finalText.length).toBeGreaterThan(0); // the provider parser produced result text
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+
+    it(`${name}: a real rate-limit stream classifies quota-blocked, not requirement-failed`, async () => {
+      const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+      try {
+        const rec = await dispatch(schemaEmittingAdapter(name, [fixtures.quota], 1), {
+          workdir: ws,
+          prompt: "x",
+        });
+        expect(rec.outcome).toBe("quota-blocked"); // CAM-EXEC-06, through product parser
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("sample-repo isolation", () => {

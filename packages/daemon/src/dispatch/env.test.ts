@@ -116,6 +116,47 @@ describe("composeWorkerEnv", () => {
     expect(env["GIT_CONFIG_SYSTEM"]).toBe("/dev/null");
   });
 
+  it("closes the git repo/exec REDIRECT channels (round-1 finding 4)", () => {
+    // GIT_DIR & friends point git at attacker-chosen state or helper binaries,
+    // untouched by /dev/null config neutralization.
+    const redirects = {
+      GIT_DIR: "/evil/.git",
+      GIT_WORK_TREE: "/evil/tree",
+      GIT_OBJECT_DIRECTORY: "/evil/objects",
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "/evil/alt",
+      GIT_INDEX_FILE: "/evil/index",
+      GIT_NAMESPACE: "evil",
+      GIT_COMMON_DIR: "/evil/common",
+      GIT_EXEC_PATH: "/evil/git-core",
+    };
+    const { env, posture } = composeWorkerEnv({ PATH: "/usr/bin", HOME: "/Users/x" }, redirects);
+    for (const k of Object.keys(redirects)) {
+      expect(env[k], k).toBeUndefined();
+      expect(posture.strippedKeys, k).toContain(k);
+    }
+  });
+
+  it("extras can NEVER clobber a host-inherited allowlist key (round-1 finding 4)", () => {
+    // An adapter extra HOME=/evil / PATH=/evil must not overwrite the sanctioned
+    // host values — the allowlist is host-derived by contract.
+    const { env } = composeWorkerEnv(
+      { PATH: "/host/bin", HOME: "/host/home", USER: "hostuser", LANG: "en_US.UTF-8" },
+      { HOME: "/evil/home", PATH: "/evil/bin", USER: "evil", LANG: "xx" },
+    );
+    expect(env["HOME"]).toBe("/host/home");
+    expect(env["PATH"]).toBe("/host/bin");
+    expect(env["USER"]).toBe("hostuser");
+    expect(env["LANG"]).toBe("en_US.UTF-8");
+  });
+
+  it("an allowlist key absent from the host stays absent even if an extra supplies it", () => {
+    // Re-assertion copies only keys the host actually had — an extra cannot
+    // introduce an allowlist key the host never set.
+    const { env } = composeWorkerEnv({ PATH: "/host/bin" }, { HOME: "/evil/home" });
+    expect(env["PATH"]).toBe("/host/bin");
+    expect(env["HOME"]).toBeUndefined();
+  });
+
   it("benign adapter extras survive (no over-stripping)", () => {
     const { env, posture } = composeWorkerEnv(
       { PATH: "/usr/bin", HOME: "/Users/x" },
