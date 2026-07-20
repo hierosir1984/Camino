@@ -147,8 +147,9 @@ Notation: **[P1]** = walking skeleton (phase 1), **[P2]** = pilot phase, **[P3]*
 > Amended 2026-07-20 (AMEND-8, approved by David in PR #47): CAM-STATE-02's dispatch clause gains
 > the automatic-path qualification — the previously unqualified "at-most-once" over-promised
 > relative to the §4.4 table it cites (no automatic retry; duplicates tolerable on worker-ref
-> advisory CI), surfaced by the WP-104 falsification review (rounds 2–3). Raw finding,
-> disposition, and the scoped verify pass are recorded on PR #47.
+> advisory CI), surfaced by the WP-104 falsification review (rounds 2–3). Raw finding and
+> disposition are recorded on PR #47; the scoped verify pass ran against the application commit
+> and its record follows in that thread.
 
 - **CAM-STATE-01 [P1]** Append-only event log in SQLite; every state transition is an event with actor, cause, and payload; derived views are rebuildable from events. (§2 inv. 3)
 - **CAM-STATE-02 [P1]** The idempotency contract table (§4.4) is implemented per operation class; ambiguity is durably recorded before any retry; workflow dispatch is at-most-once with correlation-only run-name — at-most-once binds every automatic path (no automatic retry on lost-response ambiguity); an explicit David-authorized retry of a durably recorded ambiguity may knowingly duplicate a run, which §4.4 prices as tolerable (worker-ref CI is advisory-only) and which stays visible via the correlation stamp. *Accept:* seeded duplicate-intent fixtures (replayed intents for each operation class) produce zero duplicate external side effects and one recorded ambiguity per genuinely ambiguous case.
