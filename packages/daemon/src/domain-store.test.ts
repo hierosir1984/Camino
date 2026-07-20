@@ -5,7 +5,7 @@
  * the domain side.
  */
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -683,5 +683,26 @@ describe("SqliteDomainStore — tamper-evident open", () => {
     raw.pragma("user_version = 99");
     raw.close();
     expect(() => new SqliteDomainStore(path)).toThrow(/schema version 99/);
+  });
+});
+
+describe("constructor refusal cleanup", () => {
+  it("refused opens close the native handle (no fd leak on retry loops)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "camino-domain-fd-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, "domain.sqlite");
+    new SqliteDomainStore(path).close();
+    const raw = new Database(path);
+    raw.pragma("user_version = 99");
+    raw.close();
+    const fdDir = "/dev/fd";
+    const before = readdirSync(fdDir).length;
+    for (let i = 0; i < 100; i += 1) {
+      expect(() => new SqliteDomainStore(path)).toThrow(/schema version 99/);
+    }
+    const after = readdirSync(fdDir).length;
+    // 100 refused opens must not retain 100 handles; small slack for
+    // unrelated runtime churn (same guard as the WP-104 stores).
+    expect(after - before).toBeLessThan(10);
   });
 });

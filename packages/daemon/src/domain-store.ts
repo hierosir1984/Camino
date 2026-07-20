@@ -307,44 +307,53 @@ export class SqliteDomainStore {
     this.now = options.now ?? (() => new Date());
     this.newId = options.newId ?? (() => crypto.randomUUID());
     this.db = new Database(path);
-    // The blob-cast NUL CHECKs read database-encoding bytes: on a UTF-16
-    // database every ASCII value contains 0x00 bytes and would be falsely
-    // rejected (r5 finding 4). This store requires UTF-8 — the default for
-    // every database it creates — and refuses any other encoding.
-    const encoding = this.db.pragma("encoding", { simple: true }) as string;
-    if (encoding !== "UTF-8") {
-      this.db.close();
-      throw new Error(
-        `domain database ${path} uses encoding ${encoding}; this store requires UTF-8 ` +
-          "(its byte-level NUL constraints assume single-byte-free ASCII text)",
-      );
-    }
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    const version = this.db.pragma("user_version", { simple: true }) as number;
-    if (version === 0) {
-      this.db.exec(SCHEMA);
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-    } else if (version !== SCHEMA_VERSION) {
-      throw new Error(
-        `domain database ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
-      );
-    } else {
-      // Tamper evidence: a database claiming this schema version must still
-      // carry the tables and the mission-immutability triggers. Recreating a
-      // missing object here would silently accept a rewritten store — refuse.
-      const objects = this.db
-        .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
-        .all() as Array<{ name: string }>;
-      const names = new Set(objects.map((o) => o.name));
-      for (const required of REQUIRED_OBJECTS) {
-        if (!names.has(required)) {
-          throw new Error(
-            `domain database ${path} claims schema version ${version} but is missing ${required} — ` +
-              "refusing to open a possibly tampered or truncated store",
-          );
+    // EVERY refusal path below must close the native handle — a caller
+    // retry-looping on a refused store must not leak file descriptors
+    // until GC gets around to it. (Same fix as the WP-104 event-store /
+    // intent-journal constructors; found by the WP-104 review round 2 as
+    // an out-of-scope observation, applied here on David's direction.)
+    try {
+      // The blob-cast NUL CHECKs read database-encoding bytes: on a UTF-16
+      // database every ASCII value contains 0x00 bytes and would be falsely
+      // rejected (r5 finding 4). This store requires UTF-8 — the default for
+      // every database it creates — and refuses any other encoding.
+      const encoding = this.db.pragma("encoding", { simple: true }) as string;
+      if (encoding !== "UTF-8") {
+        throw new Error(
+          `domain database ${path} uses encoding ${encoding}; this store requires UTF-8 ` +
+            "(its byte-level NUL constraints assume single-byte-free ASCII text)",
+        );
+      }
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      const version = this.db.pragma("user_version", { simple: true }) as number;
+      if (version === 0) {
+        this.db.exec(SCHEMA);
+        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      } else if (version !== SCHEMA_VERSION) {
+        throw new Error(
+          `domain database ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
+        );
+      } else {
+        // Tamper evidence: a database claiming this schema version must still
+        // carry the tables and the mission-immutability triggers. Recreating a
+        // missing object here would silently accept a rewritten store — refuse.
+        const objects = this.db
+          .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger')")
+          .all() as Array<{ name: string }>;
+        const names = new Set(objects.map((o) => o.name));
+        for (const required of REQUIRED_OBJECTS) {
+          if (!names.has(required)) {
+            throw new Error(
+              `domain database ${path} claims schema version ${version} but is missing ${required} — ` +
+                "refusing to open a possibly tampered or truncated store",
+            );
+          }
         }
       }
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
   }
 
