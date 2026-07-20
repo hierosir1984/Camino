@@ -52,6 +52,7 @@ import type {
 import { CANON_FACT_KINDS } from "@camino/shared";
 import type { LedgerView, LedgerViewEntry } from "./canon-intent.js";
 import { recordedAtProblem, safeErrorLabel } from "./canon-intent.js";
+import { deepFreeze } from "./deep-freeze.js";
 
 /** One named projection rule (implementation or evidence axis), for coverage-walked fixtures. */
 export interface ProjectionRule {
@@ -60,7 +61,7 @@ export interface ProjectionRule {
   readonly statement: string;
 }
 
-export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
+export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = deepFreeze([
   {
     rule: "I1",
     axis: "implementation",
@@ -129,9 +130,9 @@ export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
     statement:
       "absence-resolved(C, absent) clears the suspicion AND every presence for C — branch presence, inherited mainline, or the main landing — ⇒ absent (confirmed gone)",
   },
-] as const;
+] as const);
 
-export const EVIDENCE_RULES: readonly ProjectionRule[] = [
+export const EVIDENCE_RULES: readonly ProjectionRule[] = deepFreeze([
   {
     rule: "E1",
     axis: "evidence",
@@ -202,7 +203,7 @@ export const EVIDENCE_RULES: readonly ProjectionRule[] = [
     statement:
       "same-context verdicts take precedence over inherited main verdicts regardless of recording order (a later main verdict cannot mask a branch's own proof)",
   },
-] as const;
+] as const);
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 

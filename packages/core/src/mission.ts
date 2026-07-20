@@ -12,9 +12,10 @@
  * the derived view, never by the caller — see MISSION_CONTEXT_ENRICHMENT.
  */
 import type { EnrichmentSpec, MachineDef, TransitionRow } from "./machine.js";
+import { deepFreeze } from "./deep-freeze.js";
 import { attested, nonEmptyString, stringArray } from "./machine.js";
 
-export const MISSION_ACTIVE_STATES = [
+export const MISSION_ACTIVE_STATES = deepFreeze([
   "queued",
   "draft",
   "planned",
@@ -27,19 +28,22 @@ export const MISSION_ACTIVE_STATES = [
   "paused-manual",
   "escalated",
   "blocked",
-] as const;
+] as const);
 
-export const MISSION_TERMINAL_STATES = [
+export const MISSION_TERMINAL_STATES = deepFreeze([
   "complete",
   "complete-with-residue",
   "abandoned",
   "re-routed", // A.1b only
-] as const;
+] as const);
 
 export type MissionState =
   (typeof MISSION_ACTIVE_STATES)[number] | (typeof MISSION_TERMINAL_STATES)[number];
 
-export const MISSION_STATES = [...MISSION_ACTIVE_STATES, ...MISSION_TERMINAL_STATES] as const;
+export const MISSION_STATES = deepFreeze([
+  ...MISSION_ACTIVE_STATES,
+  ...MISSION_TERMINAL_STATES,
+] as const);
 
 export type MissionRoute = "integration" | "quick-task";
 
@@ -195,16 +199,17 @@ export type MissionEvent =
  * derived view (never trusting caller-supplied values) before running the
  * transition. Pure declaration; the recorder implements it.
  */
-export const MISSION_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> = {
-  "mission-resumed": [{ field: "resumeTo", source: "paused-from" }],
-  "mission-merge-approved": [
-    { field: "currentCandidateSha", source: "current-candidate-sha" },
-    { field: "currentPacketHash", source: "current-packet-hash" },
-  ],
-  "push-confirmed": [{ field: "approvedCandidateSha", source: "approved-candidate-sha" }],
-  "quick-validation-red": [{ field: "failureCount", source: "next-mission-failure-count" }],
-  "gate-violation-detected": [{ field: "pausedFrom", source: "paused-from" }],
-};
+export const MISSION_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> =
+  deepFreeze({
+    "mission-resumed": [{ field: "resumeTo", source: "paused-from" }],
+    "mission-merge-approved": [
+      { field: "currentCandidateSha", source: "current-candidate-sha" },
+      { field: "currentPacketHash", source: "current-packet-hash" },
+    ],
+    "push-confirmed": [{ field: "approvedCandidateSha", source: "approved-candidate-sha" }],
+    "quick-validation-red": [{ field: "failureCount", source: "next-mission-failure-count" }],
+    "gate-violation-detected": [{ field: "pausedFrom", source: "paused-from" }],
+  });
 
 type MissionRow = TransitionRow<MissionState, MissionEvent>;
 
@@ -825,26 +830,26 @@ const quickTaskRows: readonly MissionRow[] = [
   abandoned, // A.1b←A.1#24 (inherited)
 ];
 
-export const missionIntegrationMachine: MachineDef<MissionState, MissionEvent> = {
+export const missionIntegrationMachine: MachineDef<MissionState, MissionEvent> = deepFreeze({
   name: "mission (A.1 integration route)",
   states: MISSION_STATES,
   terminalStates: MISSION_TERMINAL_STATES,
   rows: integrationRows,
-};
+});
 
-export const missionQuickTaskMachine: MachineDef<MissionState, MissionEvent> = {
+export const missionQuickTaskMachine: MachineDef<MissionState, MissionEvent> = deepFreeze({
   name: "mission (A.1b quick-task route)",
   states: MISSION_STATES,
   terminalStates: MISSION_TERMINAL_STATES,
   rows: quickTaskRows,
-};
+});
 
 export function missionMachineFor(route: MissionRoute): MachineDef<MissionState, MissionEvent> {
   return route === "integration" ? missionIntegrationMachine : missionQuickTaskMachine;
 }
 
 /** The creation event that starts each route (route is derived from it on replay). */
-export const MISSION_CREATION_EVENTS: Readonly<Record<string, MissionRoute>> = {
+export const MISSION_CREATION_EVENTS: Readonly<Record<string, MissionRoute>> = deepFreeze({
   "mission-created": "integration",
   "quick-task-intake": "quick-task",
-};
+});

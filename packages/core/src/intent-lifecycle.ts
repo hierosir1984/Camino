@@ -40,9 +40,10 @@ import type {
   IntentStatus,
   OperationResult,
 } from "@camino/shared";
+import { deepFreeze } from "./deep-freeze.js";
 
 /** How a confirmation or failure came about. */
-export const INTENT_RESOLUTION_ROUTES = ["response", "reconciliation"] as const;
+export const INTENT_RESOLUTION_ROUTES = deepFreeze(["response", "reconciliation"] as const);
 export type IntentResolutionRoute = (typeof INTENT_RESOLUTION_ROUTES)[number];
 
 /** The folded state of one intent. */

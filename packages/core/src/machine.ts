@@ -15,6 +15,7 @@
  * The engine is pure: no I/O, no clock, no randomness. Recording applied
  * and rejected transitions is the daemon recorder's job.
  */
+import { deepFreeze } from "./deep-freeze.js";
 
 /** A machine event: a name plus a payload carrying its guard inputs. */
 export interface MachineEvent {
@@ -148,7 +149,7 @@ export interface EnrichmentSpec {
  * "David approves" to the recorded actor. A caller-supplied value for
  * either is a malformed payload, refused before any transition runs.
  */
-export const RESERVED_PAYLOAD_FIELDS = ["type", "actor"] as const;
+export const RESERVED_PAYLOAD_FIELDS = deepFreeze(["type", "actor"] as const);
 
 /** True when the payload field is exactly `true` (attested facts must be explicit). */
 export function attested(value: unknown): value is true {
