@@ -34,10 +34,15 @@
 // `plan()`/`parseLine()` are arbitrary functions; adapter code can read
 // process.env or a global and transform a value (e.g. base64) beyond any
 // substring screen. The static + plan-level checks below are therefore a
-// NECESSARY screen, not a sufficient proof of custody. Sufficiency comes from
-// the dispatch-level obligations (run against a fake, zero quota) that the
-// [F] implementation's own conformance suite MUST add — see
-// API_KEY_ADAPTER_DISPATCH_OBLIGATIONS. The checks are pure, framework-free
+// NECESSARY screen, not a sufficient proof of custody. The dispatch-level
+// obligations (run against a fake, zero quota) that the [F] implementation's
+// own conformance suite MUST add — see API_KEY_ADAPTER_DISPATCH_OBLIGATIONS —
+// are likewise REQUIRED behavioral checks, not sufficiency (round-7 finding
+// 4): they observe declared names and produced artifacts, so a value adapter
+// code TRANSFORMS (base64/xor/reversal) or exfiltrates out-of-band is the
+// NAMED RESIDUAL BOUNDARY, closed by the container's isolation + egress
+// allowlist (WP-107, CAM-EXEC-03), not by any in-process check. The checks
+// here are pure, framework-free
 // (they return violations rather than asserting), executable TODAY against any
 // ApiKeyAdapterSpec — which is how packages/shared/src/api-key-adapter.test.ts
 // proves they discriminate — while no product ApiKeyAdapterSpec ships in WP-105.

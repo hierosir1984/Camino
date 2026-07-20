@@ -8,6 +8,7 @@ import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
 import {
   buildRegistry,
+  buildRegistryForTest,
   cliOnPath,
   DEFAULT_ATTESTATIONS_PATH,
   hasRegistryProvenance,
@@ -65,7 +66,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
   });
 
   it("a missing CLI disables that adapter with the presence reason", () => {
-    const reg = buildRegistry({ cliPresent: () => false });
+    const reg = buildRegistryForTest({ cliPresent: () => false });
     expect(reg.map((a) => a.name).sort()).toEqual(["claude-code", "codex-cli", "grok-build"]);
     for (const a of reg) {
       expect(a.enabled).toBe(false);
@@ -74,7 +75,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
   });
 
   it("grok is disabled with the gate reason when the attestations record is unreadable", () => {
-    const reg = buildRegistry({
+    const reg = buildRegistryForTest({
       cliPresent: ALL_PRESENT,
       attestationsPath: "/nonexistent/attestations.json",
     });
@@ -118,7 +119,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     for (const { content, reason } of cases) {
       const file = tmpAttestations(content);
       try {
-        const reg = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file });
+        const reg = buildRegistryForTest({ cliPresent: ALL_PRESENT, attestationsPath: file });
         const grok = reg.find((a) => a.name === "grok-build")!;
         expect(grok.enabled, content).toBe(false);
         expect(grok.disabledReason, content).toMatch(reason);
@@ -138,7 +139,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     const content = `{"xaiSanctionedPath":{"status":${"[".repeat(depth)}1${"]".repeat(depth)}}}`;
     const file = tmpAttestations(content);
     try {
-      const reg = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file });
+      const reg = buildRegistryForTest({ cliPresent: ALL_PRESENT, attestationsPath: file });
       const grok = reg.find((a) => a.name === "grok-build")!;
       expect(grok.enabled).toBe(false);
       expect(grok.disabledReason).toContain('not "accepted"');
@@ -152,7 +153,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
       JSON.stringify({ xaiSanctionedPath: { status: "x".repeat(5_000_000) } }),
     );
     try {
-      const grok = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: huge }).find(
+      const grok = buildRegistryForTest({ cliPresent: ALL_PRESENT, attestationsPath: huge }).find(
         (a) => a.name === "grok-build",
       )!;
       expect(grok.enabled).toBe(false);
@@ -169,7 +170,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     for (const [status, reason] of cases) {
       const file = tmpAttestations(JSON.stringify({ xaiSanctionedPath: { status } }));
       try {
-        const grok = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file }).find(
+        const grok = buildRegistryForTest({ cliPresent: ALL_PRESENT, attestationsPath: file }).find(
           (a) => a.name === "grok-build",
         )!;
         expect(grok.enabled).toBe(false);
@@ -183,7 +184,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
   it("grok is enabled when the record is accepted", () => {
     const file = tmpAttestations(JSON.stringify({ xaiSanctionedPath: { status: "accepted" } }));
     try {
-      const reg = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file });
+      const reg = buildRegistryForTest({ cliPresent: ALL_PRESENT, attestationsPath: file });
       const grok = reg.find((a) => a.name === "grok-build")!;
       expect(grok.enabled).toBe(true);
       expect(grok.disabledReason).toBeUndefined();
@@ -197,30 +198,45 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     // the registry consumes the genuine WP-000 record: with the CLI present,
     // grok's gate decision comes from docs/plan/phase-0-prereq-attestations.json.
     expect(DEFAULT_ATTESTATIONS_PATH).toMatch(/docs\/plan\/phase-0-prereq-attestations\.json$/);
-    const reg = buildRegistry({ cliPresent: ALL_PRESENT });
+    const reg = buildRegistryForTest({ cliPresent: ALL_PRESENT });
     const grok = reg.find((a) => a.name === "grok-build")!;
     expect(grok.enabled).toBe(true);
   });
 
+  it("the PUBLIC registry is zero-argument: real PATH scan + real attestations only (round-7 finding 1)", () => {
+    // The public surface cannot substitute the gates that mint provenance —
+    // injection lives ONLY in buildRegistryForTest, which the package barrel
+    // does not export (and the "exports" map blocks deep imports). Enablement
+    // here depends on the running machine, so assert decision COMPLETENESS and
+    // the provenance invariant, not specific enablement.
+    const reg = buildRegistry();
+    expect(reg.map((a) => a.name).sort()).toEqual(["claude-code", "codex-cli", "grok-build"]);
+    for (const a of reg) {
+      expect(typeof a.enabled).toBe("boolean");
+      if (!a.enabled) expect(a.disabledReason).toBeTruthy();
+      expect(hasRegistryProvenance(a), a.name).toBe(a.enabled === true);
+    }
+  });
+
   it("provenance = gate-ENABLED specs only; factories, copies, and disabled specs carry none (round-6 finding 1)", () => {
-    for (const spec of buildRegistry({ cliPresent: ALL_PRESENT })) {
+    for (const spec of buildRegistryForTest({ cliPresent: ALL_PRESENT })) {
       expect(hasRegistryProvenance(spec), spec.name).toBe(true);
     }
     // A DISABLED registry spec is deliberately NOT registered: dispatch refuses
     // it on enablement, and flipping its `enabled` flag cannot confer a
     // provenance the gate never granted.
-    for (const spec of buildRegistry({ cliPresent: () => false })) {
+    for (const spec of buildRegistryForTest({ cliPresent: () => false })) {
       expect(hasRegistryProvenance(spec), spec.name).toBe(false);
     }
     // The raw factory and even a field-for-field COPY of a gated spec carry no
     // provenance — WeakSet membership cannot be forged by copying properties.
     expect(hasRegistryProvenance(claudeAdapter())).toBe(false);
-    const gated = buildRegistry({ cliPresent: ALL_PRESENT })[0]!;
+    const gated = buildRegistryForTest({ cliPresent: ALL_PRESENT })[0]!;
     expect(hasRegistryProvenance({ ...gated })).toBe(false);
   });
 
   it("registry decisions are complete: every adapter carries enabled, and a reason when off", () => {
-    const reg = buildRegistry({ cliPresent: (bin) => bin === "claude" });
+    const reg = buildRegistryForTest({ cliPresent: (bin) => bin === "claude" });
     for (const a of reg) {
       expect(typeof a.enabled).toBe("boolean");
       if (!a.enabled) expect(a.disabledReason).toBeTruthy(); // reason recorded when disabled
@@ -233,10 +249,10 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     // Present-but-... : claude/codex are enabled by their recorded (accepted)
     // sanctioned-path constant, grok by the attestation record — none is
     // presence-only. Absence disables each with the presence reason.
-    const present = buildRegistry({ cliPresent: ALL_PRESENT });
+    const present = buildRegistryForTest({ cliPresent: ALL_PRESENT });
     expect(present.every((a) => a.enabled)).toBe(true);
 
-    const absent = buildRegistry({ cliPresent: () => false });
+    const absent = buildRegistryForTest({ cliPresent: () => false });
     expect(
       absent.every((a) => !a.enabled && /CLI not found on PATH$/.test(a.disabledReason!)),
     ).toBe(true);

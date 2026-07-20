@@ -308,6 +308,7 @@ function noProcessRecord(
     exitCode: null,
     durationMs: Date.now() - startedMs,
     events: [],
+    quotaSignalSeen: false,
     ...extra,
   };
 }
@@ -502,6 +503,7 @@ export async function dispatch(
     const tailRing: StreamEvent[] = [];
     let totalEvents = 0;
     let anyEventQuota = false;
+    let lastEventQuota = false;
     const recordEvent = (ev: StreamEvent) => {
       totalEvents++;
       // Defensive read: a buggy parser could return an event whose quotaSignal
@@ -514,6 +516,7 @@ export async function dispatch(
         sig = false;
       }
       if (sig) anyEventQuota = true;
+      lastEventQuota = sig; // reset by every later event: "did the stream END on a quota error?"
       if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);
       else {
         tailRing.push(ev);
@@ -660,7 +663,13 @@ export async function dispatch(
     } else if (killReason === "cancel") {
       outcome = "cancelled";
     } else if (exitCode === 0) {
-      outcome = "succeeded";
+      // A stream whose FINAL parsed event carries a quota signal ended on a
+      // terminal quota error — a refusal even when the CLI exits 0 (CLIs do
+      // report error results with zero exits). An EARLIER signal followed by
+      // further events and a clean exit is a recovered, transient limit:
+      // still "succeeded", with the pressure exposed via quotaSignalSeen for
+      // the WP-106 quota-aware scheduler (round-7 finding 2).
+      outcome = lastEventQuota ? "quota-blocked" : "succeeded";
     } else if (quotaBlocked) {
       outcome = "quota-blocked";
     } else {
@@ -680,6 +689,7 @@ export async function dispatch(
       exitCode,
       durationMs: Date.now() - started,
       events,
+      quotaSignalSeen: anyEventQuota,
     };
 
     // Lease settlement is LAST, strictly after the group-gone determination
@@ -711,6 +721,7 @@ export async function dispatch(
       exitCode: null,
       durationMs: Date.now() - started,
       events: [],
+      quotaSignalSeen: false, // exception path makes no stream claims (events: [])
       unexpectedError: safeStringify(err),
     };
     await settleFor(record);

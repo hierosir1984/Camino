@@ -27,7 +27,9 @@
   `HOME` (e.g. `~/.claude/settings.json`, `~/.codex/auth.json`,
   `~/.grok/config.toml`) OR the OS keychain (Codex `keyring` mode; the
   `apiKeyHelper` command below stores the Anthropic key in the macOS Keychain).
-  Camino references host credential STATE via `HOME` (for file-based CLI auth)
+  Custody is **vendor-CLI-owned, via its active config root or the OS
+  keychain**; Camino references host credential STATE only through each
+  official CLI's granted roots (`HOME` plus that CLI's own config-root var)
   and never touches the keychain itself — it only lets each official CLI use
   its own credential.
 - Worker dispatches run with an allowlisted environment (base: `PATH USER
@@ -82,7 +84,10 @@ setting — nothing Camino-visible changes.
    # (prompts for the key; stores it in the macOS login keychain)
    ```
 
-2. **Point Claude Code at it** — add to `~/.claude/settings.json`:
+2. **Point Claude Code at it** — add to `settings.json` in Claude Code's
+   ACTIVE config root, `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`
+   (when `CLAUDE_CONFIG_DIR` is set it replaces every `~/.claude` path, and
+   the composer passes it through to claude workers):
 
    ```json
    {
@@ -97,7 +102,7 @@ setting — nothing Camino-visible changes.
    confirm usage in the Anthropic Console.
 
 4. **Revert** (back to subscription): remove the `apiKeyHelper` entry from
-   `~/.claude/settings.json`. Subscription auth from `claude auth login`
+   `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`. Subscription auth from `claude auth login`
    resumes — the CLI reads its own stored credential (the sanctioned path). On
    **macOS** that credential is in the login **Keychain**, not a file under
    `HOME` (file storage applies to Linux/Windows); a dispatched worker runs as
@@ -148,14 +153,16 @@ lives.
 
 Grok Build supports two API-key mechanisms: the `XAI_API_KEY` environment
 variable, and a persistent `model.api_key` setting in its own config file
-`~/.grok/config.toml` (per xAI's documented configuration; the config-file key
-takes precedence over session auth). Its stored login (`grok login`, cached
-under `~/.grok/`) is the **subscription** flow.
+`${GROK_HOME:-$HOME/.grok}/config.toml` (per xAI's documented configuration —
+`$GROK_HOME` relocates the whole root; the config-file key takes precedence
+over session auth). Its stored login (`grok login`, cached under the same
+root) is the **subscription** flow.
 
 - **Fallback that works through Camino dispatch:** set the API key in grok's
-  own config file under `HOME` as a PER-MODEL table (installed `grok 0.2.102`
-  rejects a bare top-level `model.api_key` string — it expects a table). Per
-  xAI's per-model configuration, use e.g. in `~/.grok/config.toml`:
+  own config file under its ACTIVE root as a PER-MODEL table (installed
+  `grok 0.2.102` rejects a bare top-level `model.api_key` string — it expects
+  a table). Per xAI's per-model configuration, use e.g. in
+  `${GROK_HOME:-$HOME/.grok}/config.toml`:
 
   ```toml
   [model.grok-build]
@@ -165,10 +172,12 @@ under `~/.grok/`) is the **subscription** flow.
   default = "grok-build"
   ```
 
-  Confirm with `grok inspect` (no `modelOverrideWarnings`). This is the
-  same custody model as the other two providers — the vendor's own CLI reading
-  its own config under `HOME`, the sanctioned path (CAM-SEC-06). Because `HOME`
-  is preserved for the worker, the official CLI loads that config; Camino never
+  Confirm with `grok inspect` (no `modelOverrideWarnings`). This is the same
+  custody model as the other two providers — **vendor-CLI-owned custody via
+  its active config root** (file-backed here; Anthropic/Codex may instead use
+  the OS keychain), the sanctioned path (CAM-SEC-06). Because `HOME` and
+  grok's own config root (`GROK_HOME`) are preserved for grok's workers, the
+  official CLI loads that config — including a relocated root; Camino never
   reads or proxies the key. Follow xAI's current docs for the exact table name.
 - **The env-var route does not reach a worker:** Camino's worker-env composer
   deliberately strips `XAI_API_KEY` (and every credential-shaped var), so
@@ -176,8 +185,9 @@ under `~/.grok/`) is the **subscription** flow.
   route above for a grok API-key fallback through Camino. (A future [F] API-key
   adapter could instead declare `XAI_API_KEY` as a passed-through credential
   var; the config-file route needs no such adapter.)
-- **Revert:** remove `model.api_key` from `~/.grok/config.toml`; the stored
-  `grok login` subscription resumes.
+- **Revert:** remove `model.api_key` from
+  `${GROK_HOME:-$HOME/.grok}/config.toml`; the stored `grok login`
+  subscription resumes.
 - xAI is **not** in CAM-ROUTE-08's critical set (its Accept names Anthropic and
   OpenAI), so Phase 2's exercise does not depend on this — it is documented
   here for completeness.

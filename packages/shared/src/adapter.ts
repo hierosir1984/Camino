@@ -213,6 +213,13 @@ export interface DispatchRecord {
   exitCode: number | null;
   durationMs: number;
   events: StreamEvent[];
+  /**
+   * True iff ANY parsed event carried a quota signal — including a transient
+   * one the worker recovered from (outcome "succeeded"). Lets the quota-aware
+   * scheduler (CAM-ROUTE-06, WP-106) observe pressure without misreading a
+   * recovered dispatch as blocked (round-7 finding 2).
+   */
+  quotaSignalSeen: boolean;
   /** Present iff a LeaseHandle was supplied to the dispatch. */
   lease?: LeaseDisposition;
 }

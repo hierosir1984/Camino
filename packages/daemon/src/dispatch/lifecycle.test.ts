@@ -11,7 +11,7 @@ import {
 } from "./lifecycle.js";
 import { mockAdapter } from "./adapters/mock.js";
 import { claudeAdapter } from "./adapters/claude.js";
-import { buildRegistry, hasRegistryProvenance } from "./registry.js";
+import { buildRegistryForTest, hasRegistryProvenance } from "./registry.js";
 import { classifyByQuotaSignal } from "./quota.js";
 import { makeWorkspace, headSha, committedSince } from "./workspace.js";
 
@@ -834,7 +834,7 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
     // emits the provider's schema while the spec keeps its provenance: the
     // PRODUCT parser runs inside the real dispatch. (The default attestations
     // path is the genuine repo record, accepted 2026-07-17.)
-    const spec = buildRegistry({ cliPresent: () => true }).find((s) => s.name === name)!;
+    const spec = buildRegistryForTest({ cliPresent: () => true }).find((s) => s.name === name)!;
     const script = `const lines=${JSON.stringify(lines)};for(const l of lines)process.stdout.write(l+"\\n");process.exit(${exitCode});`;
     (spec as { plan: AdapterSpec["plan"] }).plan = () => ({
       file: process.execPath,
@@ -886,7 +886,42 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
         rmSync(ws, { recursive: true, force: true });
       }
     });
+
+    it(`${name}: a TERMINAL quota error with exit 0 still classifies quota-blocked (round-7 finding 2)`, async () => {
+      // CLIs report error results with zero exit codes; a stream that ENDS on
+      // a quota-signaling error event is a refusal regardless of exit code.
+      const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+      try {
+        const rec = await dispatch(schemaEmittingAdapter(name, [fixtures.quota], 0), {
+          workdir: ws,
+          prompt: "x",
+        });
+        expect(rec.exitCode).toBe(0);
+        expect(rec.outcome).toBe("quota-blocked");
+        expect(rec.quotaSignalSeen).toBe(true);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
   }
+
+  it("a RECOVERED quota signal (later events, clean exit) stays succeeded, with the pressure exposed (round-7 finding 2)", async () => {
+    // An early rate-limit the worker moved past must not be misread as
+    // blocked; the transient signal stays visible to the WP-106 quota-aware
+    // scheduler via quotaSignalSeen.
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const claude = PROVIDER_LINES["claude-code"]!;
+      const rec = await dispatch(
+        schemaEmittingAdapter("claude-code", [claude.quota, ...claude.solve], 0),
+        { workdir: ws, prompt: "x" },
+      );
+      expect(rec.outcome).toBe("succeeded"); // final event is the success result, not the quota error
+      expect(rec.quotaSignalSeen).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });
 
 // Round-6 finding 1: CAM-EXEC-01's sanctioned-path gate is enforced AT THE
@@ -912,7 +947,7 @@ describe("registry provenance at the dispatch boundary (round-6 finding 1)", () 
   it("flipping `enabled` on a DISABLED registry spec does not confer provenance — still refused", async () => {
     const ws = makeWorkspace();
     try {
-      const disabled = buildRegistry({ cliPresent: () => false }).find(
+      const disabled = buildRegistryForTest({ cliPresent: () => false }).find(
         (s) => s.name === "claude-code",
       )!;
       (disabled as { enabled: boolean }).enabled = true; // forge the decision…
@@ -927,7 +962,9 @@ describe("registry provenance at the dispatch boundary (round-6 finding 1)", () 
   it("a spread COPY of a gated spec loses provenance and is refused (membership is not copyable)", async () => {
     const ws = makeWorkspace();
     try {
-      const gated = buildRegistry({ cliPresent: () => true }).find((s) => s.name === "codex-cli")!;
+      const gated = buildRegistryForTest({ cliPresent: () => true }).find(
+        (s) => s.name === "codex-cli",
+      )!;
       expect(hasRegistryProvenance(gated)).toBe(true);
       const copy = { ...gated };
       expect(hasRegistryProvenance(copy)).toBe(false);

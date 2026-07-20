@@ -210,8 +210,29 @@ function gate(
  * The v1 adapter set (CAM-EXEC-01): every adapter is returned — enabled, or
  * disabled with its recorded reason. Each is gated on BOTH CLI presence and a
  * recorded sanctioned-path decision; the first failed gate names the reason.
+ *
+ * ZERO-ARGUMENT on purpose (round-7 finding 1): the real PATH scan and the
+ * real repo attestations record are the only gates that can mint registry
+ * provenance through the package's PUBLIC surface. The injectable-probe
+ * variant (buildRegistryForTest) is deliberately NOT exported from the
+ * package barrel, and the package "exports" map blocks deep imports — so a
+ * public caller cannot substitute the probes that decide enablement.
  */
-export function buildRegistry(opts: RegistryOptions = {}): AdapterSpec[] {
+export function buildRegistry(): AdapterSpec[] {
+  return buildRegistryWith({});
+}
+
+/**
+ * TEST-ONLY injection surface (CLI-presence probe + attestations path).
+ * Reachable only by module-path imports inside this repo — the named
+ * first-party boundary (WP-107 owns process isolation); the package's public
+ * gate is the zero-argument buildRegistry() above.
+ */
+export function buildRegistryForTest(opts: RegistryOptions): AdapterSpec[] {
+  return buildRegistryWith(opts);
+}
+
+function buildRegistryWith(opts: RegistryOptions): AdapterSpec[] {
   const present = opts.cliPresent ?? ((bin: string) => cliOnPath(bin, process.env["PATH"]));
   const attestationsPath = opts.attestationsPath ?? DEFAULT_ATTESTATIONS_PATH;
 

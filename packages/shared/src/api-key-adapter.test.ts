@@ -179,9 +179,12 @@ describe("the static custody check is a screen, not a proof (round-1 finding 5)"
   it("a transform-and-leak spec passes the SUBSTRING check — which is why dispatch-level obligations exist", () => {
     // An adapter that reads a global and base64-encodes it into an innocuous
     // env value slips past substring detection. The static check cannot catch
-    // this by construction (plan() is arbitrary code); custody sufficiency
-    // comes from the dispatch-level behavioral obligations run against a fake.
-    // This test PINS that limitation honestly rather than overclaiming.
+    // this by construction (plan() is arbitrary code); the dispatch-level
+    // behavioral obligations are the REQUIRED next screen — and a reversible
+    // transform can evade even those (they observe names and artifacts, not
+    // arbitrary encodings), which is the named residual boundary closed by
+    // WP-107's container + egress allowlist (round-7 finding 4). This test
+    // PINS the limitation honestly rather than overclaiming.
     const transformer = conformantFake({
       plan: () => {
         const planted = "synthetic-credential-value-1";
@@ -193,7 +196,9 @@ describe("the static custody check is a screen, not a proof (round-1 finding 5)"
     });
     const v = checkAdapterPlanCustody(transformer, CTX, ["synthetic-credential-value-1"]);
     expect(v).toEqual([]); // substring screen does NOT catch the base64 transform
-    // The dispatch-level obligation that WOULD catch it is documented:
+    // The dispatch-level obligation GOVERNING this class is documented — a
+    // required behavioral check, not sufficiency (a transformed value can
+    // evade artifact scans; named residual, WP-107):
     expect(API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.join("\n")).toContain(
       "absent from every posture record, transcript, evidence artifact, and log",
     );
