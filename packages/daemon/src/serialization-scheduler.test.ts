@@ -696,6 +696,38 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
   });
 
+  it("activation is urgent-first, not global FIFO: a younger urgent task activates ahead of an OLDER queued primary (AMEND-7 verify pass)", () => {
+    const h = newHarness();
+    // A quick task holds primary (unadmittable) so BOTH later missions queue.
+    const q0 = intakeQuickTask(h, "Quick holder", false);
+    expect(planAndApproveQuick(h, q0)).toBe("approved");
+    startQuickExecution(h, q0);
+
+    // Reversed intake order vs the r5 finding 1 test above: the PRIMARY
+    // queues first and is the OLDER entry — a single global FIFO would pick
+    // it. Only per-lane urgent-first activation picks the younger urgent.
+    const m1 = intakePrdMission(h, "Older primary");
+    expect(planAndApprove(h, m1)).toBe("queued"); // primary held
+    const qU = intakeQuickTask(h, "Younger urgent", true);
+    expect(planAndApproveQuick(h, qU)).toBe("queued"); // lane unavailable (quick primary)
+
+    // The holder terminates: both slots free, the primary entry is OLDER.
+    completeQuickTask(h, q0, "holder-sha");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "urgent", missionId: qU, to: "approved" },
+    ]);
+    expect(h.recorder.currentState("mission", m1)).toBe("queued");
+
+    // The urgent task lands → the older primary follows.
+    startQuickExecution(h, qU);
+    completeQuickTask(h, qU, "urgent-sha");
+    expect(h.scheduler.activateNext(h.repoId)).toEqual([
+      { lane: "primary", missionId: m1, to: "approved" },
+    ]);
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+    expect(h.scheduler.auditActivations(h.repoId)).toEqual([]);
+  });
+
   it("admission is symmetric: a primary approval while the urgent lane is occupied queues (r4 finding 1)", () => {
     const h = newHarness();
     // Urgent-first: an urgent quick task alone on the repo takes the lane
@@ -760,6 +792,34 @@ describe("the urgent lane (CAM-CORE-08 'one active mission, plus the urgent lane
     // The urgent task lands; the paused quick task resumes to executing.
     completeQuickTask(h, qU, "urgent-sha");
     expect(apply(h, q, "mission-resumed", {}, "david")).toBe("executing");
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+  });
+
+  it("a paused-external primary is parked: the urgent lane admits beside it (AMEND-7 verify pass)", () => {
+    const h = newHarness();
+    const m1 = intakePrdMission(h, "Externally paused primary");
+    planAndApprove(h, m1);
+    startExecution(h, m1);
+    // An ExternalEdit impact parks the primary (A.1#14) — the third parked
+    // state, previously unexercised at the scheduler level.
+    apply(h, m1, "external-edit-detected");
+    expect(h.recorder.currentState("mission", m1)).toBe("paused-external");
+
+    const qU = intakeQuickTask(h, "Urgent while externally paused", true);
+    expect(h.scheduler.executionSlotFreeFor(qU)).toBe(true);
+    expect(planAndApproveQuick(h, qU)).toBe("approved");
+    startQuickExecution(h, qU);
+    const during = h.scheduler.laneOccupancy(h.repoId);
+    expect(during.primary).toEqual({ missionId: m1, state: "paused-external" });
+    expect(during.urgent).toEqual({ missionId: qU, state: "executing" });
+    expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
+
+    // The urgent task lands; the impact assessment completes; the primary
+    // resumes (A.1#20).
+    completeQuickTask(h, qU, "urgent-sha");
+    expect(
+      apply(h, m1, "interruption-resolved", { affectedIssuesHandled: true }, "camino:scheduler"),
+    ).toBe("executing");
     expect(h.scheduler.serializationViolations(h.repoId)).toEqual([]);
   });
 
