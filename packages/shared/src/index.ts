@@ -1,5 +1,9 @@
+// NOTE: the requirement-id and intent-id GRAMMARS are deliberately absent from
+// this barrel as live RegExps — reach them through their predicates. See the
+// note on REQUIREMENT_ID_PATTERN_SOURCE for why freezing a RegExp is not
+// enough, and barrel-immutability.test.ts for the pin.
 export {
-  REQUIREMENT_ID_PATTERN,
+  REQUIREMENT_ID_PATTERN_SOURCE,
   isRequirementId,
   parseRequirementId,
   formatRequirementId,
@@ -30,7 +34,8 @@ export {
   INTENT_STATUSES,
   DefinitiveRefusalError,
   IndeterminateOutcomeError,
-  INTENT_ID_PATTERN,
+  INTENT_ID_PATTERN_SOURCE,
+  isValidIntentId,
   intentMarkerToken,
   correlationToken,
 } from "./external-ops.js";

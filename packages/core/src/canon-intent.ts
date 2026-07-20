@@ -47,7 +47,7 @@
  * expressible path; it cannot make an in-process liar inexpressible,
  * and does not claim to.
  */
-import { LEDGER_EVENTS, REQUIREMENT_ID_PATTERN } from "@camino/shared";
+import { LEDGER_EVENTS, REQUIREMENT_ID_PATTERN_SOURCE, isRequirementId } from "@camino/shared";
 import type {
   IntentDisposition,
   LedgerAppendInput,
@@ -358,7 +358,7 @@ function payloadProblem(event: LedgerEventName, payload: Record<string, unknown>
       if (reason !== null) return reason;
       const conflictWith = payload["conflictWith"];
       if (conflictWith !== null) {
-        if (typeof conflictWith !== "string" || !REQUIREMENT_ID_PATTERN.test(conflictWith)) {
+        if (typeof conflictWith !== "string" || !isRequirementId(conflictWith)) {
           return "conflictWith must be null or a requirement id (CAM-AREA-NN)";
         }
       }
@@ -414,8 +414,8 @@ export function decideLedgerAppend(
 function decideLedgerAppendInner(view: LedgerView, input: LedgerAppendInput): LedgerAppendDecision {
   const requirementProblem = ((): string | null => {
     if (typeof input.requirementId !== "string") return "requirementId must be a string";
-    if (!REQUIREMENT_ID_PATTERN.test(input.requirementId)) {
-      return `requirementId must match the stable-id grammar ${REQUIREMENT_ID_PATTERN} (CAM-AREA-NN)`;
+    if (!isRequirementId(input.requirementId)) {
+      return `requirementId must match the stable-id grammar /${REQUIREMENT_ID_PATTERN_SOURCE}/ (CAM-AREA-NN)`;
     }
     return null;
   })();

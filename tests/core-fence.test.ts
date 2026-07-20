@@ -130,7 +130,7 @@ const BYPASS_PROBES: Array<{ name: string; file: string; source: string }> = [
     name: "relative parent-traversal into shared sources",
     file: "__fence_trip__parent.ts",
     source:
-      'import { REQUIREMENT_ID_PATTERN } from "../../shared/src/requirement-id.js";\nexport const leak = REQUIREMENT_ID_PATTERN;\n',
+      'import { isRequirementId } from "../../shared/src/requirement-id.js";\nexport const leak = isRequirementId;\n',
   },
   {
     name: "any parent traversal at all (core/src is flat by policy)",

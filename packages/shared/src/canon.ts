@@ -24,14 +24,14 @@
  * table (with each row's design citation) is
  * `DISPOSITION_TRANSITIONS` in @camino/core.
  */
-export const INTENT_DISPOSITIONS = [
+export const INTENT_DISPOSITIONS = Object.freeze([
   "proposed",
   "accepted",
   "disputed",
   "resolved-accepted",
   "assumed",
   "descoped",
-] as const;
+] as const);
 export type IntentDisposition = (typeof INTENT_DISPOSITIONS)[number];
 
 /**
@@ -40,7 +40,7 @@ export type IntentDisposition = (typeof INTENT_DISPOSITIONS)[number];
  * intent"). `assumed` is accepted intent with a documented assumption the
  * user signed off.
  */
-export const ACCEPTED_FAMILY = ["accepted", "resolved-accepted", "assumed"] as const;
+export const ACCEPTED_FAMILY = Object.freeze(["accepted", "resolved-accepted", "assumed"] as const);
 
 /**
  * The intent ledger's CLOSED event vocabulary (CAM-CANON-01): exactly the
@@ -50,7 +50,7 @@ export const ACCEPTED_FAMILY = ["accepted", "resolved-accepted", "assumed"] as c
  * edits, and probe results have no name here and therefore no way in.
  * Those are observations; they belong to `CANON_FACT_KINDS`.
  */
-export const LEDGER_EVENTS = [
+export const LEDGER_EVENTS = Object.freeze([
   /** PRD intake surfaced this requirement from the user's own text (design invariant 6). */
   "requirement-proposed",
   /** Intake confirmation: the user confirmed the checklist item (CAM-PLAN-02). */
@@ -63,7 +63,7 @@ export const LEDGER_EVENTS = [
   "dispute-assumed",
   /** Descope approval: the user explicitly removed the requirement from intent. */
   "requirement-descoped",
-] as const;
+] as const);
 export type LedgerEventName = (typeof LEDGER_EVENTS)[number];
 
 /** What a ledger writer submits; the store assigns `seq` and `recordedAt`. */
@@ -96,7 +96,7 @@ export interface LedgerReadFilter {
  * projection derives implementation-state and evidence-state from facts,
  * and intent-disposition exclusively from ledger records (CAM-CANON-01).
  */
-export const CANON_FACT_KINDS = [
+export const CANON_FACT_KINDS = Object.freeze([
   /** Branch B's changes touch requirement R (drives the no-inheritance rule). */
   "requirement-touched",
   /** R's implementation is present on branch B at a SHA (issue merge into the mission branch). */
@@ -123,7 +123,7 @@ export const CANON_FACT_KINDS = [
   "verification-blocked",
   /** A previously recorded verification block cleared. */
   "verification-unblocked",
-] as const;
+] as const);
 export type CanonFactKind = (typeof CANON_FACT_KINDS)[number];
 
 /** What a fact writer submits; the store assigns `seq` and `recordedAt`. */
@@ -157,7 +157,12 @@ export type ImplementationState =
   | { readonly kind: "suspected-absent" };
 
 /** Evidence-state (CAM-CANON-03, verbatim values). */
-export const EVIDENCE_STATES = ["unverified", "verified-live", "stale", "blocked"] as const;
+export const EVIDENCE_STATES = Object.freeze([
+  "unverified",
+  "verified-live",
+  "stale",
+  "blocked",
+] as const);
 export type EvidenceState = (typeof EVIDENCE_STATES)[number];
 
 /**

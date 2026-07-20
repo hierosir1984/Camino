@@ -3,7 +3,7 @@ import {
   formatRequirementId,
   isRequirementId,
   parseRequirementId,
-  REQUIREMENT_ID_PATTERN,
+  REQUIREMENT_ID_PATTERN_SOURCE,
 } from "./requirement-id.js";
 
 describe("requirement IDs", () => {
@@ -30,6 +30,10 @@ describe("requirement IDs", () => {
   });
 
   it("pattern stays anchored (no partial matches)", () => {
-    expect(REQUIREMENT_ID_PATTERN.test("xxCAM-CORE-01yy")).toBe(false);
+    expect(isRequirementId("xxCAM-CORE-01yy")).toBe(false);
+    // The exported SOURCE carries the anchors, so messages built from it
+    // describe the grammar the predicate actually enforces.
+    expect(REQUIREMENT_ID_PATTERN_SOURCE.startsWith("^")).toBe(true);
+    expect(REQUIREMENT_ID_PATTERN_SOURCE.endsWith("$")).toBe(true);
   });
 });

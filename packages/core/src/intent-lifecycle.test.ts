@@ -4,7 +4,7 @@
  * fail-closed log verification recovery rides on.
  */
 import { describe, expect, it } from "vitest";
-import { INTENT_ID_PATTERN, correlationToken, intentMarkerToken } from "@camino/shared";
+import { correlationToken, intentMarkerToken, isValidIntentId } from "@camino/shared";
 import type { IntentEventRecord } from "@camino/shared";
 import {
   DAVID_ACTOR,
@@ -463,7 +463,7 @@ describe("intent-id grammar and token containment (round 2, finding 1)", () => {
       });
       expect(decision.ok, JSON.stringify(bad)).toBe(false);
     }
-    expect(INTENT_ID_PATTERN.test("intent-A.2_ok")).toBe(true);
+    expect(isValidIntentId("intent-A.2_ok")).toBe(true);
   });
 
   it("token containment is impossible for distinct grammar-legal ids", () => {

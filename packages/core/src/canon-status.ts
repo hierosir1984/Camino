@@ -40,7 +40,7 @@
  * walks assert mechanical coverage over the fired sets — coverage is
  * observed, not self-reported (review round 1, finding 10).
  */
-import { REQUIREMENT_ID_PATTERN } from "@camino/shared";
+import { isRequirementId } from "@camino/shared";
 import type {
   CanonFactInput,
   CanonFactRecord,
@@ -298,10 +298,7 @@ export function validateCanonFact(input: CanonFactInput): FactValidation {
 }
 
 function validateCanonFactInner(input: CanonFactInput): FactValidation {
-  if (
-    typeof input.requirementId !== "string" ||
-    !REQUIREMENT_ID_PATTERN.test(input.requirementId)
-  ) {
+  if (typeof input.requirementId !== "string" || !isRequirementId(input.requirementId)) {
     return { ok: false, problem: "requirementId must match the stable-id grammar (CAM-AREA-NN)" };
   }
   if (!(CANON_FACT_KINDS as readonly string[]).includes(input.kind)) {
