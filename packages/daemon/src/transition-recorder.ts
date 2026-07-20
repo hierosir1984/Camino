@@ -21,8 +21,11 @@
  * Single-writer: one recorder owns a store at a time. Every append is a
  * compare-and-swap against the recorder's known last seq, atomic with the
  * insert inside the store's transaction; a second writer's interleaving
- * refuses rather than corrupts. The durable cross-process recovery lock is
- * WP-104 (CAM-STATE-03).
+ * refuses rather than corrupts. The durable cross-process guarantee is the
+ * WP-104 writer lock (writer-lock.ts, CAM-STATE-03): the production
+ * composition (recovery.ts) acquires it before this recorder's store
+ * opens, and the store asserts it before every append — the CAS below
+ * stays as in-process defense-in-depth beneath that kernel guarantee.
  */
 import type { EntityKind, EventRecord, EventStore, RejectionCode } from "@camino/shared";
 import { decideTransition, foldView, applyRecord, verifyReplay } from "@camino/core";
@@ -98,7 +101,8 @@ export class TransitionRecorder {
     });
     // Atomic single-writer append: the store checks-and-inserts in one
     // transaction against the recorder's known last seq (CAM-STATE-03;
-    // the durable cross-process recovery lock lands with WP-104).
+    // in-process defense-in-depth beneath the WP-104 writer lock the
+    // production composition holds).
     const record = this.store.append(
       {
         entityKind,
