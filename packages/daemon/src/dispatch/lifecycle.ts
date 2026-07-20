@@ -516,13 +516,29 @@ export async function dispatch(
     let pendingQuota = false;
     const recordEvent = (ev: StreamEvent) => {
       totalEvents++;
-      // Defensive read: a buggy parser could return an event whose quotaSignal
-      // is a throwing getter — that must not crash the harness (round-3
-      // finding 1; same spirit as the parseLine try/catch).
-      // Read the two properties in SEPARATE try blocks: a throwing
-      // terminalSuccess getter must NOT erase an already-read valid quotaSignal
-      // (that would misclassify a rate-limit as requirement-failed, violating
-      // CAM-EXEC-06 — round-12 finding 2).
+      // NORMALIZE the parsed event to a plain snapshot ONCE on entry, each
+      // field read in its OWN guard. A buggy/hostile first-party parser could
+      // return an event with a throwing getter on ANY field; reading each
+      // independently here means (a) a throw on one field never erases another
+      // (a throwing terminalSuccess must not drop a valid quotaSignal —
+      // CAM-EXEC-06, round-12 finding 2), and (b) every DOWNSTREAM read
+      // (classification, assembleFinalText) operates on a plain object with no
+      // getters, so nothing past this point can throw and override the outcome
+      // (rounds 3–12 hostile-getter class, closed structurally here).
+      let kind: StreamEvent["kind"] = "other";
+      try {
+        const k = ev.kind;
+        if (k === "assistant" || k === "tool" || k === "result" || k === "error") kind = k;
+      } catch {
+        kind = "other";
+      }
+      let text = "";
+      try {
+        const t = ev.text;
+        if (typeof t === "string") text = t;
+      } catch {
+        text = "";
+      }
       let sig = false;
       try {
         sig = ev.quotaSignal === true;
@@ -535,6 +551,12 @@ export async function dispatch(
       } catch {
         terminalOk = false;
       }
+      const snap: StreamEvent = {
+        kind,
+        text,
+        ...(sig ? { quotaSignal: true } : {}),
+        ...(terminalOk ? { terminalSuccess: true } : {}),
+      };
       if (sig) {
         anyEventQuota = true;
         pendingQuota = true;
@@ -544,9 +566,9 @@ export async function dispatch(
         // codex agent_message is NOT terminal; turn.completed is).
         pendingQuota = false;
       }
-      if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);
+      if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(snap);
       else {
-        tailRing.push(ev);
+        tailRing.push(snap);
         if (tailRing.length > EVENT_TAIL_CAP) tailRing.shift();
       }
     };

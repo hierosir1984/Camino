@@ -682,6 +682,33 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("a throwing getter on ANY parsed-event field (kind) cannot drop the quota classification — events are normalized on entry (round-12 hostile-getter class)", async () => {
+    // The event snapshot at recordEvent reads every field in its own guard, so
+    // a hostile kind getter cannot make assembleFinalText throw and let the
+    // outer catch override quota-blocked with requirement-failed.
+    const ws = makeWorkspace();
+    try {
+      const hostile: AdapterSpec = {
+        ...mockAdapter("quota"),
+        parseLine: (): StreamEvent =>
+          ({
+            text: "429 rate limit reached",
+            quotaSignal: true,
+            get kind(): StreamEvent["kind"] {
+              throw new Error("toxic kind getter");
+            },
+          }) as unknown as StreamEvent,
+      };
+      const rec = await dispatch(hostile, { workdir: ws, prompt: "x" });
+      expect(rec.exitCode).not.toBe(0);
+      expect(rec.outcome).toBe("quota-blocked"); // preserved despite the throwing kind getter
+      expect(rec.quotaSignalSeen).toBe(true);
+      expect(rec.unexpectedError).toBeUndefined(); // no throw escaped into the catch
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a throwing transcript sink cannot crash the dispatch; cleanup + lease still run (round-1 finding 2)", async () => {
     const ws = makeWorkspace();
     try {
