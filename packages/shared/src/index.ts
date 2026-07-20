@@ -70,10 +70,15 @@ export {
   STRIPPED_ENV_EXACT,
   STRIPPED_ENV_PREFIXES,
   WORKER_ENV_ALLOWLIST,
+  OFFICIAL_ADAPTER_NAMES,
+  OFFICIAL_CLI_CONFIG_ROOTS,
+  CREDENTIAL_ROOT_ENV_KEYS,
+  isCredentialRootEnvKey,
   isStrippedWorkerEnvKey,
   isGitOrSshChannelEnvKey,
   isWorkerEnvAllowlistKey,
 } from "./adapter.js";
+export type { OfficialAdapterName } from "./adapter.js";
 export type {
   StreamEvent,
   DispatchOutcome,

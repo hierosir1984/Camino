@@ -9,13 +9,25 @@
 // lives in @camino/shared so this composer and the API-key adapter contract
 // check enforce ONE source of truth: a channel the composer closes cannot be
 // re-opened by an API-key adapter declaring it as a "credential env var".
-import type { EnvPostureRecord } from "@camino/shared";
+import type { EnvPostureRecord, OfficialAdapterName } from "@camino/shared";
 import {
   WORKER_ENV_ALLOWLIST,
+  OFFICIAL_CLI_CONFIG_ROOTS,
+  isCredentialRootEnvKey,
   isGithubCredentialShapedKey,
   isStrippedWorkerEnvKey,
   isWorkerEnvAllowlistKey,
 } from "@camino/shared";
+
+/**
+ * Adapter identity for credential-root scoping (round-6 finding 2). An
+ * official CLI receives HOME + its OWN config root; any other worker receives
+ * NO credential roots (CAM-SEC-06: composition references host credential
+ * state for official CLIs only — enforced here, not merely stated).
+ */
+export interface WorkerEnvScope {
+  officialCli?: OfficialAdapterName;
+}
 
 /**
  * Compose a clean worker environment: an allowlist of inherited keys (locked
@@ -40,12 +52,19 @@ import {
 export function composeWorkerEnv(
   source: NodeJS.ProcessEnv,
   extra: Record<string, string> = {},
+  scope: WorkerEnvScope = {},
 ): { env: Record<string, string>; posture: EnvPostureRecord } {
   const env: Record<string, string> = {};
 
-  // 1. Inherit the host allowlist.
+  // 1. Inherit the host allowlist, credential roots SCOPED per adapter
+  //    identity (round-6 finding 2): an official CLI gets HOME + its OWN
+  //    config root; every other worker gets the base keys only.
+  const grantedRoots = new Set<string>(
+    scope.officialCli ? ["HOME", OFFICIAL_CLI_CONFIG_ROOTS[scope.officialCli]] : [],
+  );
   const inherited: Record<string, string> = {};
   for (const key of WORKER_ENV_ALLOWLIST) {
+    if (isCredentialRootEnvKey(key) && !grantedRoots.has(key)) continue;
     const v = source[key];
     if (typeof v === "string") inherited[key] = v;
   }
@@ -92,6 +111,9 @@ export function composeWorkerEnv(
       gitGlobalNeutralized:
         env["GIT_CONFIG_GLOBAL"] === "/dev/null" && env["GIT_CONFIG_SYSTEM"] === "/dev/null",
       strippedKeys: strippedKeys.sort(),
+      // Which credential roots this worker was actually granted AND the host
+      // had set (names only) — [] for every non-official worker.
+      credentialRootKeys: [...grantedRoots].filter((k) => k in inherited).sort(),
     },
   };
 }

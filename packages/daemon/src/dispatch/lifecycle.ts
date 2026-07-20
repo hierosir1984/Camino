@@ -28,7 +28,10 @@ import type {
   EnvPostureRecord,
   StreamEvent,
 } from "@camino/shared";
+import { OFFICIAL_ADAPTER_NAMES } from "@camino/shared";
+import type { OfficialAdapterName } from "@camino/shared";
 import { composeWorkerEnv } from "./env.js";
+import { hasRegistryProvenance } from "./registry.js";
 
 /** Kill-confirm timings. Production defaults (PRD §5 registry item 4): 30s grace. */
 export interface KillConfirmTimings {
@@ -283,6 +286,7 @@ const EMPTY_POSTURE: EnvPostureRecord = {
   githubCredentialKeys: [],
   gitGlobalNeutralized: false,
   strippedKeys: [],
+  credentialRootKeys: [],
 };
 
 /** Build a terminal record for a dispatch that never produced a running child. */
@@ -363,6 +367,32 @@ export async function dispatch(
     throw new DisabledAdapterError(adapterName, reason);
   }
 
+  // CAM-EXEC-01 registry provenance (round-6 finding 1): an ENABLED spec
+  // bearing an official adapter name must be the exact object buildRegistry()
+  // gated — a first-party caller that constructs (or spreads/copies) an
+  // official spec without the sanctioned-path gate is refused with the same
+  // typed error class, lease settled first. (See hasRegistryProvenance for the
+  // named boundary: this defeats accidental gate bypass, not in-process
+  // forgery — that isolation is WP-107's container.)
+  const officialCli: OfficialAdapterName | undefined = (
+    OFFICIAL_ADAPTER_NAMES as readonly string[]
+  ).includes(adapterName)
+    ? (adapterName as OfficialAdapterName)
+    : undefined;
+  if (officialCli && !hasRegistryProvenance(adapter)) {
+    if (lease) {
+      try {
+        await lease.release({ groupGone: true, outcome: "requirement-failed" });
+      } catch {
+        /* a broken lease store must not mask the refusal */
+      }
+    }
+    throw new DisabledAdapterError(
+      adapterName,
+      "official adapter spec lacks registry provenance — obtain adapters from buildRegistry() (CAM-EXEC-01 sanctioned-path gate)",
+    );
+  }
+
   // TOTAL EXCEPTION SAFETY (rounds 3–5 finding 1). dispatch's object inputs —
   // adapter, opts, signal, lease, timings — are first-party Camino code; the
   // UNTRUSTED surface is the worker's output STREAM (strings), handled totally
@@ -436,7 +466,7 @@ export async function dispatch(
     const rawTimeout = opts.timeoutMs; // one read
     timeoutMs = typeof rawTimeout === "number" ? rawTimeout : undefined;
     onLine = opts.onLine; // snapshot the sink once (round-5 finding 1)
-    posture = composeWorkerEnv(process.env).posture;
+    posture = composeWorkerEnv(process.env, {}, { officialCli }).posture;
 
     if (signal?.aborted) {
       // Cancelled before anything ran: nothing spawned, nothing to kill.
@@ -457,7 +487,7 @@ export async function dispatch(
     // adapter (requirement-failed), never a leaked lease (round-1 finding 2;
     // round-2 finding 3 widened this to the env getter and the spawn call).
     const plan = adapter.plan(ctx);
-    const composed = composeWorkerEnv(process.env, plan.env ?? {});
+    const composed = composeWorkerEnv(process.env, plan.env ?? {}, { officialCli });
     posture = composed.posture;
 
     child = spawn(plan.file, plan.args, {

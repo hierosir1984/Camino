@@ -128,6 +128,13 @@ export interface EnvPostureRecord {
    * record opens.)
    */
   strippedKeys: string[];
+  /**
+   * The credential-root key NAMES granted by adapter-scoped composition and
+   * actually present on the host (round-6 finding 2) — e.g.
+   * ["CODEX_HOME", "HOME"] for an official codex-cli dispatch; ALWAYS [] for a
+   * non-official adapter. Names only, like every posture field.
+   */
+  credentialRootKeys: string[];
 }
 
 /**
@@ -309,27 +316,30 @@ export const STRIPPED_ENV_EXACT = [
 export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "SSH_"] as const;
 
 /**
- * The host-inherited allowlist: the ONLY host env keys a worker inherits.
+ * The worker env inheritance UNION: every host env key ANY worker may inherit.
+ * Composition scopes it further per adapter identity (round-6 finding 2):
  *
- * HOME plus the official CLIs' config-root vars (CODEX_HOME, CLAUDE_CONFIG_DIR,
- * GROK_HOME) are included on purpose — the official vendor CLIs read their OWN
- * subscription auth from those locations (the sanctioned path, CAM-SEC-06). A
- * user who relocated a CLI's config (a non-default CODEX_HOME / GROK_HOME)
- * would otherwise fail to authenticate (round-5 finding 2). These are
- * config-DIRECTORY pointers, not credentials: the composer references the
- * host's own value so each official CLI finds its own credential; Camino never
- * reads, copies, or proxies the credential itself.
+ *   - The BASE keys (PATH/USER/LOGNAME/SHELL/LANG/LC_ALL/TMPDIR) go to every
+ *     worker.
+ *   - The CREDENTIAL-ROOT keys (HOME + the official CLIs' config-root vars
+ *     CODEX_HOME / CLAUDE_CONFIG_DIR / GROK_HOME) reference host credential
+ *     state, so composeWorkerEnv grants them ONLY to an official-CLI dispatch
+ *     — and each official CLI receives HOME plus its OWN root alone
+ *     (CAM-SEC-06: "composition references host credential state for official
+ *     CLIs only" is ENFORCED at composition, not merely stated). A user who
+ *     relocated a CLI's config (a non-default CODEX_HOME / GROK_HOME) still
+ *     authenticates (round-5 finding 2). These are config-DIRECTORY pointers,
+ *     not credentials: the composer references the host's own value so each
+ *     official CLI finds its own credential; Camino never reads, copies, or
+ *     proxies the credential itself.
  *
- * CAM-SEC-06 SCOPING ("host credential state for official CLIs only"): the v1
- * adapter set is EXCLUSIVELY the three official vendor CLIs (CAM-EXEC-01), so
- * inheriting these config roots references host credential state for official
- * CLIs only. The [F] API-key adapter path does NOT broaden HOME-style access —
- * it references credentials by an explicitly DECLARED env var (see
- * api-key-adapter.ts), keeping any non-official credential reference scoped and
- * named.
+ * The [F] API-key adapter path does NOT broaden this: a non-official adapter's
+ * worker env carries NO credential roots at all, and credentials reach it only
+ * via explicitly DECLARED env var names (see api-key-adapter.ts).
  *
- * Shared so the composer inherits exactly these and the API-key contract
- * refuses to let an adapter alias a credential onto one of them.
+ * Shared so the composer inherits exactly (a scoped subset of) these and the
+ * API-key contract refuses to let an adapter alias a credential onto ANY of
+ * them.
  */
 export const WORKER_ENV_ALLOWLIST = [
   "PATH",
@@ -340,11 +350,42 @@ export const WORKER_ENV_ALLOWLIST = [
   "LANG",
   "LC_ALL",
   "TMPDIR",
-  // Official-CLI config roots (sanctioned auth locations), round-5 finding 2.
+  // Official-CLI config roots (sanctioned auth locations), round-5 finding 2;
+  // granted per adapter identity only (round-6 finding 2).
   "CODEX_HOME",
   "CLAUDE_CONFIG_DIR",
   "GROK_HOME",
 ] as const;
+
+/**
+ * The v1 official-CLI adapter set (CAM-EXEC-01). dispatch() requires registry
+ * provenance for a spec bearing one of these names (round-6 finding 1), and
+ * env composition grants credential roots only to them (round-6 finding 2).
+ */
+export const OFFICIAL_ADAPTER_NAMES = ["claude-code", "codex-cli", "grok-build"] as const;
+export type OfficialAdapterName = (typeof OFFICIAL_ADAPTER_NAMES)[number];
+
+/** Each official CLI's config-root env var — the only root it receives besides HOME. */
+export const OFFICIAL_CLI_CONFIG_ROOTS: Record<OfficialAdapterName, string> = {
+  "claude-code": "CLAUDE_CONFIG_DIR",
+  "codex-cli": "CODEX_HOME",
+  "grok-build": "GROK_HOME",
+};
+
+/**
+ * The allowlist subset that references host credential state (CAM-SEC-06).
+ * Granted per adapter identity at composition, never inherited by default.
+ */
+export const CREDENTIAL_ROOT_ENV_KEYS = [
+  "HOME",
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "GROK_HOME",
+] as const;
+
+export function isCredentialRootEnvKey(key: string): boolean {
+  return (CREDENTIAL_ROOT_ENV_KEYS as readonly string[]).includes(key);
+}
 
 /**
  * Is this key one of the git config/redirect or SSH-agent CAPABILITY channels

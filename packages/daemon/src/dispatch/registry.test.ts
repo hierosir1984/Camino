@@ -6,7 +6,12 @@ import type { AdapterSpec } from "@camino/shared";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
-import { buildRegistry, cliOnPath, DEFAULT_ATTESTATIONS_PATH } from "./registry.js";
+import {
+  buildRegistry,
+  cliOnPath,
+  DEFAULT_ATTESTATIONS_PATH,
+  hasRegistryProvenance,
+} from "./registry.js";
 import { runAdapter, renderReport, type AdapterEvidence } from "./smoke.js";
 
 // CAM-EXEC-01 negative path: an adapter whose sanctioned-path / presence check
@@ -195,6 +200,22 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     const reg = buildRegistry({ cliPresent: ALL_PRESENT });
     const grok = reg.find((a) => a.name === "grok-build")!;
     expect(grok.enabled).toBe(true);
+  });
+
+  it("every registry spec carries provenance; a direct factory or a copy does not (round-6 finding 1)", () => {
+    for (const spec of buildRegistry({ cliPresent: ALL_PRESENT })) {
+      expect(hasRegistryProvenance(spec), spec.name).toBe(true);
+    }
+    // Disabled specs are registry products too (dispatch refuses them on
+    // enablement first; provenance still recorded).
+    for (const spec of buildRegistry({ cliPresent: () => false })) {
+      expect(hasRegistryProvenance(spec), spec.name).toBe(true);
+    }
+    // The raw factory and even a field-for-field COPY of a gated spec carry no
+    // provenance — WeakSet membership cannot be forged by copying properties.
+    expect(hasRegistryProvenance(claudeAdapter())).toBe(false);
+    const gated = buildRegistry({ cliPresent: ALL_PRESENT })[0]!;
+    expect(hasRegistryProvenance({ ...gated })).toBe(false);
   });
 
   it("registry decisions are complete: every adapter carries enabled, and a reason when off", () => {

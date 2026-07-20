@@ -128,8 +128,10 @@ if (mode === "hang") {
   emit("error", "429 rate_limit_exceeded: usage limit reached, retry later");
   process.exit(3);
 } else if (mode === "quota-raw") {
-  // A quota signal on a single NON-JSON line (parser drops it) — the raw scan
-  // must still catch it.
+  // A quota signal on a single NON-JSON line: the mock adapter's own non-JSON
+  // (error-context) branch classifies it — the lifecycle has NO raw-line scan
+  // (removed in round 3; round-4 finding 2 scoped dropped-line protection to
+  // the parsers' error channels).
   process.stdout.write("provider error: 429 rate_limit_exceeded, retry later\n");
   process.exit(4);
 } else if (mode === "flood") {

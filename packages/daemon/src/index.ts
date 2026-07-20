@@ -73,9 +73,11 @@ export { composeWorkerEnv } from "./dispatch/env.js";
 export { classifyByQuotaSignal } from "./dispatch/quota.js";
 export { buildRegistry, cliOnPath, DEFAULT_ATTESTATIONS_PATH } from "./dispatch/registry.js";
 export type { RegistryOptions } from "./dispatch/registry.js";
-export { claudeAdapter } from "./dispatch/adapters/claude.js";
-export { codexAdapter } from "./dispatch/adapters/codex.js";
-export { grokAdapter } from "./dispatch/adapters/grok.js";
+// The raw adapter factories are deliberately NOT exported (round-6 finding 1):
+// the package's only path to a dispatchable official adapter is buildRegistry()
+// — its sanctioned-path gate stamps registry provenance, which dispatch()
+// requires for official adapter names. (package.json "exports" confines deep
+// imports, so this is a real package-boundary constraint, not advice.)
 export { committedSince, headSha, makeWorkspace } from "./dispatch/workspace.js";
 
 // WP-109: Living Canon durable stores (CAM-CANON-01/02/03).

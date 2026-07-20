@@ -11,8 +11,7 @@ import {
 } from "./lifecycle.js";
 import { mockAdapter } from "./adapters/mock.js";
 import { claudeAdapter } from "./adapters/claude.js";
-import { codexAdapter } from "./adapters/codex.js";
-import { grokAdapter } from "./adapters/grok.js";
+import { buildRegistry, hasRegistryProvenance } from "./registry.js";
 import { classifyByQuotaSignal } from "./quota.js";
 import { makeWorkspace, headSha, committedSince } from "./workspace.js";
 
@@ -829,15 +828,19 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
   };
 
   function schemaEmittingAdapter(name: string, lines: string[], exitCode: number): AdapterSpec {
-    // Reuse the PRODUCT parser for `name`, but make plan() run a fake CLI that
-    // emits that provider's schema — so parseLine runs inside the real dispatch.
-    const real = {
-      "claude-code": claudeAdapter,
-      "codex-cli": codexAdapter,
-      "grok-build": grokAdapter,
-    }[name]!();
+    // Obtain the REAL gated spec through buildRegistry (registry provenance,
+    // round-6 finding 1 — dispatch refuses an official-name spec that skipped
+    // the sanctioned-path gate), then substitute plan() IN PLACE so a fake CLI
+    // emits the provider's schema while the spec keeps its provenance: the
+    // PRODUCT parser runs inside the real dispatch. (The default attestations
+    // path is the genuine repo record, accepted 2026-07-17.)
+    const spec = buildRegistry({ cliPresent: () => true }).find((s) => s.name === name)!;
     const script = `const lines=${JSON.stringify(lines)};for(const l of lines)process.stdout.write(l+"\\n");process.exit(${exitCode});`;
-    return { ...real, plan: () => ({ file: process.execPath, args: ["-e", script] }) };
+    (spec as { plan: AdapterSpec["plan"] }).plan = () => ({
+      file: process.execPath,
+      args: ["-e", script],
+    });
+    return spec;
   }
 
   for (const [name, fixtures] of Object.entries(PROVIDER_LINES)) {
@@ -851,6 +854,17 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
         expect(rec.outcome).toBe("succeeded");
         expect(rec.streamedEvents).toBeGreaterThan(0);
         expect(rec.finalText.length).toBeGreaterThan(0); // the provider parser produced result text
+        // Scoped credential roots (round-6 finding 2): an official CLI gets
+        // HOME + its OWN config root only — never a sibling CLI's root.
+        const ownRoot = {
+          "claude-code": "CLAUDE_CONFIG_DIR",
+          "codex-cli": "CODEX_HOME",
+          "grok-build": "GROK_HOME",
+        }[name]!;
+        expect(rec.envPosture.credentialRootKeys).toContain("HOME");
+        for (const other of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"]) {
+          if (other !== ownRoot) expect(rec.envPosture.credentialRootKeys).not.toContain(other);
+        }
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }
@@ -864,14 +878,65 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
           prompt: "x",
         });
         expect(rec.outcome).toBe("quota-blocked"); // CAM-EXEC-06, through product parser
-        // Prove the PARSER flagged it (not only the lifecycle's raw-line scan):
-        // a parsed event carries quotaSignal (round-2 finding 8).
+        // Prove the PARSER produced the signal — the lifecycle has had NO
+        // raw-line scan since round 3; a parsed event carries quotaSignal
+        // (round-2 finding 8, round-3 finding 2).
         expect(rec.events.some((e) => e.quotaSignal === true)).toBe(true);
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }
     });
   }
+});
+
+// Round-6 finding 1: CAM-EXEC-01's sanctioned-path gate is enforced AT THE
+// DISPATCH BOUNDARY, not only inside buildRegistry — an enabled spec bearing
+// an official adapter name must be the exact object the registry gated.
+describe("registry provenance at the dispatch boundary (round-6 finding 1)", () => {
+  it("an enabled official-name spec that skipped buildRegistry is refused, lease settled", async () => {
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      // The raw factory default-enables — exactly the accidental bypass the
+      // provenance check refuses (typed, before plan()).
+      await expect(
+        dispatch(claudeAdapter(), { workdir: ws, prompt: "x" }, { lease }),
+      ).rejects.toThrow(/registry provenance/);
+      expect(released).toBe(1); // nothing ran → released, never stranded
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a spread COPY of a gated spec loses provenance and is refused (membership is not copyable)", async () => {
+    const ws = makeWorkspace();
+    try {
+      const gated = buildRegistry({ cliPresent: () => true }).find((s) => s.name === "codex-cli")!;
+      expect(hasRegistryProvenance(gated)).toBe(true);
+      const copy = { ...gated };
+      expect(hasRegistryProvenance(copy)).toBe(false);
+      await expect(dispatch(copy, { workdir: ws, prompt: "x" })).rejects.toThrow(
+        DisabledAdapterError,
+      );
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("non-official adapters (the mock) need no provenance and get NO credential roots (round-6 finding 2)", async () => {
+    const ws = makeWorkspace();
+    try {
+      const rec = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" });
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.envPosture.credentialRootKeys).toEqual([]);
+      for (const root of ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GROK_HOME"]) {
+        expect(rec.envPosture.keys).not.toContain(root);
+      }
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("sample-repo isolation", () => {

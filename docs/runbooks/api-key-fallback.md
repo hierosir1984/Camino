@@ -30,10 +30,15 @@
   Camino references host credential STATE via `HOME` (for file-based CLI auth)
   and never touches the keychain itself — it only lets each official CLI use
   its own credential.
-- Worker dispatches run with an allowlisted environment (`PATH HOME USER
-  LOGNAME SHELL LANG LC_ALL TMPDIR` + git neutralization). `HOME` is preserved
-  exactly so each official CLI can read **its own** file-based auth state — the
-  sanctioned path, for subscription auth and API-key auth alike.
+- Worker dispatches run with an allowlisted environment (base: `PATH USER
+  LOGNAME SHELL LANG LC_ALL TMPDIR` + git neutralization), with credential
+  roots granted **per adapter**: an official CLI's dispatch additionally
+  inherits `HOME` plus that CLI's **own** config-root var
+  (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME`) so it reads **its own**
+  auth state — including a relocated config root — for subscription auth and
+  API-key auth alike. A non-official adapter inherits no credential roots at
+  all (CAM-SEC-06: composition references host credential state for official
+  CLIs only).
 - **Ambient provider key env vars do not reach workers by design.** Exporting
   `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` in your shell has no
   effect on a Camino dispatch (the composer strips credential-shaped keys —

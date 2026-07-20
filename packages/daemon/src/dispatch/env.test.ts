@@ -7,19 +7,23 @@ import { composeWorkerEnv } from "./env.js";
 
 describe("composeWorkerEnv", () => {
   it("inherits ONLY the allowlist; parent credential-shaped vars never leak in", () => {
-    const { env, posture } = composeWorkerEnv({
-      PATH: "/usr/bin",
-      HOME: "/Users/x",
-      USER: "x",
-      LANG: "en_US.UTF-8",
-      // none of these are on the allowlist:
-      GITHUB_TOKEN: "ghp_parent",
-      ANTHROPIC_API_KEY: "sk-ant-parent",
-      OPENAI_API_KEY: "sk-parent",
-      XAI_API_KEY: "xai-parent",
-      SSH_AUTH_SOCK: "/tmp/agent.sock",
-      RANDOM_PARENT_VAR: "noise",
-    });
+    const { env, posture } = composeWorkerEnv(
+      {
+        PATH: "/usr/bin",
+        HOME: "/Users/x",
+        USER: "x",
+        LANG: "en_US.UTF-8",
+        // none of these are on the allowlist:
+        GITHUB_TOKEN: "ghp_parent",
+        ANTHROPIC_API_KEY: "sk-ant-parent",
+        OPENAI_API_KEY: "sk-parent",
+        XAI_API_KEY: "xai-parent",
+        SSH_AUTH_SOCK: "/tmp/agent.sock",
+        RANDOM_PARENT_VAR: "noise",
+      },
+      {},
+      { officialCli: "claude-code" }, // official scope: HOME granted (round-6 finding 2)
+    );
     expect(env["GITHUB_TOKEN"]).toBeUndefined();
     expect(env["ANTHROPIC_API_KEY"]).toBeUndefined();
     expect(env["OPENAI_API_KEY"]).toBeUndefined();
@@ -143,18 +147,60 @@ describe("composeWorkerEnv", () => {
     }
   });
 
-  it("preserves the official CLIs' config-root vars so custom locations still authenticate (round-5 finding 2)", () => {
-    const { env } = composeWorkerEnv({
+  it("each official CLI gets HOME + its OWN config root only — relocated configs authenticate, siblings' roots do not leak (round-5 finding 2, scoped per round-6 finding 2)", () => {
+    const host = {
       PATH: "/usr/bin",
       HOME: "/Users/x",
       CODEX_HOME: "/custom/codex",
       CLAUDE_CONFIG_DIR: "/custom/claude",
       GROK_HOME: "/custom/grok",
+    };
+    const cases = [
+      { officialCli: "codex-cli", own: "CODEX_HOME", value: "/custom/codex" },
+      { officialCli: "claude-code", own: "CLAUDE_CONFIG_DIR", value: "/custom/claude" },
+      { officialCli: "grok-build", own: "GROK_HOME", value: "/custom/grok" },
+    ] as const;
+    for (const { officialCli, own, value } of cases) {
+      const { env, posture } = composeWorkerEnv(host, {}, { officialCli });
+      expect(env[own], officialCli).toBe(value); // its own (possibly relocated) root
+      expect(env["HOME"], officialCli).toBe("/Users/x");
+      for (const other of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "GROK_HOME"]) {
+        if (other !== own)
+          expect(env[other], `${officialCli} must not see ${other}`).toBeUndefined();
+      }
+      expect(posture.credentialRootKeys).toEqual([...["HOME", own]].sort());
+    }
+  });
+
+  it("a NON-official worker gets no credential roots at all (round-6 finding 2, CAM-SEC-06)", () => {
+    const { env, posture } = composeWorkerEnv({
+      PATH: "/usr/bin",
+      HOME: "/Users/x",
+      USER: "x",
+      CODEX_HOME: "/custom/codex",
+      CLAUDE_CONFIG_DIR: "/custom/claude",
+      GROK_HOME: "/custom/grok",
     });
-    expect(env["CODEX_HOME"]).toBe("/custom/codex");
-    expect(env["CLAUDE_CONFIG_DIR"]).toBe("/custom/claude");
-    expect(env["GROK_HOME"]).toBe("/custom/grok");
-    expect(env["HOME"]).toBe("/Users/x");
+    for (const root of ["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "GROK_HOME"]) {
+      expect(env[root], root).toBeUndefined();
+    }
+    expect(env["PATH"]).toBe("/usr/bin"); // base keys still compose
+    expect(env["USER"]).toBe("x");
+    expect(posture.credentialRootKeys).toEqual([]);
+  });
+
+  it("an extra can never introduce a credential root the scope did not grant", () => {
+    // Allowlist keys are host-only (round-1 finding 4), which also means an
+    // adapter extra cannot smuggle in a sibling CLI's root or HOME.
+    const { env } = composeWorkerEnv(
+      { PATH: "/usr/bin", HOME: "/Users/x", CLAUDE_CONFIG_DIR: "/custom/claude" },
+      { CODEX_HOME: "/evil/codex", GROK_HOME: "/evil/grok", HOME: "/evil/home" },
+      { officialCli: "claude-code" },
+    );
+    expect(env["CLAUDE_CONFIG_DIR"]).toBe("/custom/claude"); // granted, host-derived
+    expect(env["HOME"]).toBe("/Users/x"); // granted, host value wins
+    expect(env["CODEX_HOME"]).toBeUndefined(); // not granted; extra rejected
+    expect(env["GROK_HOME"]).toBeUndefined();
   });
 
   it("strips the whole SSH_* family by prefix, incl. SSH_SK_PROVIDER (round-3 finding 3)", () => {
@@ -181,6 +227,7 @@ describe("composeWorkerEnv", () => {
     const { env } = composeWorkerEnv(
       { PATH: "/host/bin", HOME: "/host/home", USER: "hostuser", LANG: "en_US.UTF-8" },
       { HOME: "/evil/home", PATH: "/evil/bin", USER: "evil", LANG: "xx" },
+      { officialCli: "claude-code" },
     );
     expect(env["HOME"]).toBe("/host/home");
     expect(env["PATH"]).toBe("/host/bin");
@@ -191,7 +238,11 @@ describe("composeWorkerEnv", () => {
   it("an allowlist key absent from the host stays absent even if an extra supplies it", () => {
     // Re-assertion copies only keys the host actually had — an extra cannot
     // introduce an allowlist key the host never set.
-    const { env } = composeWorkerEnv({ PATH: "/host/bin" }, { HOME: "/evil/home" });
+    const { env } = composeWorkerEnv(
+      { PATH: "/host/bin" },
+      { HOME: "/evil/home" },
+      { officialCli: "claude-code" }, // HOME granted by scope — but the host never set it
+    );
     expect(env["PATH"]).toBe("/host/bin");
     expect(env["HOME"]).toBeUndefined();
   });

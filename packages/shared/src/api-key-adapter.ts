@@ -19,6 +19,12 @@
 //     from HOST env state into the worker env at spawn time: composition
 //     references host credential state; Camino never persists, logs, records,
 //     or proxies the values. Posture records carry key NAMES only.
+//   - The worker env an API-key adapter receives is the NON-official base
+//     (round-6 finding 2): NO HOME and NO official-CLI config root
+//     (CLAUDE_CONFIG_DIR / CODEX_HOME / GROK_HOME) — composeWorkerEnv grants
+//     credential roots per adapter identity, to official CLIs only
+//     (CAM-SEC-06). An API-key adapter's credential surface is therefore
+//     exactly its DECLARED names, never ambient host credential roots.
 //   - Values must never appear in argv (process listings are world-readable
 //     on shared systems), in stdin prompts, in SpawnPlan env values, or in
 //     any Camino store or evidence artifact.
