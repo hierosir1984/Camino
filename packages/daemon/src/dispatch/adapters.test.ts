@@ -196,6 +196,54 @@ describe("adapter quota gating is error-context-only (round-3 finding 2)", () =>
     );
     expect(codexErr?.quotaSignal).toBeUndefined();
   });
+
+  it("codex turn.failed carries quota via its NESTED error.message (round-4 finding 2)", () => {
+    // Official Codex 0.144 schema: {type:"turn.failed", error:{message}}. The
+    // type does not contain "error", so it must be handled explicitly.
+    const ev = codexAdapter().parseLine(
+      '{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}',
+      "stdout",
+    );
+    expect(ev?.kind).toBe("error");
+    expect(ev?.quotaSignal).toBe(true);
+  });
+
+  it("claude does NOT flag quota-looking non-JSON on STDOUT, only on stderr (round-4 finding 2)", () => {
+    const stdout = claudeAdapter().parseLine(
+      "Documentation example: HTTP 429 means rate limiting.",
+      "stdout",
+    );
+    expect(stdout).toBeNull(); // stdout prose is not an error context
+
+    const stderr = claudeAdapter().parseLine("HTTP 429 Too Many Requests", "stderr");
+    expect(stderr?.kind).toBe("error");
+    expect(stderr?.quotaSignal).toBe(true);
+  });
+
+  it("a truncated/malformed provider error on STDERR still yields a quota signal (round-4 finding 2)", () => {
+    // Dropped-line protection, scoped to the error channel: a truncated JSON
+    // error whose signal token survives the truncation still classifies.
+    for (const adapter of [codexAdapter(), grokAdapter()]) {
+      const ev = adapter.parseLine('{"error":{"message":"rate_limit_exceeded — truncat', "stderr");
+      expect(ev?.quotaSignal, adapter.name).toBe(true);
+    }
+    // …but a malformed line on STDOUT is not treated as a quota error.
+    expect(codexAdapter().parseLine('{"broken rate_limit_exceeded', "stdout")).toBeNull();
+  });
+
+  it("flags the installed provider exhaustion strings the raw scan used to catch (round-4 finding 3)", () => {
+    for (const s of [
+      "You hit your weekly limit.",
+      "You hit your free usage limit.",
+      "run out of credits",
+      "over your spending limit",
+      "usage balance exhausted",
+      "Please retry after 10 seconds.",
+      "You have exceeded your rate limit.",
+    ]) {
+      expect(classifyErrorTextForQuota(s), s).toBe(true);
+    }
+  });
 });
 
 // Parser robustness: syntactically valid events with malformed shapes, and

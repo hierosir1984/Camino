@@ -37,9 +37,11 @@ export function codexAdapter(
       // stderr, error items, and error events — never assistant/agent output.
       const errText = (text: string): { quotaSignal: true } | Record<string, never> =>
         classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
-      if (!trimmed.startsWith("{")) {
-        // Codex prints non-JSON progress/errors, esp. on stderr — an error
-        // channel, so a rate-limit / exhaustion signal here is a quota signal.
+      // A non-JSON OR malformed-JSON line on STDERR is diagnostic/error output:
+      // catch a rate-limit / exhaustion signal here so a truncated provider
+      // error is not lost (round-4 finding 2 — restores WP-001 dropped-line
+      // protection, but scoped to the error channel to stay prose-safe).
+      const stderrErr = (): StreamEvent | null => {
         if (channel === "stderr" && trimmed.length > 0) {
           const eq = classifyErrorTextForQuota(trimmed);
           return {
@@ -49,17 +51,25 @@ export function codexAdapter(
           };
         }
         return null;
-      }
+      };
+      if (!trimmed.startsWith("{")) return stderrErr();
       let obj: Record<string, unknown>;
       try {
         obj = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
-        return null;
+        return stderrErr(); // malformed JSON on stderr can still carry the signal
       }
       // Observed codex 0.144 JSONL: {type:"thread.started"|"item.completed"|
-      // "turn.completed", item?:{type:"agent_message"|"error"|"command_execution"
-      // |"file_change"|…, text?|message?}}.
+      // "turn.completed"|"turn.failed", item?:{…}, error?:{message}}.
       const type = String(obj["type"] ?? "");
+      // turn.failed carries a nested {error:{message}} (official 0.144 schema)
+      // and does NOT contain "error" in its type — handle it explicitly
+      // (round-4 finding 2).
+      if (type === "turn.failed") {
+        const err = (obj["error"] ?? {}) as Record<string, unknown>;
+        const text = String(err["message"] ?? "turn.failed").slice(0, 400);
+        return { kind: "error", text, ...errText(text) };
+      }
       if (type === "item.completed" || type === "item.started") {
         const item = (obj["item"] ?? {}) as Record<string, unknown>;
         const itemType = String(item["type"] ?? "");

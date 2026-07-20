@@ -38,9 +38,12 @@ export function grokAdapter(
       const trimmed = line.trim();
       // Quota is only trusted in an ERROR CONTEXT (round-2/3 finding 2/5):
       // stderr and error events — never the token-streamed assistant answer.
-      if (!trimmed.startsWith("{")) {
+      // A non-JSON OR malformed-JSON line on STDERR is diagnostic/error output;
+      // catch a signal there so a truncated provider error is not lost (round-4
+      // finding 2, dropped-line protection scoped to the error channel).
+      const stderrErr = (): StreamEvent | null => {
         if (channel === "stderr" && trimmed.length > 0) {
-          const eq = classifyErrorTextForQuota(trimmed); // stderr = error context
+          const eq = classifyErrorTextForQuota(trimmed);
           return {
             kind: eq ? "error" : "other",
             text: trimmed.slice(0, 400),
@@ -48,14 +51,19 @@ export function grokAdapter(
           };
         }
         return null;
-      }
+      };
+      if (!trimmed.startsWith("{")) return stderrErr();
       let obj: Record<string, unknown>;
       try {
         obj = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
-        return null;
+        return stderrErr(); // malformed JSON on stderr can still carry the signal
       }
       // Observed grok 0.2 streaming-json: {type:"thought"|"text"|"end", data?}.
+      // NOTE: grok's REAL exhaustion envelope is unverified (WP-001 never hit a
+      // real rate limit). This adapter trusts a rate-limit signal on an
+      // explicit error event or on stderr; if grok were observed to emit
+      // exhaustion on a `text` event, this gating would need that shape added.
       // Assistant answer arrives token-fragmented as many {type:"text",data}
       // events; reasoning as {type:"thought",data}; the turn closes with
       // {type:"end"}. (finalText reassembly of the fragments is in the

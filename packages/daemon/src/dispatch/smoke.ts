@@ -1,8 +1,9 @@
 // WP-105: real-CLI smoke evidence harness. Drives one trivial issue through
-// each ENABLED adapter on the user's live subscriptions, recording evidence
-// for the PR. This spends real quota (deliberately minimal — one solve per
-// adapter; the conformance mechanics are already proven quota-free in
-// lifecycle.test.ts); run it manually, never in CI.
+// each ENABLED adapter using whatever auth each official CLI currently holds
+// (subscription, or API key when run per docs/runbooks/api-key-fallback.md),
+// recording evidence for the PR. This spends real quota (deliberately minimal
+// — one solve per adapter; the conformance mechanics are already proven
+// quota-free in lifecycle.test.ts); run it manually, never in CI.
 //
 //   node --run dispatch:smoke                 # one solve per enabled adapter
 //   node --run dispatch:smoke -- --cancel     # + a real mid-run cancel per adapter

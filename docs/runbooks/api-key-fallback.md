@@ -92,14 +92,16 @@ setting — nothing Camino-visible changes.
    confirm usage in the Anthropic Console.
 
 4. **Revert** (back to subscription): remove the `apiKeyHelper` entry from
-   `~/.claude/settings.json`. Subscription auth stored under `HOME` by
-   `claude auth login` resumes (the CLI reads its own stored credential — the
-   sanctioned path). **Note:** `claude setup-token` is a *different* mechanism —
-   it prints a long-lived token the caller must supply as the
-   `CLAUDE_CODE_OAUTH_TOKEN` environment variable, and Camino's worker-env
-   composer deliberately STRIPS that (it is `TOKEN`-shaped), so a setup-token
-   credential does not reach a dispatched worker. Use `claude auth login`
-   (stored under HOME) for a subscription that must survive a dispatch, not
+   `~/.claude/settings.json`. Subscription auth from `claude auth login`
+   resumes — the CLI reads its own stored credential (the sanctioned path). On
+   **macOS** that credential is in the login **Keychain**, not a file under
+   `HOME` (file storage applies to Linux/Windows); a dispatched worker runs as
+   the same user and so the `claude` CLI can read it, and Camino never touches
+   it. **Note:** `claude setup-token` is a *different* mechanism — it prints a
+   long-lived token the caller must supply as the `CLAUDE_CODE_OAUTH_TOKEN`
+   environment variable, which Camino's worker-env composer deliberately STRIPS
+   (it is `TOKEN`-shaped), so a setup-token credential does not reach a worker.
+   Use `claude auth login` for a subscription that must survive a dispatch, not
    `setup-token`. Optionally delete the keychain item:
    `security delete-generic-password -a "$USER" -s anthropic-fallback`.
 
@@ -110,11 +112,14 @@ stdin (never argv).
 
 Codex's credential STORAGE is selected by `cli_auth_credentials_store` =
 `file` (→ `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`), `keyring`
-(OS keychain — no file under `~/.codex`), or `auto`. Do not assume a file
-path — in `keyring` mode there is none. `codex login status` reports the
-authentication METHOD/identity (e.g. "Logged in using ChatGPT"), not the
-storage backend; use it to confirm which identity is active, and check
-`cli_auth_credentials_store` for where the credential lives.
+(OS keychain — no file under `~/.codex`), `auto`, or `ephemeral`
+(process-memory only — nothing persists). Do not assume a file path. **In
+`ephemeral` mode `codex login --with-api-key` does NOT persist**, so a later
+smoke process would not see it — use `file`/`keyring`/`auto` for the fallback.
+`codex login status` reports the authentication METHOD/identity (e.g. "Logged
+in using ChatGPT"), not the storage backend; use it to confirm which identity
+is active, and check `cli_auth_credentials_store` for where the credential
+lives.
 
 1. **Prepare the key** (funded Platform account, WP-000 attestation): create an
    API key in the OpenAI console, store it in the keychain as above

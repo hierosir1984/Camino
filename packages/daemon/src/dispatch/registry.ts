@@ -138,10 +138,20 @@ function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: 
       reason: "xAI sanctioned-path status absent from record (WP-000 gate)",
     };
   }
-  // Describe a wrong status by TYPE — never JSON.stringify an arbitrary-depth
-  // value, which stack-overflows on a deeply nested object (round-3 finding 4).
-  // A legitimate status is a short string, so quoting a string is safe.
-  const shown = typeof status === "string" ? JSON.stringify(status) : `a ${typeof status} value`;
+  // Describe a wrong status precisely but BOUNDED: never JSON.stringify an
+  // arbitrary-depth value (stack overflow, round-3 finding 4) or an arbitrarily
+  // large string (log amplification, round-4 finding 5). Distinguish
+  // null / array / object (all `typeof "object"`) for a precise reason.
+  const shown =
+    status === null
+      ? "null"
+      : Array.isArray(status)
+        ? "an array"
+        : typeof status === "object"
+          ? "an object"
+          : typeof status === "string"
+            ? JSON.stringify(status.slice(0, 60))
+            : `a ${typeof status} value`;
   return {
     accepted: false,
     reason: `xAI sanctioned-path status is ${shown}, not "accepted" (WP-000 gate)`,

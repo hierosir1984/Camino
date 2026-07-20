@@ -32,28 +32,29 @@ export function claudeAdapter(
       if (ctx.model) args.push("--model", ctx.model);
       return { file: "claude", args };
     },
-    parseLine(line: string): StreamEvent | null {
+    parseLine(line: string, channel: "stdout" | "stderr"): StreamEvent | null {
       const trimmed = line.trim();
       // Quota is only trusted in an ERROR CONTEXT (round-2/3 finding: a
       // rate-limit signature or exhaustion phrase in ASSISTANT prose is not a
       // quota block). Non-error events never carry quotaSignal; error events do.
       const errText = (text: string): { quotaSignal: true } | Record<string, never> =>
         classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
-      if (!trimmed.startsWith("{")) {
-        // Non-JSON from claude is stderr/diagnostic (an error channel) — a
-        // rate-limit / exhaustion signal here is a real quota signal.
-        if (classifyErrorTextForQuota(trimmed)) {
+      // A non-JSON OR malformed-JSON line on STDERR is diagnostic/error output.
+      // claude emits its stream-json on STDOUT, so non-JSON on stdout is NOT an
+      // error context — flagging quota-looking stdout prose was a false positive
+      // (round-4 finding 2). Only stderr diagnostics carry a quota signal here.
+      const stderrErr = (): StreamEvent | null => {
+        if (channel === "stderr" && classifyErrorTextForQuota(trimmed)) {
           return { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true };
         }
         return null;
-      }
+      };
+      if (!trimmed.startsWith("{")) return stderrErr();
       let obj: Record<string, unknown>;
       try {
         obj = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
-        return classifyErrorTextForQuota(trimmed)
-          ? { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true }
-          : null;
+        return stderrErr(); // malformed JSON on stderr can still carry the signal
       }
       const type = String(obj["type"] ?? "");
       switch (type) {

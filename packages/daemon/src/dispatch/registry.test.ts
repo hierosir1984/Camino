@@ -142,6 +142,39 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     }
   });
 
+  it("a huge status string yields a BOUNDED reason, and null/array/object are distinguished (round-4 finding 5)", () => {
+    const huge = tmpAttestations(
+      JSON.stringify({ xaiSanctionedPath: { status: "x".repeat(5_000_000) } }),
+    );
+    try {
+      const grok = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: huge }).find(
+        (a) => a.name === "grok-build",
+      )!;
+      expect(grok.enabled).toBe(false);
+      expect(grok.disabledReason!.length).toBeLessThan(200); // not 5 MB
+    } finally {
+      rmSync(huge, { force: true });
+    }
+    // Precise, distinct reasons for null / array / object statuses.
+    const cases: Array<[unknown, RegExp]> = [
+      [null, /status is null/],
+      [[1, 2], /status is an array/],
+      [{ a: 1 }, /status is an object/],
+    ];
+    for (const [status, reason] of cases) {
+      const file = tmpAttestations(JSON.stringify({ xaiSanctionedPath: { status } }));
+      try {
+        const grok = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file }).find(
+          (a) => a.name === "grok-build",
+        )!;
+        expect(grok.enabled).toBe(false);
+        expect(grok.disabledReason, JSON.stringify(status)).toMatch(reason);
+      } finally {
+        rmSync(file, { force: true });
+      }
+    }
+  });
+
   it("grok is enabled when the record is accepted", () => {
     const file = tmpAttestations(JSON.stringify({ xaiSanctionedPath: { status: "accepted" } }));
     try {

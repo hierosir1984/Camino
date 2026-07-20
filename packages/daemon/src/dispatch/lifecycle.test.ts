@@ -462,6 +462,44 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       const rB = await dispatch(hostileName, { workdir: ws, prompt: "x" });
       expect(rB.adapter).toBe("unknown-adapter"); // snapshotted safely, no throw escaped
 
+      // (b2) hostile opts.signal / opts.killConfirm getters (read inside the
+      // try now, round-4 finding 1) → caught, record returned, lease settled.
+      // Each opts object carries `lease` as a data property + one throwing
+      // getter; the getter must fire only INSIDE dispatch, never when the test
+      // builds the object (so no spread).
+      {
+        let rel1 = 0;
+        const opts1 = {
+          lease: { release: () => void rel1++ } as LeaseHandle,
+          get signal(): AbortSignal {
+            throw new Error("signal getter threw");
+          },
+        };
+        const r1 = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" }, opts1);
+        expect(typeof r1.outcome).toBe("string"); // returned a record, no throw
+        expect(rel1).toBe(1); // lease read first → settled
+
+        let rel2 = 0;
+        const opts2 = {
+          lease: { release: () => void rel2++ } as LeaseHandle,
+          get killConfirm(): { graceMs: number; sigkillWaitMs: number } {
+            throw new Error("killConfirm getter threw");
+          },
+        };
+        const r2 = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" }, opts2);
+        expect(typeof r2.outcome).toBe("string");
+        expect(rel2).toBe(1);
+      }
+
+      // (b3) a hostile cancelAfterFirstEventMs getter is read once (snapshot),
+      // NOT inside the async readline callback — so it cannot crash the process.
+      const rB3 = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" }, {
+        get cancelAfterFirstEventMs(): number {
+          throw new Error("cancelAfterFirstEventMs getter threw");
+        },
+      } as never);
+      expect(typeof rB3.outcome).toBe("string"); // record returned, no async crash
+
       // (c) a hostile killConfirm.graceMs getter, on the cancel path — the
       // cooperative worker dies on the SIGTERM killConfirm sends before the
       // getter throws, so no process leaks; the dispatch returns a record.

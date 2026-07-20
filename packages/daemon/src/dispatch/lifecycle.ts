@@ -271,6 +271,20 @@ function safeAdapterName(adapter: AdapterSpec): string {
   }
 }
 
+/** Coerce a duration option to a finite non-negative number, else the fallback (round-4 finding 1). */
+function clampMs(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** Posture baseline used before env composition runs (or if it can't). */
+const EMPTY_POSTURE: EnvPostureRecord = {
+  keys: [],
+  githubCredentialKeys: [],
+  gitGlobalNeutralized: false,
+  strippedKeys: [],
+};
+
 /** Build a terminal record for a dispatch that never produced a running child. */
 function noProcessRecord(
   adapterName: string,
@@ -308,25 +322,43 @@ export async function dispatch(
   ctx: AdapterContext,
   opts: DispatchOptions = {},
 ): Promise<DispatchRecord> {
-  if (!adapter.enabled) {
-    // Refuse BEFORE plan(): a disabled adapter's code never runs (CAM-EXEC-01).
-    // (The only intentional throw from dispatch — everything else returns a record.)
-    throw new DisabledAdapterError(adapter.name, adapter.disabledReason);
-  }
   const started = Date.now();
-
-  // TOTAL EXCEPTION SAFETY (round-3 finding 1). dispatch's object inputs —
-  // adapter, opts, signal, lease — are first-party Camino code; the UNTRUSTED
-  // surface is the worker's output STREAM (strings), handled totally below. To
-  // ensure a buggy caller/adapter (e.g. a throwing getter on a config field)
-  // can never terminate the daemon or strand a lease, ALL work after the
-  // enabled check runs inside one try/catch/finally that returns a record on
-  // any throw, and the trusted object inputs are snapshotted ONCE up front (a
-  // mutating/throwing getter cannot then change behavior mid-flight).
   const adapterName = safeAdapterName(adapter);
-  const lease = opts.lease;
-  const signal = opts.signal;
-  const timings = opts.killConfirm ?? PRODUCTION_KILL_CONFIRM;
+
+  // Enablement is read fail-closed: a hostile/broken `enabled` getter is
+  // treated as disabled, so the ONLY throw dispatch ever propagates is
+  // DisabledAdapterError (round-3/4 finding 1). Everything else returns a record.
+  let enabled = false;
+  try {
+    enabled = adapter.enabled === true;
+  } catch {
+    enabled = false;
+  }
+  if (!enabled) {
+    let reason: string | undefined;
+    try {
+      reason = adapter.disabledReason;
+    } catch {
+      reason = "disabled reason unavailable";
+    }
+    throw new DisabledAdapterError(adapterName, reason);
+  }
+
+  // TOTAL EXCEPTION SAFETY (round-3/4 finding 1). dispatch's object inputs —
+  // adapter, opts, signal, lease, timings — are first-party Camino code; the
+  // UNTRUSTED surface is the worker's output STREAM (strings), handled totally
+  // below. To ensure a buggy caller/adapter (a throwing/mutating getter on a
+  // config field) can never terminate the daemon or strand a lease: ALL option
+  // reads happen ONCE inside the single try/catch/finally, and time values are
+  // snapshotted as validated PLAIN NUMBERS so no async callback ever re-reads a
+  // getter (which the lexical try could not catch) and a broken value cannot
+  // stall kill-confirm.
+  let lease: LeaseHandle | undefined;
+  let signal: AbortSignal | undefined;
+  let timings: KillConfirmTimings = PRODUCTION_KILL_CONFIRM;
+  let cancelAfterMs: number | undefined;
+  let timeoutMs: number | undefined;
+  let posture: EnvPostureRecord = EMPTY_POSTURE;
 
   // Settle the lease AT MOST ONCE across every path (round-2 review finding 4):
   // a single guarded closure so no error path can re-enter release().
@@ -336,10 +368,6 @@ export async function dispatch(
     leaseSettled = true;
     record.lease = await settleLease(lease, processGroupConfirmedGone(record), record.outcome);
   };
-
-  // The composed baseline posture (no extras) is safe to compute up front and
-  // is the fallback if plan()/its env getter throws (round-2 finding 3).
-  let posture: EnvPostureRecord = composeWorkerEnv(process.env).posture;
 
   // State the whole body shares.
   let child: ChildProcess | undefined;
@@ -363,9 +391,10 @@ export async function dispatch(
     }
     killReason = reason;
     const c = child;
-    // sweepGroupSafe (not killConfirm) so a hostile/broken timings getter can
-    // only yield a groupGone:false record, never a late unhandled rejection
-    // (round-3 finding 1). killPromise therefore never rejects.
+    // sweepGroupSafe (not killConfirm) so a broken timings value can only yield
+    // a groupGone:false record, never a late unhandled rejection (round-3
+    // finding 1). timings is plain validated numbers, so escalation to SIGKILL
+    // always proceeds (round-4 finding 1). killPromise therefore never rejects.
     killPromise = sweepGroupSafe(c, timings).then((k) => {
       killRecord = k;
     });
@@ -373,6 +402,22 @@ export async function dispatch(
   const onAbort = () => requestKill("cancel");
 
   try {
+    // Snapshot every option ONCE, lease FIRST (so a later hostile read still
+    // settles the lease via the catch). Time values become validated numbers.
+    lease = opts.lease;
+    signal = opts.signal;
+    timings = {
+      graceMs: clampMs(opts.killConfirm?.graceMs, PRODUCTION_KILL_CONFIRM.graceMs),
+      sigkillWaitMs: clampMs(
+        opts.killConfirm?.sigkillWaitMs,
+        PRODUCTION_KILL_CONFIRM.sigkillWaitMs,
+      ),
+    };
+    cancelAfterMs =
+      typeof opts.cancelAfterFirstEventMs === "number" ? opts.cancelAfterFirstEventMs : undefined;
+    timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : undefined;
+    posture = composeWorkerEnv(process.env).posture;
+
     if (signal?.aborted) {
       // Cancelled before anything ran: nothing spawned, nothing to kill.
       const record = noProcessRecord(adapterName, "cancelled", posture, started);
@@ -494,8 +539,11 @@ export async function dispatch(
         recordEvent(ev);
         if (!sawFirstEvent) {
           sawFirstEvent = true;
-          if (opts.cancelAfterFirstEventMs != null) {
-            cancelTimer = setTimeout(() => requestKill("cancel"), opts.cancelAfterFirstEventMs);
+          // Use the snapshotted plain number, never re-read opts inside this
+          // async callback (the lexical try can't catch a throw here) — round-4
+          // finding 1.
+          if (cancelAfterMs != null) {
+            cancelTimer = setTimeout(() => requestKill("cancel"), cancelAfterMs);
           }
         }
       });
@@ -503,8 +551,8 @@ export async function dispatch(
     if (child.stdout) consume("stdout", child.stdout);
     if (child.stderr) consume("stderr", child.stderr);
 
-    if (opts.timeoutMs != null) {
-      timeoutTimer = setTimeout(() => requestKill("timeout"), opts.timeoutMs);
+    if (timeoutMs != null) {
+      timeoutTimer = setTimeout(() => requestKill("timeout"), timeoutMs);
     }
 
     const exitCode = await new Promise<number | null>((resolve) => {

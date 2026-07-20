@@ -4,69 +4,77 @@
 // would corrupt the outcome ledger and trigger spurious family switches.
 //
 // TWO classifiers, because a signal is only reliable in ERROR CONTEXT, not in
-// arbitrary assistant prose (round-2 review finding 5 — matching provider
-// exhaustion PHRASES anywhere in a worker's answer manufactures false
-// positives like "Customer's credit balance is too low for financing"):
+// arbitrary assistant prose (round-2/3 finding: matching provider exhaustion
+// PHRASES anywhere in a worker's answer manufactures false positives):
 //
-//   classifyByQuotaSignal(text) — prose-SAFE structured signatures only
+//   classifyByQuotaSignal(text) — structured, prose-RESISTANT signatures
 //     (HTTP status codes in context, error-type tokens, header syntax). Safe
-//     to scan over ANY line, including assistant prose and the lifecycle's
-//     raw-line backstop, because these forms do not occur in benign text.
+//     to scan over any line because these forms are unusual in benign prose.
 //
-//   isProviderExhaustionMessage(text) — the providers' human-readable
-//     exhaustion PHRASES ("you've hit your usage limit", "credit balance is
-//     too low", "usage limit reached"). Reliable ONLY when the adapter already
-//     knows the line is an error/failed-result event — the adapters apply it in
-//     their error branches, never to assistant text.
+//   classifyErrorTextForQuota(text) — structured signatures OR the providers'
+//     human-readable exhaustion PHRASES. Reliable ONLY when the adapter already
+//     knows the line is an error/failed-result/stderr event — the adapters
+//     apply it in their error branches, never over assistant text.
 //
-// This is a maintained signature list, not a completeness proof: provider
-// wording changes, and the routing layer (WP-106) owns keeping it current.
-// Classification is per-line by contract — providers emit a signal atomically
-// on one line; joining adjacent lines manufactures false positives from
-// unrelated text and is deliberately not done (WP-001 review #4-r4).
+// BOUNDARY (rounds 2–4): free-text classification cannot PERFECTLY separate a
+// real rate-limit error from an error that merely quotes an exhaustion phrase
+// (e.g. an assertion failure containing "usage limit reached"), and no fixed
+// list of provider wording is complete — providers change strings and add new
+// ones. This is a REGENERATING surface (the WP-003 unicode / git-env
+// precedent): the list below targets the providers' CURRENT, observed
+// exhaustion messages; systematic misclassification is corrected by the
+// routing layer's outcome ledger (WP-106), which owns keeping this current.
+// WP-105's conformance guarantees (kill-confirm, lease ordering, env posture)
+// do not depend on perfect quota classification.
 
-// Prose-safe structured signatures. Each requires a status/error/header form
-// that benign engineering prose does not take.
+// Prose-resistant structured signatures. Each requires a status/error/header
+// form that benign engineering prose is unlikely to take.
 const STRUCTURED_QUOTA_MARKERS = [
   // A 429/529 status code in a status context — never a bare number, so
-  // "#429", "issue 429", "the 429th commit" do NOT match (round-1 finding 6),
-  // while "HTTP 429", "Error: 429", `"status_code":429`, `"statusCode": 429` do.
+  // "#429", "issue 429", "the 429th commit" do NOT match, while "HTTP 429",
+  // "Error: 429", `"status_code":429` do.
   /\b(?:HTTP\/?[0-9.]*\s*|status[_ ]?code|statuscode|status|code|error)["'\s:=]*(?:429|529)\b/i,
   /\b(?:429|529)\b\s*(?:too many requests|[-–—:])/i,
   /["':](?:429|529)\s*[}\],"]/, // a 4xx as a JSON value: {"code":429} (key context, not a comma list)
   /too many requests/i,
-  // Error-type TOKENS (underscore/dash forms) — these are machine strings, not
-  // prose: "rate limiting documentation" (space form) does NOT match.
+  // Error-type TOKENS (underscore/dash forms) — machine strings, not prose:
+  // "rate limiting documentation" (space form) does NOT match.
   /rate[_-]limit(?:_exceeded|_error|ed)\b/i,
   /rate limit (?:exceeded|reached)/i,
   /overloaded_error/i,
   /insufficient[_-]quota/i,
   /quota[_-](?:exceeded|exhausted)/i,
   /resource[_-]exhausted/i,
-  // Retry-After only in header syntax (colon/equals then a value) OR as a
-  // delay token followed by a number — not "Retry-After header parsing".
-  /retry[_\s-]?after\s*[:=]\s*\S/i,
-  /retry[_-]after[\s_]+\d/i,
+  // Retry-After: header syntax (colon/equals then a value) OR a delay form
+  // (retry-after followed by a number) — not "Retry-After header parsing".
+  /retry[_\s-]?after\s*[:=]/i,
+  /retry[_\s-]?after[\s_]*\d/i,
 ];
 
 // Provider exhaustion phrases — reliable only in an error context (see above).
+// Includes the strings found in the installed Codex 0.144.x and Grok 0.2.x
+// binaries (round-4 finding 3); kept current by WP-106.
 const EXHAUSTION_PHRASE_MARKERS = [
-  /you'?ve hit your usage limit/i, // Codex CLI
-  /usage limit (?:reached|exceeded)/i,
-  /credit balance is too low/i, // Anthropic spent-balance block
+  /you(?:'ve)? hit your (?:\w+ )?(?:usage )?limit/i, // "you've hit your usage limit", "you hit your weekly/free … limit"
+  /(?:usage|rate|weekly|monthly|daily) limit (?:reached|exceeded)/i,
+  /exceeded your (?:rate|usage|weekly|monthly|daily) limit/i,
+  /(?:credit|usage) balance (?:is too low|exhausted)/i,
+  /(?:run(?:ning)? )?out of credits/i,
+  /over your spending limit/i,
   /quota (?:exceeded|exhausted)/i, // space form (prose-risky, hence error-context only)
   /insufficient quota/i,
+  /please retry after \d/i, // "Please retry after 10 seconds."
 ];
 
-/** Prose-safe: a structured rate-limit signature is present. */
+/** Prose-resistant: a structured rate-limit signature is present. */
 export function classifyByQuotaSignal(text: string): boolean {
   return STRUCTURED_QUOTA_MARKERS.some((re) => re.test(text));
 }
 
 /**
- * Error-context: the text carries a provider exhaustion signal — either a
- * structured signature OR a known exhaustion phrase. Call ONLY when the line is
- * already known to be an error/failed-result event (adapters do this in their
+ * Error-context: the text carries a provider exhaustion signal — a structured
+ * signature OR a known exhaustion phrase. Call ONLY when the line is already
+ * known to be an error/failed-result/stderr event (adapters do this in their
  * error branches); never over assistant prose.
  */
 export function classifyErrorTextForQuota(text: string): boolean {
