@@ -240,11 +240,11 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
   if (LINE_TERMINATOR.test(value)) {
     return `${field} must be single-line (no line terminators \u2014 canon renders one line per field)`;
   }
-  // Trojan-Source class (review round 3 finding 6): bidi overrides/isolates
-  // and the BOM/ZWNBSP can visually REORDER or hide rendered canon text
-  // while the bytes stay "faithful", so body comparison would only catch
-  // their later removal. Reject them at the source \u2014 canon statements are
-  // plain single-line text.
+  // Reordering / hidden-payload controls (review round 3 finding 6): bidi
+  // overrides/isolates and the BOM/ZWNBSP can visually REORDER or hide
+  // rendered canon text while the bytes stay "faithful", so the body
+  // comparison would only catch their later removal. Reject them at the
+  // source \u2014 canon statements are plain single-line text.
   if (BIDI_OR_FORMAT_CONTROL.test(value)) {
     return `${field} must not contain bidirectional or format control characters`;
   }
@@ -260,16 +260,27 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
 const LINE_TERMINATOR = /[\n\r\u0085\u000b\u000c\u2028\u2029]/;
 
 /**
- * Bidirectional and invisible format controls that can reorder or hide
- * displayed text (the Trojan-Source class, CVE-2021-42574; review round 3
- * finding 6, completed by round 4 finding 2): every Bidi_Control (LRM/RLM,
- * ALM U+061C, embeddings/overrides U+202A-E, isolates U+2066-9), the
- * deprecated format controls U+206A-F, the invisible carriers ZWSP U+200B
- * and WORD JOINER U+2060-2064, BOM/ZWNBSP U+FEFF, interlinear annotation
- * anchors U+FFF9-B, and the tag characters U+E0001/U+E0020-E007F (an
- * invisible payload channel). Deliberately NOT a blanket \\p{Cf} ban:
- * ZWNJ/ZWJ (U+200C/D) stay allowed \u2014 they are load-bearing in ordinary
- * text (Persian/Indic joining, emoji sequences).
+ * Control characters that can visually REORDER rendered text or carry a
+ * hidden payload, which canon's single-line plain-text fields have no use
+ * for (review round 3 finding 6, completed by round 4 finding 2). The
+ * targeted set: every Bidi_Control (LRM/RLM, ALM U+061C,
+ * embeddings/overrides U+202A-E, isolates U+2066-9), the deprecated
+ * format controls U+206A-F, the invisible spacers ZWSP U+200B and
+ * WORD JOINER U+2060-2064, BOM/ZWNBSP U+FEFF, the interlinear annotation
+ * anchors U+FFF9-B, and the tag block U+E0001/U+E0020-E007F (an invisible
+ * data channel).
+ *
+ * SCOPE, stated honestly (round-4 verify note): a TARGETED policy for
+ * reordering / hidden-payload controls, deliberately NOT a blanket
+ * default-ignorable ban. Characters that neither reorder nor hide a
+ * payload stay allowed \u2014 the zero-width joiner/non-joiner U+200C/D
+ * (load-bearing in Persian/Indic joining and emoji sequences), and other
+ * benign invisibles (soft hyphen U+00AD, combining grapheme joiner
+ * U+034F, variation selectors). A future policy change belongs in one
+ * place: this constant, pinned by the accept/reject table in
+ * canon-intent.test.ts. Structural tampering with the RENDERED canon file
+ * is caught separately by the body-faithfulness comparison
+ * (computeCanonDivergence), independent of this per-field rule.
  */
 const BIDI_OR_FORMAT_CONTROL =
   /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u206a-\u206f\ufeff\ufff9-\ufffb\u{e0001}\u{e0020}-\u{e007f}]/u;

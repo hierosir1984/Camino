@@ -432,6 +432,37 @@ describe("decideLedgerAppend refusals", () => {
     expect(ok).toEqual({ ok: true });
   });
 
+  it("pins the exact text-control accept/reject policy (r4 finding 2 + verify note: no silent drift)", () => {
+    const decide = (statement: string): boolean =>
+      decideLedgerAppend(emptyView, {
+        requirementId: R,
+        event: "requirement-proposed",
+        actor: DAVID_ACTOR,
+        payload: { statement, sourceMissionId: "m1" },
+      }).ok;
+    // REJECTED: reordering / hidden-payload controls (the targeted set).
+    const rejected = [
+      0x061c, 0x200b, 0x200e, 0x200f, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x2066, 0x2067,
+      0x2068, 0x2069, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x206a, 0x206b, 0x206c, 0x206d,
+      0x206e, 0x206f, 0xfeff, 0xfff9, 0xfffa, 0xfffb, 0xe0001, 0xe0020, 0xe007f,
+    ];
+    for (const cp of rejected) {
+      expect(decide(`a${String.fromCodePoint(cp)}b`), `U+${cp.toString(16)} must be rejected`).toBe(
+        false,
+      );
+    }
+    // ACCEPTED, by design: joiners (emoji / Persian-Indic) and benign
+    // invisibles that neither reorder nor hide a payload. This half of the
+    // table is the deliberate boundary \u2014 a future edit that widens the ban
+    // to these must update this test on purpose.
+    const accepted = [0x200c, 0x200d, 0x00ad, 0x034f, 0x3164, 0xfe00, 0xfe0f];
+    for (const cp of accepted) {
+      expect(decide(`a${String.fromCodePoint(cp)}b`), `U+${cp.toString(16)} must be accepted`).toBe(
+        true,
+      );
+    }
+  });
+
   it("accepts an expanded-year recordedAt (writer/verifier agree, r2 finding 8)", () => {
     // A row whose clock produced an expanded-year toISOString must be
     // adoptable by the same verifier — else the store self-poisons.
