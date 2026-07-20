@@ -905,6 +905,29 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
     });
   }
 
+  it("a terminal quota event at the TAIL of a large burst is drained before classification (round-8 finding 3)", async () => {
+    // 'exit' can fire while stdout still holds buffered lines; a big burst
+    // ending in the quota event exercises the post-exit drain. Without it the
+    // tail is lost and the record freezes as "succeeded" before the final
+    // event is parsed. The parser tracks quota over ALL events, so the last
+    // (quota) line decides the outcome once drained.
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const claude = PROVIDER_LINES["claude-code"]!;
+      const burst = Array.from({ length: 3000 }, () => '{"type":"system","subtype":"init"}');
+      const rec = await dispatch(
+        schemaEmittingAdapter("claude-code", [...burst, claude.quota], 0),
+        { workdir: ws, prompt: "x" },
+      );
+      expect(rec.exitCode).toBe(0);
+      expect(rec.outcome).toBe("quota-blocked"); // final event drained + classified
+      expect(rec.quotaSignalSeen).toBe(true);
+      expect(rec.streamedEvents).toBe(3001); // every line drained, none truncated
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a RECOVERED quota signal (later events, clean exit) stays succeeded, with the pressure exposed (round-7 finding 2)", async () => {
     // An early rate-limit the worker moved past must not be misread as
     // blocked; the transient signal stays visible to the WP-106 quota-aware

@@ -9,6 +9,7 @@
 // lives in @camino/shared so this composer and the API-key adapter contract
 // check enforce ONE source of truth: a channel the composer closes cannot be
 // re-opened by an API-key adapter declaring it as a "credential env var".
+import { delimiter, isAbsolute } from "node:path";
 import type { EnvPostureRecord, OfficialAdapterName } from "@camino/shared";
 import {
   WORKER_ENV_ALLOWLIST,
@@ -67,6 +68,18 @@ export function composeWorkerEnv(
     if (isCredentialRootEnvKey(key) && !grantedRoots.has(key)) continue;
     const v = source[key];
     if (typeof v === "string") inherited[key] = v;
+  }
+  // Drop empty (=cwd) and relative PATH entries so a worker cannot resolve a
+  // bare command against its untrusted workspace (round-8 finding 1). The
+  // official CLI itself is spawned by its gate-resolved ABSOLUTE path; this
+  // also denies a cwd-relative shadow to the CLI's OWN child processes
+  // (git/node). A tool that hardcodes a relative exec is the named container
+  // boundary (WP-107). Same rationale as the registry's absolute-only scan.
+  if (typeof inherited["PATH"] === "string") {
+    inherited["PATH"] = inherited["PATH"]
+      .split(delimiter)
+      .filter((d) => d && isAbsolute(d))
+      .join(delimiter);
   }
   Object.assign(env, inherited);
 

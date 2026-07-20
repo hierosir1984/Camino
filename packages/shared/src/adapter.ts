@@ -231,14 +231,21 @@ export interface DispatchRecord {
  * Shared so the env composer (daemon) and the API-key contract checks use one
  * source of truth.
  */
-export const GITHUB_CREDENTIAL_MARKERS = [
+// Every exported enforcement-policy constant is Object.freeze'd (round-8
+// finding 2). These objects are consumed by the dispatch provenance check and
+// the env composer's credential-root scoping; exporting them live let a
+// package-root importer mutate policy (drop "claude-code" from the official
+// set, or a key from the credential-root set) and thereby bypass enforcement
+// WITHOUT a deep import or a gated-object mutation. Freezing closes that
+// package-public vector; reads (includes/index/iterate/spread) are unaffected.
+export const GITHUB_CREDENTIAL_MARKERS = Object.freeze([
   "GITHUB_TOKEN",
   "GH_TOKEN",
   "GH_ENTERPRISE_TOKEN",
   "GITHUB_PAT",
   "GIT_ASKPASS",
   "GIT_TOKEN",
-] as const;
+] as const);
 
 /** Is this env key name GitHub-credential-shaped? (case-insensitive substring match) */
 export function isGithubCredentialShapedKey(key: string): boolean {
@@ -292,7 +299,7 @@ export const CREDENTIAL_SHAPED_PATTERN =
  * and NAMES the container as the closer of the rest, rather than chasing an
  * unbounded denylist (the WP-003 git-fsck / WP-102 token-dir precedent).
  */
-export const STRIPPED_ENV_EXACT = [
+export const STRIPPED_ENV_EXACT = Object.freeze([
   "GIT_CONFIG",
   "GIT_CONFIG_COUNT",
   "GIT_CONFIG_PARAMETERS",
@@ -315,12 +322,16 @@ export const STRIPPED_ENV_EXACT = [
   "GIT_SSH",
   "GIT_SSH_COMMAND",
   "GIT_PROXY_COMMAND",
-] as const;
+] as const);
 
 // SSH_ closes the whole SSH_* family in one rule (SSH_AUTH_SOCK, SSH_ASKPASS,
 // SSH_SK_PROVIDER, …) — a headless worker needs no SSH_* variable, so strip by
 // prefix rather than enumerate (round-3 finding 3).
-export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "SSH_"] as const;
+export const STRIPPED_ENV_PREFIXES = Object.freeze([
+  "GIT_CONFIG_KEY_",
+  "GIT_CONFIG_VALUE_",
+  "SSH_",
+] as const);
 
 /**
  * The worker env inheritance UNION: every host env key ANY worker may inherit.
@@ -348,7 +359,7 @@ export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "S
  * API-key contract refuses to let an adapter alias a credential onto ANY of
  * them.
  */
-export const WORKER_ENV_ALLOWLIST = [
+export const WORKER_ENV_ALLOWLIST = Object.freeze([
   "PATH",
   "HOME",
   "USER",
@@ -362,33 +373,38 @@ export const WORKER_ENV_ALLOWLIST = [
   "CODEX_HOME",
   "CLAUDE_CONFIG_DIR",
   "GROK_HOME",
-] as const;
+] as const);
 
 /**
  * The v1 official-CLI adapter set (CAM-EXEC-01). dispatch() requires registry
  * provenance for a spec bearing one of these names (round-6 finding 1), and
  * env composition grants credential roots only to them (round-6 finding 2).
  */
-export const OFFICIAL_ADAPTER_NAMES = ["claude-code", "codex-cli", "grok-build"] as const;
+export const OFFICIAL_ADAPTER_NAMES = Object.freeze([
+  "claude-code",
+  "codex-cli",
+  "grok-build",
+] as const);
 export type OfficialAdapterName = (typeof OFFICIAL_ADAPTER_NAMES)[number];
 
 /** Each official CLI's config-root env var — the only root it receives besides HOME. */
-export const OFFICIAL_CLI_CONFIG_ROOTS: Record<OfficialAdapterName, string> = {
-  "claude-code": "CLAUDE_CONFIG_DIR",
-  "codex-cli": "CODEX_HOME",
-  "grok-build": "GROK_HOME",
-};
+export const OFFICIAL_CLI_CONFIG_ROOTS: Readonly<Record<OfficialAdapterName, string>> =
+  Object.freeze({
+    "claude-code": "CLAUDE_CONFIG_DIR",
+    "codex-cli": "CODEX_HOME",
+    "grok-build": "GROK_HOME",
+  });
 
 /**
  * The allowlist subset that references host credential state (CAM-SEC-06).
  * Granted per adapter identity at composition, never inherited by default.
  */
-export const CREDENTIAL_ROOT_ENV_KEYS = [
+export const CREDENTIAL_ROOT_ENV_KEYS = Object.freeze([
   "HOME",
   "CODEX_HOME",
   "CLAUDE_CONFIG_DIR",
   "GROK_HOME",
-] as const;
+] as const);
 
 export function isCredentialRootEnvKey(key: string): boolean {
   return (CREDENTIAL_ROOT_ENV_KEYS as readonly string[]).includes(key);

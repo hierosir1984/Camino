@@ -560,8 +560,22 @@ export async function dispatch(
       child.stdin.end(plan.stdin);
     }
 
+    // A stream must be fully DRAINED before outcome classification: 'exit'
+    // can fire while stdout/stderr still hold buffered lines (a terminal quota
+    // event among them), so classifying at 'exit' could freeze a "succeeded"
+    // record before the final event is parsed (round-8 finding 3). Each
+    // consumer resolves when its readline reaches EOF ('close').
+    const streamsClosed: Promise<void>[] = [];
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
       const rl = createInterface({ input: stream });
+      streamsClosed.push(
+        new Promise<void>((resolve) => {
+          rl.once("close", () => resolve());
+          // A stream 'error' also ends the readline; never leave the drain
+          // await pending on a broken pipe.
+          stream.once("error", () => resolve());
+        }),
+      );
       rl.on("line", (line) => {
         // The transcript sink is caller code — a throwing sink must not crash
         // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
@@ -615,6 +629,9 @@ export async function dispatch(
       });
     });
     if (killPromise) await killPromise; // let an in-flight kill finish
+    // Drain stdout/stderr to EOF before snapshotting events, so a line still
+    // buffered when 'exit' fired is parsed and classified (round-8 finding 3).
+    await Promise.all(streamsClosed);
 
     // Post-exit group sweep: the leader exiting does not end the GROUP — a
     // worker may leave background descendants running (same group, detached

@@ -12,8 +12,11 @@ import { classifyErrorTextForQuota } from "../quota.js";
  * CAM-SEC-06); the adapter passes no credential-shaped env.
  */
 export function codexAdapter(
-  opts: { enabled?: boolean; disabledReason?: string } = {},
+  opts: { enabled?: boolean; disabledReason?: string; resolvedPath?: string } = {},
 ): AdapterSpec {
+  // Spawn the registry-resolved ABSOLUTE executable, not a bare name re-resolved
+  // against the worker cwd (round-8 finding 1).
+  const file = opts.resolvedPath ?? "codex";
   return {
     name: "codex-cli",
     enabled: opts.enabled ?? true,
@@ -29,7 +32,7 @@ export function codexAdapter(
         "--dangerously-bypass-approvals-and-sandbox",
       ];
       if (ctx.model) args.push("-c", `model=${ctx.model}`);
-      return { file: "codex", args };
+      return { file, args };
     },
     parseLine(line: string, channel): StreamEvent | null {
       const trimmed = line.trim();

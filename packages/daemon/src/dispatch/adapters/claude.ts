@@ -14,8 +14,13 @@ import { classifyErrorTextForQuota } from "../quota.js";
  * CAM-SEC-06); the adapter passes no credential-shaped env.
  */
 export function claudeAdapter(
-  opts: { enabled?: boolean; disabledReason?: string } = {},
+  opts: { enabled?: boolean; disabledReason?: string; resolvedPath?: string } = {},
 ): AdapterSpec {
+  // Spawn the ABSOLUTE executable the registry resolved at gate time, never the
+  // bare name re-resolved against the worker's untrusted cwd (round-8 finding
+  // 1). A raw factory call (no resolvedPath) keeps the bare name, but such a
+  // spec has no registry provenance and dispatch refuses it.
+  const file = opts.resolvedPath ?? "claude";
   return {
     name: "claude-code",
     enabled: opts.enabled ?? true,
@@ -30,7 +35,7 @@ export function claudeAdapter(
         "--dangerously-skip-permissions",
       ];
       if (ctx.model) args.push("--model", ctx.model);
-      return { file: "claude", args };
+      return { file, args };
     },
     parseLine(line: string, channel: "stdout" | "stderr"): StreamEvent | null {
       const trimmed = line.trim();

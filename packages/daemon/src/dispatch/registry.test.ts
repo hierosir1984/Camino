@@ -6,10 +6,12 @@ import type { AdapterSpec } from "@camino/shared";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
+import { isAbsolute } from "node:path";
 import {
   buildRegistry,
   buildRegistryForTest,
   cliOnPath,
+  resolveCliPath,
   DEFAULT_ATTESTATIONS_PATH,
   hasRegistryProvenance,
 } from "./registry.js";
@@ -181,6 +183,21 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     }
   });
 
+  it("a gated ENABLED spec spawns the resolved ABSOLUTE executable, not the bare name (round-8 finding 1)", () => {
+    const reg = buildRegistryForTest({
+      resolveCli: (bin) => `/opt/camino/bin/${bin}`, // the exact path the gate attested
+    });
+    const ctx = { prompt: "hi", workdir: "/tmp/ws" };
+    expect(reg.find((a) => a.name === "claude-code")!.plan(ctx).file).toBe(
+      "/opt/camino/bin/claude",
+    );
+    expect(reg.find((a) => a.name === "codex-cli")!.plan(ctx).file).toBe("/opt/camino/bin/codex");
+    expect(reg.find((a) => a.name === "grok-build")!.plan(ctx).file).toBe("/opt/camino/bin/grok");
+    // resolveCli → null disables (and a disabled spec is never dispatched).
+    const none = buildRegistryForTest({ resolveCli: () => null });
+    expect(none.every((a) => !a.enabled)).toBe(true);
+  });
+
   it("grok is enabled when the record is accepted", () => {
     const file = tmpAttestations(JSON.stringify({ xaiSanctionedPath: { status: "accepted" } }));
     try {
@@ -296,6 +313,25 @@ describe("cliOnPath", () => {
       expect(cliOnPath("fake-cli", ":")).toBe(false); // only empty slots
       expect(cliOnPath("fake-cli", "relative/dir")).toBe(false); // relative ignored
       expect(cliOnPath("fake-cli", ".")).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveCliPath returns the ABSOLUTE path, never a cwd-relative one (round-8 finding 1)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "camino-resolve-"));
+    try {
+      const exe = join(dir, "fake-cli");
+      writeFileSync(exe, "#!/bin/sh\nexit 0\n");
+      chmodSync(exe, 0o755);
+      // Even with a cwd-relative slot FIRST, resolution yields the absolute
+      // candidate — this is the exact executable dispatch will spawn, so a
+      // workspace-local ./fake-cli shadow can never be selected.
+      expect(resolveCliPath("fake-cli", `.:${dir}`)).toBe(exe);
+      expect(isAbsolute(resolveCliPath("fake-cli", `.:${dir}`)!)).toBe(true);
+      expect(resolveCliPath("fake-cli", ".")).toBeNull(); // relative-only → unresolved
+      expect(resolveCliPath("fake-cli", "relative/dir")).toBeNull();
+      expect(resolveCliPath("missing", dir)).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

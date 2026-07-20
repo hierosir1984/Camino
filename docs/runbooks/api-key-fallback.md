@@ -23,15 +23,17 @@
 - Camino **never reads, stores, transmits, or proxies** any credential —
   subscription or API key. Every step below configures the **vendor's own
   CLI** through the **vendor's own auth flow**; the key lives where that CLI
-  keeps its own state. Depending on the CLI and mode that is a file under
-  `HOME` (e.g. `~/.claude/settings.json`, `~/.codex/auth.json`,
-  `~/.grok/config.toml`) OR the OS keychain (Codex `keyring` mode; the
-  `apiKeyHelper` command below stores the Anthropic key in the macOS Keychain).
-  Custody is **vendor-CLI-owned, via its active config root or the OS
-  keychain**; Camino references host credential STATE only through each
-  official CLI's granted roots (`HOME` plus that CLI's own config-root var)
-  and never touches the keychain itself — it only lets each official CLI use
-  its own credential.
+  keeps its own state. Custody is **vendor-CLI-owned, via that CLI's active
+  config root or the OS keychain** — depending on the CLI and mode that is a
+  file under the CLI's config root
+  (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`,
+  `${CODEX_HOME:-$HOME/.codex}/auth.json`,
+  `${GROK_HOME:-$HOME/.grok}/config.toml`) OR the OS keychain (Codex `keyring`
+  mode; the `apiKeyHelper` command below stores the Anthropic key in the macOS
+  Keychain). Camino references host credential STATE only through each official
+  CLI's granted roots (`HOME` plus that CLI's own config-root var, passed
+  through unchanged) and never touches the keychain itself — it only lets each
+  official CLI use its own credential.
 - Worker dispatches run with an allowlisted environment (base: `PATH USER
   LOGNAME SHELL LANG LC_ALL TMPDIR` + git neutralization), with credential
   roots granted **per adapter**: an official CLI's dispatch additionally
@@ -86,7 +88,7 @@ setting — nothing Camino-visible changes.
 
 2. **Point Claude Code at it** — add to `settings.json` in Claude Code's
    ACTIVE config root, `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`
-   (when `CLAUDE_CONFIG_DIR` is set it replaces every `~/.claude` path, and
+   (when `CLAUDE_CONFIG_DIR` is set it relocates the whole config root, and
    the composer passes it through to claude workers):
 
    ```json

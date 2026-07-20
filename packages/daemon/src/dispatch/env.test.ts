@@ -1,4 +1,13 @@
 import { describe, expect, it } from "vitest";
+import {
+  WORKER_ENV_ALLOWLIST,
+  OFFICIAL_ADAPTER_NAMES,
+  OFFICIAL_CLI_CONFIG_ROOTS,
+  CREDENTIAL_ROOT_ENV_KEYS,
+  STRIPPED_ENV_EXACT,
+  STRIPPED_ENV_PREFIXES,
+  GITHUB_CREDENTIAL_MARKERS,
+} from "@camino/shared";
 import { composeWorkerEnv } from "./env.js";
 
 // Worker env posture (CAM-SEC-06 / CAM-EXEC-02): enforcement, not detection —
@@ -262,6 +271,42 @@ describe("composeWorkerEnv", () => {
     expect(env["GIT_AUTHOR_NAME"]).toBe("Worker");
     expect(env["NO_COLOR"]).toBe("1");
     expect(posture.strippedKeys).toEqual([]);
+  });
+
+  it("drops empty and relative PATH entries so a worker cannot resolve against its cwd (round-8 finding 1)", () => {
+    const { env } = composeWorkerEnv(
+      { PATH: `.:/usr/bin:relative/dir::${"/opt/bin"}`, HOME: "/Users/x" },
+      {},
+      { officialCli: "claude-code" },
+    );
+    expect(env["PATH"]).toBe("/usr/bin:/opt/bin"); // only absolute entries survive
+    expect(env["PATH"]!.split(":")).not.toContain("."); // no cwd
+    expect(env["PATH"]!.split(":")).not.toContain(""); // no empty (=cwd) slot
+    expect(env["PATH"]!.split(":")).not.toContain("relative/dir");
+  });
+
+  it("enforcement policy exports are FROZEN — a package-root importer cannot mutate them (round-8 finding 2)", () => {
+    const policies = [
+      WORKER_ENV_ALLOWLIST,
+      OFFICIAL_ADAPTER_NAMES,
+      OFFICIAL_CLI_CONFIG_ROOTS,
+      CREDENTIAL_ROOT_ENV_KEYS,
+      STRIPPED_ENV_EXACT,
+      STRIPPED_ENV_PREFIXES,
+      GITHUB_CREDENTIAL_MARKERS,
+    ];
+    for (const p of policies) expect(Object.isFrozen(p)).toBe(true);
+    // A mutation attempt throws in strict mode (ESM is strict) — dropping
+    // "claude-code" from the official set, or a key from the credential-root
+    // set, would otherwise bypass provenance / root scoping.
+    expect(() => (OFFICIAL_ADAPTER_NAMES as unknown as string[]).pop()).toThrow(TypeError);
+    expect(() => (CREDENTIAL_ROOT_ENV_KEYS as unknown as string[]).pop()).toThrow(TypeError);
+    expect(() => {
+      (OFFICIAL_CLI_CONFIG_ROOTS as unknown as Record<string, string>)["codex-cli"] = "EVIL_HOME";
+    }).toThrow(TypeError);
+    // …and the objects are unchanged.
+    expect(OFFICIAL_ADAPTER_NAMES).toContain("claude-code");
+    expect(OFFICIAL_CLI_CONFIG_ROOTS["codex-cli"]).toBe("CODEX_HOME");
   });
 
   it("records the posture with key NAMES only and sorted", () => {

@@ -76,19 +76,24 @@ const RECORDED_SANCTIONED_PATHS: Record<
  * through an empty/relative entry, which is the safe direction. Installation
  * probe only — auth is proven by dispatch, never inspected (CAM-SEC-06).
  */
-export function cliOnPath(bin: string, pathValue: string | undefined): boolean {
-  if (!pathValue || bin.length === 0 || bin.includes("/")) return false;
+export function resolveCliPath(bin: string, pathValue: string | undefined): string | null {
+  if (!pathValue || bin.length === 0 || bin.includes("/")) return null;
   for (const dir of pathValue.split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue; // ignore empty (=cwd) and relative entries
     const candidate = join(dir, bin);
     try {
       accessSync(candidate, constants.X_OK);
-      if (statSync(candidate).isFile()) return true; // follows symlinks
+      if (statSync(candidate).isFile()) return candidate; // absolute, follows symlinks
     } catch {
       /* keep scanning */
     }
   }
-  return false;
+  return null;
+}
+
+/** Presence = the ABSOLUTE executable resolves (round-8 finding 1: the same path dispatch runs). */
+export function cliOnPath(bin: string, pathValue: string | undefined): boolean {
+  return resolveCliPath(bin, pathValue) !== null;
 }
 
 /** The xAI sanctioned-path gate decision, with a precise recorded reason on refusal. */
@@ -161,8 +166,14 @@ function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: 
 export interface RegistryOptions {
   /** Override the attestations record location (tests). */
   attestationsPath?: string;
-  /** Override the CLI presence probe (tests). */
+  /** Override the CLI presence probe (tests). Presence-only; the resolved path is synthetic. */
   cliPresent?: (bin: string) => boolean;
+  /**
+   * Override CLI resolution to an ABSOLUTE path or null (tests). Takes
+   * precedence over cliPresent; use it when a test needs the exact path
+   * dispatch will spawn (round-8 finding 1).
+   */
+  resolveCli?: (bin: string) => string | null;
 }
 
 /**
@@ -186,22 +197,33 @@ export function hasRegistryProvenance(spec: AdapterSpec): boolean {
   return REGISTRY_GATED.has(spec);
 }
 
-/** Apply the CLI-presence + recorded sanctioned-path gate to one adapter factory. */
+/**
+ * Apply the CLI-resolution + recorded sanctioned-path gate to one adapter
+ * factory. The ABSOLUTE executable resolved here is threaded into the factory
+ * so plan() spawns exactly the binary the gate attested — never a bare name
+ * re-resolved against the worker's untrusted cwd (round-8 finding 1).
+ */
 function gate(
   name: string,
-  present: boolean,
+  resolvedPath: string | null,
   cliBin: string,
   sanctioned: { accepted: boolean; reason?: string },
-  make: (opts?: { enabled?: boolean; disabledReason?: string }) => AdapterSpec,
+  make: (opts?: {
+    enabled?: boolean;
+    disabledReason?: string;
+    resolvedPath?: string;
+  }) => AdapterSpec,
 ): AdapterSpec {
-  if (!present) return make({ enabled: false, disabledReason: `${cliBin} CLI not found on PATH` });
+  if (resolvedPath === null) {
+    return make({ enabled: false, disabledReason: `${cliBin} CLI not found on PATH` });
+  }
   if (!sanctioned.accepted) {
     return make({
       enabled: false,
       disabledReason: sanctioned.reason ?? `${name} sanctioned-path not recorded accepted`,
     });
   }
-  const spec = make();
+  const spec = make({ resolvedPath }); // spawn the attested absolute executable
   REGISTRY_GATED.add(spec); // provenance = the gate ENABLED this exact object
   return spec;
 }
@@ -233,26 +255,35 @@ export function buildRegistryForTest(opts: RegistryOptions): AdapterSpec[] {
 }
 
 function buildRegistryWith(opts: RegistryOptions): AdapterSpec[] {
-  const present = opts.cliPresent ?? ((bin: string) => cliOnPath(bin, process.env["PATH"]));
+  // Resolve each CLI to an ABSOLUTE path (or null). Precedence: an explicit
+  // test resolver, else a presence probe mapped to a clearly-synthetic
+  // NON-executable absolute path (injected-presence specs are never really
+  // dispatched — the provider tests substitute plan()), else the real PATH
+  // scan (round-8 finding 1).
+  const resolveCli: (bin: string) => string | null =
+    opts.resolveCli ??
+    (opts.cliPresent
+      ? (bin: string) => (opts.cliPresent!(bin) ? `/nonexistent-test-cli/${bin}` : null)
+      : (bin: string) => resolveCliPath(bin, process.env["PATH"]));
   const attestationsPath = opts.attestationsPath ?? DEFAULT_ATTESTATIONS_PATH;
 
   const claude = gate(
     "claude-code",
-    present("claude"),
+    resolveCli("claude"),
     "claude",
     RECORDED_SANCTIONED_PATHS["claude-code"]!,
     claudeAdapter,
   );
   const codex = gate(
     "codex-cli",
-    present("codex"),
+    resolveCli("codex"),
     "codex",
     RECORDED_SANCTIONED_PATHS["codex-cli"]!,
     codexAdapter,
   );
   const grok = gate(
     "grok-build",
-    present("grok"),
+    resolveCli("grok"),
     "grok",
     xaiSanctioned(attestationsPath),
     grokAdapter,
