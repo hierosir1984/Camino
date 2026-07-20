@@ -629,16 +629,15 @@ export async function dispatch(
       });
     });
     if (killPromise) await killPromise; // let an in-flight kill finish
-    // Drain stdout/stderr to EOF before snapshotting events, so a line still
-    // buffered when 'exit' fired is parsed and classified (round-8 finding 3).
-    await Promise.all(streamsClosed);
 
-    // Post-exit group sweep: the leader exiting does not end the GROUP — a
-    // worker may leave background descendants running (same group, detached
-    // spawn). A finished dispatch must not leak workers (CAM-EXEC-06 process
-    // cleanup), and the lease below must not be released over a live group.
-    // When no kill-confirm ran, probe the group and sweep any survivors with
-    // the same SIGTERM → grace → SIGKILL sequence.
+    // Post-exit group sweep BEFORE the stream drain: the leader exiting does
+    // not end the GROUP — a worker may leave background descendants running
+    // (same group, detached spawn). A finished dispatch must not leak workers
+    // (CAM-EXEC-06 process cleanup), and the lease below must not be released
+    // over a live group. When no kill-confirm ran, probe the group and sweep
+    // any survivors with the same SIGTERM → grace → SIGKILL sequence. Sweeping
+    // FIRST also frees an in-group descendant that inherited (and is holding)
+    // the stdout/stderr pipe, so the drain below can reach EOF.
     // (A descendant that changes its own process group — setpgid/setsid —
     // escapes even this sweep; that residual is WP-107's container's, per the
     // boundary at the top of this file.)
@@ -647,6 +646,21 @@ export async function dispatch(
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child, timings); // never throws; fail-closed
     }
+
+    // Drain stdout/stderr to EOF so a line still buffered when 'exit' fired is
+    // parsed and classified (round-8 finding 3) — but BOUNDED: a group-escaped
+    // descendant (the named WP-107 boundary above) could hold a pipe open
+    // forever, and the drain must never hang dispatch past cleanup. After the
+    // in-group sweep, legit pipes reach EOF in milliseconds; cap the residual
+    // wait and classify with whatever drained.
+    const drainCapMs = Math.max(timings.sigkillWaitMs, 1000);
+    await Promise.race([
+      Promise.all(streamsClosed),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, drainCapMs);
+        t.unref?.(); // a dangling cap timer must not keep the loop alive
+      }),
+    ]);
 
     const events = retainedEvents();
 

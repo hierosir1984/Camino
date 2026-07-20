@@ -108,6 +108,25 @@ if (mode === "hang") {
     emitSync("result", "finished while leaving a lingering descendant");
     process.exit(0);
   }, 10);
+} else if (mode === "escaped-stdout-holder") {
+  // A descendant that ESCAPES the process group (its own new session) AND
+  // inherits stdout, holding the pipe's write end open after the leader exits
+  // 0. The group-scoped post-exit sweep cannot reap it (the named WP-107
+  // boundary), so the parent's stdout never reaches EOF — the lifecycle's
+  // BOUNDED drain must return anyway rather than hang (round-8 finding 3). The
+  // descendant records its pid so the test can reap it, and self-exits as a
+  // safety net.
+  const pidFile = join(process.cwd(), ".escaped-holder-pid");
+  // `exec sleep` so the recorded pid BECOMES the sleep (killing it reaps the
+  // holder cleanly — no orphaned sleep left behind).
+  const child = spawn("sh", ["-c", `echo $$ > "${pidFile}"; exec sleep 30`], {
+    detached: true, // new session → escapes the leader's process group
+    stdio: ["ignore", "inherit", "ignore"], // inherits (holds) the stdout pipe
+  });
+  child.unref();
+  emitSync("assistant", "spawned an escaped stdout-holding descendant");
+  emitSync("result", "leader done; descendant holds stdout in its own session");
+  process.exit(0);
 } else if (mode === "graceful-cancel") {
   let stop = false;
   process.on("SIGTERM", () => {

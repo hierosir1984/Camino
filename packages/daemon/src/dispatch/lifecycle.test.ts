@@ -303,6 +303,37 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("a group-escaped descendant holding stdout cannot HANG dispatch — the drain is bounded (round-8 finding 3)", async () => {
+    // The round-8 drain awaits stream EOF before classifying. A descendant that
+    // escaped the group (own session) and inherited stdout holds the pipe open
+    // forever; the group-scoped sweep can't reap it (the WP-107 boundary), so
+    // the drain MUST be bounded. FAST_KILL → drain cap ~2s; the descendant
+    // sleeps 30s, so a return well under that proves the cap bounded it.
+    const ws = makeWorkspace();
+    const pidFile = join(ws, ".escaped-holder-pid");
+    try {
+      const started = Date.now();
+      const rec = await dispatch(
+        mockAdapter("escaped-stdout-holder"),
+        { workdir: ws, prompt: "leak stdout" },
+        { killConfirm: FAST_KILL },
+      );
+      const elapsedMs = Date.now() - started;
+      expect(rec.outcome).toBe("succeeded"); // leader exited 0; the holder is the WP-107 boundary
+      expect(rec.streamedEvents).toBeGreaterThanOrEqual(2); // the leader's own lines were drained
+      expect(elapsedMs).toBeLessThan(8000); // bounded by the ~2s cap, NOT the descendant's 30s sleep
+    } finally {
+      if (existsSync(pidFile)) {
+        try {
+          process.kill(Number(readFileSync(pidFile, "utf8").trim()));
+        } catch {
+          /* already gone */
+        }
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("lease release is sequenced strictly AFTER group-gone on the cancel path (registry item 4)", async () => {
     const ws = makeWorkspace();
     try {
