@@ -321,6 +321,107 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("an ASYNC transcript sink that rejects cannot crash the dispatch (round-2 finding 3)", async () => {
+    // A void-typed sink that returns a rejecting promise would otherwise become
+    // an unhandledRejection (which fails the vitest run). The dispatch must
+    // swallow it.
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const rec = await dispatch(
+        mockAdapter(),
+        { workdir: ws, prompt: "x" },
+        {
+          lease,
+          onLine: () => Promise.reject(new Error("async sink rejected")) as unknown as void,
+        },
+      );
+      expect(rec.outcome).toBe("succeeded");
+      expect(released).toBe(1);
+      // Give any stray rejection a tick to surface (it must not).
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a throwing plan.env GETTER is handled as a broken adapter, lease settled (round-2 finding 3)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const envGetterAdapter: AdapterSpec = {
+        ...mockAdapter(),
+        plan: () => ({
+          file: process.execPath,
+          args: [],
+          get env(): Record<string, string> {
+            throw new Error("plan.env getter threw");
+          },
+        }),
+      };
+      const rec = await dispatch(envGetterAdapter, { workdir: ws, prompt: "x" }, { lease });
+      expect(rec.spawned).toBe(false);
+      expect(rec.outcome).toBe("requirement-failed");
+      expect(rec.unexpectedError).toContain("plan.env getter threw");
+      expect(released).toBe(1); // nothing spawned → lease released
+      expect(rec.lease).toEqual({ released: true });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a plan() that throws a NON-stringifiable value does not crash error handling (round-2 finding 3)", async () => {
+    const ws = makeWorkspace();
+    try {
+      const toxic = {
+        get [Symbol.toPrimitive]() {
+          throw new Error("toString threw");
+        },
+        toString() {
+          throw new Error("toString threw");
+        },
+      };
+      const toxicAdapter: AdapterSpec = {
+        ...mockAdapter(),
+        plan: () => {
+          throw toxic;
+        },
+      };
+      const rec = await dispatch(toxicAdapter, { workdir: ws, prompt: "x" });
+      expect(rec.spawned).toBe(false);
+      expect(rec.outcome).toBe("requirement-failed"); // safeStringify never re-throws
+      expect(typeof rec.unexpectedError).toBe("string");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a lease.release that throws a TOXIC value is recorded, and release is called EXACTLY once (round-2 finding 4)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let releases = 0;
+      const toxic = {
+        toString() {
+          throw new Error("release error conversion threw");
+        },
+      };
+      const lease: LeaseHandle = {
+        release: () => {
+          releases++;
+          throw toxic; // a hostile error that would break String(err)
+        },
+      };
+      const rec = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" }, { lease });
+      expect(releases).toBe(1); // NOT twice — no re-entry into settlement
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.lease).toMatchObject({ released: false, heldReason: "release-threw" });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a throwing transcript sink cannot crash the dispatch; cleanup + lease still run (round-1 finding 2)", async () => {
     const ws = makeWorkspace();
     try {
@@ -359,7 +460,7 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       const rec = await dispatch(throwingPlan, { workdir: ws, prompt: "x" }, { lease });
       expect(rec.spawned).toBe(false);
       expect(rec.outcome).toBe("requirement-failed"); // broken adapter, not a leaked throw
-      expect(rec.unexpectedError).toContain("plan() threw");
+      expect(rec.unexpectedError).toContain("plan failed"); // the raw adapter error, captured
       expect(released).toBe(1); // nothing spawned → lease releasable
       expect(rec.lease).toEqual({ released: true });
     } finally {
@@ -529,10 +630,15 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
   });
 });
 
-// Round-1 finding 10: drive each PROVIDER adapter's real plan()+parseLine
-// through the full lifecycle in CI, zero quota — the provider's own stream
-// schema, spawned by a fake CLI that emits it, so parsing + classification +
-// kill-confirm run against product provider code, not just unit-tested parsers.
+// Round-1 finding 10 (scope corrected per round-2 finding 8): drive each
+// PROVIDER adapter's real parseLine + the real lifecycle's classification in
+// CI, zero quota — the provider's own stream schema, emitted by a fake CLI, so
+// the product PARSER runs inside the real dispatch. NOTE this substitutes
+// plan() (to run the fake CLI) and the workers exit naturally, so it does NOT
+// exercise the real provider plan() argv or kill-confirm — those are covered
+// by the mock-adapter lifecycle tests above and the real-CLI smoke run. The
+// quota assertion below is strengthened to require the PARSER (not the raw-line
+// backstop) produced the signal.
 describe("provider adapters through the real lifecycle (zero quota)", () => {
   const PROVIDER_LINES: Record<string, { solve: string[]; quota: string }> = {
     "claude-code": {
@@ -591,7 +697,7 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
       }
     });
 
-    it(`${name}: a real rate-limit stream classifies quota-blocked, not requirement-failed`, async () => {
+    it(`${name}: a real rate-limit stream classifies quota-blocked via the PARSER`, async () => {
       const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
       try {
         const rec = await dispatch(schemaEmittingAdapter(name, [fixtures.quota], 1), {
@@ -599,6 +705,9 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
           prompt: "x",
         });
         expect(rec.outcome).toBe("quota-blocked"); // CAM-EXEC-06, through product parser
+        // Prove the PARSER flagged it (not only the lifecycle's raw-line scan):
+        // a parsed event carries quotaSignal (round-2 finding 8).
+        expect(rec.events.some((e) => e.quotaSignal === true)).toBe(true);
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }

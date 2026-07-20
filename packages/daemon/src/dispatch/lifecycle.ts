@@ -5,11 +5,16 @@
 // sweep, centralized outcome classification, and lease release sequenced
 // strictly after the GROUP is confirmed gone (PRD §5 registry item 4).
 //
-// Containment boundary (round-1 review finding 1): "gone" is the worker's
-// process GROUP. A descendant that detaches into its own session escapes
-// group signals; complete process-tree containment is WP-107's container
-// (PID namespace). This layer owns the group-scoped ordering guarantee and
-// says so.
+// Containment boundary (round-1 review finding 1; scope widened per round-2
+// finding 2): "gone" is the worker's process GROUP. A descendant that changes
+// its own process group — setpgid(0,0) (same session) OR setsid (new session)
+// — escapes both the group signal and the group-liveness probe. Complete
+// process-tree containment is WP-107's container (PID namespace / cgroup),
+// where the whole worker tree is killable as a unit regardless of group. This
+// layer owns the group-scoped ordering guarantee and says so. The PRD's
+// "process-tree-gone" wording (registry item 4, CAM-EXEC-06) describes the
+// post-container end state; a proposed scoping amendment (AMEND-9) is parked
+// for David — see the PR.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type {
@@ -198,7 +203,44 @@ export function processGroupConfirmedGone(rec: {
   return true;
 }
 
-/** Release the lease iff the group is confirmed gone; otherwise hold, recorded. */
+/**
+ * Convert an unknown thrown value to a short string WITHOUT ever throwing —
+ * a hostile error whose `toString`/`Symbol.toPrimitive` throws must not turn
+ * error handling into a new crash (round-2 review findings 3, 4).
+ */
+function safeStringify(value: unknown): string {
+  try {
+    return String(value).slice(0, 400);
+  } catch {
+    try {
+      return Object.prototype.toString.call(value).slice(0, 400);
+    } catch {
+      return "[unstringifiable value]";
+    }
+  }
+}
+
+/**
+ * Kill-confirm that NEVER throws (round-2 review finding 1): on the error path
+ * a sweep that itself throws must not be mistaken for "group gone". A throw
+ * becomes a recorded groupGone:false so the lease is held fail-closed.
+ */
+async function sweepGroupSafe(
+  child: ChildProcess,
+  timings: KillConfirmTimings,
+): Promise<KillConfirmRecord> {
+  try {
+    return await killConfirm(child, timings);
+  } catch {
+    return { requested: true, escalatedToSigkill: false, groupGone: false, elapsedMs: 0 };
+  }
+}
+
+/**
+ * Release the lease iff the group is confirmed gone; otherwise hold, recorded.
+ * NEVER throws — a broken lease store or a hostile release error must not turn
+ * settlement into a crash that re-enters settlement (round-2 findings 3, 4).
+ */
 async function settleLease(
   lease: LeaseHandle,
   groupGone: boolean,
@@ -215,7 +257,7 @@ async function settleLease(
     return {
       released: false,
       heldReason: "release-threw",
-      releaseError: String(err).slice(0, 400),
+      releaseError: safeStringify(err),
     };
   }
 }
@@ -248,8 +290,9 @@ function noProcessRecord(
  * the CLI detached (own process group), parse both streams line-by-line into
  * normalized events, and either let it finish or cancel/timeout it with
  * kill-confirm. Outcome is classified centrally; the lease (when provided) is
- * settled LAST — after the group-gone determination — and always settled,
- * even if the dispatch body throws (finally).
+ * settled LAST — after the group-gone determination — and always settled on
+ * every terminal path (normal return and the catch), at most once. Neither
+ * settlement nor the finally can throw, so a dispatch always returns a record.
  */
 export async function dispatch(
   adapter: AdapterSpec,
@@ -263,32 +306,30 @@ export async function dispatch(
   const started = Date.now();
   const timings = opts.killConfirm ?? PRODUCTION_KILL_CONFIRM;
 
+  // Settle the lease AT MOST ONCE across every path (round-2 review finding 4):
+  // a single guarded closure so no error path can re-enter release().
+  let leaseSettled = false;
+  const settleFor = async (record: DispatchRecord): Promise<void> => {
+    if (!opts.lease || leaseSettled) return;
+    leaseSettled = true;
+    record.lease = await settleLease(opts.lease, processGroupConfirmedGone(record), record.outcome);
+  };
+
   if (opts.signal?.aborted) {
     // Cancelled before anything ran: nothing spawned, nothing to kill; the
     // posture records the composed baseline (no adapter extras — plan() is
     // not consulted for a dispatch that never starts).
     const { posture } = composeWorkerEnv(process.env);
     const record = noProcessRecord(adapter, "cancelled", posture, started);
-    if (opts.lease) record.lease = await settleLease(opts.lease, true, record.outcome);
+    await settleFor(record); // spawned:false → group trivially gone → released
     return record;
   }
 
-  // plan() is adapter code — a throw here is a broken adapter, handled like a
-  // spawn failure (requirement-failed), never a leaked lease (round-1 finding 2).
-  let plan;
-  try {
-    plan = adapter.plan(ctx);
-  } catch (err) {
-    const { posture } = composeWorkerEnv(process.env);
-    const record = noProcessRecord(adapter, "requirement-failed", posture, started, {
-      unexpectedError: `plan() threw: ${String(err).slice(0, 400)}`,
-    });
-    if (opts.lease) record.lease = await settleLease(opts.lease, true, record.outcome);
-    return record;
-  }
-  const { env, posture } = composeWorkerEnv(process.env, plan.env ?? {});
+  // The composed baseline posture (no extras) is safe to compute up front and
+  // is the fallback if plan()/its env getter throws (round-2 finding 3).
+  let posture: EnvPostureRecord = composeWorkerEnv(process.env).posture;
 
-  // State the whole body shares; settled in the finally below.
+  // State the whole body shares.
   let child: ChildProcess | undefined;
   let exited = false;
   let killReason: "cancel" | "timeout" | null = null;
@@ -323,9 +364,17 @@ export async function dispatch(
   if (opts.signal?.aborted) pendingCancel = true;
 
   try {
+    // plan() AND its env composition run inside the try: plan() is adapter code
+    // and `plan.env` may be a throwing getter — both are handled as a broken
+    // adapter (requirement-failed), never a leaked lease (round-1 finding 2;
+    // round-2 finding 3 widened this to the env getter and the spawn call).
+    const plan = adapter.plan(ctx);
+    const composed = composeWorkerEnv(process.env, plan.env ?? {});
+    posture = composed.posture;
+
     child = spawn(plan.file, plan.args, {
       cwd: ctx.workdir,
-      env,
+      env: composed.env,
       detached: true,
       stdio: [plan.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
@@ -372,7 +421,7 @@ export async function dispatch(
 
     if (spawnFailed) {
       const record = noProcessRecord(adapter, "requirement-failed", posture, started);
-      if (opts.lease) record.lease = await settleLease(opts.lease, true, record.outcome);
+      await settleFor(record); // no process → group trivially gone → released
       return record;
     }
 
@@ -391,9 +440,15 @@ export async function dispatch(
       const rl = createInterface({ input: stream });
       rl.on("line", (line) => {
         // The transcript sink is caller code — a throwing sink must not crash
-        // the dispatch (round-1 review finding 2).
+        // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
+        // an ASYNC sink (declared void but returning a promise) could reject
+        // and become an unhandledRejection crash — swallow that too (round-2
+        // review finding 3).
         try {
-          opts.onLine?.(channel, line);
+          const maybePromise = opts.onLine?.(channel, line) as unknown;
+          if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
+            void (maybePromise as Promise<unknown>).catch(() => {});
+          }
         } catch {
           /* a broken sink is not the worker's fault */
         }
@@ -441,7 +496,7 @@ export async function dispatch(
     let postExitCleanup: KillConfirmRecord | undefined;
     const pid = child.pid;
     if (!killRecord && pid != null && groupAlive(pid)) {
-      postExitCleanup = await killConfirm(child, timings);
+      postExitCleanup = await sweepGroupSafe(child, timings); // never throws; fail-closed
     }
 
     const events = retainedEvents();
@@ -451,20 +506,22 @@ export async function dispatch(
     // CAM-EXEC-06. anyEventQuota is tracked over ALL events, not just retained.
     const quotaBlocked = quotaSeenInRaw || anyEventQuota;
 
-    // A cancel/timeout is authoritative from `killReason`, set ONLY by
-    // requestKill and ONLY while the child was genuinely still running. A
-    // process that had already exited never gets a killReason and is classified
-    // on its exit code — no natural completion is mislabeled.
+    // A cancel/timeout is authoritative from `killReason`, set only by
+    // requestKill. A process that had already exited never gets a killReason
+    // and is classified on its exit code.
     //
-    // Accepted residual (WP-001 review #3; scope corrected per round-1 review
-    // finding 11): the exit event is asynchronous, so a cancel/timeout that
-    // fires in the same event-loop window as a natural exit-0 can be recorded
-    // as cancelled/killed. The window is bounded by event-loop scheduling (not
-    // a hard sub-millisecond claim), and the mislabel is ledger-safe (a
-    // cancelled attempt is excluded from scorecards, not falsely credited). The
-    // attempt state machine (Appendix A) records cancel-requested and exited as
-    // separate events and reconciles them rather than forcing a synchronous
-    // label; WP-105 keeps the conservative synchronous label at the seam.
+    // Accepted residual (WP-001 review #3; scope corrected per round-1 finding
+    // 11 and round-2 finding 10 — stated without an absolute no-mislabel
+    // claim): the exit event is asynchronous, so a cancel/timeout that fires in
+    // the same event-loop turn as a natural exit-0 that Node has not yet
+    // delivered CAN be recorded as cancelled/killed even though the OS process
+    // already exited 0 (a zombie answers kill(pid,0)). The window is bounded by
+    // event-loop scheduling, not a hard sub-millisecond bound, and the mislabel
+    // is ledger-safe (a cancelled attempt is excluded from scorecards, not
+    // falsely credited). The attempt state machine (Appendix A) records
+    // cancel-requested and exited as separate events and reconciles them rather
+    // than forcing a synchronous label; WP-105 keeps the conservative
+    // synchronous label at the seam.
     let outcome: DispatchOutcome;
     if (killReason === "timeout") {
       outcome = "killed";
@@ -495,22 +552,19 @@ export async function dispatch(
 
     // Lease settlement is LAST, strictly after the group-gone determination
     // (PRD §5 registry item 4: … → group-gone → lease release).
-    if (opts.lease) {
-      record.lease = await settleLease(opts.lease, processGroupConfirmedGone(record), outcome);
-    }
+    await settleFor(record);
     return record;
   } catch (err) {
-    // Anything unexpected in the body (e.g. a stream/API error we didn't
-    // anticipate) still cleans up and settles the lease (round-1 finding 2).
-    // Best-effort sweep the group so we do not leak a worker, then settle.
+    // Anything unexpected in the body (a stream/API error, a throwing plan()
+    // or its env getter) still cleans up and settles the lease exactly once
+    // (round-1 finding 2). FAIL-CLOSED cleanup evidence (round-2 finding 1): a
+    // sweep is recorded whenever a child exists — if the group is still alive
+    // and the sweep can't confirm it gone, that is a groupGone:false record, so
+    // the lease is HELD, never released over a possibly-live group.
     let postExitCleanup: KillConfirmRecord | undefined;
     const pid = child?.pid;
     if (!killRecord && pid != null && groupAlive(pid)) {
-      try {
-        postExitCleanup = await killConfirm(child!, timings);
-      } catch {
-        /* best effort */
-      }
+      postExitCleanup = await sweepGroupSafe(child!, timings);
     }
     const record: DispatchRecord = {
       adapter: adapter.name,
@@ -525,19 +579,20 @@ export async function dispatch(
       exitCode: null,
       durationMs: Date.now() - started,
       events: [],
-      unexpectedError: String(err).slice(0, 400),
+      unexpectedError: safeStringify(err),
     };
-    if (opts.lease) {
-      record.lease = await settleLease(
-        opts.lease,
-        processGroupConfirmedGone(record),
-        record.outcome,
-      );
-    }
+    await settleFor(record);
     return record;
   } finally {
     if (cancelTimer) clearTimeout(cancelTimer);
     if (timeoutTimer) clearTimeout(timeoutTimer);
-    opts.signal?.removeEventListener("abort", onAbort);
+    // Even removeEventListener can throw on a hostile duck-typed signal
+    // (round-2 finding 11) — the finally must never replace the returned record
+    // with a throw.
+    try {
+      opts.signal?.removeEventListener("abort", onAbort);
+    } catch {
+      /* a hostile signal must not break the return */
+    }
   }
 }

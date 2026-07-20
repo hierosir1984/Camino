@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal } from "../quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Claude Code (official CLI), headless.
@@ -76,7 +76,12 @@ export function claudeAdapter(
         case "result": {
           const text = String(obj["result"] ?? obj["subtype"] ?? "result");
           const isError = obj["is_error"] === true || obj["subtype"] === "error_max_turns";
-          return { kind: isError ? "error" : "result", text: text.slice(0, 400), ...q };
+          // In an ERROR result, trust the provider's exhaustion phrases
+          // ("Credit balance is too low", "usage limit reached") — this is the
+          // error context those phrases are reliable in (round-2 finding 5).
+          const eq =
+            isError && classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
+          return { kind: isError ? "error" : "result", text: text.slice(0, 400), ...eq };
         }
         case "user":
           return { kind: "tool", text: "tool_result", ...q };

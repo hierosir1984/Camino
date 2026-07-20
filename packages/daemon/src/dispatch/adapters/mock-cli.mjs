@@ -8,7 +8,7 @@
 //                         commit it, emit a result event, exit 0.
 //   hang                — spawn a `sleep` grandchild, IGNORE SIGTERM, stream
 //                         forever → forces SIGKILL escalation and proves the
-//                         whole process TREE is cleaned up.
+//                         whole process GROUP is cleaned up.
 //   orphan              — leader exits on SIGTERM while a descendant ignores
 //                         it → proves group-gated SIGKILL escalation.
 //   grace-descendant    — leader exits instantly, descendant needs ~200ms →
@@ -24,7 +24,7 @@
 // Every mode writes its pid to `.mock-pid` in the workspace at startup: the
 // leader is the group leader (detached spawn), so tests can probe
 // kill(-pid, 0) themselves to verify the whole group is genuinely gone —
-// independent corroboration of the lifecycle's own tree-gone claim.
+// independent corroboration of the lifecycle's own group-gone claim.
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync, writeSync } from "node:fs";
@@ -95,7 +95,7 @@ if (mode === "hang") {
   // Without the post-exit sweep the descendant outlives the dispatch — and a
   // lease released at that moment would have two effective owners of one
   // environment. The descendant traps TERM and exits promptly (cooperative),
-  // so the sweep should confirm tree-gone WITHOUT SIGKILL escalation.
+  // so the sweep should confirm group-gone WITHOUT SIGKILL escalation.
   const marker = join(process.cwd(), ".linger-descendant-ready");
   spawn("sh", ["-c", `trap "exit 0" TERM; : > "${marker}"; while :; do sleep 1; done`], {
     stdio: "ignore",

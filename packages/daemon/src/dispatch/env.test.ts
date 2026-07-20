@@ -116,10 +116,12 @@ describe("composeWorkerEnv", () => {
     expect(env["GIT_CONFIG_SYSTEM"]).toBe("/dev/null");
   });
 
-  it("closes the git repo/exec REDIRECT channels (round-1 finding 4)", () => {
-    // GIT_DIR & friends point git at attacker-chosen state or helper binaries,
-    // untouched by /dev/null config neutralization.
-    const redirects = {
+  it("closes the git repo/exec REDIRECT and command-execution channels (round-1 finding 4, round-2 finding 7)", () => {
+    // GIT_DIR & friends point git at attacker-chosen state; GIT_EXTERNAL_DIFF /
+    // GIT_EDITOR / GIT_PAGER / GIT_SEQUENCE_EDITOR make an ordinary git
+    // invocation run an attacker binary — untouched by /dev/null config
+    // neutralization.
+    const channels = {
       GIT_DIR: "/evil/.git",
       GIT_WORK_TREE: "/evil/tree",
       GIT_OBJECT_DIRECTORY: "/evil/objects",
@@ -128,9 +130,14 @@ describe("composeWorkerEnv", () => {
       GIT_NAMESPACE: "evil",
       GIT_COMMON_DIR: "/evil/common",
       GIT_EXEC_PATH: "/evil/git-core",
+      GIT_EXTERNAL_DIFF: "/evil/differ",
+      GIT_EDITOR: "/evil/editor",
+      GIT_SEQUENCE_EDITOR: "/evil/seq",
+      GIT_PAGER: "/evil/pager",
+      GIT_TEMPLATE_DIR: "/evil/templates",
     };
-    const { env, posture } = composeWorkerEnv({ PATH: "/usr/bin", HOME: "/Users/x" }, redirects);
-    for (const k of Object.keys(redirects)) {
+    const { env, posture } = composeWorkerEnv({ PATH: "/usr/bin", HOME: "/Users/x" }, channels);
+    for (const k of Object.keys(channels)) {
       expect(env[k], k).toBeUndefined();
       expect(posture.strippedKeys, k).toContain(k);
     }

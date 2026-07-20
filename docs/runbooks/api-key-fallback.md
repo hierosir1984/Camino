@@ -48,11 +48,12 @@ node --run dispatch:smoke -- --only=claude   # or codex / grok
 ```
 
 Confirm on the printed console line: `outcome=succeeded` and a `committed=`
-SHA. The env posture (`githubCredentialKeys: []`, git neutralized) is written
-to `packages/daemon/dispatch-smoke/REPORT.md` and `summary.json` — check the
-`Env: GH creds` column there reads `none ✓`. Then check the provider's console
-shows the usage landed on the **API account** (that is the proof the fallback
-path, not the subscription, served the dispatch).
+SHA. For the env posture: `REPORT.md` shows the derived `Env: GH creds` column
+(should read `none ✓`); the full posture — including `gitGlobalNeutralized`
+and the stripped-key list — is in `packages/daemon/dispatch-smoke/summary.json`
+only. Then check the provider's console shows the usage landed on the **API
+account** (that is the proof the fallback path, not the subscription, served
+the dispatch).
 
 ---
 
@@ -101,10 +102,13 @@ setting — nothing Camino-visible changes.
 Codex stores auth in its own state under `~/.codex/`; the login subcommand has
 a first-class API-key mode that reads the key from stdin (never argv).
 
-Codex stores auth under `CODEX_HOME` (default `~/.codex/`); its storage mode
-is configurable (`file` → `~/.codex/auth.json`, `keyring`, or `auto`), so do
-not assume a specific file — treat `codex login status` as the source of truth
-for which mode/identity is active.
+Codex's credential STORAGE is selected by `cli_auth_credentials_store` =
+`file` (→ `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`), `keyring`
+(OS keychain — no file under `~/.codex`), or `auto`. Do not assume a file
+path — in `keyring` mode there is none. `codex login status` reports the
+authentication METHOD/identity (e.g. "Logged in using ChatGPT"), not the
+storage backend; use it to confirm which identity is active, and check
+`cli_auth_credentials_store` for where the credential lives.
 
 1. **Prepare the key** (funded Platform account, WP-000 attestation): create an
    API key in the OpenAI console, store it in the keychain as above
@@ -133,11 +137,23 @@ takes precedence over session auth). Its stored login (`grok login`, cached
 under `~/.grok/`) is the **subscription** flow.
 
 - **Fallback that works through Camino dispatch:** set the API key in grok's
-  own config file under `HOME` (`~/.grok/config.toml`, `model.api_key`, per
-  xAI's current docs). This is the same custody model as the other two
-  providers — the vendor's own CLI reading its own config under `HOME`, the
-  sanctioned path (CAM-SEC-06). Because `HOME` is preserved for the worker, the
-  official CLI loads that config; Camino never reads or proxies the key.
+  own config file under `HOME` as a PER-MODEL table (installed `grok 0.2.102`
+  rejects a bare top-level `model.api_key` string — it expects a table). Per
+  xAI's per-model configuration, use e.g. in `~/.grok/config.toml`:
+
+  ```toml
+  [model.grok-build]
+  api_key = "<your xAI API key>"
+
+  [models]
+  default = "grok-build"
+  ```
+
+  Confirm with `grok models inspect` (no `modelOverrideWarnings`). This is the
+  same custody model as the other two providers — the vendor's own CLI reading
+  its own config under `HOME`, the sanctioned path (CAM-SEC-06). Because `HOME`
+  is preserved for the worker, the official CLI loads that config; Camino never
+  reads or proxies the key. Follow xAI's current docs for the exact table name.
 - **The env-var route does not reach a worker:** Camino's worker-env composer
   deliberately strips `XAI_API_KEY` (and every credential-shaped var), so
   exporting it in your shell has no effect on a dispatch. Use the config-file

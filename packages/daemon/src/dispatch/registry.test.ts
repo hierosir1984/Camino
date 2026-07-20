@@ -82,7 +82,7 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     expect(reg.find((a) => a.name === "codex-cli")!.enabled).toBe(true);
   });
 
-  it("grok is disabled with a PRECISE reason per malformation class (round-1 finding 8)", () => {
+  it("grok is disabled with a PRECISE reason per malformation class (round-1 finding 8, round-2 finding 6)", () => {
     const cases: Array<{ content: string; reason: RegExp }> = [
       {
         content: JSON.stringify({ xaiSanctionedPath: { status: "pending" } }),
@@ -90,6 +90,11 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
       },
       { content: JSON.stringify({ somethingElse: true }), reason: /status absent from record/ },
       { content: "not json at all", reason: /malformed \(not valid JSON\)/ },
+      // JSON that parses but is not an object must DISABLE, not crash (finding 6).
+      { content: "null", reason: /not a JSON object/ },
+      { content: "[1,2,3]", reason: /not a JSON object/ },
+      { content: '"a string"', reason: /not a JSON object/ },
+      { content: "42", reason: /not a JSON object/ },
     ];
     for (const { content, reason } of cases) {
       const file = tmpAttestations(content);

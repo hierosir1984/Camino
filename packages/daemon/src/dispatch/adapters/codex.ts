@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal } from "../quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Codex CLI (official), headless.
@@ -36,9 +36,15 @@ export function codexAdapter(
       const quota = classifyByQuotaSignal(trimmed);
       const q = quota ? { quotaSignal: true as const } : {};
       if (!trimmed.startsWith("{")) {
-        // Codex also prints non-JSON progress/errors, esp. on stderr.
+        // Codex also prints non-JSON progress/errors, esp. on stderr — an
+        // error channel, so exhaustion phrases are trusted here (finding 5).
         if (channel === "stderr" && trimmed.length > 0) {
-          return { kind: quota ? "error" : "other", text: trimmed.slice(0, 400), ...q };
+          const eq = classifyErrorTextForQuota(trimmed);
+          return {
+            kind: eq ? "error" : "other",
+            text: trimmed.slice(0, 400),
+            ...(eq ? { quotaSignal: true as const } : {}),
+          };
         }
         return null;
       }
@@ -57,9 +63,16 @@ export function codexAdapter(
         const itemType = String(item["type"] ?? "");
         const text = String(item["text"] ?? item["message"] ?? itemType).slice(0, 400);
         if (itemType === "agent_message") return { kind: "result", text, ...q };
-        // codex emits non-fatal warnings as "error" items; only a quota signal
-        // makes one meaningful for classification.
-        if (itemType === "error") return { kind: quota ? "error" : "other", text, ...q };
+        // codex emits non-fatal warnings as "error" items; in that error
+        // context, trust exhaustion phrases too (round-2 finding 5).
+        if (itemType === "error") {
+          const eq = classifyErrorTextForQuota(text);
+          return {
+            kind: eq ? "error" : "other",
+            text,
+            ...(eq ? { quotaSignal: true as const } : {}),
+          };
+        }
         if (/command|exec|file|patch|tool|mcp/.test(itemType))
           return { kind: "tool", text: itemType, ...q };
         return { kind: "other", text: itemType || "item", ...q };
@@ -68,7 +81,9 @@ export function codexAdapter(
         return { kind: "other", text: type, ...q };
       }
       if (type.includes("error")) {
-        return { kind: "error", text: String(obj["message"] ?? type).slice(0, 400), ...q };
+        const text = String(obj["message"] ?? type).slice(0, 400);
+        const eq = classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
+        return { kind: "error", text, ...eq };
       }
       return { kind: "other", text: type || "event", ...q };
     },

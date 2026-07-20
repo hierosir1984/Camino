@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal } from "../quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Grok Build CLI (official), headless — enablement gated on the recorded
@@ -40,7 +40,12 @@ export function grokAdapter(
       const q = quota ? { quotaSignal: true as const } : {};
       if (!trimmed.startsWith("{")) {
         if (channel === "stderr" && trimmed.length > 0) {
-          return { kind: quota ? "error" : "other", text: trimmed.slice(0, 400), ...q };
+          const eq = classifyErrorTextForQuota(trimmed); // stderr = error context
+          return {
+            kind: eq ? "error" : "other",
+            text: trimmed.slice(0, 400),
+            ...(eq ? { quotaSignal: true as const } : {}),
+          };
         }
         return null;
       }
@@ -67,7 +72,9 @@ export function grokAdapter(
         return { kind: "result", text: data.slice(0, 400), ...q };
       }
       if (type.includes("error")) {
-        return { kind: "error", text: (data || type).slice(0, 400), ...q };
+        const text = (data || type).slice(0, 400);
+        const eq = classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
+        return { kind: "error", text, ...eq };
       }
       if (type.includes("tool") || type.includes("edit") || type.includes("exec")) {
         return { kind: "tool", text: type, ...q };

@@ -88,15 +88,17 @@ export interface AdapterSpec {
  * verification. Lease release is sequenced strictly AFTER `groupGone` is
  * confirmed (see LeaseHandle).
  *
- * Containment boundary (round-1 review finding 1): "gone" here means the
- * worker's process GROUP is gone. A descendant that deliberately detaches
- * into its OWN session/group (setsid / double-fork, reparented to init)
- * escapes both the group signal and the group-liveness probe — no
- * signal-based mechanism on this layer can contain that. Complete
- * process-tree containment is the container's job: WP-107 runs each worker
- * in a PID namespace where killing the container reaps every pid regardless
- * of session. At THIS layer the fencing guarantee is scoped to the process
- * group, and that scope is stated, not overclaimed.
+ * Containment boundary (round-1 review finding 1; widened per round-2 finding
+ * 2): "gone" here means the worker's process GROUP is gone. A descendant that
+ * changes its own process group — setpgid(0,0) (same session) or setsid (new
+ * session) — escapes both the group signal and the group-liveness probe; no
+ * signal-based mechanism on this layer can contain that. Complete process-tree
+ * containment is the container's job: WP-107 runs each worker in a PID
+ * namespace / cgroup where killing the container reaps every pid regardless of
+ * group. At THIS layer the fencing guarantee is scoped to the process group,
+ * and that scope is stated, not overclaimed. The PRD's "process-tree-gone"
+ * wording (registry item 4, CAM-EXEC-06) describes the post-container end
+ * state; a proposed scoping amendment (AMEND-9) is parked for David.
  */
 export interface KillConfirmRecord {
   requested: boolean;
@@ -153,8 +155,10 @@ export interface LeaseReleaseContext {
  *     deliberately held and the DispatchRecord says so, because releasing a
  *     lease while a worker may still be running would permit two owners of one
  *     environment (the fencing invariant CAM-STATE-04 exists to prevent);
- *   - even when the dispatch body throws unexpectedly: settlement runs in a
- *     finally, so a thrown dispatch never silently strands a lease.
+ *   - even when the dispatch body throws unexpectedly: settlement runs on
+ *     EVERY terminal path (the normal return AND the error catch, each exactly
+ *     once via an internal guard), so a thrown dispatch never silently strands
+ *     a lease.
  *
  * Group scope, not full-tree (round-1 review finding 1): a descendant that
  * detaches into its own session escapes group containment; the environment's
@@ -247,18 +251,33 @@ export const CREDENTIAL_SHAPED_PATTERN =
  *   - git config injection: GIT_CONFIG / GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n /
  *     GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS bypass the /dev/null
  *     global+system neutralization entirely (credential.helper, core.sshCommand);
+ *     GIT_CONFIG_GLOBAL/SYSTEM/TERMINAL_PROMPT are the composer's own forced
+ *     keys — listed here so the predicate is authoritative (the composer
+ *     re-forces them to safe values after stripping);
  *   - git repo/exec redirect: GIT_DIR / GIT_WORK_TREE / GIT_OBJECT_DIRECTORY /
  *     GIT_ALTERNATE_OBJECT_DIRECTORIES / GIT_INDEX_FILE / GIT_NAMESPACE /
  *     GIT_COMMON_DIR / GIT_EXEC_PATH point git at attacker-chosen state or
  *     helper binaries (round-1 review finding 4);
+ *   - git command-execution channels: GIT_EXTERNAL_DIFF / GIT_EDITOR /
+ *     GIT_SEQUENCE_EDITOR / GIT_PAGER / GIT_TEMPLATE_DIR make an ordinary git
+ *     invocation run an attacker-chosen binary (round-2 review finding 7 —
+ *     GIT_EXTERNAL_DIFF executes on `git diff`);
  *   - transport / agent: GIT_SSH / GIT_SSH_COMMAND / GIT_PROXY_COMMAND /
  *     SSH_AUTH_SOCK / SSH_ASKPASS hand out arbitrary transport commands and
  *     the user's SSH agent.
+ *
+ * BOUNDARY (round-2 finding 7): git's env surface is large; this list covers
+ * the known capability-granting channels. Complete isolation from every git
+ * env var is the CONTAINER's job (WP-107, CAM-EXEC-02). The env layer closes
+ * the known channels and the container closes the rest.
  */
 export const STRIPPED_ENV_EXACT = [
   "GIT_CONFIG",
   "GIT_CONFIG_COUNT",
   "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_TERMINAL_PROMPT",
   "GIT_DIR",
   "GIT_WORK_TREE",
   "GIT_OBJECT_DIRECTORY",
@@ -267,6 +286,11 @@ export const STRIPPED_ENV_EXACT = [
   "GIT_NAMESPACE",
   "GIT_COMMON_DIR",
   "GIT_EXEC_PATH",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_EDITOR",
+  "GIT_SEQUENCE_EDITOR",
+  "GIT_PAGER",
+  "GIT_TEMPLATE_DIR",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
   "GIT_PROXY_COMMAND",

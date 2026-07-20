@@ -95,13 +95,21 @@ describe("checkApiKeyAdapterSpec (static declaration conformance)", () => {
     }
   });
 
-  it("REFUSES declaring a stripped git/SSH capability channel as a credential var (round-1 finding 5)", () => {
+  it("REFUSES declaring a stripped git/SSH capability channel as a credential var (round-1 finding 5, round-2 finding 7)", () => {
     for (const k of [
       "GIT_CONFIG_COUNT",
       "GIT_SSH_COMMAND",
       "SSH_AUTH_SOCK",
       "GIT_DIR",
       "GIT_CONFIG_KEY_0",
+      // round-2 finding 7: command-execution + composer-forced channels are now
+      // in the one shared predicate, so the API-key checker rejects them too.
+      "GIT_EXTERNAL_DIFF",
+      "GIT_EDITOR",
+      "GIT_PAGER",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_SYSTEM",
+      "GIT_TERMINAL_PROMPT",
     ]) {
       const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
       expect(

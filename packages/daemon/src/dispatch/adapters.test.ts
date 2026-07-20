@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
-import { classifyByQuotaSignal } from "./quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota } from "./quota.js";
 import { committedSince, headSha, makeWorkspace } from "./workspace.js";
 
 // Per-provider quota classification (CAM-EXEC-06), provoked without spending
@@ -52,41 +52,80 @@ describe("per-provider quota classification", () => {
     }
   });
 
-  it("genuine rate-limit phrasings ARE flagged", () => {
+  it("genuine STRUCTURED rate-limit signatures ARE flagged prose-safely", () => {
     for (const bad of [
       "429 Too Many Requests",
+      "HTTP 429",
+      "Error: 429",
+      "status 429",
+      '{"status_code":429}',
+      '{"statusCode": 429}',
       "rate_limit_exceeded",
-      "usage limit reached",
-      "quota exceeded",
+      "rate_limit_error",
       "overloaded_error",
+      "insufficient_quota",
+      "resource_exhausted",
       "retry-after: 30",
+      "retry_after 10s",
+      "Retry-After: Wed, 21 Oct 2015 07:28:00 GMT",
     ]) {
       expect(classifyByQuotaSignal(bad), bad).toBe(true);
     }
   });
 
-  it("does NOT flag a benign 429 issue reference or retry-after documentation (round-1 finding 6)", () => {
+  it("does NOT flag benign 429/retry-after/exhaustion PROSE with the structured classifier (round-2 finding 5)", () => {
     for (const benign of [
       "Resolved GitHub issue #429 about caching",
       "issue 429 was closed",
       "the 429th commit landed",
       "Implemented Retry-After header parsing",
       "Fixed bug in retry-after config docs",
+      "rate limiting strategy documentation",
+      // The provider exhaustion PHRASES are prose-risky, so the prose-safe
+      // classifier deliberately does NOT match them — only the error-context
+      // classifier does (see below).
+      "Customer's credit balance is too low for financing",
+      "Documentation: usage limit reached in older tiers",
+      "You've hit your usage limit.",
+      "Credit balance is too low",
     ]) {
       expect(classifyByQuotaSignal(benign), benign).toBe(false);
     }
   });
 
-  it("DOES flag the providers' current exhaustion strings (round-1 finding 6)", () => {
+  it("the ERROR-CONTEXT classifier flags provider exhaustion phrases (round-2 finding 5)", () => {
     for (const real of [
       "You've hit your usage limit.", // installed Codex CLI
       "Credit balance is too low", // Anthropic spent-balance block
-      "HTTP 429 Too Many Requests",
-      "status 429",
-      "Error: 429",
+      "usage limit reached",
+      "usage limit exceeded",
+      "quota exceeded",
+      "HTTP 429 Too Many Requests", // structured signatures still count
     ]) {
-      expect(classifyByQuotaSignal(real), real).toBe(true);
+      expect(classifyErrorTextForQuota(real), real).toBe(true);
     }
+    // …but even in error context, genuinely unrelated failures are not quota.
+    for (const notQuota of ["file not found", "syntax error on line 3", "the operation failed"]) {
+      expect(classifyErrorTextForQuota(notQuota), notQuota).toBe(false);
+    }
+  });
+
+  it("an assistant message that merely MENTIONS an exhaustion phrase is not flagged as quota", () => {
+    // The claude parser routes assistant content through the prose-safe path;
+    // only an ERROR result trusts the phrase (round-2 finding 5).
+    const assistant = claudeAdapter().parseLine(
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Their credit balance is too low, so suggest topping up."}]}}',
+      "stdout",
+    );
+    expect(assistant?.kind).toBe("assistant");
+    expect(assistant?.quotaSignal).toBeUndefined();
+
+    const errorResult = claudeAdapter().parseLine(
+      '{"type":"result","subtype":"error","is_error":true,"result":"Credit balance is too low"}',
+      "stdout",
+    );
+    expect(errorResult?.kind).toBe("error");
+    expect(errorResult?.quotaSignal).toBe(true); // trusted in the error result
   });
 });
 

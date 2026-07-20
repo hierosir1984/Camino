@@ -102,15 +102,24 @@ function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: 
       reason: "xAI sanctioned-path record unreadable (docs/plan/phase-0-prereq-attestations.json)",
     };
   }
-  let att: { xaiSanctionedPath?: { status?: unknown } };
+  let parsed: unknown;
   try {
-    att = JSON.parse(raw) as { xaiSanctionedPath?: { status?: unknown } };
+    parsed = JSON.parse(raw);
   } catch {
     return {
       accepted: false,
       reason: "xAI sanctioned-path record malformed (not valid JSON)",
     };
   }
+  // JSON `null` / a non-object (array, string, number) parses fine but is not a
+  // record — guard before property access (round-2 review finding 6).
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      accepted: false,
+      reason: "xAI sanctioned-path record malformed (not a JSON object)",
+    };
+  }
+  const att = parsed as { xaiSanctionedPath?: { status?: unknown } };
   const status = att.xaiSanctionedPath?.status;
   if (status === "accepted") return { accepted: true };
   if (status === undefined) {
