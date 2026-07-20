@@ -909,6 +909,21 @@ describe("registry provenance at the dispatch boundary (round-6 finding 1)", () 
     }
   });
 
+  it("flipping `enabled` on a DISABLED registry spec does not confer provenance — still refused", async () => {
+    const ws = makeWorkspace();
+    try {
+      const disabled = buildRegistry({ cliPresent: () => false }).find(
+        (s) => s.name === "claude-code",
+      )!;
+      (disabled as { enabled: boolean }).enabled = true; // forge the decision…
+      await expect(dispatch(disabled, { workdir: ws, prompt: "x" })).rejects.toThrow(
+        /registry provenance/, // …the gate never enabled this object
+      );
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a spread COPY of a gated spec loses provenance and is refused (membership is not copyable)", async () => {
     const ws = makeWorkspace();
     try {

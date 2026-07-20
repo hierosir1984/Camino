@@ -202,14 +202,15 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
     expect(grok.enabled).toBe(true);
   });
 
-  it("every registry spec carries provenance; a direct factory or a copy does not (round-6 finding 1)", () => {
+  it("provenance = gate-ENABLED specs only; factories, copies, and disabled specs carry none (round-6 finding 1)", () => {
     for (const spec of buildRegistry({ cliPresent: ALL_PRESENT })) {
       expect(hasRegistryProvenance(spec), spec.name).toBe(true);
     }
-    // Disabled specs are registry products too (dispatch refuses them on
-    // enablement first; provenance still recorded).
+    // A DISABLED registry spec is deliberately NOT registered: dispatch refuses
+    // it on enablement, and flipping its `enabled` flag cannot confer a
+    // provenance the gate never granted.
     for (const spec of buildRegistry({ cliPresent: () => false })) {
-      expect(hasRegistryProvenance(spec), spec.name).toBe(true);
+      expect(hasRegistryProvenance(spec), spec.name).toBe(false);
     }
     // The raw factory and even a field-for-field COPY of a gated spec carry no
     // provenance — WeakSet membership cannot be forged by copying properties.

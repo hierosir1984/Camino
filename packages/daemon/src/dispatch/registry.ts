@@ -166,19 +166,22 @@ export interface RegistryOptions {
 }
 
 /**
- * Registry provenance (round-6 finding 1): every spec buildRegistry returns —
- * enabled or disabled — is registered here, and dispatch() refuses an ENABLED
- * spec bearing an official adapter name that is not. WeakSet membership cannot
- * be copied onto a forged object (unlike a symbol property), so a spread/copy
- * of a gated spec deliberately loses provenance. NAMED BOUNDARY: this defeats
- * ACCIDENTAL bypass of the sanctioned-path gate by first-party code; it is not
- * in-process capability sealing (code in this process can import the factory
- * modules by path) — that isolation is the container/process boundary
- * (WP-107, CAM-EXEC-02).
+ * Registry provenance (round-6 finding 1): a spec is registered here ONLY when
+ * buildRegistry's gate ENABLED it, and dispatch() refuses an enabled spec
+ * bearing an official adapter name that is not registered. WeakSet membership
+ * cannot be copied onto a forged object (unlike a symbol property), so a
+ * spread/copy of a gated spec loses provenance — and a DISABLED registry spec
+ * is deliberately NOT registered, so flipping its `enabled` flag cannot confer
+ * a provenance the gate never granted (disabled specs are refused on
+ * enablement; an enabled-flipped one is refused on provenance). NAMED
+ * BOUNDARY: this defeats ACCIDENTAL bypass of the sanctioned-path gate by
+ * first-party code; it is not in-process capability sealing (code in this
+ * process can import the factory modules by path or mutate a gated object) —
+ * that isolation is the container/process boundary (WP-107, CAM-EXEC-02).
  */
 const REGISTRY_GATED = new WeakSet<AdapterSpec>();
 
-/** Did this exact spec object come out of buildRegistry()'s gate? */
+/** Was this exact spec object ENABLED by buildRegistry()'s gate? */
 export function hasRegistryProvenance(spec: AdapterSpec): boolean {
   return REGISTRY_GATED.has(spec);
 }
@@ -191,18 +194,15 @@ function gate(
   sanctioned: { accepted: boolean; reason?: string },
   make: (opts?: { enabled?: boolean; disabledReason?: string }) => AdapterSpec,
 ): AdapterSpec {
-  let spec: AdapterSpec;
-  if (!present) {
-    spec = make({ enabled: false, disabledReason: `${cliBin} CLI not found on PATH` });
-  } else if (!sanctioned.accepted) {
-    spec = make({
+  if (!present) return make({ enabled: false, disabledReason: `${cliBin} CLI not found on PATH` });
+  if (!sanctioned.accepted) {
+    return make({
       enabled: false,
       disabledReason: sanctioned.reason ?? `${name} sanctioned-path not recorded accepted`,
     });
-  } else {
-    spec = make();
   }
-  REGISTRY_GATED.add(spec);
+  const spec = make();
+  REGISTRY_GATED.add(spec); // provenance = the gate ENABLED this exact object
   return spec;
 }
 
