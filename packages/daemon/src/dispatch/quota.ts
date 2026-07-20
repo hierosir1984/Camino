@@ -33,7 +33,7 @@ const STRUCTURED_QUOTA_MARKERS = [
   // while "HTTP 429", "Error: 429", `"status_code":429`, `"statusCode": 429` do.
   /\b(?:HTTP\/?[0-9.]*\s*|status[_ ]?code|statuscode|status|code|error)["'\s:=]*(?:429|529)\b/i,
   /\b(?:429|529)\b\s*(?:too many requests|[-–—:])/i,
-  /["'\s:](?:429|529)\s*[}\],"]/, // a 4xx as a JSON/bracketed value: {"code":429}
+  /["':](?:429|529)\s*[}\],"]/, // a 4xx as a JSON value: {"code":429} (key context, not a comma list)
   /too many requests/i,
   // Error-type TOKENS (underscore/dash forms) — these are machine strings, not
   // prose: "rate limiting documentation" (space form) does NOT match.

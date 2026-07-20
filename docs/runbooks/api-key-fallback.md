@@ -23,10 +23,16 @@
 - Camino **never reads, stores, transmits, or proxies** any credential —
   subscription or API key. Every step below configures the **vendor's own
   CLI** through the **vendor's own auth flow**; the key lives where that CLI
-  keeps its own state, under `HOME`.
+  keeps its own state. Depending on the CLI and mode that is a file under
+  `HOME` (e.g. `~/.claude/settings.json`, `~/.codex/auth.json`,
+  `~/.grok/config.toml`) OR the OS keychain (Codex `keyring` mode; the
+  `apiKeyHelper` command below stores the Anthropic key in the macOS Keychain).
+  Camino references host credential STATE via `HOME` (for file-based CLI auth)
+  and never touches the keychain itself — it only lets each official CLI use
+  its own credential.
 - Worker dispatches run with an allowlisted environment (`PATH HOME USER
   LOGNAME SHELL LANG LC_ALL TMPDIR` + git neutralization). `HOME` is preserved
-  exactly so each official CLI can read **its own** auth state — that is the
+  exactly so each official CLI can read **its own** file-based auth state — the
   sanctioned path, for subscription auth and API-key auth alike.
 - **Ambient provider key env vars do not reach workers by design.** Exporting
   `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `XAI_API_KEY` in your shell has no
@@ -99,8 +105,8 @@ setting — nothing Camino-visible changes.
 
 ## OpenAI — Codex CLI re-authenticated with an API key
 
-Codex stores auth in its own state under `~/.codex/`; the login subcommand has
-a first-class API-key mode that reads the key from stdin (never argv).
+Codex's login subcommand has a first-class API-key mode that reads the key from
+stdin (never argv).
 
 Codex's credential STORAGE is selected by `cli_auth_credentials_store` =
 `file` (→ `$CODEX_HOME/auth.json`, default `~/.codex/auth.json`), `keyring`
@@ -149,7 +155,7 @@ under `~/.grok/`) is the **subscription** flow.
   default = "grok-build"
   ```
 
-  Confirm with `grok models inspect` (no `modelOverrideWarnings`). This is the
+  Confirm with `grok inspect` (no `modelOverrideWarnings`). This is the
   same custody model as the other two providers — the vendor's own CLI reading
   its own config under `HOME`, the sanctioned path (CAM-SEC-06). Because `HOME`
   is preserved for the worker, the official CLI loads that config; Camino never

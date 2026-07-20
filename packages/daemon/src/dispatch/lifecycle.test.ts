@@ -422,6 +422,66 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("TOTAL exception safety: a hostile first-party input returns a record, never throws to the daemon (round-3 finding 1)", async () => {
+    // dispatch's object inputs are trusted first-party code, but a bug (a
+    // throwing getter on a config field) must never terminate the daemon or
+    // strand a lease. Each hostile input below is caught → requirement-failed
+    // record + lease settled, no throw escapes.
+    const ws = makeWorkspace();
+    try {
+      // (a) a hostile signal.aborted getter
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const hostileSignal = {
+        get aborted(): boolean {
+          throw new Error("aborted getter threw");
+        },
+        addEventListener() {},
+        removeEventListener() {},
+      } as unknown as AbortSignal;
+      const rA = await dispatch(
+        mockAdapter(),
+        { workdir: ws, prompt: "x" },
+        {
+          signal: hostileSignal,
+          lease,
+        },
+      );
+      expect(rA.outcome).toBe("requirement-failed");
+      expect(released).toBe(1);
+      expect(rA.lease).toEqual({ released: true });
+
+      // (b) a hostile adapter.name getter — safeAdapterName snapshots it once
+      // in a try, so a throw yields a fallback name and the dispatch proceeds.
+      const hostileName = {
+        ...mockAdapter(),
+        get name(): string {
+          throw new Error("name getter threw");
+        },
+      } as AdapterSpec;
+      const rB = await dispatch(hostileName, { workdir: ws, prompt: "x" });
+      expect(rB.adapter).toBe("unknown-adapter"); // snapshotted safely, no throw escaped
+
+      // (c) a hostile killConfirm.graceMs getter, on the cancel path — the
+      // cooperative worker dies on the SIGTERM killConfirm sends before the
+      // getter throws, so no process leaks; the dispatch returns a record.
+      const hostileTimings = {
+        get graceMs(): number {
+          throw new Error("graceMs getter threw");
+        },
+        sigkillWaitMs: 100,
+      } as unknown as import("./lifecycle.js").KillConfirmTimings;
+      const rC = await dispatch(
+        mockAdapter("graceful-cancel"),
+        { workdir: ws, prompt: "x" },
+        { cancelAfterFirstEventMs: 50, killConfirm: hostileTimings, timeoutMs: 5_000 },
+      );
+      expect(typeof rC.outcome).toBe("string"); // returned a record, did not throw
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a throwing transcript sink cannot crash the dispatch; cleanup + lease still run (round-1 finding 2)", async () => {
     const ws = makeWorkspace();
     try {
@@ -563,12 +623,15 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("catches a quota signal on a dropped non-JSON raw line", async () => {
+  it("the PARSER catches a quota signal on a non-JSON diagnostic line (no raw scan)", async () => {
+    // round-3 finding 2 removed the lifecycle raw-line scan; the mock adapter's
+    // own non-JSON branch (an error channel) now catches the signal.
     const ws = makeWorkspace();
     try {
       const rec = await dispatch(mockAdapter("quota-raw"), { workdir: ws, prompt: "x" });
       expect(rec.exitCode).not.toBe(0);
       expect(rec.outcome).toBe("quota-blocked");
+      expect(rec.events.some((e) => e.quotaSignal === true)).toBe(true); // via the parser
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -665,7 +728,9 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
         '{"type":"text","data":"ne"}',
         '{"type":"end","data":"done"}',
       ],
-      quota: '{"type":"text","data":"error: rate_limit_exceeded — please retry_after 10s"}',
+      // A rate limit is an ERROR event (round-3 finding 2 — a "text" event is
+      // the assistant answer, never a quota signal).
+      quota: '{"type":"error","message":"rate_limit_exceeded — please retry_after 10s"}',
     },
   };
 

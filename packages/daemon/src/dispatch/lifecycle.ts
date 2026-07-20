@@ -29,7 +29,6 @@ import type {
   StreamEvent,
 } from "@camino/shared";
 import { composeWorkerEnv } from "./env.js";
-import { classifyByQuotaSignal } from "./quota.js";
 
 /** Kill-confirm timings. Production defaults (PRD §5 registry item 4): 30s grace. */
 export interface KillConfirmTimings {
@@ -126,8 +125,9 @@ async function waitGroupGone(pgid: number, ms: number): Promise<boolean> {
  * Waiting on the GROUP (not just the leader) means a cooperative descendant
  * gets the full grace window, while a stubborn one still forces SIGKILL — and
  * a leader that exits on SIGTERM while a descendant ignores it cannot orphan
- * (the WP-001 review's finding #1). Group scope, not full tree: a session
- * escapee is WP-107's container's problem (finding 1).
+ * (the WP-001 review's finding #1). Group scope, not full tree: a descendant
+ * that changes its process group (setpgid/setsid) is WP-107's container's
+ * problem (round-1 finding 1, round-2 finding 2).
  */
 export async function killConfirm(
   child: ChildProcess,
@@ -187,10 +187,10 @@ function assembleFinalText(events: readonly StreamEvent[]): string {
  * group after the leader exits and populates `postExitCleanup` whenever any
  * member survived, so "no record" means the probe found the group empty.
  *
- * Group scope, not full tree (round-1 review finding 1): a descendant that
- * detached into its own session is invisible to the group probe. This function
- * is honest about what it can confirm — the group — and WP-107's container
- * closes the residual.
+ * Group scope, not full tree (round-1 finding 1, widened round-2 finding 2): a
+ * descendant that changed its process group (setpgid/setsid) is invisible to
+ * the group probe. This function is honest about what it can confirm — the
+ * group — and WP-107's container closes the residual.
  */
 export function processGroupConfirmedGone(rec: {
   spawned: boolean;
@@ -262,16 +262,25 @@ async function settleLease(
   }
 }
 
+/** Safely read adapter.name without ever throwing on a hostile getter (round-3 finding 1). */
+function safeAdapterName(adapter: AdapterSpec): string {
+  try {
+    return String(adapter.name).slice(0, 200);
+  } catch {
+    return "unknown-adapter";
+  }
+}
+
 /** Build a terminal record for a dispatch that never produced a running child. */
 function noProcessRecord(
-  adapter: AdapterSpec,
+  adapterName: string,
   outcome: DispatchOutcome,
   posture: EnvPostureRecord,
   startedMs: number,
   extra: Partial<DispatchRecord> = {},
 ): DispatchRecord {
   return {
-    adapter: adapter.name,
+    adapter: adapterName,
     outcome,
     spawned: false,
     streamedEvents: 0,
@@ -301,29 +310,32 @@ export async function dispatch(
 ): Promise<DispatchRecord> {
   if (!adapter.enabled) {
     // Refuse BEFORE plan(): a disabled adapter's code never runs (CAM-EXEC-01).
+    // (The only intentional throw from dispatch — everything else returns a record.)
     throw new DisabledAdapterError(adapter.name, adapter.disabledReason);
   }
   const started = Date.now();
+
+  // TOTAL EXCEPTION SAFETY (round-3 finding 1). dispatch's object inputs —
+  // adapter, opts, signal, lease — are first-party Camino code; the UNTRUSTED
+  // surface is the worker's output STREAM (strings), handled totally below. To
+  // ensure a buggy caller/adapter (e.g. a throwing getter on a config field)
+  // can never terminate the daemon or strand a lease, ALL work after the
+  // enabled check runs inside one try/catch/finally that returns a record on
+  // any throw, and the trusted object inputs are snapshotted ONCE up front (a
+  // mutating/throwing getter cannot then change behavior mid-flight).
+  const adapterName = safeAdapterName(adapter);
+  const lease = opts.lease;
+  const signal = opts.signal;
   const timings = opts.killConfirm ?? PRODUCTION_KILL_CONFIRM;
 
   // Settle the lease AT MOST ONCE across every path (round-2 review finding 4):
   // a single guarded closure so no error path can re-enter release().
   let leaseSettled = false;
   const settleFor = async (record: DispatchRecord): Promise<void> => {
-    if (!opts.lease || leaseSettled) return;
+    if (!lease || leaseSettled) return;
     leaseSettled = true;
-    record.lease = await settleLease(opts.lease, processGroupConfirmedGone(record), record.outcome);
+    record.lease = await settleLease(lease, processGroupConfirmedGone(record), record.outcome);
   };
-
-  if (opts.signal?.aborted) {
-    // Cancelled before anything ran: nothing spawned, nothing to kill; the
-    // posture records the composed baseline (no adapter extras — plan() is
-    // not consulted for a dispatch that never starts).
-    const { posture } = composeWorkerEnv(process.env);
-    const record = noProcessRecord(adapter, "cancelled", posture, started);
-    await settleFor(record); // spawned:false → group trivially gone → released
-    return record;
-  }
 
   // The composed baseline posture (no extras) is safe to compute up front and
   // is the fallback if plan()/its env getter throws (round-2 finding 3).
@@ -351,19 +363,30 @@ export async function dispatch(
     }
     killReason = reason;
     const c = child;
-    killPromise = killConfirm(c, timings).then((k) => {
+    // sweepGroupSafe (not killConfirm) so a hostile/broken timings getter can
+    // only yield a groupGone:false record, never a late unhandled rejection
+    // (round-3 finding 1). killPromise therefore never rejects.
+    killPromise = sweepGroupSafe(c, timings).then((k) => {
       killRecord = k;
     });
   };
   const onAbort = () => requestKill("cancel");
-  // Arm the abort listener BEFORE spawn so an abort in the spawn window is not
-  // lost (finding 3). An abort that fired DURING plan() — before this listener
-  // existed — never re-fires (AbortSignal 'abort' is a one-shot), so also
-  // sample the flag directly and remember it as a pending cancel.
-  opts.signal?.addEventListener("abort", onAbort, { once: true });
-  if (opts.signal?.aborted) pendingCancel = true;
 
   try {
+    if (signal?.aborted) {
+      // Cancelled before anything ran: nothing spawned, nothing to kill.
+      const record = noProcessRecord(adapterName, "cancelled", posture, started);
+      await settleFor(record); // spawned:false → group trivially gone → released
+      return record;
+    }
+
+    // Arm the abort listener BEFORE spawn so an abort in the spawn window is not
+    // lost (finding 3). An abort that fired DURING plan() — before this listener
+    // existed — never re-fires (AbortSignal 'abort' is a one-shot), so also
+    // sample the flag directly and remember it as a pending cancel.
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) pendingCancel = true;
+
     // plan() AND its env composition run inside the try: plan() is adapter code
     // and `plan.env` may be a throwing getter — both are handled as a broken
     // adapter (requirement-failed), never a leaked lease (round-1 finding 2;
@@ -386,7 +409,16 @@ export async function dispatch(
     let anyEventQuota = false;
     const recordEvent = (ev: StreamEvent) => {
       totalEvents++;
-      if (ev.quotaSignal) anyEventQuota = true;
+      // Defensive read: a buggy parser could return an event whose quotaSignal
+      // is a throwing getter — that must not crash the harness (round-3
+      // finding 1; same spirit as the parseLine try/catch).
+      let sig = false;
+      try {
+        sig = ev.quotaSignal === true;
+      } catch {
+        sig = false;
+      }
+      if (sig) anyEventQuota = true;
       if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);
       else {
         tailRing.push(ev);
@@ -395,12 +427,6 @@ export async function dispatch(
     };
     const retainedEvents = (): StreamEvent[] => [...headEvents, ...tailRing];
 
-    // Incremental quota detection: a single flag, not an unbounded buffer, so a
-    // noisy/misbehaving worker cannot grow harness memory (WP-001 review #4).
-    // Scanned per-line: providers emit a rate-limit signal atomically on one
-    // line. Joining adjacent lines manufactures false positives from unrelated
-    // text and is deliberately not done (WP-001 review #4-r4).
-    let quotaSeenInRaw = false;
     let sawFirstEvent = false;
 
     const spawnFailed = await new Promise<boolean>((resolve) => {
@@ -420,7 +446,7 @@ export async function dispatch(
     });
 
     if (spawnFailed) {
-      const record = noProcessRecord(adapter, "requirement-failed", posture, started);
+      const record = noProcessRecord(adapterName, "requirement-failed", posture, started);
       await settleFor(record); // no process → group trivially gone → released
       return record;
     }
@@ -447,13 +473,17 @@ export async function dispatch(
         try {
           const maybePromise = opts.onLine?.(channel, line) as unknown;
           if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
-            void (maybePromise as Promise<unknown>).catch(() => {});
+            void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
           }
         } catch {
           /* a broken sink is not the worker's fault */
         }
-        if (!quotaSeenInRaw && classifyByQuotaSignal(line)) quotaSeenInRaw = true;
-        // A buggy parser must never crash the harness (bypassing cleanup).
+        // Quota is decided by the PARSER (structured signatures + provider
+        // exhaustion phrases in an ERROR context), NOT by a raw-line prose scan
+        // — a raw scan over assistant prose manufactured false positives
+        // ("issues 428, 429, 430", "too many requests for new features") and
+        // was removed (round-3 finding 2). A buggy parser must never crash the
+        // harness (bypassing cleanup).
         let ev: StreamEvent | null = null;
         try {
           ev = adapter.parseLine(line, channel);
@@ -487,12 +517,13 @@ export async function dispatch(
 
     // Post-exit group sweep: the leader exiting does not end the GROUP — a
     // worker may leave background descendants running (same group, detached
-    // spawn). A finished dispatch must not leak workers (CAM-EXEC-06
-    // process-tree cleanup), and the lease below must not be released over a
-    // live group. When no kill-confirm ran, probe the group and sweep any
-    // survivors with the same SIGTERM → grace → SIGKILL sequence. (A descendant
-    // that detached into its OWN session escapes even this — finding 1 — and is
-    // WP-107's container's problem.)
+    // spawn). A finished dispatch must not leak workers (CAM-EXEC-06 process
+    // cleanup), and the lease below must not be released over a live group.
+    // When no kill-confirm ran, probe the group and sweep any survivors with
+    // the same SIGTERM → grace → SIGKILL sequence.
+    // (A descendant that changes its own process group — setpgid/setsid —
+    // escapes even this sweep; that residual is WP-107's container's, per the
+    // boundary at the top of this file.)
     let postExitCleanup: KillConfirmRecord | undefined;
     const pid = child.pid;
     if (!killRecord && pid != null && groupAlive(pid)) {
@@ -501,10 +532,13 @@ export async function dispatch(
 
     const events = retainedEvents();
 
-    // Quota classification is centralized: a quota signal on any parsed event OR
-    // in the raw stream (so a signal on a dropped/malformed line is not lost) —
-    // CAM-EXEC-06. anyEventQuota is tracked over ALL events, not just retained.
-    const quotaBlocked = quotaSeenInRaw || anyEventQuota;
+    // Quota classification comes from the PARSER only (CAM-EXEC-06): each
+    // adapter flags quotaSignal on error-context events via
+    // classifyErrorTextForQuota. anyEventQuota is tracked over ALL events, not
+    // just retained. No raw-line scan (round-3 finding 2 — it false-positived
+    // on prose); an adapter that could drop a rate-limit line handles it in its
+    // own error/stderr branch instead.
+    const quotaBlocked = anyEventQuota;
 
     // A cancel/timeout is authoritative from `killReason`, set only by
     // requestKill. A process that had already exited never gets a killReason
@@ -536,7 +570,7 @@ export async function dispatch(
     }
 
     const record: DispatchRecord = {
-      adapter: adapter.name,
+      adapter: adapterName,
       outcome,
       spawned: true,
       streamedEvents: totalEvents,
@@ -567,7 +601,7 @@ export async function dispatch(
       postExitCleanup = await sweepGroupSafe(child!, timings);
     }
     const record: DispatchRecord = {
-      adapter: adapter.name,
+      adapter: adapterName,
       outcome: "requirement-failed",
       spawned: child != null,
       streamedEvents: 0,
@@ -590,7 +624,7 @@ export async function dispatch(
     // (round-2 finding 11) — the finally must never replace the returned record
     // with a throw.
     try {
-      opts.signal?.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", onAbort);
     } catch {
       /* a hostile signal must not break the return */
     }

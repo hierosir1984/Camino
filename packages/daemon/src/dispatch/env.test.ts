@@ -143,6 +143,24 @@ describe("composeWorkerEnv", () => {
     }
   });
 
+  it("strips the whole SSH_* family by prefix, incl. SSH_SK_PROVIDER (round-3 finding 3)", () => {
+    // SSH_SK_PROVIDER is a loadable library path SSH honors; the SSH_* prefix
+    // closes it and any other SSH_* directive in one rule.
+    const { env, posture } = composeWorkerEnv(
+      { PATH: "/usr/bin", HOME: "/Users/x" },
+      {
+        SSH_SK_PROVIDER: "/tmp/attacker.dylib",
+        SSH_AUTH_SOCK: "/tmp/agent.sock",
+        SSH_ASKPASS: "/tmp/askpass",
+        SSH_CONNECTION: "1.2.3.4",
+      },
+    );
+    for (const k of ["SSH_SK_PROVIDER", "SSH_AUTH_SOCK", "SSH_ASKPASS", "SSH_CONNECTION"]) {
+      expect(env[k], k).toBeUndefined();
+      expect(posture.strippedKeys, k).toContain(k);
+    }
+  });
+
   it("extras can NEVER clobber a host-inherited allowlist key (round-1 finding 4)", () => {
     // An adapter extra HOME=/evil / PATH=/evil must not overwrite the sanctioned
     // host values — the allowlist is host-derived by contract.

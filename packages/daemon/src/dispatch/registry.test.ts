@@ -88,13 +88,27 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
         content: JSON.stringify({ xaiSanctionedPath: { status: "pending" } }),
         reason: /is "pending", not "accepted"/,
       },
-      { content: JSON.stringify({ somethingElse: true }), reason: /status absent from record/ },
+      { content: JSON.stringify({ somethingElse: true }), reason: /record absent/ },
+      {
+        content: JSON.stringify({ xaiSanctionedPath: { notStatus: 1 } }),
+        reason: /status absent from record/,
+      },
       { content: "not json at all", reason: /malformed \(not valid JSON\)/ },
       // JSON that parses but is not an object must DISABLE, not crash (finding 6).
       { content: "null", reason: /not a JSON object/ },
       { content: "[1,2,3]", reason: /not a JSON object/ },
       { content: '"a string"', reason: /not a JSON object/ },
       { content: "42", reason: /not a JSON object/ },
+      // round-3 finding 4: xaiSanctionedPath present but the wrong shape.
+      { content: JSON.stringify({ xaiSanctionedPath: null }), reason: /field is not an object/ },
+      {
+        content: JSON.stringify({ xaiSanctionedPath: "accepted" }),
+        reason: /field is not an object/,
+      },
+      {
+        content: JSON.stringify({ xaiSanctionedPath: { status: ["accepted"] } }),
+        reason: /not "accepted"/,
+      },
     ];
     for (const { content, reason } of cases) {
       const file = tmpAttestations(content);
@@ -106,6 +120,25 @@ describe("adapter enablement (CAM-EXEC-01)", () => {
       } finally {
         rmSync(file, { force: true });
       }
+    }
+  });
+
+  it("a deeply-nested status DISABLES without a stack-overflow crash (round-3 finding 4)", () => {
+    // JSON.stringify on an arbitrarily deep value stack-overflows; the reason
+    // builder must describe the status by type instead. The deep JSON is built
+    // as a STRING (not via JSON.stringify, which would overflow in the test
+    // itself); JSON.parse handles this depth, and the reason builder must not
+    // then re-stringify it.
+    const depth = 6000;
+    const content = `{"xaiSanctionedPath":{"status":${"[".repeat(depth)}1${"]".repeat(depth)}}}`;
+    const file = tmpAttestations(content);
+    try {
+      const reg = buildRegistry({ cliPresent: ALL_PRESENT, attestationsPath: file });
+      const grok = reg.find((a) => a.name === "grok-build")!;
+      expect(grok.enabled).toBe(false);
+      expect(grok.disabledReason).toContain('not "accepted"');
+    } finally {
+      rmSync(file, { force: true });
     }
   });
 

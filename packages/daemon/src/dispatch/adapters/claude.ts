@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
+import { classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Claude Code (official CLI), headless.
@@ -34,19 +34,26 @@ export function claudeAdapter(
     },
     parseLine(line: string): StreamEvent | null {
       const trimmed = line.trim();
-      const quota = classifyByQuotaSignal(trimmed);
-      const q = quota ? { quotaSignal: true as const } : {};
+      // Quota is only trusted in an ERROR CONTEXT (round-2/3 finding: a
+      // rate-limit signature or exhaustion phrase in ASSISTANT prose is not a
+      // quota block). Non-error events never carry quotaSignal; error events do.
+      const errText = (text: string): { quotaSignal: true } | Record<string, never> =>
+        classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
       if (!trimmed.startsWith("{")) {
-        // Non-JSON (esp. stderr) is normally noise, but a quota signal here
-        // must NOT be lost (WP-001 review finding #6).
-        if (quota) return { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true };
+        // Non-JSON from claude is stderr/diagnostic (an error channel) — a
+        // rate-limit / exhaustion signal here is a real quota signal.
+        if (classifyErrorTextForQuota(trimmed)) {
+          return { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true };
+        }
         return null;
       }
       let obj: Record<string, unknown>;
       try {
         obj = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
-        return quota ? { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true } : null;
+        return classifyErrorTextForQuota(trimmed)
+          ? { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true }
+          : null;
       }
       const type = String(obj["type"] ?? "");
       switch (type) {
@@ -54,7 +61,8 @@ export function claudeAdapter(
           const message = obj["message"] as { content?: unknown } | undefined;
           const content = message?.content;
           // content may be a string, a non-array, or an array with null items —
-          // guard every shape (WP-001 review finding #5).
+          // guard every shape (WP-001 review finding #5). No quotaSignal on
+          // assistant text — it is the answer, not an error.
           if (Array.isArray(content)) {
             const textPart = content.find(
               (c): c is { type: string; text: string } =>
@@ -63,32 +71,38 @@ export function claudeAdapter(
             const toolPart = content.find(
               (c) => !!c && typeof c === "object" && (c as { type?: unknown }).type === "tool_use",
             );
-            if (textPart)
-              return { kind: "assistant", text: String(textPart.text).slice(0, 400), ...q };
-            if (toolPart) return { kind: "tool", text: "tool_use", ...q };
-            return { kind: "other", text: "assistant", ...q };
+            if (textPart) return { kind: "assistant", text: String(textPart.text).slice(0, 400) };
+            if (toolPart) return { kind: "tool", text: "tool_use" };
+            return { kind: "other", text: "assistant" };
           }
           if (typeof content === "string") {
-            return { kind: "assistant", text: content.slice(0, 400), ...q };
+            return { kind: "assistant", text: content.slice(0, 400) };
           }
-          return { kind: "other", text: "assistant", ...q };
+          return { kind: "other", text: "assistant" };
         }
         case "result": {
           const text = String(obj["result"] ?? obj["subtype"] ?? "result");
           const isError = obj["is_error"] === true || obj["subtype"] === "error_max_turns";
           // In an ERROR result, trust the provider's exhaustion phrases
-          // ("Credit balance is too low", "usage limit reached") — this is the
-          // error context those phrases are reliable in (round-2 finding 5).
-          const eq =
-            isError && classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
-          return { kind: isError ? "error" : "result", text: text.slice(0, 400), ...eq };
+          // ("Credit balance is too low", "usage limit reached").
+          return {
+            kind: isError ? "error" : "result",
+            text: text.slice(0, 400),
+            ...(isError ? errText(text) : {}),
+          };
+        }
+        case "error": {
+          // A top-level error event — exhaustion phrases are reliable here
+          // (round-3 finding 2).
+          const text = String(obj["result"] ?? obj["message"] ?? "error");
+          return { kind: "error", text: text.slice(0, 400), ...errText(text) };
         }
         case "user":
-          return { kind: "tool", text: "tool_result", ...q };
+          return { kind: "tool", text: "tool_result" };
         case "system":
-          return { kind: "other", text: `system:${String(obj["subtype"] ?? "")}`, ...q };
+          return { kind: "other", text: `system:${String(obj["subtype"] ?? "")}` };
         default:
-          return { kind: "other", text: type || "event", ...q };
+          return { kind: "other", text: type || "event" };
       }
     },
   };

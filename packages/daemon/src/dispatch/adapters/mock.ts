@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal } from "../quota.js";
+import { classifyErrorTextForQuota } from "../quota.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MOCK_CLI = join(here, "mock-cli.mjs");
@@ -28,7 +28,15 @@ export function mockAdapter(mode?: string): AdapterSpec {
     },
     parseLine(line: string): StreamEvent | null {
       const trimmed = line.trim();
-      if (!trimmed.startsWith("{")) return null;
+      if (!trimmed.startsWith("{")) {
+        // A bare non-JSON line (the "quota-raw" mode) is diagnostic/error
+        // output — catch a rate-limit / exhaustion signal here in the PARSER
+        // (the lifecycle no longer raw-scans, round-3 finding 2).
+        if (trimmed.length > 0 && classifyErrorTextForQuota(trimmed)) {
+          return { kind: "error", text: trimmed.slice(0, 400), quotaSignal: true };
+        }
+        return null;
+      }
       try {
         const obj = JSON.parse(trimmed) as { type?: string; text?: string };
         const kind = ((): StreamEvent["kind"] => {
@@ -43,7 +51,9 @@ export function mockAdapter(mode?: string): AdapterSpec {
           }
         })();
         const text = String(obj.text ?? "").slice(0, 400);
-        return { kind, text, ...(classifyByQuotaSignal(text) ? { quotaSignal: true } : {}) };
+        // Quota is trusted only in an ERROR event (round-3 finding 2).
+        const eq = kind === "error" && classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
+        return { kind, text, ...eq };
       } catch {
         return null;
       }

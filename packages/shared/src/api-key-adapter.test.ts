@@ -110,6 +110,9 @@ describe("checkApiKeyAdapterSpec (static declaration conformance)", () => {
       "GIT_CONFIG_GLOBAL",
       "GIT_CONFIG_SYSTEM",
       "GIT_TERMINAL_PROMPT",
+      // round-3 finding 3: the whole SSH_* family is a stripped channel.
+      "SSH_SK_PROVIDER",
+      "SSH_AUTH_SOCK",
     ]) {
       const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
       expect(

@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
+import { classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Codex CLI (official), headless.
@@ -33,11 +33,13 @@ export function codexAdapter(
     },
     parseLine(line: string, channel): StreamEvent | null {
       const trimmed = line.trim();
-      const quota = classifyByQuotaSignal(trimmed);
-      const q = quota ? { quotaSignal: true as const } : {};
+      // Quota is only trusted in an ERROR CONTEXT (round-2/3 finding 2/5):
+      // stderr, error items, and error events — never assistant/agent output.
+      const errText = (text: string): { quotaSignal: true } | Record<string, never> =>
+        classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
       if (!trimmed.startsWith("{")) {
-        // Codex also prints non-JSON progress/errors, esp. on stderr — an
-        // error channel, so exhaustion phrases are trusted here (finding 5).
+        // Codex prints non-JSON progress/errors, esp. on stderr — an error
+        // channel, so a rate-limit / exhaustion signal here is a quota signal.
         if (channel === "stderr" && trimmed.length > 0) {
           const eq = classifyErrorTextForQuota(trimmed);
           return {
@@ -62,9 +64,9 @@ export function codexAdapter(
         const item = (obj["item"] ?? {}) as Record<string, unknown>;
         const itemType = String(item["type"] ?? "");
         const text = String(item["text"] ?? item["message"] ?? itemType).slice(0, 400);
-        if (itemType === "agent_message") return { kind: "result", text, ...q };
-        // codex emits non-fatal warnings as "error" items; in that error
-        // context, trust exhaustion phrases too (round-2 finding 5).
+        if (itemType === "agent_message") return { kind: "result", text }; // the answer, not an error
+        // codex emits non-fatal warnings as "error" items; that IS an error
+        // context, so trust rate-limit / exhaustion signals there.
         if (itemType === "error") {
           const eq = classifyErrorTextForQuota(text);
           return {
@@ -74,18 +76,17 @@ export function codexAdapter(
           };
         }
         if (/command|exec|file|patch|tool|mcp/.test(itemType))
-          return { kind: "tool", text: itemType, ...q };
-        return { kind: "other", text: itemType || "item", ...q };
+          return { kind: "tool", text: itemType };
+        return { kind: "other", text: itemType || "item" };
       }
       if (type === "turn.completed" || type === "thread.started") {
-        return { kind: "other", text: type, ...q };
+        return { kind: "other", text: type };
       }
       if (type.includes("error")) {
         const text = String(obj["message"] ?? type).slice(0, 400);
-        const eq = classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
-        return { kind: "error", text, ...eq };
+        return { kind: "error", text, ...errText(text) };
       }
-      return { kind: "other", text: type || "event", ...q };
+      return { kind: "other", text: type || "event" };
     },
   };
 }

@@ -119,8 +119,18 @@ function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: 
       reason: "xAI sanctioned-path record malformed (not a JSON object)",
     };
   }
-  const att = parsed as { xaiSanctionedPath?: { status?: unknown } };
-  const status = att.xaiSanctionedPath?.status;
+  const att = parsed as { xaiSanctionedPath?: unknown };
+  const record = att.xaiSanctionedPath;
+  if (record === undefined) {
+    return { accepted: false, reason: "xAI sanctioned-path record absent (WP-000 gate)" };
+  }
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    return {
+      accepted: false,
+      reason: "xAI sanctionedPath field is not an object (WP-000 gate)",
+    };
+  }
+  const status = (record as { status?: unknown }).status;
   if (status === "accepted") return { accepted: true };
   if (status === undefined) {
     return {
@@ -128,9 +138,13 @@ function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: 
       reason: "xAI sanctioned-path status absent from record (WP-000 gate)",
     };
   }
+  // Describe a wrong status by TYPE — never JSON.stringify an arbitrary-depth
+  // value, which stack-overflows on a deeply nested object (round-3 finding 4).
+  // A legitimate status is a short string, so quoting a string is safe.
+  const shown = typeof status === "string" ? JSON.stringify(status) : `a ${typeof status} value`;
   return {
     accepted: false,
-    reason: `xAI sanctioned-path status is ${JSON.stringify(status)}, not "accepted" (WP-000 gate)`,
+    reason: `xAI sanctioned-path status is ${shown}, not "accepted" (WP-000 gate)`,
   };
 }
 

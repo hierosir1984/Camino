@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyByQuotaSignal, classifyErrorTextForQuota } from "../quota.js";
+import { classifyErrorTextForQuota } from "../quota.js";
 
 /**
  * Grok Build CLI (official), headless — enablement gated on the recorded
@@ -36,8 +36,8 @@ export function grokAdapter(
     },
     parseLine(line: string, channel): StreamEvent | null {
       const trimmed = line.trim();
-      const quota = classifyByQuotaSignal(trimmed);
-      const q = quota ? { quotaSignal: true as const } : {};
+      // Quota is only trusted in an ERROR CONTEXT (round-2/3 finding 2/5):
+      // stderr and error events — never the token-streamed assistant answer.
       if (!trimmed.startsWith("{")) {
         if (channel === "stderr" && trimmed.length > 0) {
           const eq = classifyErrorTextForQuota(trimmed); // stderr = error context
@@ -61,25 +61,30 @@ export function grokAdapter(
       // {type:"end"}. (finalText reassembly of the fragments is in the
       // lifecycle's assembleFinalText.)
       const type = String(obj["type"] ?? obj["event"] ?? "");
-      const data = String(obj["data"] ?? obj["text"] ?? obj["content"] ?? "");
+      // An error event may carry its text under data/text/content OR message
+      // (round-3 finding 2).
+      const data = String(obj["data"] ?? obj["text"] ?? obj["content"] ?? obj["message"] ?? "");
       if (type === "text" || type.includes("assistant") || type.includes("message")) {
-        return { kind: "assistant", text: data.slice(0, 400), ...q };
+        return { kind: "assistant", text: data.slice(0, 400) }; // the answer, not an error
       }
       if (type === "thought") {
-        return { kind: "other", text: "thought", ...q };
+        return { kind: "other", text: "thought" };
       }
       if (type === "end" || type.includes("result") || type.includes("done")) {
-        return { kind: "result", text: data.slice(0, 400), ...q };
+        return { kind: "result", text: data.slice(0, 400) }; // the final answer
       }
       if (type.includes("error")) {
         const text = (data || type).slice(0, 400);
-        const eq = classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : q;
-        return { kind: "error", text, ...eq };
+        return {
+          kind: "error",
+          text,
+          ...(classifyErrorTextForQuota(text) ? { quotaSignal: true as const } : {}),
+        };
       }
       if (type.includes("tool") || type.includes("edit") || type.includes("exec")) {
-        return { kind: "tool", text: type, ...q };
+        return { kind: "tool", text: type };
       }
-      return { kind: "other", text: type || "event", ...q };
+      return { kind: "other", text: type || "event" };
     },
   };
 }

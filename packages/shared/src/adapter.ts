@@ -135,7 +135,8 @@ export interface EnvPostureRecord {
  * the lifecycle only ever invokes release AFTER the worker process group is
  * confirmed gone (or was never spawned), never before. (See the containment
  * boundary on KillConfirmRecord: "gone" is scoped to the process group; a
- * deliberate session escapee is contained by WP-107's container.)
+ * descendant that changes its process group — setpgid/setsid — is contained by
+ * WP-107's container.)
  */
 export interface LeaseReleaseContext {
   groupGone: true;
@@ -160,11 +161,11 @@ export interface LeaseReleaseContext {
  *     once via an internal guard), so a thrown dispatch never silently strands
  *     a lease.
  *
- * Group scope, not full-tree (round-1 review finding 1): a descendant that
- * detaches into its own session escapes group containment; the environment's
- * true single-owner guarantee is completed by WP-107's container (kill the
- * container → every namespaced pid dies). WP-105 owns the ordering guarantee
- * at the group boundary.
+ * Group scope, not full-tree (round-1 finding 1, widened round-2 finding 2): a
+ * descendant that changes its process group — setpgid(0,0) or setsid — escapes
+ * group containment; the environment's true single-owner guarantee is
+ * completed by WP-107's container (kill the container → every namespaced pid
+ * dies). WP-105 owns the ordering guarantee at the group boundary.
  *
  * The handle's owner (the attempt runner, WP-114) decides what release()
  * actually does — it may collect evidence before releasing the underlying
@@ -262,14 +263,20 @@ export const CREDENTIAL_SHAPED_PATTERN =
  *     GIT_SEQUENCE_EDITOR / GIT_PAGER / GIT_TEMPLATE_DIR make an ordinary git
  *     invocation run an attacker-chosen binary (round-2 review finding 7 —
  *     GIT_EXTERNAL_DIFF executes on `git diff`);
- *   - transport / agent: GIT_SSH / GIT_SSH_COMMAND / GIT_PROXY_COMMAND /
- *     SSH_AUTH_SOCK / SSH_ASKPASS hand out arbitrary transport commands and
- *     the user's SSH agent.
+ *   - transport / agent: GIT_SSH / GIT_SSH_COMMAND / GIT_PROXY_COMMAND hand out
+ *     arbitrary transport commands; the SSH_* family (SSH_AUTH_SOCK,
+ *     SSH_ASKPASS, SSH_SK_PROVIDER — a loadable library path, round-3 finding
+ *     3, and every other SSH_* directive) is stripped WHOLESALE by prefix
+ *     below, since a headless coding worker needs no SSH_* variable.
  *
- * BOUNDARY (round-2 finding 7): git's env surface is large; this list covers
- * the known capability-granting channels. Complete isolation from every git
- * env var is the CONTAINER's job (WP-107, CAM-EXEC-02). The env layer closes
- * the known channels and the container closes the rest.
+ * BOUNDARY (round-2 finding 7, round-3 finding 3): the git env surface is
+ * large and regenerating — a finder can always name the next capability
+ * variable. The SSH_* surface is closed by prefix; the git capability channels
+ * are enumerated here; and complete isolation from every remaining git env var
+ * is the CONTAINER's job (WP-107, CAM-EXEC-02: isolated full clone, no host
+ * filesystem). The env layer closes the SSH surface + the known git channels
+ * and NAMES the container as the closer of the rest, rather than chasing an
+ * unbounded denylist (the WP-003 git-fsck / WP-102 token-dir precedent).
  */
 export const STRIPPED_ENV_EXACT = [
   "GIT_CONFIG",
@@ -294,11 +301,12 @@ export const STRIPPED_ENV_EXACT = [
   "GIT_SSH",
   "GIT_SSH_COMMAND",
   "GIT_PROXY_COMMAND",
-  "SSH_AUTH_SOCK",
-  "SSH_ASKPASS",
 ] as const;
 
-export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"] as const;
+// SSH_ closes the whole SSH_* family in one rule (SSH_AUTH_SOCK, SSH_ASKPASS,
+// SSH_SK_PROVIDER, …) — a headless worker needs no SSH_* variable, so strip by
+// prefix rather than enumerate (round-3 finding 3).
+export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "SSH_"] as const;
 
 /**
  * The host-inherited allowlist: the ONLY host env keys a worker inherits. HOME

@@ -25,7 +25,9 @@ describe("per-provider quota classification", () => {
     {
       name: "grok",
       adapter: grokAdapter(),
-      line: '{"type":"text","data":"error: rate_limit_exceeded — please retry_after 10s"}',
+      // A rate limit is an ERROR event, not the token-streamed "text" answer
+      // (round-3 finding 2).
+      line: '{"type":"error","message":"rate_limit_exceeded — please retry_after 10s"}',
     },
   ];
 
@@ -126,6 +128,73 @@ describe("per-provider quota classification", () => {
     );
     expect(errorResult?.kind).toBe("error");
     expect(errorResult?.quotaSignal).toBe(true); // trusted in the error result
+  });
+});
+
+// Round-3 finding 2: quotaSignal is attached ONLY in an error context. A
+// STRUCTURED signature OR an exhaustion phrase appearing in assistant/answer
+// output is NOT a quota block; the same content in an error/stderr event IS.
+describe("adapter quota gating is error-context-only (round-3 finding 2)", () => {
+  it("assistant/answer events NEVER carry quotaSignal, even quoting a rate-limit line", () => {
+    const claudeAssistant = claudeAdapter().parseLine(
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"I closed issues 428, 429, and 430; the server returned HTTP 429 earlier."}]}}',
+      "stdout",
+    );
+    expect(claudeAssistant?.kind).toBe("assistant");
+    expect(claudeAssistant?.quotaSignal).toBeUndefined();
+
+    const codexAnswer = codexAdapter().parseLine(
+      '{"type":"item.completed","item":{"type":"agent_message","text":"We rejected too many requests for new features; documented resource_exhausted handling."}}',
+      "stdout",
+    );
+    expect(codexAnswer?.kind).toBe("result");
+    expect(codexAnswer?.quotaSignal).toBeUndefined();
+
+    const grokText = grokAdapter().parseLine(
+      '{"type":"text","data":"Please retry after: lunch. HTTP 429 is the rate-limit status."}',
+      "stdout",
+    );
+    expect(grokText?.kind).toBe("assistant");
+    expect(grokText?.quotaSignal).toBeUndefined();
+  });
+
+  it("error/stderr events DO carry quotaSignal for a real signal (incl. exhaustion phrases)", () => {
+    // claude non-JSON stderr exhaustion phrase — the round-3 false-negative.
+    const claudeStderr = claudeAdapter().parseLine("Credit balance is too low", "stderr");
+    expect(claudeStderr?.kind).toBe("error");
+    expect(claudeStderr?.quotaSignal).toBe(true);
+
+    // claude top-level error event.
+    const claudeErr = claudeAdapter().parseLine(
+      '{"type":"error","message":"429 Too Many Requests"}',
+      "stdout",
+    );
+    expect(claudeErr?.kind).toBe("error");
+    expect(claudeErr?.quotaSignal).toBe(true);
+
+    // codex error item.
+    const codexErr = codexAdapter().parseLine(
+      '{"type":"item.completed","item":{"type":"error","message":"You\'ve hit your usage limit."}}',
+      "stdout",
+    );
+    expect(codexErr?.kind).toBe("error");
+    expect(codexErr?.quotaSignal).toBe(true);
+
+    // grok error event carrying its text under `message` (not `data`).
+    const grokErr = grokAdapter().parseLine(
+      '{"type":"error","message":"rate_limit_exceeded"}',
+      "stdout",
+    );
+    expect(grokErr?.kind).toBe("error");
+    expect(grokErr?.quotaSignal).toBe(true);
+  });
+
+  it("a genuinely unrelated error is NOT quota (no false positive in error context)", () => {
+    const codexErr = codexAdapter().parseLine(
+      '{"type":"item.completed","item":{"type":"error","message":"compilation failed: undefined symbol"}}',
+      "stdout",
+    );
+    expect(codexErr?.quotaSignal).toBeUndefined();
   });
 });
 
