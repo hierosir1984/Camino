@@ -39,7 +39,7 @@ import type {
   CanonFactReadFilter,
   CanonFactRecord,
 } from "@camino/shared";
-import { validateCanonFact, verifyCanonFactLog } from "@camino/core";
+import { recordedAtProblem, validateCanonFact, verifyCanonFactLog } from "@camino/core";
 import type { HeldWriterLock } from "./writer-lock.js";
 
 const SCHEMA_VERSION = 1;
@@ -255,6 +255,14 @@ export class CanonFactsStore {
     }
     const expectedLastSeq = this.#cachedLastSeq;
     const recordedAt = this.#now().toISOString();
+    // The injectable clock is part of the public surface: validate its
+    // output BEFORE persisting, so a misbehaving clock cannot write a row
+    // this same store's adoption verification would refuse at restart
+    // (review round 4, finding 3 — live-write/reopen agreement).
+    const timeIssue = recordedAtProblem(recordedAt);
+    if (timeIssue !== null) {
+      throw new Error(`clock produced an unusable timestamp: ${timeIssue}`);
+    }
     const runAppend = this.#db.transaction((): number => {
       const lastSeq = this.#db
         .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM canon_facts")

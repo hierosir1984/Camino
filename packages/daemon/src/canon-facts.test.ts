@@ -415,3 +415,26 @@ describe("round-2 regressions (falsification review findings)", () => {
     reopened.close();
   });
 });
+
+describe("round-4 regressions (falsification review findings)", () => {
+  it("f3: a clock producing a rejected timestamp cannot poison the fact store", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    class WeirdDate extends Date {
+      override toISOString(): string {
+        return "+000000-01-01T00:00:00.000Z";
+      }
+    }
+    const store = new CanonFactsStore(path, { now: () => new WeirdDate() });
+    cleanups.push(() => store.close());
+    expect(() =>
+      store.recordFact({
+        requirementId: R,
+        kind: "landed-on-main",
+        actor: "camino:merge",
+        payload: { sha: SHA },
+      }),
+    ).toThrow(/clock produced an unusable timestamp/);
+    expect(store.read()).toEqual([]);
+  });
+});

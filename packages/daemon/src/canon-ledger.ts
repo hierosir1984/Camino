@@ -26,6 +26,16 @@
  *    executing this module's SCHEMA in a fresh in-memory database
  *    (review round 1, finding 9 — an inert same-named trigger is a
  *    tampered store).
+ *  - UTF-8 pin so byte-level NUL CHECKs hold; unsafe-seq refusal at
+ *    open (BigInt probe) and at insert (CHECK).
+ *  - CAS append inside a transaction (in-process defense-in-depth under
+ *    the WP-104 writer lock, asserted per append when wired).
+ *  - Single-observation payloads: canonical JSON is the sole authority.
+ *  - Fail-closed adoption: opening re-derives the entire log through
+ *    core's verifyLedgerLog (which also validates every recordedAt) and
+ *    refuses a history the lifecycle disagrees with.
+ *  - Every constructor refusal path closes the native handle (WP-104
+ *    review round 1 finding 10 / PR #48 pattern).
  *
  * TAMPER-EVIDENT, NOT TAMPER-PROOF — the boundary, named (WP-003/WP-104
  * precedent; review round 2, findings 4/5). These checks detect
@@ -41,16 +51,6 @@
  * no in-process integrity check can add to that boundary, and chasing
  * byte-level tamper-proofing here would be unwinnable. Restart re-runs
  * adoption verification and refuses a store whose visible schema drifted.
- *  - UTF-8 pin so byte-level NUL CHECKs hold; unsafe-seq refusal at
- *    open (BigInt probe) and at insert (CHECK).
- *  - CAS append inside a transaction (in-process defense-in-depth under
- *    the WP-104 writer lock, asserted per append when wired).
- *  - Single-observation payloads: canonical JSON is the sole authority.
- *  - Fail-closed adoption: opening re-derives the entire log through
- *    core's verifyLedgerLog (which also validates every recordedAt) and
- *    refuses a history the lifecycle disagrees with.
- *  - Every constructor refusal path closes the native handle (WP-104
- *    review round 1 finding 10 / PR #48 pattern).
  *
  * Like the intent journal (and unlike the transition recorder), the
  * ledger's writers are inside the daemon — the surfaces that record
@@ -66,6 +66,7 @@ import {
   applyLedgerRecord,
   decideLedgerAppend,
   foldLedgerView,
+  recordedAtProblem,
   verifyLedgerLog,
 } from "@camino/core";
 import type { LedgerView, LedgerViewEntry } from "@camino/core";
@@ -400,6 +401,14 @@ export class CanonLedgerStore {
     }
     const expectedLastSeq = this.#cachedLastSeq;
     const recordedAt = this.#now().toISOString();
+    // The injectable clock is part of the public surface: validate its
+    // output BEFORE persisting, so a misbehaving clock cannot write a row
+    // this same store's adoption verification would refuse at restart
+    // (review round 4, finding 3 — live-write/reopen agreement).
+    const timeIssue = recordedAtProblem(recordedAt);
+    if (timeIssue !== null) {
+      throw new Error(`clock produced an unusable timestamp: ${timeIssue}`);
+    }
     const runAppend = this.#db.transaction((): number => {
       const lastSeq = this.#db
         .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM canon_ledger")

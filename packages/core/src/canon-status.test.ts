@@ -267,12 +267,15 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
     w.expect(main(HM1), { kind: "on-main" }, "verified-live", ["E2"], "verified live on main");
 
     // A later MAIN verdict must not mask the branch's own exact-binding
-    // proof (review round 1, finding 6 / self-found S1).
+    // proof (review round 1, finding 6 / self-found S1). E12 does not
+    // fire here: M1 changed R, so main's verdict was never inheritable
+    // and no precedence was applied (round 4 finding 1); the deliberate
+    // E12 walk is the untouched-carrying-branch test below.
     w.expect(
       branch(M1, HB2),
       { kind: "present-on", branch: M1 },
       "verified-live",
-      ["E2", "E12"],
+      ["E2"],
       "own verdict outranks the later main verdict",
     );
 
@@ -308,8 +311,83 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       branch(M1, HB1),
       { kind: "present-on", branch: M1 },
       "unverified",
-      ["E8", "E12"],
+      ["E8"],
       "the branch's own latest run failed; main's later pass cannot mask it",
+    );
+  });
+
+  it("E12 precedence on an UNTOUCHED carrying branch, both orderings (r4 finding 1)", () => {
+    // The only situation where same-context precedence is genuinely
+    // APPLIED: the branch never changed R, carries the landing, has its
+    // own verdict, and a main verdict competes — in either order.
+    const w = new Walk(exercised);
+    w.fact("landed-on-main", { sha: HM1 });
+    w.fact("mainline-inherited", { branch: M1, sha: HM1 });
+    // Own verdict FIRST, main verdict later:
+    w.fact("verification-verdict", {
+      contextKind: "branch",
+      branch: M1,
+      headSha: HB1,
+      baseSha: BASE1,
+      outcome: "pass",
+    });
+    w.fact("verification-verdict", {
+      contextKind: "main",
+      headSha: HM1,
+      baseSha: H0,
+      outcome: "pass",
+    });
+    w.expect(
+      branch(M1, HB1),
+      { kind: "on-main" },
+      "verified-live",
+      ["I4", "E2", "E12"],
+      "own live verdict governs over the later main verdict",
+    );
+
+    // Main verdict FIRST, own verdict later (fail direction):
+    const w2 = new Walk(exercised);
+    w2.fact("landed-on-main", { sha: HM1 });
+    w2.fact("mainline-inherited", { branch: M2, sha: HM1 });
+    w2.fact("verification-verdict", {
+      contextKind: "main",
+      headSha: HM1,
+      baseSha: H0,
+      outcome: "pass",
+    });
+    w2.fact("verification-verdict", {
+      contextKind: "branch",
+      branch: M2,
+      headSha: HB2,
+      baseSha: BASE1,
+      outcome: "fail",
+    });
+    w2.expect(
+      branch(M2, HB2),
+      { kind: "on-main" },
+      "unverified",
+      ["I4", "E8", "E12"],
+      "own fail governs; main's earlier pass cannot stand in",
+    );
+  });
+
+  it("E11 shows through on the LIVE path too (r4 finding 1)", () => {
+    const w = new Walk(exercised);
+    w.fact("landed-on-main", { sha: HM1 });
+    w.fact("verification-blocked", { contextKind: "main", reason: "quarantined" });
+    w.fact("verification-verdict", {
+      contextKind: "main",
+      headSha: HM1,
+      baseSha: H0,
+      outcome: "pass",
+    });
+    w.fact("verification-unblocked", { contextKind: "main" });
+    w.expect(
+      main(HM1),
+      { kind: "on-main" },
+      "verified-live",
+      ["I3", "E2", "E11"],
+      "a cleared block lets the live verdict show, and E11 says so",
     );
   });
 
@@ -1384,5 +1462,52 @@ describe("round-3 regressions (falsification review findings)", () => {
     const after = projectRequirementStatus(entry, facts, branch(M1, HB2));
     expect(before.implementation).toEqual({ kind: "present-on", branch: M1 });
     expect(after.implementation).toEqual({ kind: "absent" });
+  });
+});
+
+describe("round-4 regressions (falsification review findings)", () => {
+  const acc = acceptedView();
+  const entry = acc.get(R) as LedgerViewEntry;
+
+  it("f4: cross-requirement duplicate global seqs are refused by projectStatus", () => {
+    const a: CanonFactRecord = {
+      seq: 1,
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "a:b",
+      payload: { sha: HM1 },
+      recordedAt: "2026-07-02T00:00:00.000Z",
+    };
+    const b: CanonFactRecord = {
+      ...a,
+      requirementId: "CAM-DEMO-02",
+    };
+    expect(() => projectStatus(acc, [a, b], main(HM1))).toThrow(/malformed fact sequence/);
+  });
+
+  it("f4: a record whose field accessors throw becomes a clean domain refusal", () => {
+    const trap = new Proxy(
+      {},
+      {
+        get(_t, p) {
+          if (p === "seq") throw new Error("seq trap");
+          return undefined;
+        },
+      },
+    ) as unknown as CanonFactRecord;
+    expect(() => projectRequirementStatus(entry, [trap], main(HM1))).toThrow(
+      /malformed fact record/,
+    );
+    const symbolActor = {
+      seq: 1,
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: Symbol("x") as unknown as string,
+      payload: { sha: HM1 },
+      recordedAt: "2026-07-02T00:00:00.000Z",
+    } as CanonFactRecord;
+    expect(() => projectRequirementStatus(entry, [symbolActor], main(HM1))).toThrow(
+      /malformed fact record/,
+    );
   });
 });

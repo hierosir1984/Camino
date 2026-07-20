@@ -260,12 +260,19 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
 const LINE_TERMINATOR = /[\n\r\u0085\u000b\u000c\u2028\u2029]/;
 
 /**
- * Bidirectional and format controls that can reorder or hide displayed
- * text (the Trojan-Source vulnerability class, CVE-2021-42574; review
- * round 3 finding 6): LRM/RLM, the bidi embeddings/overrides U+202A-E,
- * the isolates U+2066-9, and the BOM / zero-width no-break space U+FEFF.
+ * Bidirectional and invisible format controls that can reorder or hide
+ * displayed text (the Trojan-Source class, CVE-2021-42574; review round 3
+ * finding 6, completed by round 4 finding 2): every Bidi_Control (LRM/RLM,
+ * ALM U+061C, embeddings/overrides U+202A-E, isolates U+2066-9), the
+ * deprecated format controls U+206A-F, the invisible carriers ZWSP U+200B
+ * and WORD JOINER U+2060-2064, BOM/ZWNBSP U+FEFF, interlinear annotation
+ * anchors U+FFF9-B, and the tag characters U+E0001/U+E0020-E007F (an
+ * invisible payload channel). Deliberately NOT a blanket \\p{Cf} ban:
+ * ZWNJ/ZWJ (U+200C/D) stay allowed \u2014 they are load-bearing in ordinary
+ * text (Persian/Indic joining, emoji sequences).
  */
-const BIDI_OR_FORMAT_CONTROL = /[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
+const BIDI_OR_FORMAT_CONTROL =
+  /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\u206a-\u206f\ufeff\ufff9-\ufffb\u{e0001}\u{e0020}-\u{e007f}]/u;
 
 /**
  * Exactly the forms `Date.prototype.toISOString` produces: the four-digit

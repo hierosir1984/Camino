@@ -508,26 +508,45 @@ function factSortKey(fact: CanonFactRecord): string {
   return `${fact.kind}\u0000${fact.actor}\u0000${fact.recordedAt}\u0000${safeStringify(fact.payload)}`;
 }
 
+/**
+ * Read each record's ordering-relevant fields exactly once under a guard
+ * (round 4 finding 4): a hostile record whose `seq`/`kind`/`actor`
+ * accessors throw \u2014 impossible from a store, expressible by a direct
+ * caller \u2014 becomes the same clean domain refusal as any other malformed
+ * record, never a leaked trap error.
+ */
+function guardedOrderSnapshot(fact: CanonFactRecord): { seq: number; key: string } {
+  try {
+    const seq = fact.seq;
+    return {
+      seq: typeof seq === "number" && Number.isFinite(seq) ? seq : Number.POSITIVE_INFINITY,
+      key: factSortKey(fact),
+    };
+  } catch (error) {
+    throw new Error(
+      `malformed fact record (field access threw: ${safeErrorLabel(error)}) \u2014 the projection ` +
+        "is defined over store-produced facts (CAM-CANON-03)",
+    );
+  }
+}
+
 function orderFacts(facts: readonly CanonFactRecord[]): CanonFactRecord[] {
-  const ordered = [...facts].sort((a, b) => {
-    const sa = Number.isFinite(a.seq) ? a.seq : Number.POSITIVE_INFINITY;
-    const sb = Number.isFinite(b.seq) ? b.seq : Number.POSITIVE_INFINITY;
-    if (sa !== sb) return sa < sb ? -1 : 1;
-    const ka = factSortKey(a);
-    const kb = factSortKey(b);
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  const snapshots = facts.map((fact) => ({ fact, ...guardedOrderSnapshot(fact) }));
+  snapshots.sort((a, b) => {
+    if (a.seq !== b.seq) return a.seq < b.seq ? -1 : 1;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
   });
   let last = 0;
-  for (const fact of ordered) {
-    if (!Number.isSafeInteger(fact.seq) || fact.seq <= last) {
+  for (const s of snapshots) {
+    if (!Number.isSafeInteger(s.seq) || s.seq <= last) {
       throw new Error(
-        `malformed fact sequence (seq ${String(fact.seq)} is not a safe, strictly increasing ` +
+        `malformed fact sequence (seq ${String(s.seq)} is not a safe, strictly increasing ` +
           `integer after ${String(last)}) \u2014 the projection is defined over store-produced facts (CAM-CANON-03)`,
       );
     }
-    last = fact.seq;
+    last = s.seq;
   }
-  return ordered;
+  return snapshots.map((s) => s.fact);
 }
 
 /** The projection's full answer: the tuple plus which rules produced it. */
@@ -781,10 +800,18 @@ function deriveEvidence(
   if (ownVerdicts.length > 0) {
     governing = ownVerdicts.at(-1);
     // E12 (same-context precedence) fires whenever precedence is actually
-    // APPLIED over a competing main verdict — in EITHER recording order,
-    // matching the rule's "regardless of order" statement (round 3
-    // finding 3); its absence would make coverage order-dependent.
-    if (context.kind === "branch" && verdicts.some((f) => factContextKey(f.payload) === "main")) {
+    // APPLIED over a competing main verdict — in EITHER recording order
+    // (round 3 finding 3) — and only when that main verdict would GENUINELY
+    // have been inheritable absent the own verdict: the branch never
+    // changed R and demonstrably carries the landing. A main verdict that
+    // could never inherit (changed branch, or no mainline-inherited fact)
+    // exerts no precedence for E12 to describe (round 4 finding 1).
+    if (
+      context.kind === "branch" &&
+      !everTouched &&
+      mainlineCarried &&
+      verdicts.some((f) => factContextKey(f.payload) === "main")
+    ) {
       fire("E12");
     }
   } else if (context.kind === "branch" && everTouched) {
@@ -825,6 +852,7 @@ function deriveEvidence(
   if (!inherited && headMatches && baseMatches) {
     fire("E2");
     if (blockedOutstanding) fire("E10");
+    else if (everBlocked) fire("E11"); // a cleared block let the live verdict show (round 4 finding 1)
     return "verified-live";
   }
   // Stale. E3 is the SAME-CONTEXT downgrade (its statement); the inherited
@@ -881,6 +909,11 @@ export function projectStatus(
   context: StatusContext,
 ): Map<string, StatusTuple> {
   const snapshot = snapshotContext(context);
+  // The GLOBAL sequence is validated before grouping (round 4 finding 4):
+  // seqs are store-global, so a duplicate across two requirements is just
+  // as impossible from a store as within one \u2014 grouping first would have
+  // hidden it from the per-requirement check.
+  orderFacts(facts);
   const byRequirement = new Map<string, CanonFactRecord[]>();
   for (const fact of facts) {
     const list = byRequirement.get(fact.requirementId);

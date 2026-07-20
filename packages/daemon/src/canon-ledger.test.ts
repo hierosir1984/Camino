@@ -484,3 +484,29 @@ describe("round-2 regressions (falsification review findings)", () => {
     reopened.close();
   });
 });
+
+describe("round-4 regressions (falsification review findings)", () => {
+  it("f3: a clock producing a timestamp the verifier rejects is refused BEFORE persisting", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    // A Date subclass returning the noncanonical "+000000-..." year form:
+    // toISOString-valid shape-wise, but recordedAtProblem refuses it, so
+    // the append must throw and persist NOTHING (round 4 finding 3 — a
+    // live write must never poison the store's own restart).
+    class WeirdDate extends Date {
+      override toISOString(): string {
+        return "+000000-01-01T00:00:00.000Z";
+      }
+    }
+    const store = new CanonLedgerStore(path, { now: () => new WeirdDate() });
+    cleanups.push(() => store.close());
+    expect(() => store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" })).toThrow(
+      /clock produced an unusable timestamp/,
+    );
+    expect(store.read()).toEqual([]);
+    // The store reopens clean — nothing was poisoned.
+    store.close();
+    cleanups.pop();
+    new CanonLedgerStore(path).close();
+  });
+});
