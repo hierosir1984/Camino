@@ -228,11 +228,18 @@ export function checkAdapterPlanCustody(
  * are therefore proven the way the subscription adapters prove them: against
  * the fake CLI, zero quota (packages/daemon/src/dispatch/lifecycle.test.ts is
  * the template).
+ *
+ * FROZEN like every other exported policy value in this package. This one is
+ * a stated-obligations list rather than a live gate, but the class is the
+ * same: on the unfrozen array a package-root importer could splice out an
+ * obligation and quietly shrink what a future implementation's conformance
+ * suite is told it owes. (Added after the WP-105 round-8/9 freeze pass, so it
+ * missed that sweep — caught here by the barrel-immutability sweep.)
  */
-export const API_KEY_ADAPTER_DISPATCH_OBLIGATIONS: readonly string[] = [
+export const API_KEY_ADAPTER_DISPATCH_OBLIGATIONS: readonly string[] = Object.freeze([
   "kill-confirm sequence on the shared lifecycle: SIGTERM → grace → SIGKILL → group-gone → lease release (PRD §5 registry item 4)",
   "rate-limit classification through the shared quota classifier: quota-blocked, never requirement-failed (CAM-EXEC-06)",
   "worker env composed by the shared composer with the declared credential vars passed through by NAME from host env state only (CAM-SEC-06 discipline)",
   "credential values absent from every posture record, transcript, evidence artifact, and log the dispatch produces",
   "enablement gated on the provider's recorded sanctioned-path attribute and on the declared credential vars being present in host env state (CAM-EXEC-01)",
-];
+]);

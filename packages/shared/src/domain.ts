@@ -13,7 +13,7 @@
  */
 
 /** Where a mission's content came from (CAM-CORE-02's three intake paths). */
-export const MISSION_SOURCE_KINDS = ["pasted", "file", "quick-task"] as const;
+export const MISSION_SOURCE_KINDS = Object.freeze(["pasted", "file", "quick-task"] as const);
 export type MissionSourceKind = (typeof MISSION_SOURCE_KINDS)[number];
 
 /**
@@ -22,7 +22,7 @@ export type MissionSourceKind = (typeof MISSION_SOURCE_KINDS)[number];
  * intake from the path (pasted PRD text and `.md` files are markdown,
  * `.txt` files and quick-task descriptions are text).
  */
-export const MISSION_CONTENT_FORMATS = ["markdown", "text"] as const;
+export const MISSION_CONTENT_FORMATS = Object.freeze(["markdown", "text"] as const);
 export type MissionContentFormat = (typeof MISSION_CONTENT_FORMATS)[number];
 
 export interface Project {
@@ -46,7 +46,7 @@ export interface Repo {
  * missions, `quick-task` (A.1b) for quick tasks. Mirrors @camino/core's
  * MissionRoute; declared here so the domain schema does not depend on core.
  */
-export const MISSION_ROUTES = ["integration", "quick-task"] as const;
+export const MISSION_ROUTES = Object.freeze(["integration", "quick-task"] as const);
 export type MissionRouteName = (typeof MISSION_ROUTES)[number];
 
 export interface MissionRecord {

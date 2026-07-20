@@ -38,11 +38,18 @@ import type { TransitionRecorder } from "./transition-recorder.js";
  * v1 attachment allowlist (CAM-CORE-02): markdown first-class, plain text
  * second. Everything else — `.docx` included — is rejected with the reason
  * below; converters are future work, not a fallback.
+ *
+ * FROZEN: `Readonly<...>` is a compile-time annotation, not a runtime one. On
+ * the unfrozen record a package-root importer could add `".exe": "text"` and
+ * widen the accepted-extension allowlist through the public barrel alone — no
+ * deep import, no gated-object mutation (the named WP-107 boundary). Freezing
+ * makes the allowlist non-extensible; lookups are unaffected.
  */
-export const INTAKE_ACCEPTED_EXTENSIONS: Readonly<Record<string, MissionContentFormat>> = {
-  ".md": "markdown",
-  ".txt": "text",
-};
+export const INTAKE_ACCEPTED_EXTENSIONS: Readonly<Record<string, MissionContentFormat>> =
+  Object.freeze({
+    ".md": "markdown",
+    ".txt": "text",
+  });
 
 /**
  * Upper bound on retained intake content (bytes of UTF-8), stated in every

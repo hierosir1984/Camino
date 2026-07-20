@@ -26,11 +26,12 @@
  */
 import {
   INTENT_EVENTS,
-  INTENT_ID_PATTERN,
+  INTENT_ID_PATTERN_SOURCE,
   LABEL_DESIRED_STATES,
   OPERATION_CLASSES,
   OPERATION_TARGET_KINDS,
   intentMarkerToken,
+  isValidIntentId,
 } from "@camino/shared";
 import type {
   ExternalOperationSpec,
@@ -99,8 +100,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  */
 function intentIdProblem(value: unknown): string | null {
   if (typeof value !== "string") return "intentId must be a string";
-  if (!INTENT_ID_PATTERN.test(value)) {
-    return `intentId must match ${INTENT_ID_PATTERN} (Camino-generated ids only — the marker-token containment proof depends on this grammar)`;
+  if (!isValidIntentId(value)) {
+    return `intentId must match /${INTENT_ID_PATTERN_SOURCE}/ (Camino-generated ids only — the marker-token containment proof depends on this grammar)`;
   }
   return null;
 }

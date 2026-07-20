@@ -58,8 +58,17 @@
  * it against real backends).
  */
 
-/** The nine operation classes of the design §4.4 table, closed. */
-export const OPERATION_CLASSES = [
+/**
+ * The nine operation classes of the design §4.4 table, closed.
+ *
+ * FROZEN, like every exported classification set in this package: `as const`
+ * is a compile-time assertion only — at runtime the array stays mutable, so a
+ * package-root importer could `push()` a tenth class (or splice one out) and
+ * change what core's validateOperationSpec accepts, WITHOUT a deep import or
+ * a gated-object mutation (the named WP-107 boundary). Freezing closes that
+ * package-public vector; reads (includes/index/iterate/spread) are unaffected.
+ */
+export const OPERATION_CLASSES = Object.freeze([
   "branch-create",
   "push",
   "pr-create",
@@ -69,15 +78,15 @@ export const OPERATION_CLASSES = [
   "workflow-dispatch",
   "test-service-mutation",
   "catch-all",
-] as const;
+] as const);
 export type OperationClass = (typeof OPERATION_CLASSES)[number];
 
 /** Where a label/comment lands (GitHub numbers issues and PRs together). */
-export const OPERATION_TARGET_KINDS = ["issue", "pull-request"] as const;
+export const OPERATION_TARGET_KINDS = Object.freeze(["issue", "pull-request"] as const);
 export type OperationTargetKind = (typeof OPERATION_TARGET_KINDS)[number];
 
 /** Desired end state for the naturally idempotent label class. */
-export const LABEL_DESIRED_STATES = ["present", "absent"] as const;
+export const LABEL_DESIRED_STATES = Object.freeze(["present", "absent"] as const);
 export type LabelDesiredState = (typeof LABEL_DESIRED_STATES)[number];
 
 /**
@@ -92,11 +101,15 @@ export type LabelDesiredState = (typeof LABEL_DESIRED_STATES)[number];
  * and under that grammar token containment is impossible for distinct
  * ids: any token's only "[" is its first character, so a contained token
  * must be a prefix, which forces one id to be a prefix of the other
- * followed by "]" — a character the grammar excludes from ids. The
- * marker/correlation FIELDS on the specs are additionally validated to
- * equal the intent id exactly (the design's "intent UUID" is the
- * intent's own id, not a caller-chosen string), so the reconciliation
- * key is bound to the journal identity it reconciles.
+ * followed by "]" — a character the grammar excludes from ids. That
+ * exclusion is what `isValidIntentId` enforces, and it is why the grammar
+ * is not exported as a live RegExp (see the note below it): a rewritable
+ * grammar would silently invalidate this proof.
+ *
+ * The marker/correlation FIELDS on the specs are additionally validated to
+ * equal the intent id exactly (the design's "intent UUID" is the intent's
+ * own id, not a caller-chosen string), so the reconciliation key is bound
+ * to the journal identity it reconciles.
  */
 
 /**
@@ -105,8 +118,22 @@ export type LabelDesiredState = (typeof LABEL_DESIRED_STATES)[number];
  * alphabet costs nothing and makes the token-containment proof above
  * hold. Enforced by core's decideIntentAppend on every journal write and
  * on every replay (a raw-written id outside the grammar refuses at open).
+ *
+ * MODULE-PRIVATE by design, for the reason spelled out on the requirement-id
+ * grammar: `RegExp.prototype.compile()` rewrites a regex's pattern BEFORE the
+ * `lastIndex` write that Object.freeze turns into a TypeError, so freezing
+ * leaves the swap intact for any caller willing to catch. Reach the grammar
+ * through `isValidIntentId`; the immutable SOURCE string carries the text.
  */
-export const INTENT_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+const INTENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** The intent-id grammar's pattern text, for error messages and tests. */
+export const INTENT_ID_PATTERN_SOURCE: string = INTENT_ID_RE.source;
+
+/** Does `value` obey the closed intent-id grammar the containment proof needs? */
+export function isValidIntentId(value: string): boolean {
+  return INTENT_ID_RE.test(value);
+}
 export function intentMarkerToken(intentId: string): string {
   return `[camino-intent:${intentId}]`;
 }
@@ -267,7 +294,7 @@ export type OperationResult = Readonly<Record<string, string | number | boolean 
  *   abandoned           a human closed an escalated intent without retry —
  *                       terminal, actor-bound to David
  */
-export const INTENT_EVENTS = [
+export const INTENT_EVENTS = Object.freeze([
   "recorded",
   "execution-started",
   "confirmed",
@@ -277,7 +304,7 @@ export const INTENT_EVENTS = [
   "escalated",
   "retry-authorized",
   "abandoned",
-] as const;
+] as const);
 export type IntentEventName = (typeof INTENT_EVENTS)[number];
 
 /**
@@ -287,7 +314,7 @@ export type IntentEventName = (typeof INTENT_EVENTS)[number];
  * between the ambiguity row and its escalation row (recovery is idempotent
  * across a crash between the two).
  */
-export const INTENT_STATUSES = [
+export const INTENT_STATUSES = Object.freeze([
   "recorded",
   "execution-started",
   "confirmed",
@@ -295,7 +322,7 @@ export const INTENT_STATUSES = [
   "ambiguity-recorded",
   "escalated",
   "abandoned",
-] as const;
+] as const);
 export type IntentStatus = (typeof INTENT_STATUSES)[number];
 
 /** A persisted intent journal row. */

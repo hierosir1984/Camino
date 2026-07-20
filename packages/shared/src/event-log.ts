@@ -13,7 +13,7 @@
  * log alone.
  */
 
-export const ENTITY_KINDS = ["mission", "issue", "attempt"] as const;
+export const ENTITY_KINDS = Object.freeze(["mission", "issue", "attempt"] as const);
 export type EntityKind = (typeof ENTITY_KINDS)[number];
 
 export type EventOutcome = "applied" | "rejected";

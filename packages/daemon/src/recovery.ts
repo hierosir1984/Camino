@@ -92,13 +92,25 @@ export interface RecoveryOptions {
   readonly actor?: string;
 }
 
-export const STATE_FILES = {
+/**
+ * The durable state directory's file names.
+ *
+ * FROZEN, and this one is load-bearing beyond tidiness: `writerLock` selects
+ * the file whose kernel lock IS the single-writer guarantee (CAM-STATE-04).
+ * `as const` is compile-time only, so on the unfrozen record a package-root
+ * importer could retarget `writerLock` between two openRecoveredState calls
+ * and end up with TWO recovered-state owners over one state directory — each
+ * holding a lock on a different file, neither fencing the other. That needs
+ * no deep import and no gated-object mutation (the named WP-107 boundary),
+ * just the public barrel. Freezing closes it; reads are unaffected.
+ */
+export const STATE_FILES = Object.freeze({
   writerLock: "writer-lock.sqlite",
   events: "events.sqlite",
   intents: "intents.sqlite",
   canonLedger: "canon-ledger.sqlite",
   canonFacts: "canon-facts.sqlite",
-} as const;
+} as const);
 
 /**
  * Open Camino's durable state under the writer lock and reconcile. THE
