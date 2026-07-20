@@ -71,12 +71,24 @@ Notation: **[P1]** = walking skeleton (phase 1), **[P2]** = pilot phase, **[P3]*
 
 ### 4.3 CAM-EXEC — workers and quarantine
 
+> Amended 2026-07-20 (AMEND-10, approved by David in PR #50): CAM-EXEC-06's "process-tree
+> cleanup" and §5 registry item 4's kill-confirm are delivered in two layers — the **adapter
+> layer** (WP-105) performs group-scoped kill-confirm (SIGTERM → grace → SIGKILL →
+> process-**group**-gone verification → lease release), complete for workers that stay within
+> their process group; the **container** (WP-107, CAM-EXEC-02: PID namespace / cgroup) closes
+> full process-**tree** containment, since a worker that deliberately changes its process group
+> (setpgid/setsid) can only be reaped as a unit inside a PID namespace. Lease fencing
+> (CAM-STATE-04) at the adapter layer is scoped to the process group; the container completes
+> the single-owner guarantee. Surfaced by the WP-105 falsification review (round 2, finding 2);
+> raw finding and dispositions recorded on PR #50. (Numbering: AMEND-9 was assigned to the
+> CAM-CANON-01 note applied on PR #51 / WP-109.)
+
 - **CAM-EXEC-01 [P1]** Worker adapters v1: Claude Code (official CLI), Codex CLI (official), and **Grok Build CLI (official; added at David's direction)**, spawned headless on David's subscriptions; an API-key adapter interface is defined (implementation **[F]**). Subscription auth is only ever exercised inside that vendor's official harness. **Per-adapter enablement is gated on sanctioned-path verification at onboarding.** For xAI, the *technical* headless path is verified — official Grok Build documentation supports scripted/headless operation and third-party integration — so the onboarding check is contractual/policy confirmation, recorded like every registry attribute. *Accept:* every **enabled** adapter passes the dispatch spike; an adapter whose sanctioned-path check fails is installable but visibly disabled with the reason recorded. (§5.2, §9)
 - **CAM-EXEC-02 [P1]** Workers run in containers with isolated full clones — never linked worktrees — and zero GitHub credentials; provider auth is made available read-only per harness requirements. (§5.1)
 - **CAM-EXEC-03 [P1]** Worker egress is allowlisted (package registries, docs domains per repo config); per-attempt budgets (tokens where reportable, wall-clock always) kill-and-escalate on breach. (§5.1)
 - **CAM-EXEC-04 [P1]** Quarantine intake: shallow-fetch of the worker's final head only, with object-count/size budgets; policy checks on the final tree (scope vs contract, protected paths incl. `.gitattributes`/CI/`.camino/`, canonical path identity — case-fold and Unicode-normalization collisions rejected — submodule/gitlink introductions blocked, symlink targets checked, **reserved-name and trailing-dot aliases rejected**, tree size budget); then **squash-and-rebuild**: a fresh Camino-authored commit applying that tree onto the assigned base, **with worker attribution recorded in a commit trailer**. Worker merge commits are rejected. *Accept:* the Phase 0 quarantine rejection suite (§7, Phase 0 item 3) passes. (§5.1)
 - **CAM-EXEC-05 [P1]** Worker workspace history is archived before cleanup under quotas (defaults: §5 registry item 11) for audit.
-- **CAM-EXEC-06 [P1]** Adapters own stream parsing, cancellation, process-tree cleanup (kill-confirm sequence: §5 registry item 4), and quota-limit classification (a rate-limit failure is `quota-blocked`, never `requirement-failed`).
+- **CAM-EXEC-06 [P1]** Adapters own stream parsing, cancellation, process cleanup (kill-confirm sequence: §5 registry item 4 — group-scoped at the adapter layer; full process-tree containment completed by the WP-107 container per AMEND-10), and quota-limit classification (a rate-limit failure is `quota-blocked`, never `requirement-failed`).
 - **CAM-EXEC-07 [P1]** Context packs are assembled by the control plane: canon excerpts rendered with ledger status for the worker's branch context, the issue contract, approved knowledge entries, and provenance tags per content class. Workers never wander the docs folder. (§3.1, §3.7)
 - **CAM-EXEC-08 [P2]** Candidate knowledge entries written by any attempt are immediately visible to repair attempts of the same issue (provenance-marked); promotion to approved happens via human batch or deterministic rule-classes only. (§3.7)
 - **CAM-EXEC-09 [P1]** Untrusted text (issue bodies, repo content, web content) is treated as data; the untrusted-content robustness baseline (§7, Phase 0 item 4) runs before the first unattended mission and its findings gate hardening claims. (§5.3 T2)
@@ -193,7 +205,7 @@ Notation: **[P1]** = walking skeleton (phase 1), **[P2]** = pilot phase, **[P3]*
 1. **Revalidation retry bound:** 2 automatic rebuild-and-revalidate cycles per merge candidate, then escalate.
 2. **User-observable path heuristics (initial):** `**/{components,pages,views,screens,routes}/**`, template/style files, API schema files (`openapi*`, `*.graphql`), CLI entrypoints, notification/email templates, i18n resources, migrations touching user-visible data, feature-flag definitions. Extensible per repo in `.camino/config.yml`. **Heuristics are the floor, not the decision:** planner judgment can add observability, and reviewer concurrence is required to remove it (CAM-PLAN-06).
 3. **Attention numbers:** as CAM-OBS-02.
-4. **Transition table:** normative in **Appendix A**; kill-confirm = SIGTERM → 30s → SIGKILL → process-tree-gone verification → lease release.
+4. **Transition table:** normative in **Appendix A**; kill-confirm = SIGTERM → 30s → SIGKILL → process-group-gone verification → lease release at the adapter layer; process-tree-gone is the post-container end state (WP-107, CAM-EXEC-02) per AMEND-10.
 5. **Lease generations:** monotonic per environment in SQLite; 30s heartbeat, 5min TTL; runner rejects stale generations.
 6. **Knowledge promotion rule-classes:** as CAM-CANON-09.
 7. **Probe tooling:** Playwright specs + HTTP scripts in `.camino/probes/`, one file per requirement ID.

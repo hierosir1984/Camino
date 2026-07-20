@@ -12,9 +12,9 @@
 // process-tree containment is WP-107's container (PID namespace / cgroup),
 // where the whole worker tree is killable as a unit regardless of group. This
 // layer owns the group-scoped ordering guarantee and says so. The PRD's
-// "process-tree-gone" wording (registry item 4, CAM-EXEC-06) describes the
-// post-container end state; a proposed scoping amendment (AMEND-9) is parked
-// for David — see the PR.
+// "process-tree-gone" (registry item 4, CAM-EXEC-06) is scoped per AMEND-10
+// (approved 2026-07-20, PR #50): this layer delivers group-gone; WP-107's
+// container completes full-tree containment.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import type {

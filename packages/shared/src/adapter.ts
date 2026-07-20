@@ -96,9 +96,9 @@ export interface AdapterSpec {
  * containment is the container's job: WP-107 runs each worker in a PID
  * namespace / cgroup where killing the container reaps every pid regardless of
  * group. At THIS layer the fencing guarantee is scoped to the process group,
- * and that scope is stated, not overclaimed. The PRD's "process-tree-gone"
- * wording (registry item 4, CAM-EXEC-06) describes the post-container end
- * state; a proposed scoping amendment (AMEND-9) is parked for David.
+ * and that scope is stated, not overclaimed. The PRD scopes this in two layers
+ * per AMEND-10 (approved 2026-07-20, PR #50): group-gone at this layer;
+ * process-tree-gone is the post-container end state (WP-107).
  */
 export interface KillConfirmRecord {
   requested: boolean;
