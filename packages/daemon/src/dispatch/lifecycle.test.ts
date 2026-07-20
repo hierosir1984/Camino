@@ -945,15 +945,26 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
     const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
     try {
       const claude = PROVIDER_LINES["claude-code"]!;
-      const burst = Array.from({ length: 3000 }, () => '{"type":"system","subtype":"init"}');
-      const rec = await dispatch(
-        schemaEmittingAdapter("claude-code", [...burst, claude.quota], 0),
-        { workdir: ws, prompt: "x" },
-      );
+      // Generate the burst INSIDE the script (a loop), never as a giant `-e`
+      // argument: 3000 lines serialized into one argv string exceeds Linux's
+      // per-arg limit (MAX_ARG_STRLEN, 128KB) → E2BIG spawn failure on CI even
+      // though macOS allows it. Registry-gated spec, plan() substituted in place.
+      const N = 3000;
+      const spec = buildRegistryForTest({ cliPresent: () => true }).find(
+        (s) => s.name === "claude-code",
+      )!;
+      const script =
+        `for(let i=0;i<${N};i++)process.stdout.write('{"type":"system","subtype":"init"}\\n');` +
+        `process.stdout.write(${JSON.stringify(claude.quota)}+"\\n");process.exit(0);`;
+      (spec as { plan: AdapterSpec["plan"] }).plan = () => ({
+        file: process.execPath,
+        args: ["-e", script],
+      });
+      const rec = await dispatch(spec, { workdir: ws, prompt: "x" });
       expect(rec.exitCode).toBe(0);
       expect(rec.outcome).toBe("quota-blocked"); // final event drained + classified
       expect(rec.quotaSignalSeen).toBe(true);
-      expect(rec.streamedEvents).toBe(3001); // every line drained, none truncated
+      expect(rec.streamedEvents).toBe(N + 1); // every line drained, none truncated
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
