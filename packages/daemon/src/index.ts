@@ -60,6 +60,29 @@ export type {
   SerializationViolation,
 } from "./serialization-scheduler.js";
 
+// WP-105: the product adapter/dispatch layer (CAM-EXEC-01/06, CAM-SEC-06).
+export {
+  dispatch,
+  killConfirm,
+  processGroupConfirmedGone,
+  DisabledAdapterError,
+  PRODUCTION_KILL_CONFIRM,
+} from "./dispatch/lifecycle.js";
+export type { DispatchOptions, KillConfirmTimings } from "./dispatch/lifecycle.js";
+export { composeWorkerEnv } from "./dispatch/env.js";
+export { classifyByQuotaSignal } from "./dispatch/quota.js";
+// buildRegistry is the zero-argument PRODUCTION gate (round-7 finding 1): the
+// injectable-probe variant (buildRegistryForTest) is deliberately NOT exported
+// here, so the public surface cannot substitute the CLI-presence/attestation
+// gates that mint registry provenance.
+export { buildRegistry, cliOnPath, DEFAULT_ATTESTATIONS_PATH } from "./dispatch/registry.js";
+// The raw adapter factories are deliberately NOT exported (round-6 finding 1):
+// the package's only path to a dispatchable official adapter is buildRegistry()
+// — its sanctioned-path gate stamps registry provenance, which dispatch()
+// requires for official adapter names. (package.json "exports" confines deep
+// imports, so this is a real package-boundary constraint, not advice.)
+export { committedSince, headSha, makeWorkspace } from "./dispatch/workspace.js";
+
 // WP-109: Living Canon durable stores (CAM-CANON-01/02/03).
 export { CanonLedgerStore } from "./canon-ledger.js";
 export type {

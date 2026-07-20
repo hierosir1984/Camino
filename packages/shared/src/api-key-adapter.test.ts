@@ -1,0 +1,216 @@
+import { describe, expect, it } from "vitest";
+import type { AdapterContext, SpawnPlan } from "./adapter.js";
+import {
+  API_KEY_ADAPTER_DISPATCH_OBLIGATIONS,
+  isCredentialEnvVarNameValid,
+  checkAdapterPlanCustody,
+  checkApiKeyAdapterSpec,
+  checkPlanCredentialCustody,
+  type ApiKeyAdapterSpec,
+} from "./api-key-adapter.js";
+
+// The conformance-test SKELETON must itself discriminate: a conformant spec
+// passes every check, and each contract violation trips its named check. The
+// fakes below are test fixtures proving the skeleton works — no product
+// API-key adapter ships in WP-105 (the implementation is [F]).
+
+const CTX: AdapterContext = { workdir: "/tmp/ws", prompt: "solve the issue" };
+const PLANTED = ["synthetic-credential-value-1", "synthetic-credential-value-2"];
+
+function conformantFake(overrides: Partial<ApiKeyAdapterSpec> = {}): ApiKeyAdapterSpec {
+  return {
+    kind: "api-key",
+    provider: "example",
+    name: "example-api",
+    enabled: false,
+    disabledReason: "no implementation ships in WP-105 (interface is [F])",
+    credentialEnvVars: ["EXAMPLE_API_KEY"],
+    plan(ctx): SpawnPlan {
+      // A conformant plan never touches credential values: the composer passes
+      // the declared env var through from host state at spawn time.
+      return { file: "example-cli", args: ["-p", ctx.prompt, "--headless"] };
+    },
+    parseLine: () => null,
+    ...overrides,
+  };
+}
+
+describe("checkApiKeyAdapterSpec (static declaration conformance)", () => {
+  it("a conformant spec passes with zero violations", () => {
+    expect(checkApiKeyAdapterSpec(conformantFake())).toEqual([]);
+  });
+
+  it("flags a wrong kind discriminator", () => {
+    const v = checkApiKeyAdapterSpec(
+      conformantFake({ kind: "subscription" as unknown as "api-key" }),
+    );
+    expect(v.map((x) => x.check)).toContain("kind");
+  });
+
+  it("flags an empty provider and an empty name", () => {
+    const v = checkApiKeyAdapterSpec(conformantFake({ provider: "", name: "" }));
+    expect(v.map((x) => x.check)).toEqual(expect.arrayContaining(["provider", "name"]));
+  });
+
+  it("flags an empty credential declaration", () => {
+    const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [] }));
+    expect(v.map((x) => x.check)).toContain("credential-env-vars");
+  });
+
+  it("flags malformed env var names (grammar is uppercase POSIX)", () => {
+    for (const bad of ["example_api_key", "1KEY", "WITH-DASH", "WITH SPACE", ""]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [bad] }));
+      expect(
+        v.map((x) => x.check),
+        bad,
+      ).toContain("credential-env-vars");
+      expect(isCredentialEnvVarNameValid(bad), bad).toBe(false);
+    }
+  });
+
+  it("flags duplicate declarations", () => {
+    const v = checkApiKeyAdapterSpec(
+      conformantFake({ credentialEnvVars: ["EXAMPLE_API_KEY", "EXAMPLE_API_KEY"] }),
+    );
+    expect(v.some((x) => x.detail.includes("more than once"))).toBe(true);
+  });
+
+  it("REFUSES a GitHub-credential-shaped declaration: the GitHub channel stays closed", () => {
+    for (const gh of ["GITHUB_TOKEN", "GH_TOKEN", "MY_GITHUB_PAT"]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [gh] }));
+      expect(
+        v.some((x) => x.detail.includes("GitHub-credential-shaped")),
+        gh,
+      ).toBe(true);
+    }
+  });
+
+  it("REFUSES declaring a host-allowlist key as a credential var (round-1 finding 5)", () => {
+    for (const k of ["HOME", "PATH", "USER", "TMPDIR"]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(
+        v.some((x) => x.detail.includes("host-inherited allowlist key")),
+        k,
+      ).toBe(true);
+    }
+  });
+
+  it("REFUSES declaring a stripped git/SSH capability channel as a credential var (round-1 finding 5, round-2 finding 7)", () => {
+    for (const k of [
+      "GIT_CONFIG_COUNT",
+      "GIT_SSH_COMMAND",
+      "SSH_AUTH_SOCK",
+      "GIT_DIR",
+      "GIT_CONFIG_KEY_0",
+      // round-2 finding 7: command-execution + composer-forced channels are now
+      // in the one shared predicate, so the API-key checker rejects them too.
+      "GIT_EXTERNAL_DIFF",
+      "GIT_EDITOR",
+      "GIT_PAGER",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_SYSTEM",
+      "GIT_TERMINAL_PROMPT",
+      // round-3 finding 3: the whole SSH_* family is a stripped channel.
+      "SSH_SK_PROVIDER",
+      "SSH_AUTH_SOCK",
+    ]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(
+        v.some((x) => x.detail.includes("git config/redirect or SSH-agent channel")),
+        k,
+      ).toBe(true);
+    }
+  });
+
+  it("ALLOWS a genuine credential-shaped var (it is supposed to be a key)", () => {
+    for (const k of ["GLM_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_TOKEN"]) {
+      const v = checkApiKeyAdapterSpec(conformantFake({ credentialEnvVars: [k] }));
+      expect(v, k).toEqual([]); // credential-shaped is expected, not a violation
+    }
+  });
+});
+
+describe("checkPlanCredentialCustody (values never reach the plan)", () => {
+  it("a conformant plan passes with planted values in scope", () => {
+    expect(checkAdapterPlanCustody(conformantFake(), CTX, PLANTED)).toEqual([]);
+  });
+
+  it("catches a credential value embedded in argv", () => {
+    const spec = conformantFake({
+      plan: () => ({ file: "example-cli", args: ["--api-key", PLANTED[0]!] }),
+    });
+    const v = checkAdapterPlanCustody(spec, CTX, PLANTED);
+    expect(v.some((x) => x.check === "plan-custody" && x.detail.includes("plan.args"))).toBe(true);
+  });
+
+  it("catches a credential value delivered via stdin", () => {
+    const spec = conformantFake({
+      plan: (ctx) => ({ file: "example-cli", args: [], stdin: `${ctx.prompt}\n${PLANTED[1]!}` }),
+    });
+    const v = checkAdapterPlanCustody(spec, CTX, PLANTED);
+    expect(v.some((x) => x.detail.includes("plan.stdin"))).toBe(true);
+  });
+
+  it("catches a credential value smuggled through a plan env value", () => {
+    const spec = conformantFake({
+      plan: () => ({ file: "example-cli", args: [], env: { HARMLESS_LOOKING: PLANTED[0]! } }),
+    });
+    const v = checkAdapterPlanCustody(spec, CTX, PLANTED);
+    expect(v.some((x) => x.detail.includes('plan.env["HARMLESS_LOOKING"]'))).toBe(true);
+  });
+
+  it("REFUSES a plan that sets its own declared credential var, regardless of value", () => {
+    const spec = conformantFake({
+      plan: () => ({ file: "example-cli", args: [], env: { EXAMPLE_API_KEY: "anything" } }),
+    });
+    const v = checkAdapterPlanCustody(spec, CTX, PLANTED);
+    expect(v.some((x) => x.detail.includes('declared credential var "EXAMPLE_API_KEY"'))).toBe(
+      true,
+    );
+  });
+
+  it("empty planted values never false-positive", () => {
+    const plan: SpawnPlan = { file: "x", args: ["y"] };
+    expect(checkPlanCredentialCustody(conformantFake(), plan, [""])).toEqual([]);
+  });
+});
+
+describe("the static custody check is a screen, not a proof (round-1 finding 5)", () => {
+  it("a transform-and-leak spec passes the SUBSTRING check — which is why dispatch-level obligations exist", () => {
+    // An adapter that reads a global and base64-encodes it into an innocuous
+    // env value slips past substring detection. The static check cannot catch
+    // this by construction (plan() is arbitrary code); the dispatch-level
+    // behavioral obligations are the REQUIRED next screen — and a reversible
+    // transform can evade even those (they observe names and artifacts, not
+    // arbitrary encodings), which is the named residual boundary closed by
+    // WP-107's container + egress allowlist (round-7 finding 4). This test
+    // PINS the limitation honestly rather than overclaiming.
+    const transformer = conformantFake({
+      plan: () => {
+        const planted = "synthetic-credential-value-1";
+        // Any reversible transform defeats a raw-substring screen — here a
+        // simple reversal stands in for base64/xor/etc. (no Node types needed).
+        const smuggled = planted.split("").reverse().join("");
+        return { file: "example-cli", args: [], env: { INNOCENT_LOOKING: smuggled } };
+      },
+    });
+    const v = checkAdapterPlanCustody(transformer, CTX, ["synthetic-credential-value-1"]);
+    expect(v).toEqual([]); // substring screen does NOT catch the base64 transform
+    // The dispatch-level obligation GOVERNING this class is documented — a
+    // required behavioral check, not sufficiency (a transformed value can
+    // evade artifact scans; named residual, WP-107):
+    expect(API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.join("\n")).toContain(
+      "absent from every posture record, transcript, evidence artifact, and log",
+    );
+  });
+});
+
+describe("dispatch-level obligations (documented for the [F] implementation)", () => {
+  it("names the kill-confirm sequence and the quota classification contract", () => {
+    const text = API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.join("\n");
+    expect(API_KEY_ADAPTER_DISPATCH_OBLIGATIONS.length).toBeGreaterThan(0);
+    expect(text).toContain("SIGTERM → grace → SIGKILL → group-gone → lease release");
+    expect(text).toContain("quota-blocked, never requirement-failed");
+    expect(text).toContain("host env state");
+  });
+});

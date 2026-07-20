@@ -62,6 +62,49 @@ export type {
   GitHubQueryTransport,
 } from "./external-ops.js";
 
+// WP-105: the worker-adapter dispatch contract (CAM-EXEC-01/06, CAM-SEC-06).
+export {
+  GITHUB_CREDENTIAL_MARKERS,
+  isGithubCredentialShapedKey,
+  CREDENTIAL_SHAPED_PATTERN_SOURCE,
+  STRIPPED_ENV_EXACT,
+  STRIPPED_ENV_PREFIXES,
+  WORKER_ENV_ALLOWLIST,
+  OFFICIAL_ADAPTER_NAMES,
+  OFFICIAL_CLI_CONFIG_ROOTS,
+  CREDENTIAL_ROOT_ENV_KEYS,
+  isCredentialRootEnvKey,
+  isStrippedWorkerEnvKey,
+  isGitOrSshChannelEnvKey,
+  isWorkerEnvAllowlistKey,
+} from "./adapter.js";
+export type { OfficialAdapterName } from "./adapter.js";
+export type {
+  StreamEvent,
+  DispatchOutcome,
+  SpawnPlan,
+  AdapterContext,
+  AdapterSpec,
+  KillConfirmRecord,
+  EnvPostureRecord,
+  LeaseReleaseContext,
+  LeaseHandle,
+  LeaseDisposition,
+  DispatchRecord,
+} from "./adapter.js";
+
+// WP-105: the API-key adapter interface — typed contract + conformance
+// skeleton, implementation [F] (CAM-EXEC-01 interface clause).
+export {
+  CREDENTIAL_ENV_VAR_PATTERN_SOURCE,
+  isCredentialEnvVarNameValid,
+  checkApiKeyAdapterSpec,
+  checkPlanCredentialCustody,
+  checkAdapterPlanCustody,
+  API_KEY_ADAPTER_DISPATCH_OBLIGATIONS,
+} from "./api-key-adapter.js";
+export type { ApiKeyAdapterSpec, ConformanceViolation } from "./api-key-adapter.js";
+
 // WP-109: Living Canon — intent ledger, canon facts, status tuple (CAM-CANON-01/02/03).
 export {
   ACCEPTED_FAMILY,

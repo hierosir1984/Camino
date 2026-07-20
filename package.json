@@ -14,6 +14,7 @@
   "scripts": {
     "test": "eslint . && prettier --check . && tsc -b && vitest run",
     "daemon": "node packages/gui/build.mjs && node --import tsx packages/daemon/src/main.ts",
+    "dispatch:smoke": "node --import tsx packages/daemon/src/dispatch/smoke.ts",
     "spike:test": "vitest run spikes",
     "spike:dispatch": "node --import tsx spikes/dispatch/run.ts",
     "spike:plan-probe": "node --import tsx spikes/plan-probe/run.ts",

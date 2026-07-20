@@ -10,6 +10,9 @@ coverage/
 # transient fence-trip fixtures created by tests
 **/__fence_trip__*
 
+# WP-105 real-CLI smoke evidence (disposable; the durable record is the PR)
+packages/daemon/dispatch-smoke/
+
 # raw spike transcript streams (disposable; REPORT.md + summary.json are committed)
 spikes/dispatch/transcripts/*.jsonl
 spikes/plan-probe/transcripts/*.jsonl
