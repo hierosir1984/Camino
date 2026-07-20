@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AdapterContext, SpawnPlan } from "./adapter.js";
 import {
   API_KEY_ADAPTER_DISPATCH_OBLIGATIONS,
-  CREDENTIAL_ENV_VAR_PATTERN,
+  isCredentialEnvVarNameValid,
   checkAdapterPlanCustody,
   checkApiKeyAdapterSpec,
   checkPlanCredentialCustody,
@@ -64,7 +64,7 @@ describe("checkApiKeyAdapterSpec (static declaration conformance)", () => {
         v.map((x) => x.check),
         bad,
       ).toContain("credential-env-vars");
-      expect(CREDENTIAL_ENV_VAR_PATTERN.test(bad), bad).toBe(false);
+      expect(isCredentialEnvVarNameValid(bad), bad).toBe(false);
     }
   });
 

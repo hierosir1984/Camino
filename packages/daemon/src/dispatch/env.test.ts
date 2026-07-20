@@ -285,6 +285,19 @@ describe("composeWorkerEnv", () => {
     expect(env["PATH"]!.split(":")).not.toContain("relative/dir");
   });
 
+  it("never emits PATH='' — an all-relative/empty host PATH deletes the key, not a cwd-resolving empty (round-9 finding 1)", () => {
+    const { env } = composeWorkerEnv(
+      { PATH: ".:relative/dir::", HOME: "/Users/x" },
+      {},
+      { officialCli: "claude-code" },
+    );
+    // An empty PATH string is ONE empty entry → execvp resolves it against cwd
+    // (the untrusted workspace). The key must be absent, not "".
+    expect(env["PATH"]).toBeUndefined();
+    expect("PATH" in env).toBe(false);
+    expect(env["HOME"]).toBe("/Users/x"); // the rest of the env still composes
+  });
+
   it("enforcement policy exports are FROZEN — a package-root importer cannot mutate them (round-8 finding 2)", () => {
     const policies = [
       WORKER_ENV_ALLOWLIST,

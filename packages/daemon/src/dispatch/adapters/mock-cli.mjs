@@ -127,6 +127,25 @@ if (mode === "hang") {
   emitSync("assistant", "spawned an escaped stdout-holding descendant");
   emitSync("result", "leader done; descendant holds stdout in its own session");
   process.exit(0);
+} else if (mode === "escaped-late-writer") {
+  // Like escaped-stdout-holder, but the escaped (new-session) descendant writes
+  // a MARKER line AFTER a delay — past the parent's drain cap. If the parent
+  // tore its readline/stream down at the cap (round-9 finding 3), the marker is
+  // never parsed. `trap "" PIPE` keeps the holder alive (ignore SIGPIPE when the
+  // parent closes the pipe) so the test can reap it via the pid file.
+  const pidFile = join(process.cwd(), ".escaped-holder-pid");
+  const child = spawn(
+    "sh",
+    [
+      "-c",
+      `trap "" PIPE; echo $$ > "${pidFile}"; sleep 2; printf '{"type":"result","text":"LATE_MARKER"}\\n'; exec sleep 30`,
+    ],
+    { detached: true, stdio: ["ignore", "inherit", "ignore"] },
+  );
+  child.unref();
+  emitSync("assistant", "leader done; escaped late-writer holds stdout");
+  emitSync("result", "leader exit");
+  process.exit(0);
 } else if (mode === "graceful-cancel") {
   let stop = false;
   process.on("SIGTERM", () => {

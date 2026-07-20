@@ -76,10 +76,20 @@ export function composeWorkerEnv(
   // (git/node). A tool that hardcodes a relative exec is the named container
   // boundary (WP-107). Same rationale as the registry's absolute-only scan.
   if (typeof inherited["PATH"] === "string") {
-    inherited["PATH"] = inherited["PATH"]
+    const safe = inherited["PATH"]
       .split(delimiter)
       .filter((d) => d && isAbsolute(d))
       .join(delimiter);
+    if (safe.length > 0) {
+      inherited["PATH"] = safe;
+    } else {
+      // NEVER emit PATH="" (round-9 finding 1): an empty PATH string is one
+      // empty entry, which execvp resolves against the CURRENT DIRECTORY — a
+      // worker's untrusted cwd — reopening the shadow the sanitization closes.
+      // Deleting the key falls back to execvp's built-in absolute default
+      // (/usr/bin:/bin), never cwd.
+      delete inherited["PATH"];
+    }
   }
   Object.assign(env, inherited);
 

@@ -66,7 +66,7 @@ export type {
 export {
   GITHUB_CREDENTIAL_MARKERS,
   isGithubCredentialShapedKey,
-  CREDENTIAL_SHAPED_PATTERN,
+  CREDENTIAL_SHAPED_PATTERN_SOURCE,
   STRIPPED_ENV_EXACT,
   STRIPPED_ENV_PREFIXES,
   WORKER_ENV_ALLOWLIST,
@@ -96,7 +96,8 @@ export type {
 // WP-105: the API-key adapter interface — typed contract + conformance
 // skeleton, implementation [F] (CAM-EXEC-01 interface clause).
 export {
-  CREDENTIAL_ENV_VAR_PATTERN,
+  CREDENTIAL_ENV_VAR_PATTERN_SOURCE,
+  isCredentialEnvVarNameValid,
   checkApiKeyAdapterSpec,
   checkPlanCredentialCustody,
   checkAdapterPlanCustody,

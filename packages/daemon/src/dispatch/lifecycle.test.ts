@@ -45,6 +45,17 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     expect(PRODUCTION_KILL_CONFIRM).toEqual({ graceMs: 30_000, sigkillWaitMs: 5_000 });
   });
 
+  it("PRODUCTION_KILL_CONFIRM is FROZEN — a package-root importer can't zero/NaN the timings (round-9 finding 2)", () => {
+    expect(Object.isFrozen(PRODUCTION_KILL_CONFIRM)).toBe(true);
+    expect(() => {
+      (PRODUCTION_KILL_CONFIRM as { graceMs: number }).graceMs = 0;
+    }).toThrow(TypeError);
+    expect(() => {
+      (PRODUCTION_KILL_CONFIRM as { sigkillWaitMs: number }).sigkillWaitMs = NaN;
+    }).toThrow(TypeError);
+    expect(PRODUCTION_KILL_CONFIRM.graceMs).toBe(30_000); // unchanged
+  });
+
   it("spawns, streams events, and the worker produces a local commit", async () => {
     const ws = makeWorkspace();
     const before = headSha(ws);
@@ -322,6 +333,43 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       expect(rec.outcome).toBe("succeeded"); // leader exited 0; the holder is the WP-107 boundary
       expect(rec.streamedEvents).toBeGreaterThanOrEqual(2); // the leader's own lines were drained
       expect(elapsedMs).toBeLessThan(8000); // bounded by the ~2s cap, NOT the descendant's 30s sleep
+    } finally {
+      if (existsSync(pidFile)) {
+        try {
+          process.kill(Number(readFileSync(pidFile, "utf8").trim()));
+        } catch {
+          /* already gone */
+        }
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("when the drain cap wins, stream consumers are torn down — no line is parsed after the record (round-9 finding 3)", async () => {
+    // Without teardown, the readline keeps delivering lines after dispatch has
+    // returned (and the inherited pipe pins the process). The escaped holder
+    // writes LATE_MARKER at ~2s, past the ~1s cap; a torn-down reader never
+    // sees it.
+    const ws = makeWorkspace();
+    const pidFile = join(ws, ".escaped-holder-pid");
+    const seen: string[] = [];
+    try {
+      const rec = await dispatch(
+        mockAdapter("escaped-late-writer"),
+        { workdir: ws, prompt: "x" },
+        {
+          killConfirm: { graceMs: 400, sigkillWaitMs: 1000 }, // drain cap → 1000ms
+          onLine: (_c, l) => {
+            seen.push(l);
+          },
+        },
+      );
+      expect(rec.outcome).toBe("succeeded");
+      const countAtReturn = seen.length;
+      // Wait well past the holder's 2s marker write.
+      await new Promise((r) => setTimeout(r, 2500));
+      expect(seen.some((l) => l.includes("LATE_MARKER"))).toBe(false); // reader torn down
+      expect(seen.length).toBe(countAtReturn); // no late lines parsed at all
     } finally {
       if (existsSync(pidFile)) {
         try {

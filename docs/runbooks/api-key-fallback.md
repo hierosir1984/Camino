@@ -74,9 +74,10 @@ the dispatch).
 
 ## Anthropic — Claude Code re-authenticated with an API key
 
-Claude Code reads API-key auth from its own settings under `HOME` via
-`apiKeyHelper` (a command that prints the key), so the switch is a CLI-side
-setting — nothing Camino-visible changes.
+Claude Code reads API-key auth from its own settings in its active config root
+(`${CLAUDE_CONFIG_DIR:-$HOME/.claude}`) via `apiKeyHelper` (a command that
+prints the key), so the switch is a CLI-side setting — nothing Camino-visible
+changes.
 
 1. **Prepare the key** (funded Console account, WP-000 attestation): create an
    API key in the Anthropic Console. Store it in your keychain, e.g.:

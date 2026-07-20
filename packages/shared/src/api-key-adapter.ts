@@ -59,7 +59,16 @@ import {
  * provider key var is uppercase, and a lowercase declaration is far more
  * likely a mistake than a real CLI contract.
  */
-export const CREDENTIAL_ENV_VAR_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+// MODULE-PRIVATE by design (round-9 finding 2): a public RegExp is mutable via
+// the legacy RegExp.prototype.compile() even after Object.freeze, so the
+// enforcement pattern stays private behind a predicate; the immutable SOURCE
+// string is exported for messages/tests.
+const CREDENTIAL_ENV_VAR_RE = /^[A-Z_][A-Z0-9_]*$/;
+export const CREDENTIAL_ENV_VAR_PATTERN_SOURCE: string = CREDENTIAL_ENV_VAR_RE.source;
+/** Is `name` a POSIX-portable, uppercase-only env var name (credential declaration grammar)? */
+export function isCredentialEnvVarNameValid(name: string): boolean {
+  return CREDENTIAL_ENV_VAR_RE.test(name);
+}
 
 /**
  * An adapter for a provider that authenticates with an API key (implementation
@@ -76,8 +85,9 @@ export interface ApiKeyAdapterSpec extends AdapterSpec {
   /**
    * The env var NAMES the provider CLI reads its API key from (values are
    * resolved from host env state by the composer at spawn time, never by the
-   * adapter). Non-empty; each name must match CREDENTIAL_ENV_VAR_PATTERN and
-   * must not be GitHub-credential-shaped.
+   * adapter). Non-empty; each name must satisfy isCredentialEnvVarNameValid
+   * (grammar CREDENTIAL_ENV_VAR_PATTERN_SOURCE) and must not be
+   * GitHub-credential-shaped.
    */
   readonly credentialEnvVars: readonly string[];
 }
@@ -112,10 +122,10 @@ export function checkApiKeyAdapterSpec(spec: ApiKeyAdapterSpec): ConformanceViol
   }
   const seen = new Set<string>();
   for (const name of spec.credentialEnvVars) {
-    if (typeof name !== "string" || !CREDENTIAL_ENV_VAR_PATTERN.test(name)) {
+    if (typeof name !== "string" || !isCredentialEnvVarNameValid(name)) {
       violations.push({
         check: "credential-env-vars",
-        detail: `"${String(name)}" is not a valid env var name (${CREDENTIAL_ENV_VAR_PATTERN.source})`,
+        detail: `"${String(name)}" is not a valid env var name (${CREDENTIAL_ENV_VAR_PATTERN_SOURCE})`,
       });
       continue;
     }

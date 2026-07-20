@@ -38,10 +38,14 @@ export interface KillConfirmTimings {
   graceMs: number;
   sigkillWaitMs: number;
 }
-export const PRODUCTION_KILL_CONFIRM: KillConfirmTimings = {
+// Frozen (round-9 finding 2): a mutable exported production-timing object let
+// a package-root importer set graceMs/sigkillWaitMs to 0/NaN and break
+// kill-confirm + the drain cap. Caller-supplied timings still go through
+// clampMs; drainCapMs additionally guards non-finite values.
+export const PRODUCTION_KILL_CONFIRM: KillConfirmTimings = Object.freeze({
   graceMs: 30_000,
   sigkillWaitMs: 5_000,
-};
+});
 
 /**
  * Dispatching a disabled adapter is a policy violation, not an outcome
@@ -566,8 +570,17 @@ export async function dispatch(
     // record before the final event is parsed (round-8 finding 3). Each
     // consumer resolves when its readline reaches EOF ('close').
     const streamsClosed: Promise<void>[] = [];
+    // Keep the consumer handles so, if the drain CAP wins (a group-escaped
+    // descendant still holding the pipe), we can forcibly tear them down —
+    // otherwise the readline keeps parsing lines AFTER the record is
+    // snapshotted and the inherited pipe pins the process (round-9 finding 3).
+    const consumers: Array<{
+      rl: ReturnType<typeof createInterface>;
+      stream: NodeJS.ReadableStream;
+    }> = [];
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
       const rl = createInterface({ input: stream });
+      consumers.push({ rl, stream });
       streamsClosed.push(
         new Promise<void>((resolve) => {
           rl.once("close", () => resolve());
@@ -653,14 +666,38 @@ export async function dispatch(
     // forever, and the drain must never hang dispatch past cleanup. After the
     // in-group sweep, legit pipes reach EOF in milliseconds; cap the residual
     // wait and classify with whatever drained.
-    const drainCapMs = Math.max(timings.sigkillWaitMs, 1000);
-    await Promise.race([
-      Promise.all(streamsClosed),
-      new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, drainCapMs);
+    const drainCapMs = Math.max(
+      Number.isFinite(timings.sigkillWaitMs) && timings.sigkillWaitMs > 0
+        ? timings.sigkillWaitMs
+        : 0,
+      1000,
+    );
+    const CAP = Symbol("drain-cap");
+    const drainResult = await Promise.race([
+      Promise.all(streamsClosed).then(() => "eof" as const),
+      new Promise<typeof CAP>((resolve) => {
+        const t = setTimeout(() => resolve(CAP), drainCapMs);
         t.unref?.(); // a dangling cap timer must not keep the loop alive
       }),
     ]);
+    if (drainResult === CAP) {
+      // The cap won: a pipe is still held (a group-escaped descendant). Tear
+      // the consumers down so no line is parsed after this snapshot and the
+      // inherited pipe stops pinning the process (round-9 finding 3). The
+      // residual descendant is the named WP-107 container boundary.
+      for (const { rl, stream } of consumers) {
+        try {
+          rl.close();
+        } catch {
+          /* already closed */
+        }
+        try {
+          (stream as { destroy?: () => void }).destroy?.();
+        } catch {
+          /* best-effort teardown */
+        }
+      }
+    }
 
     const events = retainedEvents();
 

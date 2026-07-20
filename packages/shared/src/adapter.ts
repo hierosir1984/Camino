@@ -259,9 +259,16 @@ export function isGithubCredentialShapedKey(key: string): boolean {
  * dispatch authenticate as something Camino never intended (e.g. a provider
  * API key silently re-billing the dispatch to an API account). Matched
  * case-insensitively as a substring pattern.
+ *
+ * MODULE-PRIVATE by design (round-9 finding 2): a public RegExp export is
+ * mutable through the legacy `RegExp.prototype.compile()` even after
+ * Object.freeze, so this enforcement pattern is NOT exported — reach it only
+ * through isStrippedWorkerEnvKey(). The immutable SOURCE string is exported
+ * for messages/tests.
  */
-export const CREDENTIAL_SHAPED_PATTERN =
+const CREDENTIAL_SHAPED_RE =
   /API[_-]?KEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|SECRET|TOKEN|CREDENTIAL|PASSWORD|PASSPHRASE/i;
+export const CREDENTIAL_SHAPED_PATTERN_SOURCE: string = CREDENTIAL_SHAPED_RE.source;
 
 /**
  * The env key names / prefixes the worker-env composer STRIPS as a class,
@@ -434,7 +441,7 @@ export function isStrippedWorkerEnvKey(key: string): boolean {
   const upper = key.toUpperCase();
   return (
     isGithubCredentialShapedKey(upper) ||
-    CREDENTIAL_SHAPED_PATTERN.test(upper) ||
+    CREDENTIAL_SHAPED_RE.test(upper) ||
     isGitOrSshChannelEnvKey(upper)
   );
 }
