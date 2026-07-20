@@ -9,12 +9,13 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { intentMarkerToken } from "@camino/shared";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { FakeGitHub } from "./chaos/fake-github.js";
 import { FakeCatchAll, FakeTestService } from "./chaos/fake-services.js";
 import { IntentExecutor } from "./intent-executor.js";
 import { IntentJournal } from "./intent-journal.js";
-import { openRecoveredState, reconcileIntents } from "./recovery.js";
+import { STATE_FILES, openRecoveredState, reconcileIntents } from "./recovery.js";
 import { WriterLock, WriterLockHeldError } from "./writer-lock.js";
 
 const SHA_A = "a".repeat(40);
@@ -979,5 +980,111 @@ describe("round-3 regressions", () => {
     h.executor.execute("i1");
     expect(h.github.effectCounts().get("branch:r:original")).toBe(1);
     expect(h.github.effectCounts().get("branch:r:mutated")).toBeUndefined();
+  });
+});
+
+describe("WP-109: canon stores in the recovery composition", () => {
+  it("opens the intent ledger and fact store under the writer lock and closes them with the state", () => {
+    const dir = tempDir();
+    const stateDir = join(dir, "state");
+    mkdirSync(stateDir);
+    const github = new FakeGitHub(join(dir, "github.json"));
+
+    const state = openRecoveredState(stateDir, { github });
+    state.canonLedger.proposeRequirement("CAM-DEMO-01", {
+      statement: "recovered intent survives",
+      sourceMissionId: "mission-1",
+    });
+    state.canonLedger.acceptRequirement("CAM-DEMO-01");
+    state.canonFacts.recordFact({
+      requirementId: "CAM-DEMO-01",
+      kind: "landed-on-main",
+      actor: "camino:merge",
+      payload: { sha: SHA_A },
+    });
+    state.close();
+
+    // Everything durable survives the next recovery cycle, and the
+    // fail-closed adoption paths (verifyLedgerLog / verifyCanonFactLog)
+    // ran inside the constructors on the way back up.
+    const again = openRecoveredState(stateDir, { github });
+    expect(again.canonLedger.entry("CAM-DEMO-01")?.disposition).toBe("accepted");
+    expect(again.canonFacts.read()).toHaveLength(1);
+    again.close();
+  });
+
+  it("canon appends assert the SAME lock the composition acquired", () => {
+    const dir = tempDir();
+    const stateDir = join(dir, "state");
+    mkdirSync(stateDir);
+    const github = new FakeGitHub(join(dir, "github.json"));
+    const state = openRecoveredState(stateDir, { github });
+    // Sabotage exactly what a daemon bug could: release the lock while
+    // holding store handles. Every canon write must refuse loudly.
+    state.lock.release();
+    expect(() =>
+      state.canonLedger.proposeRequirement("CAM-DEMO-01", {
+        statement: "s",
+        sourceMissionId: "m1",
+      }),
+    ).toThrow(/writer lock/);
+    expect(() =>
+      state.canonFacts.recordFact({
+        requirementId: "CAM-DEMO-01",
+        kind: "landed-on-main",
+        actor: "camino:merge",
+        payload: { sha: SHA_A },
+      }),
+    ).toThrow(/writer lock/);
+    state.eventStore.close();
+    state.journal.close();
+    state.canonLedger.close();
+    state.canonFacts.close();
+  });
+
+  it("a refused canon store open releases the lock and closes the earlier stores (ctor-cleanup chain)", () => {
+    const dir = tempDir();
+    const stateDir = join(dir, "state");
+    mkdirSync(stateDir);
+    const github = new FakeGitHub(join(dir, "github.json"));
+    openRecoveredState(stateDir, { github }).close();
+
+    // Corrupt the LAST store in the open order: everything before it
+    // must be unwound by the catch path.
+    const raw = new Database(join(stateDir, STATE_FILES.canonFacts));
+    raw.pragma("user_version = 9");
+    raw.close();
+    expect(() => openRecoveredState(stateDir, { github })).toThrow(/schema version 9/);
+
+    // The lock was released by the cleanup chain: acquiring it directly
+    // succeeds (a leaked lock would refuse instantly, WP-104 contract).
+    const lock = WriterLock.acquire(join(stateDir, STATE_FILES.writerLock));
+    lock.release();
+  });
+});
+
+describe("WP-109 r1 finding 14: exception-safe teardown", () => {
+  it("a throwing closer does not strand the lock or the remaining closers", () => {
+    const dir = tempDir();
+    const stateDir = join(dir, "state");
+    mkdirSync(stateDir);
+    const github = new FakeGitHub(join(dir, "github.json"));
+    const state = openRecoveredState(stateDir, { github });
+    // Sabotage the FIRST closer in the chain (own-property shadow).
+    const sabotaged = state.canonFacts as unknown as { close: () => void };
+    sabotaged.close = () => {
+      throw new Error("injected close failure");
+    };
+    expect(() => state.close()).toThrow(/injected close failure/);
+    // Every later closer ran and the lock was released: a fresh
+    // acquisition succeeds instead of refusing (WP-104 contract).
+    const lock = WriterLock.acquire(join(stateDir, STATE_FILES.writerLock));
+    lock.release();
+    // And the other stores really are closed: reopening the whole state
+    // succeeds (a leaked handle on macOS/WAL would not block, so the
+    // lock probe above is the load-bearing assertion; this one proves
+    // the composition is reusable after the failure).
+    const again = openRecoveredState(stateDir, { github });
+    again.close();
   });
 });
