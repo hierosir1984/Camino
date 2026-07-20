@@ -42,6 +42,8 @@ import { join } from "node:path";
 import { decideReconciliation, statusOnlyVerdict } from "@camino/core";
 import type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "@camino/core";
 import type { ExternalOperationSpec, GitHubQueryTransport } from "@camino/shared";
+import { CanonFactsStore } from "./canon-facts.js";
+import { CanonLedgerStore } from "./canon-ledger.js";
 import { SqliteEventStore } from "./event-store.js";
 import { IntentJournal } from "./intent-journal.js";
 import { TransitionRecorder } from "./transition-recorder.js";
@@ -73,6 +75,10 @@ export interface RecoveredState {
   readonly eventStore: SqliteEventStore;
   readonly recorder: TransitionRecorder;
   readonly journal: IntentJournal;
+  /** WP-109: the Living Canon's intent ledger (user actions only, CAM-CANON-01). */
+  readonly canonLedger: CanonLedgerStore;
+  /** WP-109: per-requirement observations the status projection folds (CAM-CANON-03). */
+  readonly canonFacts: CanonFactsStore;
   readonly report: RecoveryReport;
   close(): void;
 }
@@ -90,6 +96,8 @@ export const STATE_FILES = {
   writerLock: "writer-lock.sqlite",
   events: "events.sqlite",
   intents: "intents.sqlite",
+  canonLedger: "canon-ledger.sqlite",
+  canonFacts: "canon-facts.sqlite",
 } as const;
 
 /**
@@ -113,6 +121,8 @@ export function openRecoveredState(
   const lock = WriterLock.acquire(join(stateDir, STATE_FILES.writerLock));
   let eventStore: SqliteEventStore | undefined;
   let journal: IntentJournal | undefined;
+  let canonLedger: CanonLedgerStore | undefined;
+  let canonFacts: CanonFactsStore | undefined;
   try {
     eventStore = new SqliteEventStore(join(stateDir, STATE_FILES.events), {
       ...(options.now === undefined ? {} : { now: options.now }),
@@ -124,22 +134,43 @@ export function openRecoveredState(
       ...(options.now === undefined ? {} : { now: options.now }),
       writerLock: lock,
     });
+    // WP-109: the canon stores open under the same lock; both run their
+    // fail-closed adoption verification in their constructors. Canon has
+    // no reconciliation step here — the ledger records user actions only
+    // (nothing to reconcile against the outside world), and fact
+    // reconciliation is the CAM-CANON-06 reconciler's job (later WP).
+    canonLedger = new CanonLedgerStore(join(stateDir, STATE_FILES.canonLedger), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
+    canonFacts = new CanonFactsStore(join(stateDir, STATE_FILES.canonFacts), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
     const report = reconcileIntents(journal, queries, options);
     const openJournal = journal;
     const openStore = eventStore;
+    const openCanonLedger = canonLedger;
+    const openCanonFacts = canonFacts;
     return {
       lock,
       eventStore,
       recorder,
       journal,
+      canonLedger,
+      canonFacts,
       report,
       close(): void {
+        openCanonFacts.close();
+        openCanonLedger.close();
         openJournal.close();
         openStore.close();
         lock.release();
       },
     };
   } catch (error) {
+    canonFacts?.close();
+    canonLedger?.close();
     journal?.close();
     eventStore?.close();
     lock.release();

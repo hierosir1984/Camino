@@ -59,3 +59,16 @@ export type {
   SchedulingLane,
   SerializationViolation,
 } from "./serialization-scheduler.js";
+
+// WP-109: Living Canon durable stores (CAM-CANON-01/02/03).
+export { CanonLedgerStore } from "./canon-ledger.js";
+export type {
+  CanonLedgerStoreOptions,
+  DescopeRequirementInput,
+  DisputeRequirementInput,
+  ProposeRequirementInput,
+  ResolveDisputeAcceptedInput,
+  ResolveDisputeAssumedInput,
+} from "./canon-ledger.js";
+export { CanonFactsStore } from "./canon-facts.js";
+export type { CanonFactsStoreOptions } from "./canon-facts.js";

@@ -89,3 +89,47 @@ export {
   ReconcileFactsMismatchError,
 } from "./reconcile.js";
 export type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "./reconcile.js";
+
+// WP-109: Living Canon — intent-ledger lifecycle, status projection,
+// canon rendering + freshness (CAM-CANON-01/02/03).
+export {
+  DISPOSITION_TRANSITIONS,
+  applyLedgerRecord,
+  decideLedgerAppend,
+  foldLedgerView,
+  verifyLedgerLog,
+} from "./canon-intent.js";
+export type {
+  DispositionTransition,
+  LedgerAppendDecision,
+  LedgerLogDivergence,
+  LedgerView,
+  LedgerViewEntry,
+} from "./canon-intent.js";
+
+export {
+  EVIDENCE_RULES,
+  IMPLEMENTATION_RULES,
+  projectRequirementStatus,
+  projectStatus,
+  renderStatusLine,
+  validateCanonFact,
+  verifyCanonFactLog,
+} from "./canon-status.js";
+export type { FactValidation, ProjectionRule } from "./canon-status.js";
+
+export {
+  STANDALONE_FOLD_AGE_DAYS,
+  STANDALONE_FOLD_REQUIREMENT_THRESHOLD,
+  canonFragment,
+  computeCanonDivergence,
+  parseCanonMarker,
+  renderCanon,
+  standaloneFoldRequired,
+} from "./canon-render.js";
+export type {
+  CanonDivergence,
+  CanonMarker,
+  RenderCanonOptions,
+  StandaloneFoldDecision,
+} from "./canon-render.js";
