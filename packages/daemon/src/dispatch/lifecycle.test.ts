@@ -89,6 +89,62 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("a disabled dispatch with a lease SETTLES it before throwing (round-5 finding 1)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let released = 0;
+      const lease: LeaseHandle = { release: () => void released++ };
+      const disabled = { ...mockAdapter(), enabled: false, disabledReason: "off" };
+      await expect(dispatch(disabled, { workdir: ws, prompt: "x" }, { lease })).rejects.toThrow(
+        DisabledAdapterError,
+      );
+      expect(released).toBe(1); // nothing ran → lease released, never stranded
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("a hostile disabledReason getter still yields DisabledAdapterError (round-5 finding 1)", async () => {
+    const ws = makeWorkspace();
+    try {
+      const hostile = {
+        ...mockAdapter(),
+        enabled: false,
+        get disabledReason(): string {
+          return {
+            toString: () => {
+              throw new Error("reason toString threw");
+            },
+          } as unknown as string;
+        },
+      };
+      await expect(dispatch(hostile, { workdir: ws, prompt: "x" })).rejects.toThrow(
+        DisabledAdapterError,
+      );
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("cancelAfterFirstEventMs is read EXACTLY ONCE, so a value-then-toxic getter cannot crash (round-5 finding 1)", async () => {
+    const ws = makeWorkspace();
+    try {
+      let reads = 0;
+      const opts = {
+        get cancelAfterFirstEventMs(): number {
+          reads++;
+          if (reads === 1) return 50;
+          throw new Error("second read of cancelAfterFirstEventMs");
+        },
+      };
+      const rec = await dispatch(mockAdapter(), { workdir: ws, prompt: "x" }, opts as never);
+      expect(reads).toBe(1); // read once → no toxic second read reaches setTimeout
+      expect(typeof rec.outcome).toBe("string");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("mid-run cancel executes kill-confirm and the whole process GROUP is gone (leader ignores SIGTERM)", async () => {
     const ws = makeWorkspace();
     try {

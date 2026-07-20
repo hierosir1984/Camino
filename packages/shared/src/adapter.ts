@@ -309,11 +309,27 @@ export const STRIPPED_ENV_EXACT = [
 export const STRIPPED_ENV_PREFIXES = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "SSH_"] as const;
 
 /**
- * The host-inherited allowlist: the ONLY host env keys a worker inherits. HOME
- * is included on purpose — the official vendor CLIs read their OWN
- * subscription auth from under it (the sanctioned path, CAM-SEC-06). Shared so
- * the composer inherits exactly these and the API-key contract refuses to let
- * an adapter alias a credential onto one of them.
+ * The host-inherited allowlist: the ONLY host env keys a worker inherits.
+ *
+ * HOME plus the official CLIs' config-root vars (CODEX_HOME, CLAUDE_CONFIG_DIR,
+ * GROK_HOME) are included on purpose — the official vendor CLIs read their OWN
+ * subscription auth from those locations (the sanctioned path, CAM-SEC-06). A
+ * user who relocated a CLI's config (a non-default CODEX_HOME / GROK_HOME)
+ * would otherwise fail to authenticate (round-5 finding 2). These are
+ * config-DIRECTORY pointers, not credentials: the composer references the
+ * host's own value so each official CLI finds its own credential; Camino never
+ * reads, copies, or proxies the credential itself.
+ *
+ * CAM-SEC-06 SCOPING ("host credential state for official CLIs only"): the v1
+ * adapter set is EXCLUSIVELY the three official vendor CLIs (CAM-EXEC-01), so
+ * inheriting these config roots references host credential state for official
+ * CLIs only. The [F] API-key adapter path does NOT broaden HOME-style access —
+ * it references credentials by an explicitly DECLARED env var (see
+ * api-key-adapter.ts), keeping any non-official credential reference scoped and
+ * named.
+ *
+ * Shared so the composer inherits exactly these and the API-key contract
+ * refuses to let an adapter alias a credential onto one of them.
  */
 export const WORKER_ENV_ALLOWLIST = [
   "PATH",
@@ -324,6 +340,10 @@ export const WORKER_ENV_ALLOWLIST = [
   "LANG",
   "LC_ALL",
   "TMPDIR",
+  // Official-CLI config roots (sanctioned auth locations), round-5 finding 2.
+  "CODEX_HOME",
+  "CLAUDE_CONFIG_DIR",
+  "GROK_HOME",
 ] as const;
 
 /**

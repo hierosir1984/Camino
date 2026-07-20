@@ -325,6 +325,16 @@ export async function dispatch(
   const started = Date.now();
   const adapterName = safeAdapterName(adapter);
 
+  // Read the lease ONCE up front (safely) so even the disabled-refusal path can
+  // settle it — a supplied lease is never stranded on any terminal path,
+  // including the DisabledAdapterError throw (round-5 finding 1).
+  let lease: LeaseHandle | undefined;
+  try {
+    lease = opts.lease;
+  } catch {
+    lease = undefined;
+  }
+
   // Enablement is read fail-closed: a hostile/broken `enabled` getter is
   // treated as disabled, so the ONLY throw dispatch ever propagates is
   // DisabledAdapterError (round-3/4 finding 1). Everything else returns a record.
@@ -335,29 +345,39 @@ export async function dispatch(
     enabled = false;
   }
   if (!enabled) {
-    let reason: string | undefined;
+    // A supplied lease is released before refusing (nothing ran → group
+    // trivially gone), so the disabled path never strands it (round-5 finding 1).
+    if (lease) {
+      try {
+        await lease.release({ groupGone: true, outcome: "requirement-failed" });
+      } catch {
+        /* a broken lease store must not mask the refusal */
+      }
+    }
+    let reason: string;
     try {
-      reason = adapter.disabledReason;
+      reason = safeStringify(adapter.disabledReason);
     } catch {
       reason = "disabled reason unavailable";
     }
     throw new DisabledAdapterError(adapterName, reason);
   }
 
-  // TOTAL EXCEPTION SAFETY (round-3/4 finding 1). dispatch's object inputs —
+  // TOTAL EXCEPTION SAFETY (rounds 3–5 finding 1). dispatch's object inputs —
   // adapter, opts, signal, lease, timings — are first-party Camino code; the
   // UNTRUSTED surface is the worker's output STREAM (strings), handled totally
   // below. To ensure a buggy caller/adapter (a throwing/mutating getter on a
-  // config field) can never terminate the daemon or strand a lease: ALL option
-  // reads happen ONCE inside the single try/catch/finally, and time values are
-  // snapshotted as validated PLAIN NUMBERS so no async callback ever re-reads a
+  // config field) can never terminate the daemon or strand a lease: EVERY
+  // option is read EXACTLY ONCE into a local (a getter that returns a good
+  // value then a toxic one cannot reach an async callback), and time values are
+  // snapshotted as validated PLAIN NUMBERS so no async callback re-reads a
   // getter (which the lexical try could not catch) and a broken value cannot
   // stall kill-confirm.
-  let lease: LeaseHandle | undefined;
   let signal: AbortSignal | undefined;
   let timings: KillConfirmTimings = PRODUCTION_KILL_CONFIRM;
   let cancelAfterMs: number | undefined;
   let timeoutMs: number | undefined;
+  let onLine: DispatchOptions["onLine"];
   let posture: EnvPostureRecord = EMPTY_POSTURE;
 
   // Settle the lease AT MOST ONCE across every path (round-2 review finding 4):
@@ -402,20 +422,20 @@ export async function dispatch(
   const onAbort = () => requestKill("cancel");
 
   try {
-    // Snapshot every option ONCE, lease FIRST (so a later hostile read still
-    // settles the lease via the catch). Time values become validated numbers.
-    lease = opts.lease;
+    // Snapshot every remaining option EXACTLY ONCE into a local (lease was read
+    // up front). Each getter is read a single time; time values become
+    // validated plain numbers.
     signal = opts.signal;
+    const km = opts.killConfirm; // one read
     timings = {
-      graceMs: clampMs(opts.killConfirm?.graceMs, PRODUCTION_KILL_CONFIRM.graceMs),
-      sigkillWaitMs: clampMs(
-        opts.killConfirm?.sigkillWaitMs,
-        PRODUCTION_KILL_CONFIRM.sigkillWaitMs,
-      ),
+      graceMs: clampMs(km?.graceMs, PRODUCTION_KILL_CONFIRM.graceMs),
+      sigkillWaitMs: clampMs(km?.sigkillWaitMs, PRODUCTION_KILL_CONFIRM.sigkillWaitMs),
     };
-    cancelAfterMs =
-      typeof opts.cancelAfterFirstEventMs === "number" ? opts.cancelAfterFirstEventMs : undefined;
-    timeoutMs = typeof opts.timeoutMs === "number" ? opts.timeoutMs : undefined;
+    const rawCancel = opts.cancelAfterFirstEventMs; // one read (round-5 finding 1)
+    cancelAfterMs = typeof rawCancel === "number" ? rawCancel : undefined;
+    const rawTimeout = opts.timeoutMs; // one read
+    timeoutMs = typeof rawTimeout === "number" ? rawTimeout : undefined;
+    onLine = opts.onLine; // snapshot the sink once (round-5 finding 1)
     posture = composeWorkerEnv(process.env).posture;
 
     if (signal?.aborted) {
@@ -516,7 +536,7 @@ export async function dispatch(
         // and become an unhandledRejection crash — swallow that too (round-2
         // review finding 3).
         try {
-          const maybePromise = opts.onLine?.(channel, line) as unknown;
+          const maybePromise = onLine?.(channel, line) as unknown;
           if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
             void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
           }

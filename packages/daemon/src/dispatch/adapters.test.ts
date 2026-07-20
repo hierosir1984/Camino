@@ -54,7 +54,7 @@ describe("per-provider quota classification", () => {
     }
   });
 
-  it("genuine STRUCTURED rate-limit signatures ARE flagged prose-safely", () => {
+  it("genuine STRUCTURED rate-limit signatures ARE flagged in a prose-resistant way", () => {
     for (const bad of [
       "429 Too Many Requests",
       "HTTP 429",
@@ -83,7 +83,7 @@ describe("per-provider quota classification", () => {
       "Implemented Retry-After header parsing",
       "Fixed bug in retry-after config docs",
       "rate limiting strategy documentation",
-      // The provider exhaustion PHRASES are prose-risky, so the prose-safe
+      // The provider exhaustion PHRASES are prose-risky, so the prose-resistant
       // classifier deliberately does NOT match them — only the error-context
       // classifier does (see below).
       "Customer's credit balance is too low for financing",
@@ -113,7 +113,7 @@ describe("per-provider quota classification", () => {
   });
 
   it("an assistant message that merely MENTIONS an exhaustion phrase is not flagged as quota", () => {
-    // The claude parser routes assistant content through the prose-safe path;
+    // The claude parser routes assistant content through the prose-resistant path;
     // only an ERROR result trusts the phrase (round-2 finding 5).
     const assistant = claudeAdapter().parseLine(
       '{"type":"assistant","message":{"content":[{"type":"text","text":"Their credit balance is too low, so suggest topping up."}]}}',

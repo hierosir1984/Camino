@@ -40,7 +40,7 @@ export function codexAdapter(
       // A non-JSON OR malformed-JSON line on STDERR is diagnostic/error output:
       // catch a rate-limit / exhaustion signal here so a truncated provider
       // error is not lost (round-4 finding 2 — restores WP-001 dropped-line
-      // protection, but scoped to the error channel to stay prose-safe).
+      // protection, but scoped to the error channel to stay prose-resistant).
       const stderrErr = (): StreamEvent | null => {
         if (channel === "stderr" && trimmed.length > 0) {
           const eq = classifyErrorTextForQuota(trimmed);

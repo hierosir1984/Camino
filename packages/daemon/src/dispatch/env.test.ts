@@ -143,6 +143,20 @@ describe("composeWorkerEnv", () => {
     }
   });
 
+  it("preserves the official CLIs' config-root vars so custom locations still authenticate (round-5 finding 2)", () => {
+    const { env } = composeWorkerEnv({
+      PATH: "/usr/bin",
+      HOME: "/Users/x",
+      CODEX_HOME: "/custom/codex",
+      CLAUDE_CONFIG_DIR: "/custom/claude",
+      GROK_HOME: "/custom/grok",
+    });
+    expect(env["CODEX_HOME"]).toBe("/custom/codex");
+    expect(env["CLAUDE_CONFIG_DIR"]).toBe("/custom/claude");
+    expect(env["GROK_HOME"]).toBe("/custom/grok");
+    expect(env["HOME"]).toBe("/Users/x");
+  });
+
   it("strips the whole SSH_* family by prefix, incl. SSH_SK_PROVIDER (round-3 finding 3)", () => {
     // SSH_SK_PROVIDER is a loadable library path SSH honors; the SSH_* prefix
     // closes it and any other SSH_* directive in one rule.
