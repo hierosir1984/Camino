@@ -103,6 +103,14 @@ export const CANON_FACT_KINDS = [
   "implementation-recorded",
   /** A confirmed landing put R's implementation on main (CAM-CANON-10: only confirmed pushes). */
   "landed-on-main",
+  /**
+   * Branch B's tree CARRIES R's main landing — recorded by ancestry-aware
+   * machinery (branch creation/sync, the reconciler) that verified the
+   * landing commit is an ancestor of B's head. Main state never leaks
+   * into a branch context without this fact: the projection has no git
+   * and must not guess ancestry (review round 1, finding 7).
+   */
+  "mainline-inherited",
   /** A revert removed R's implementing change in a context (main or a branch). */
   "revert-recorded",
   /** An external edit or failing probe suggests R's implementation no longer exists (§3.1). */
@@ -166,12 +174,23 @@ export interface StatusTuple {
 }
 
 /**
- * The reader's context: main at a known head, or a branch at a known head.
- * The caller (context-pack builder, GUI) supplies the head SHA it is
- * rendering for — evidence liveness is a comparison between a verdict's
- * recorded binding and THIS head (invariant 7: evidence binds to SHAs and
- * expires rather than rebinding).
+ * The reader's context. The caller (context-pack builder, GUI) supplies
+ * the SHAs it is rendering for — evidence liveness is a comparison
+ * between a verdict's recorded binding and THIS context (invariant 7:
+ * evidence binds to (head SHA, base SHA) and expires rather than
+ * rebinding; review round 1, finding 4).
+ *
+ * A branch context carries its base on main: a candidate's verdict is
+ * live only while BOTH its head and its base still match. Main is not a
+ * candidate against anything, so the main context carries no base —
+ * main verdicts bind at their head.
  */
 export type StatusContext =
   | { readonly kind: "main"; readonly headSha: string }
-  | { readonly kind: "branch"; readonly branch: string; readonly headSha: string };
+  | {
+      readonly kind: "branch";
+      readonly branch: string;
+      readonly headSha: string;
+      /** The branch's current base on main; part of the live-evidence binding. */
+      readonly baseSha: string;
+    };

@@ -48,11 +48,29 @@ export interface RenderCanonOptions {
 }
 
 function assertIsoUtc(field: string, value: string): void {
-  if (!ISO_UTC_PATTERN.test(value) || Number.isNaN(Date.parse(value))) {
+  // Round-trip identity, not just shape: the regex alone admits
+  // impossible dates JavaScript silently normalizes — 2026-02-30 parses
+  // as March 2nd (review round 1, finding 12).
+  const parsed = Date.parse(value);
+  if (
+    !ISO_UTC_PATTERN.test(value) ||
+    Number.isNaN(parsed) ||
+    new Date(parsed).toISOString() !== value
+  ) {
     throw new Error(
-      `${field} must be an ISO-8601 UTC timestamp (toISOString form), got ${JSON.stringify(value)}`,
+      `${field} must be a real ISO-8601 UTC instant (toISOString form), got ${JSON.stringify(value)}`,
     );
   }
+}
+
+/**
+ * Line-ending normalization: canon files may pass through editors or
+ * checkouts that rewrite line endings; comparing or parsing without
+ * normalizing would turn a byte-level CRLF conversion into a spurious
+ * full divergence (review round 1, finding 11).
+ */
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 /**
@@ -111,23 +129,35 @@ export function renderCanon(view: LedgerView, options: RenderCanonOptions): stri
 }
 
 /**
- * Extract the rendered-at marker from canon text. Returns null when the
- * text carries no marker or more than one — an ambiguous or absent
- * marker means freshness CANNOT be proven, and the divergence functions
- * treat that conservatively (full divergence, fold due).
+ * Extract the rendered-at marker from canon text (line endings
+ * normalized first). Returns null when the text carries no marker or
+ * more than one — an ambiguous or absent marker means freshness CANNOT
+ * be proven, and the divergence functions treat that conservatively
+ * (full divergence, fold due). A marker-shaped line inside a code fence
+ * is not special-cased here: an edited file that smuggles one fails the
+ * body-faithfulness comparison instead (`computeCanonDivergence`), and
+ * the renderer itself never emits fences or multi-line statements (the
+ * ledger enforces single-line text fields).
  */
 export function parseCanonMarker(text: string): CanonMarker | null {
   const matches: CanonMarker[] = [];
-  for (const line of text.split("\n")) {
+  for (const line of normalizeLineEndings(text).split("\n")) {
     const match = MARKER_LINE_PATTERN.exec(line);
     if (match !== null) {
       const renderedAt = match[1] as string;
-      if (Number.isNaN(Date.parse(renderedAt))) continue;
+      const parsed = Date.parse(renderedAt);
+      if (Number.isNaN(parsed) || new Date(parsed).toISOString() !== renderedAt) continue;
       matches.push({ renderedAt, ledgerSeq: Number(match[2]) });
     }
   }
   return matches.length === 1 ? (matches[0] as CanonMarker) : null;
 }
+
+/** Why freshness could not be proven from the file itself. */
+export type FreshnessDefect =
+  | "no-marker" // absent, duplicated, or malformed marker
+  | "foreign-marker" // the marker names a seq this ledger has not reached
+  | "body-mismatch"; // the body is not the faithful rendering of ledger@marker
 
 export interface CanonDivergence {
   /** Requirement ids whose current rendering differs from the marker-time rendering. */
@@ -139,23 +169,37 @@ export interface CanonDivergence {
    * Null when nothing diverges.
    */
   readonly oldestDivergenceAt: string | null;
+  /**
+   * Null when the file proved its own freshness lineage (single valid
+   * marker, reachable seq, byte-faithful body). Otherwise the reason the
+   * comparison fell back to conservative full divergence.
+   */
+  readonly freshnessDefect: FreshnessDefect | null;
 }
 
 /**
- * Compare the ledger against a canon file's marker. `records` is the
- * FULL ledger log in seq order (the store's adoption verification
- * already vouched for it). A null marker — no marker, several markers,
- * or a marker naming a seq this ledger has not reached (a foreign or
- * corrupt file) — is treated as full divergence since each
+ * Compare the ledger against the ACTUAL canon file text (review round
+ * 1, finding 3: a marker alone proves nothing — an edited or truncated
+ * body behind a current marker must not read as fresh). `records` is
+ * the FULL ledger log in seq order (the store's adoption verification
+ * already vouched for it).
+ *
+ * The file proves its lineage only if: it carries exactly one valid
+ * marker; the marker's seq is within this ledger; and the whole text
+ * (line endings normalized) is BYTE-IDENTICAL to `renderCanon` of the
+ * ledger folded to that seq with the marker's own timestamp — rendering
+ * is deterministic, so any edit, truncation, or foreign content fails.
+ * A file that cannot prove its lineage is fully divergent since each
  * requirement's first record: freshness that cannot be proven is not
  * assumed (fail toward folding).
  */
 export function computeCanonDivergence(
   records: readonly LedgerEventRecord[],
-  marker: CanonMarker | null,
+  canonText: string,
 ): CanonDivergence {
+  const marker = parseCanonMarker(canonText);
   const lastSeq = records.at(-1)?.seq ?? 0;
-  if (marker === null || marker.ledgerSeq > lastSeq) {
+  const conservative = (defect: FreshnessDefect): CanonDivergence => {
     const firstRecordAt = new Map<string, string>();
     for (const record of records) {
       if (!firstRecordAt.has(record.requirementId)) {
@@ -164,10 +208,24 @@ export function computeCanonDivergence(
     }
     const diverged = [...firstRecordAt.keys()].sort();
     const oldest = diverged.length === 0 ? null : ([...firstRecordAt.values()].sort()[0] as string);
-    return { divergedRequirementIds: diverged, oldestDivergenceAt: oldest };
-  }
+    return {
+      divergedRequirementIds: diverged,
+      oldestDivergenceAt: oldest,
+      freshnessDefect: defect,
+    };
+  };
+  if (marker === null) return conservative("no-marker");
+  if (marker.ledgerSeq > lastSeq) return conservative("foreign-marker");
 
   const markerView = foldLedgerView(records.filter((r) => r.seq <= marker.ledgerSeq));
+  const expectedText = renderCanon(markerView, {
+    ledgerSeq: marker.ledgerSeq,
+    renderedAt: marker.renderedAt,
+  });
+  if (normalizeLineEndings(canonText) !== expectedText) {
+    return conservative("body-mismatch");
+  }
+
   const markerFragments = new Map<string, string>();
   for (const [id, entry] of markerView) markerFragments.set(id, canonFragment(entry));
 
@@ -176,7 +234,7 @@ export function computeCanonDivergence(
   // returned. A change that changes back (accepted → disputed →
   // resolved-accepted with the same text) is not a divergence: the file
   // is still an accurate rendering of current intent.
-  const view = foldLedgerView(records.filter((r) => r.seq <= marker.ledgerSeq));
+  const view = markerView;
   const departedSince = new Map<string, string>();
   for (const record of records) {
     if (record.seq <= marker.ledgerSeq) continue;
@@ -192,7 +250,7 @@ export function computeCanonDivergence(
   }
   const diverged = [...departedSince.keys()].sort();
   const oldest = diverged.length === 0 ? null : ([...departedSince.values()].sort()[0] as string);
-  return { divergedRequirementIds: diverged, oldestDivergenceAt: oldest };
+  return { divergedRequirementIds: diverged, oldestDivergenceAt: oldest, freshnessDefect: null };
 }
 
 export interface StandaloneFoldDecision {

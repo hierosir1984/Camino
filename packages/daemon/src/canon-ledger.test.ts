@@ -61,13 +61,18 @@ describe("the six named user-action methods", () => {
     expect(store.entry(R)?.disposition).toBe("descoped");
     expect(store.lastSeq).toBe(5);
 
-    // Re-proposal (D2) and the assumed path.
-    store.proposeRequirement(R, { statement: "back again", sourceMissionId: "mission-2" });
-    store.disputeRequirement(R, { reason: "unknowable history", conflictWith: "CAM-DEMO-02" });
-    store.resolveDisputeAssumed(R, { assumption: "legacy behavior intended" });
-    expect(store.entry(R)).toMatchObject({
+    // Descoped is terminal (r1 finding 13); the assumed path runs on a
+    // fresh requirement id.
+    expect(() =>
+      store.proposeRequirement(R, { statement: "back again", sourceMissionId: "mission-2" }),
+    ).toThrow(/not legal from disposition "descoped"/);
+    const R2 = "CAM-DEMO-04";
+    store.proposeRequirement(R2, { statement: "another", sourceMissionId: "mission-2" });
+    store.disputeRequirement(R2, { reason: "unknowable history", conflictWith: "CAM-DEMO-02" });
+    store.resolveDisputeAssumed(R2, { assumption: "legacy behavior intended" });
+    expect(store.entry(R2)).toMatchObject({
       disposition: "assumed",
-      statement: "back again",
+      statement: "another",
       assumption: "legacy behavior intended",
     });
   });
@@ -88,14 +93,21 @@ describe("the six named user-action methods", () => {
     ).toThrow(/embedded NUL/);
   });
 
-  it("exposes NO generic append surface (CAM-CANON-01 by construction)", () => {
+  it("exposes NO generic append surface, not even at runtime (CAM-CANON-01, r1 finding 2)", () => {
     const store = openStore(tempDir());
     const surface = store as unknown as Record<string, unknown>;
     expect(surface["append"]).toBeUndefined();
     expect(surface["recordFact"]).toBeUndefined();
-    // @ts-expect-error — appendEvent is private: code-lifecycle handlers cannot name it.
-    const privateProbe: unknown = store.appendEvent;
-    expect(privateProbe).toBeTypeOf("function");
+    // The single write path is an ECMAScript #private method: it does not
+    // exist as a property from outside the class, so a code-lifecycle
+    // handler cannot reach it even reflectively.
+    expect(surface["appendEvent"]).toBeUndefined();
+    expect(Object.getOwnPropertyNames(store)).toEqual([]);
+    expect(
+      Object.getOwnPropertyNames(Object.getPrototypeOf(store)).filter((n) =>
+        n.toLowerCase().includes("append"),
+      ),
+    ).toEqual([]);
   });
 });
 
@@ -229,7 +241,7 @@ describe("fail-closed adoption and tamper evidence", () => {
     const raw = new Database(path);
     raw.exec("DROP TRIGGER canon_ledger_append_only_delete");
     raw.close();
-    expect(() => new CanonLedgerStore(path)).toThrow(/missing canon_ledger_append_only_delete/);
+    expect(() => new CanonLedgerStore(path)).toThrow(/schema objects/);
   });
 
   it("refuses an unknown schema version", () => {
@@ -292,22 +304,128 @@ describe("single-writer discipline", () => {
     expect(() => store.acceptRequirement(R)).toThrow(/without the writer lock/);
   });
 
-  it("refuses to append inside an enclosing transaction", () => {
+  it("the store handle is fully encapsulated: no reflective route to the connection", () => {
+    const store = openStore(tempDir());
+    // Every field is an ECMAScript #private: a buggy or hostile in-process
+    // caller cannot pull the raw connection out of the store and drive it
+    // into an enclosing transaction (the in-transaction refusal guards the
+    // store's own code paths; encapsulation removes the reflective ones).
+    expect(Object.getOwnPropertyNames(store)).toEqual([]);
+    expect((store as unknown as Record<string, unknown>)["db"]).toBeUndefined();
+  });
+});
+
+describe("round-1 regressions (falsification review findings)", () => {
+  it("f1: INSERT OR REPLACE cannot rewrite history — the append-order guard fires before REPLACE deletes", () => {
     const dir = tempDir();
     const path = join(dir, "canon-ledger.sqlite");
     const store = new CanonLedgerStore(path, { now: fixedClock() });
-    cleanups.push(() => store.close());
-    // Reach the private db handle the way a buggy composition might: via
-    // another connection is not enough (inTransaction is per-connection),
-    // so drive the store's own connection through a reflective handle.
-    const db = (store as unknown as { db: Database.Database }).db;
-    db.exec("BEGIN");
-    try {
-      expect(() => store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" })).toThrow(
-        /enclosing transaction/,
+    store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" });
+    store.acceptRequirement(R);
+    store.close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT OR REPLACE INTO canon_ledger (seq, requirement_id, event, actor, payload, recorded_at) VALUES (2, ?, 'requirement-descoped', ?, ?, ?)",
+        )
+        .run(R, DAVID_ACTOR, JSON.stringify({ reason: "smuggled" }), "2026-07-20T00:00:00.000Z"),
+    ).toThrow(/conflicting or out-of-order INSERT rejected/);
+    // History is intact and the store reopens clean.
+    expect(raw.prepare("SELECT COUNT(*) AS n FROM canon_ledger").get()).toEqual({ n: 2 });
+    raw.close();
+    cleanups.pop();
+    const reopened = new CanonLedgerStore(path, { now: fixedClock() });
+    expect(reopened.entry(R)?.disposition).toBe("accepted");
+    reopened.close();
+  });
+
+  it("f1: a raw INSERT at a below-max gap seq is refused (append order, not just conflicts)", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    const store = new CanonLedgerStore(path, { now: fixedClock() });
+    store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" });
+    store.acceptRequirement(R);
+    store.close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO canon_ledger (seq, requirement_id, event, actor, payload, recorded_at) VALUES (1, ?, 'requirement-descoped', ?, ?, ?)",
+        )
+        .run(
+          "CAM-DEMO-09",
+          DAVID_ACTOR,
+          JSON.stringify({ reason: "r" }),
+          "2026-07-20T00:00:00.000Z",
+        ),
+    ).toThrow(/conflicting or out-of-order INSERT rejected/);
+  });
+
+  it("f9: an inert same-named trigger is a tampered store — definitions are verified, not names", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    new CanonLedgerStore(path).close();
+    const raw = new Database(path);
+    raw.exec(`DROP TRIGGER canon_ledger_append_only_update;
+CREATE TRIGGER canon_ledger_append_only_update BEFORE UPDATE ON canon_ledger
+BEGIN SELECT 1; END;`);
+    raw.close();
+    expect(() => new CanonLedgerStore(path)).toThrow(/does not match this daemon's definition/);
+  });
+
+  it("f9: a dropped index is a tampered store", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    new CanonLedgerStore(path).close();
+    const raw = new Database(path);
+    raw.exec("DROP INDEX idx_canon_ledger_requirement");
+    raw.close();
+    expect(() => new CanonLedgerStore(path)).toThrow(/schema objects/);
+  });
+
+  it("f8: sequence numbers beyond JavaScript's safe range are refused at insert AND at open", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    new CanonLedgerStore(path).close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    // The schema CHECK refuses the insert outright.
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO canon_ledger (seq, requirement_id, event, actor, payload, recorded_at) VALUES (?, ?, 'requirement-proposed', ?, ?, ?)",
+        )
+        .run(
+          BigInt(2) ** BigInt(53),
+          R,
+          DAVID_ACTOR,
+          JSON.stringify({ statement: "s", sourceMissionId: "m" }),
+          "2026-07-20T00:00:00.000Z",
+        ),
+    ).toThrow(/CHECK/);
+  });
+
+  it("f12: a raw row with a non-instant recordedAt is refused at adoption", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    new CanonLedgerStore(path).close();
+    const raw = new Database(path);
+    raw
+      .prepare(
+        "INSERT INTO canon_ledger (requirement_id, event, actor, payload, recorded_at) VALUES (?, 'requirement-proposed', ?, ?, ?)",
+      )
+      .run(
+        "CAM-DEMO-08",
+        DAVID_ACTOR,
+        JSON.stringify({ statement: "s", sourceMissionId: "m" }),
+        "merge-event/not-an-iso-time",
       );
-    } finally {
-      db.exec("ROLLBACK");
-    }
+    raw.close();
+    // (The impossible-date variant, 2026-02-30, is covered at the core
+    // layer; one durable round-trip proves the store wires it.)
+    expect(() => new CanonLedgerStore(path)).toThrow(/recordedAt/);
   });
 });

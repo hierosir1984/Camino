@@ -97,6 +97,7 @@ export {
   applyLedgerRecord,
   decideLedgerAppend,
   foldLedgerView,
+  recordedAtProblem,
   verifyLedgerLog,
 } from "./canon-intent.js";
 export type {
@@ -110,13 +111,14 @@ export type {
 export {
   EVIDENCE_RULES,
   IMPLEMENTATION_RULES,
+  explainRequirementStatus,
   projectRequirementStatus,
   projectStatus,
   renderStatusLine,
   validateCanonFact,
   verifyCanonFactLog,
 } from "./canon-status.js";
-export type { FactValidation, ProjectionRule } from "./canon-status.js";
+export type { ExplainedStatus, FactValidation, ProjectionRule } from "./canon-status.js";
 
 export {
   STANDALONE_FOLD_AGE_DAYS,
@@ -130,6 +132,7 @@ export {
 export type {
   CanonDivergence,
   CanonMarker,
+  FreshnessDefect,
   RenderCanonOptions,
   StandaloneFoldDecision,
 } from "./canon-render.js";

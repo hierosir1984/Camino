@@ -1062,3 +1062,29 @@ describe("WP-109: canon stores in the recovery composition", () => {
     lock.release();
   });
 });
+
+describe("WP-109 r1 finding 14: exception-safe teardown", () => {
+  it("a throwing closer does not strand the lock or the remaining closers", () => {
+    const dir = tempDir();
+    const stateDir = join(dir, "state");
+    mkdirSync(stateDir);
+    const github = new FakeGitHub(join(dir, "github.json"));
+    const state = openRecoveredState(stateDir, { github });
+    // Sabotage the FIRST closer in the chain (own-property shadow).
+    const sabotaged = state.canonFacts as unknown as { close: () => void };
+    sabotaged.close = () => {
+      throw new Error("injected close failure");
+    };
+    expect(() => state.close()).toThrow(/injected close failure/);
+    // Every later closer ran and the lock was released: a fresh
+    // acquisition succeeds instead of refusing (WP-104 contract).
+    const lock = WriterLock.acquire(join(stateDir, STATE_FILES.writerLock));
+    lock.release();
+    // And the other stores really are closed: reopening the whole state
+    // succeeds (a leaked handle on macOS/WAL would not block, so the
+    // lock probe above is the load-bearing assertion; this one proves
+    // the composition is reusable after the failure).
+    const again = openRecoveredState(stateDir, { github });
+    again.close();
+  });
+});

@@ -63,6 +63,12 @@ describe("recordFact", () => {
     });
     store.recordFact({
       requirementId: R,
+      kind: "mainline-inherited",
+      actor: "camino:branch-sync",
+      payload: { branch: "mission-m2", sha: SHA2 },
+    });
+    store.recordFact({
+      requirementId: R,
       kind: "revert-recorded",
       actor: "camino:merge",
       payload: { contextKind: "main", sha: SHA2 },
@@ -105,9 +111,9 @@ describe("recordFact", () => {
     });
 
     expect(new Set(store.read().map((f) => f.kind)).size).toBe(CANON_FACT_KINDS.length);
-    expect(store.read({ requirementId: R })).toHaveLength(8);
-    expect(store.read({ afterSeq: 8 })).toHaveLength(1);
-    expect(store.lastSeq).toBe(9);
+    expect(store.read({ requirementId: R })).toHaveLength(9);
+    expect(store.read({ afterSeq: 9 })).toHaveLength(1);
+    expect(store.lastSeq).toBe(10);
     const first = store.read()[0];
     expect(first?.recordedAt).toBe("2026-07-20T00:00:00.000Z");
   });
@@ -229,7 +235,7 @@ describe("store discipline", () => {
     let raw = new Database(path);
     raw.exec("DROP TRIGGER canon_facts_append_only_update");
     raw.close();
-    expect(() => new CanonFactsStore(path)).toThrow(/missing canon_facts_append_only_update/);
+    expect(() => new CanonFactsStore(path)).toThrow(/schema objects/);
 
     const path2 = join(dir, "canon-facts-2.sqlite");
     new CanonFactsStore(path2).close();
@@ -308,5 +314,73 @@ describe("store discipline", () => {
         payload: { sha: SHA2 },
       }),
     ).toThrow(/without the writer lock/);
+  });
+});
+
+describe("round-1 regressions (falsification review findings)", () => {
+  it("f1: INSERT OR REPLACE cannot rewrite facts — the append-order guard fires first", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    const store = new CanonFactsStore(path, { now: fixedClock() });
+    store.recordFact({
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "camino:merge",
+      payload: { sha: SHA },
+    });
+    store.close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT OR REPLACE INTO canon_facts (seq, requirement_id, kind, actor, payload, recorded_at) VALUES (1, ?, 'revert-recorded', 'x:y', ?, ?)",
+        )
+        .run(R, JSON.stringify({ contextKind: "main", sha: SHA2 }), "2026-07-20T00:00:00.000Z"),
+    ).toThrow(/conflicting or out-of-order INSERT rejected/);
+    expect(raw.prepare("SELECT kind FROM canon_facts WHERE seq = 1").get()).toEqual({
+      kind: "landed-on-main",
+    });
+  });
+
+  it("f8: an unsafe raw seq is refused by the schema CHECK; a tampered-schema file is refused at open", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    new CanonFactsStore(path).close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO canon_facts (seq, requirement_id, kind, actor, payload, recorded_at) VALUES (?, ?, 'landed-on-main', 'x:y', ?, ?)",
+        )
+        .run(BigInt(2) ** BigInt(53), R, JSON.stringify({ sha: SHA }), "2026-07-20T00:00:00.000Z"),
+    ).toThrow(/CHECK/);
+  });
+
+  it("f9: an inert same-named trigger is a tampered store", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    new CanonFactsStore(path).close();
+    const raw = new Database(path);
+    raw.exec(`DROP TRIGGER canon_facts_append_only_delete;
+CREATE TRIGGER canon_facts_append_only_delete BEFORE DELETE ON canon_facts
+BEGIN SELECT 1; END;`);
+    raw.close();
+    expect(() => new CanonFactsStore(path)).toThrow(/does not match this daemon's definition/);
+  });
+
+  it("f12: a raw row with a non-instant recordedAt is refused at adoption", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    new CanonFactsStore(path).close();
+    const raw = new Database(path);
+    raw
+      .prepare(
+        "INSERT INTO canon_facts (requirement_id, kind, actor, payload, recorded_at) VALUES (?, 'landed-on-main', 'x:y', ?, ?)",
+      )
+      .run(R, JSON.stringify({ sha: SHA }), "2026-02-30T00:00:00.000Z");
+    raw.close();
+    expect(() => new CanonFactsStore(path)).toThrow(/not a real instant/);
   });
 });

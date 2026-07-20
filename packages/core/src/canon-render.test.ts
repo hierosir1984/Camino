@@ -1,9 +1,10 @@
 /**
  * Canon rendering + freshness tests (WP-109, CAM-CANON-02 acceptance):
- * the rendered file carries a parseable rendered-at marker; the
- * standalone intent-only fold triggers when ledger-vs-text divergence
- * exceeds 5 requirements or 7 days — strict inequalities, boundary-walked
- * both sides.
+ * the rendered file carries a parseable rendered-at marker; freshness is
+ * bound to the ACTUAL file body, not the marker alone (review round 1,
+ * finding 3); the standalone intent-only fold triggers when
+ * ledger-vs-text divergence exceeds 5 requirements or 7 days — strict
+ * inequalities, boundary-walked both sides.
  */
 import { describe, expect, it } from "vitest";
 import type { LedgerEventName, LedgerEventRecord } from "@camino/shared";
@@ -41,6 +42,14 @@ function proposeAndAccept(
     rec(startSeq, id, "requirement-proposed", { statement, sourceMissionId: "m1" }, at),
     rec(startSeq + 1, id, "requirement-accepted", {}, at),
   ];
+}
+
+/** The faithful canon file for a ledger prefix — what a fold would have committed. */
+function faithfulText(records: LedgerEventRecord[], ledgerSeq: number, renderedAt = T0): string {
+  return renderCanon(foldLedgerView(records.filter((r) => r.seq <= ledgerSeq)), {
+    ledgerSeq,
+    renderedAt,
+  });
 }
 
 const plusMs = (iso: string, ms: number): string => new Date(Date.parse(iso) + ms).toISOString();
@@ -129,9 +138,12 @@ describe("renderCanon (CAM-CANON-02: canon text = rendered projection of accepte
     expect(text).not.toContain("old text");
   });
 
-  it("refuses caller bugs: bad timestamps and bad seqs", () => {
+  it("refuses caller bugs: bad timestamps (incl. impossible dates) and bad seqs", () => {
     const view = foldLedgerView([]);
     expect(() => renderCanon(view, { ledgerSeq: 0, renderedAt: "yesterday" })).toThrow(/ISO-8601/);
+    expect(() =>
+      renderCanon(view, { ledgerSeq: 0, renderedAt: "2026-02-30T00:00:00.000Z" }),
+    ).toThrow(/ISO-8601/);
     expect(() => renderCanon(view, { ledgerSeq: -1, renderedAt: T0 })).toThrow(/non-negative/);
     expect(() => renderCanon(view, { ledgerSeq: 1.5, renderedAt: T0 })).toThrow(
       /non-negative integer/,
@@ -149,16 +161,22 @@ describe("parseCanonMarker", () => {
     expect(parseCanonMarker(`${line}\n${line}\n`)).toBeNull();
   });
 
-  it("ignores malformed markers (bad date, bad seq, wrong shape)", () => {
+  it("ignores malformed markers (bad date, impossible date, bad seq, wrong shape)", () => {
     for (const badLine of [
       "<!-- camino:canon rendered-at=2026-07-01 ledger-seq=1 -->",
       `<!-- camino:canon rendered-at=${T0} ledger-seq=01 -->`,
       `<!-- camino:canon rendered-at=${T0} ledger-seq=-1 -->`,
-      `<!-- camino:canon rendered-at=2026-13-99T00:00:00.000Z ledger-seq=1 -->`,
+      `<!-- camino:canon rendered-at=2026-02-30T00:00:00.000Z ledger-seq=1 -->`,
       `<!--camino:canon rendered-at=${T0} ledger-seq=1-->`,
     ]) {
       expect(parseCanonMarker(`${badLine}\n`), badLine).toBeNull();
     }
+  });
+
+  it("parses CRLF text (line endings normalized, finding 11)", () => {
+    const text = renderCanon(foldLedgerView([]), { ledgerSeq: 3, renderedAt: T0 });
+    const crlf = text.replace(/\n/g, "\r\n");
+    expect(parseCanonMarker(crlf)).toEqual({ ledgerSeq: 3, renderedAt: T0 });
   });
 
   it("round-trips through renderCanon output", () => {
@@ -168,14 +186,60 @@ describe("parseCanonMarker", () => {
 });
 
 describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", () => {
-  it("no ledger movement since the marker: zero divergence, no fold at any age", () => {
+  it("a faithful, current file: zero divergence, no defect, no fold at any age", () => {
     const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
-    expect(divergence).toEqual({ divergedRequirementIds: [], oldestDivergenceAt: null });
+    const divergence = computeCanonDivergence(records, faithfulText(records, 2));
+    expect(divergence).toEqual({
+      divergedRequirementIds: [],
+      oldestDivergenceAt: null,
+      freshnessDefect: null,
+    });
     expect(standaloneFoldRequired(divergence, plusMs(T0, 30 * DAY))).toEqual({
       required: false,
       reason: null,
     });
+  });
+
+  it("an edited body behind a current marker is NOT fresh (finding 3)", () => {
+    const records = proposeAndAccept(1, "CAM-DEMO-01", "the real accepted text");
+    const genuine = faithfulText(records, 2);
+    const hostile = genuine.replace("the real accepted text", "replacement content");
+    const divergence = computeCanonDivergence(records, hostile);
+    expect(divergence.freshnessDefect).toBe("body-mismatch");
+    expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
+    expect(standaloneFoldRequired(divergence, plusMs(T0, 8 * DAY)).required).toBe(true);
+  });
+
+  it("a truncated body behind a current marker is NOT fresh", () => {
+    const records = [
+      ...proposeAndAccept(1, "CAM-DEMO-01", "one"),
+      ...proposeAndAccept(3, "CAM-DEMO-02", "two"),
+    ];
+    const genuine = faithfulText(records, 4);
+    const truncated = genuine.split("\n").slice(0, -2).join("\n");
+    expect(computeCanonDivergence(records, truncated).freshnessDefect).toBe("body-mismatch");
+  });
+
+  it("CRLF conversion alone is NOT divergence (finding 11)", () => {
+    const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
+    const crlf = faithfulText(records, 2).replace(/\n/g, "\r\n");
+    const divergence = computeCanonDivergence(records, crlf);
+    expect(divergence).toEqual({
+      divergedRequirementIds: [],
+      oldestDivergenceAt: null,
+      freshnessDefect: null,
+    });
+  });
+
+  it("a marker-shaped line smuggled into the body fails faithfulness, not the parser", () => {
+    const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
+    const genuine = faithfulText(records, 2);
+    // Append a fenced block containing a second marker-shaped line: the
+    // parser sees two markers → no-marker defect, conservative.
+    const smuggled = `${genuine}\n\`\`\`\n<!-- camino:canon rendered-at=${T0} ledger-seq=99 -->\n\`\`\`\n`;
+    const divergence = computeCanonDivergence(records, smuggled);
+    expect(divergence.freshnessDefect).toBe("no-marker");
+    expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
   });
 
   it("proposal-only movement does not start the divergence clock (nothing renderable changed)", () => {
@@ -189,13 +253,14 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
         plusMs(T0, DAY),
       ),
     ];
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, faithfulText(records.slice(0, 2), 2));
+    expect(divergence.freshnessDefect).toBeNull();
     expect(divergence.divergedRequirementIds).toEqual([]);
   });
 
   it("counts newly accepted requirements; exactly the threshold does NOT trigger, one more does", () => {
     const base = proposeAndAccept(1, "CAM-DEMO-00", "base");
-    const marker = { ledgerSeq: 2, renderedAt: T0 };
+    const canon = faithfulText(base, 2);
     const accepted = (n: number): LedgerEventRecord[] => {
       const out: LedgerEventRecord[] = [...base];
       for (let i = 1; i <= n; i += 1) {
@@ -212,14 +277,15 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
     };
     const atThreshold = computeCanonDivergence(
       accepted(STANDALONE_FOLD_REQUIREMENT_THRESHOLD),
-      marker,
+      canon,
     );
+    expect(atThreshold.freshnessDefect).toBeNull();
     expect(atThreshold.divergedRequirementIds).toHaveLength(5);
     expect(standaloneFoldRequired(atThreshold, plusMs(T0, DAY)).required).toBe(false);
 
     const overThreshold = computeCanonDivergence(
       accepted(STANDALONE_FOLD_REQUIREMENT_THRESHOLD + 1),
-      marker,
+      canon,
     );
     expect(overThreshold.divergedRequirementIds).toHaveLength(6);
     expect(standaloneFoldRequired(overThreshold, plusMs(T0, DAY))).toEqual({
@@ -234,7 +300,7 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
       ...proposeAndAccept(1, "CAM-DEMO-01", "s"),
       ...proposeAndAccept(3, "CAM-DEMO-02", "later", changedAt),
     ];
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, faithfulText(records.slice(0, 2), 2));
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-02"]);
     expect(divergence.oldestDivergenceAt).toBe(changedAt);
 
@@ -251,7 +317,7 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
       ...proposeAndAccept(1, "CAM-DEMO-01", "s"),
       rec(3, "CAM-DEMO-01", "requirement-descoped", { reason: "dropped" }, plusMs(T0, DAY)),
     ];
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, faithfulText(records.slice(0, 2), 2));
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
   });
 
@@ -273,7 +339,7 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
         plusMs(T0, 2 * DAY),
       ),
     ];
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, faithfulText(records.slice(0, 2), 2));
     // disputed rendered differently for a while, but the resolution
     // restored the exact accepted fragment — nothing to fold now.
     expect(divergence.divergedRequirementIds).toEqual([]);
@@ -291,33 +357,37 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
         plusMs(T0, DAY),
       ),
     ];
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 2, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, faithfulText(records.slice(0, 2), 2));
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
   });
 
   it("no marker: freshness cannot be proven — full conservative divergence", () => {
     const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
-    const divergence = computeCanonDivergence(records, null);
+    const divergence = computeCanonDivergence(records, "# some hand-written canon\n");
+    expect(divergence.freshnessDefect).toBe("no-marker");
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
     expect(divergence.oldestDivergenceAt).toBe(T0);
   });
 
-  it("a marker claiming a seq this ledger has not reached is treated as no marker", () => {
+  it("a marker claiming a seq this ledger has not reached is a foreign marker", () => {
     const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
-    const divergence = computeCanonDivergence(records, { ledgerSeq: 99, renderedAt: T0 });
+    const foreign = renderCanon(foldLedgerView(records), { ledgerSeq: 99, renderedAt: T0 });
+    const divergence = computeCanonDivergence(records, foreign);
+    expect(divergence.freshnessDefect).toBe("foreign-marker");
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
   });
 
-  it("an empty ledger with no marker has nothing to fold", () => {
-    const divergence = computeCanonDivergence([], null);
-    expect(divergence).toEqual({ divergedRequirementIds: [], oldestDivergenceAt: null });
+  it("an empty ledger with unprovable freshness has nothing to fold", () => {
+    const divergence = computeCanonDivergence([], "no marker at all\n");
+    expect(divergence.divergedRequirementIds).toEqual([]);
+    expect(divergence.freshnessDefect).toBe("no-marker");
     expect(standaloneFoldRequired(divergence, T0).required).toBe(false);
   });
 
   it("standaloneFoldRequired refuses malformed timestamps (caller bug)", () => {
     expect(() =>
       standaloneFoldRequired(
-        { divergedRequirementIds: [], oldestDivergenceAt: null },
+        { divergedRequirementIds: [], oldestDivergenceAt: null, freshnessDefect: null },
         "not-a-time",
       ),
     ).toThrow(/ISO-8601/);

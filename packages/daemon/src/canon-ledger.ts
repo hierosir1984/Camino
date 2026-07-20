@@ -4,24 +4,36 @@
  * legality, closed payload schemas, user-actor binding, disposition
  * folding — lives in @camino/core canon-intent; this file is I/O.
  *
- * THE MUTATION SURFACE IS SIX NAMED USER-ACTION METHODS. There is no
- * public generic append: a caller cannot hand this store an event name,
- * so a merge/revert/abandon handler has no expressible way to reach the
- * ledger (CAM-CANON-01 "by construction" — see canon-intent.ts for the
- * full three-layer argument). Beneath the method surface the same
- * refusals exist at the decision layer (decideLedgerAppend) and in the
- * schema itself (event-name CHECK over the six user actions, actor CHECK
- * pinned to 'david'), so even raw SQL against the file is refused.
+ * THE MUTATION SURFACE IS SIX NAMED USER-ACTION METHODS funneling into a
+ * runtime-private (#) append: a caller cannot hand this store an event
+ * name, and the private method is not reachable at runtime either
+ * (review round 1, finding 2). The same refusals exist at the decision
+ * layer (decideLedgerAppend) and in the schema itself — event-name CHECK
+ * over the six user actions, actor CHECK pinned to 'david', an
+ * append-order trigger closing the INSERT OR REPLACE class (REPLACE
+ * resolves a key conflict by DELETING the conflicting row without firing
+ * DELETE triggers unless the writer enabled recursive triggers — review
+ * round 1 finding 1, the WP-103 r1-finding-1 class), and a seq ceiling
+ * CHECK keeping every sequence number in JavaScript's safe-integer range
+ * (finding 8). What the store cannot verify is CALLER INTENT — see
+ * canon-intent.ts for the precise boundary statement.
  *
  * The shell mirrors the WP-101/WP-104 stores deliberately:
- *  - Append-only enforced by BEFORE UPDATE/DELETE triggers, not API shape.
- *  - Tamper-evident open; UTF-8 pin so byte-level NUL CHECKs hold.
+ *  - Append-only enforced by BEFORE UPDATE/DELETE triggers plus the
+ *    conflicting/out-of-order INSERT guard, not API shape.
+ *  - Tamper-evident open verifies schema DEFINITIONS, not just object
+ *    names: the file's sqlite_master rows must equal those produced by
+ *    executing this module's SCHEMA in a fresh in-memory database
+ *    (review round 1, finding 9 — an inert same-named trigger is a
+ *    tampered store).
+ *  - UTF-8 pin so byte-level NUL CHECKs hold; unsafe-seq refusal at
+ *    open (BigInt probe) and at insert (CHECK).
  *  - CAS append inside a transaction (in-process defense-in-depth under
  *    the WP-104 writer lock, asserted per append when wired).
  *  - Single-observation payloads: canonical JSON is the sole authority.
  *  - Fail-closed adoption: opening re-derives the entire log through
- *    core's verifyLedgerLog and refuses a history the lifecycle
- *    disagrees with.
+ *    core's verifyLedgerLog (which also validates every recordedAt) and
+ *    refuses a history the lifecycle disagrees with.
  *  - Every constructor refusal path closes the native handle (WP-104
  *    review round 1 finding 10 / PR #48 pattern).
  *
@@ -46,11 +58,14 @@ import type { HeldWriterLock } from "./writer-lock.js";
 
 const SCHEMA_VERSION = 1;
 
+/** The largest sequence number JavaScript can represent exactly. */
+const MAX_SAFE_SEQ = 9007199254740991;
+
 const EVENT_LIST_SQL = LEDGER_EVENTS.map((event) => `'${event}'`).join(", ");
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS canon_ledger (
-  seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+  seq            INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq BETWEEN 1 AND ${MAX_SAFE_SEQ}),
   requirement_id TEXT NOT NULL CHECK (typeof(requirement_id) = 'text' AND length(requirement_id) > 0 AND instr(CAST(requirement_id AS BLOB), x'00') = 0),
   event          TEXT NOT NULL CHECK (event IN (${EVENT_LIST_SQL})),
   actor          TEXT NOT NULL CHECK (actor = '${DAVID_ACTOR}'),
@@ -71,6 +86,13 @@ BEFORE DELETE ON canon_ledger
 BEGIN
   SELECT RAISE(ABORT, 'intent ledger is append-only (CAM-CANON-01): DELETE rejected');
 END;
+
+CREATE TRIGGER IF NOT EXISTS canon_ledger_append_order
+BEFORE INSERT ON canon_ledger
+WHEN NEW.seq > 0 AND NEW.seq <= (SELECT COALESCE(MAX(seq), 0) FROM canon_ledger)
+BEGIN
+  SELECT RAISE(ABORT, 'intent ledger is append-only (CAM-CANON-01): conflicting or out-of-order INSERT rejected');
+END;
 `;
 
 interface LedgerRow {
@@ -80,6 +102,29 @@ interface LedgerRow {
   actor: string;
   payload: string;
   recorded_at: string;
+}
+
+/**
+ * The schema objects a healthy store contains, as (name → creation SQL)
+ * produced by executing SCHEMA in a pristine in-memory database. SQLite
+ * normalizes the stored text the same way for the file and for memory,
+ * so definition tampering — an inert same-named trigger, a dropped
+ * CHECK, a removed index — shows up as a text mismatch.
+ */
+let expectedLedgerSchema: Map<string, string> | null = null;
+function expectedSchemaObjects(): Map<string, string> {
+  if (expectedLedgerSchema !== null) return expectedLedgerSchema;
+  const mem = new Database(":memory:");
+  try {
+    mem.exec(SCHEMA);
+    const rows = mem
+      .prepare("SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all() as Array<{ name: string; sql: string | null }>;
+    expectedLedgerSchema = new Map(rows.map((r) => [r.name, r.sql ?? ""]));
+    return expectedLedgerSchema;
+  } finally {
+    mem.close();
+  }
 }
 
 export interface CanonLedgerStoreOptions {
@@ -114,65 +159,85 @@ export interface DescopeRequirementInput {
 }
 
 export class CanonLedgerStore {
-  private readonly db: Database.Database;
-  private readonly now: () => Date;
-  private readonly writerLock: HeldWriterLock | undefined;
-  private readonly insert: Database.Statement;
-  private view: LedgerView;
-  private cachedLastSeq: number;
+  readonly #db: Database.Database;
+  readonly #now: () => Date;
+  readonly #writerLock: HeldWriterLock | undefined;
+  readonly #insert: Database.Statement;
+  #view: LedgerView;
+  #cachedLastSeq: number;
 
   constructor(path: string, options: CanonLedgerStoreOptions = {}) {
-    this.now = options.now ?? (() => new Date());
-    this.writerLock = options.writerLock;
-    this.db = new Database(path);
+    this.#now = options.now ?? (() => new Date());
+    this.#writerLock = options.writerLock;
+    this.#db = new Database(path);
     // EVERY refusal path below must close the native handle (WP-104
     // round-1 finding 10; the PR #48 domain-store pattern).
     try {
-      this.db.pragma("journal_mode = WAL");
-      const encoding = this.db.pragma("encoding", { simple: true }) as string;
+      this.#db.pragma("journal_mode = WAL");
+      const encoding = this.#db.pragma("encoding", { simple: true }) as string;
       if (encoding !== "UTF-8") {
         throw new Error(
           `intent ledger ${path} uses encoding ${encoding}; the byte-level NUL constraints ` +
             "assume UTF-8 — refusing to open (WP-103 precedent)",
         );
       }
-      const version = this.db.pragma("user_version", { simple: true }) as number;
+      const version = this.#db.pragma("user_version", { simple: true }) as number;
       if (version === 0) {
-        this.db.exec(SCHEMA);
-        this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        this.#db.exec(SCHEMA);
+        this.#db.pragma(`user_version = ${SCHEMA_VERSION}`);
       } else if (version !== SCHEMA_VERSION) {
         throw new Error(
           `intent ledger ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
         );
-      } else {
-        const objects = this.db
-          .prepare(
-            `SELECT name FROM sqlite_master
-             WHERE (type = 'table' AND name = 'canon_ledger')
-                OR (type = 'trigger' AND name IN ('canon_ledger_append_only_update', 'canon_ledger_append_only_delete'))`,
-          )
-          .all() as Array<{ name: string }>;
-        const names = new Set(objects.map((o) => o.name));
-        for (const required of [
-          "canon_ledger",
-          "canon_ledger_append_only_update",
-          "canon_ledger_append_only_delete",
-        ]) {
-          if (!names.has(required)) {
-            throw new Error(
-              `intent ledger ${path} claims schema version ${version} but is missing ${required} — ` +
-                "refusing to open a possibly tampered or truncated ledger",
-            );
-          }
+      }
+      // Tamper-evident open, DEFINITIONS not names (review round 1,
+      // finding 9): the file's schema objects must equal the ones this
+      // module's SCHEMA produces — on the fresh-create path too, which
+      // is cheap and catches a raced writer.
+      const expected = expectedSchemaObjects();
+      const actual = new Map(
+        (
+          this.#db
+            .prepare(
+              "SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .all() as Array<{ name: string; sql: string | null }>
+        ).map((r) => [r.name, r.sql ?? ""]),
+      );
+      if (actual.size !== expected.size) {
+        throw new Error(
+          `intent ledger ${path} has ${actual.size} schema objects, expected ${expected.size} — ` +
+            "refusing to open a tampered or foreign store",
+        );
+      }
+      for (const [name, sql] of expected) {
+        if (actual.get(name) !== sql) {
+          throw new Error(
+            `intent ledger ${path} schema object ${name} does not match this daemon's definition — ` +
+              "refusing to open a tampered or foreign store",
+          );
         }
       }
-      this.insert = this.db.prepare(
+      // Unsafe-seq refusal (review round 1, finding 8): a file whose
+      // highest seq exceeds Number.MAX_SAFE_INTEGER would alias distinct
+      // rows once converted to JavaScript numbers.
+      const maxSeqStmt = this.#db.prepare("SELECT COALESCE(MAX(seq), 0) AS m FROM canon_ledger");
+      maxSeqStmt.safeIntegers(true);
+      const maxSeq = (maxSeqStmt.get() as { m: bigint }).m;
+      if (maxSeq > BigInt(MAX_SAFE_SEQ)) {
+        throw new Error(
+          `intent ledger ${path} contains seq ${maxSeq} beyond JavaScript's safe-integer range — ` +
+            "refusing to open (sequence numbers would alias)",
+        );
+      }
+      this.#insert = this.#db.prepare(
         `INSERT INTO canon_ledger (requirement_id, event, actor, payload, recorded_at)
          VALUES (@requirementId, @event, @actor, @payload, @recordedAt)`,
       );
       // Fail-closed adoption: refuse a ledger whose history the intent
-      // lifecycle disagrees with.
-      const records = this.readAll();
+      // lifecycle disagrees with (verifyLedgerLog also validates every
+      // recordedAt is a real toISOString instant — finding 12).
+      const records = this.#readAll();
       const divergences = verifyLedgerLog(records);
       if (divergences.length > 0) {
         const detail = divergences
@@ -184,21 +249,21 @@ export class CanonLedgerStore {
             `refusing to adopt it: ${detail}`,
         );
       }
-      this.view = foldLedgerView(records);
-      this.cachedLastSeq = records.at(-1)?.seq ?? 0;
+      this.#view = foldLedgerView(records);
+      this.#cachedLastSeq = records.at(-1)?.seq ?? 0;
     } catch (error) {
-      this.db.close();
+      this.#db.close();
       throw error;
     }
   }
 
   get lastSeq(): number {
-    return this.cachedLastSeq;
+    return this.#cachedLastSeq;
   }
 
   /** Intake surfaced a requirement from the user's PRD text (design invariant 6). */
   proposeRequirement(requirementId: string, input: ProposeRequirementInput): LedgerEventRecord {
-    return this.appendEvent(requirementId, "requirement-proposed", {
+    return this.#appendEvent(requirementId, "requirement-proposed", {
       statement: input.statement,
       sourceMissionId: input.sourceMissionId,
     });
@@ -206,12 +271,12 @@ export class CanonLedgerStore {
 
   /** Intake confirmation: the user confirmed the checklist item (CAM-PLAN-02). */
   acceptRequirement(requirementId: string): LedgerEventRecord {
-    return this.appendEvent(requirementId, "requirement-accepted", {});
+    return this.#appendEvent(requirementId, "requirement-accepted", {});
   }
 
   /** Intake surfaced a contradiction; the user's answer is pending. */
   disputeRequirement(requirementId: string, input: DisputeRequirementInput): LedgerEventRecord {
-    return this.appendEvent(requirementId, "requirement-disputed", {
+    return this.#appendEvent(requirementId, "requirement-disputed", {
       reason: input.reason,
       conflictWith: input.conflictWith,
     });
@@ -224,7 +289,7 @@ export class CanonLedgerStore {
   ): LedgerEventRecord {
     const payload: Record<string, unknown> = { resolution: input.resolution };
     if (input.statement !== undefined) payload["statement"] = input.statement;
-    return this.appendEvent(requirementId, "dispute-resolved-accepted", payload);
+    return this.#appendEvent(requirementId, "dispute-resolved-accepted", payload);
   }
 
   /** Dispute answer: the user signed off a documented assumption (§3.1). */
@@ -232,12 +297,12 @@ export class CanonLedgerStore {
     requirementId: string,
     input: ResolveDisputeAssumedInput,
   ): LedgerEventRecord {
-    return this.appendEvent(requirementId, "dispute-assumed", { assumption: input.assumption });
+    return this.#appendEvent(requirementId, "dispute-assumed", { assumption: input.assumption });
   }
 
   /** Descope approval: the user explicitly removed the requirement from intent. */
   descopeRequirement(requirementId: string, input: DescopeRequirementInput): LedgerEventRecord {
-    return this.appendEvent(requirementId, "requirement-descoped", { reason: input.reason });
+    return this.#appendEvent(requirementId, "requirement-descoped", { reason: input.reason });
   }
 
   /** All matching rows in ascending seq order. */
@@ -253,42 +318,43 @@ export class CanonLedgerStore {
       params["afterSeq"] = filter.afterSeq;
     }
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
+    const rows = this.#db
       .prepare(`SELECT * FROM canon_ledger${where} ORDER BY seq ASC`)
       .all(params) as LedgerRow[];
-    return rows.map((row) => this.toRecord(row));
+    return rows.map((row) => this.#toRecord(row));
   }
 
   /** A snapshot copy of the folded view (mutating it cannot influence the ledger). */
   currentView(): LedgerView {
-    return structuredClone(this.view);
+    return structuredClone(this.#view);
   }
 
   /** One requirement's folded entry, snapshot copy. */
   entry(requirementId: string): LedgerViewEntry | undefined {
-    const entry = this.view.get(requirementId);
+    const entry = this.#view.get(requirementId);
     return entry === undefined ? undefined : structuredClone(entry);
   }
 
   close(): void {
-    this.db.close();
+    this.#db.close();
   }
 
   /**
-   * The single private write path all six methods funnel through. The
-   * payload is observed exactly once by JSON serialization; the parsed
-   * canonical form is validated, persisted, folded, and returned. The
-   * CAS is unconditional (WP-104 precedent): every append verifies the
-   * store's highest seq still equals this instance's view of it,
-   * atomically with the insert.
+   * The single write path all six methods funnel through — an
+   * ECMAScript #private method, unreachable at runtime from outside the
+   * class (review round 1, finding 2). The payload is observed exactly
+   * once by JSON serialization; the parsed canonical form is validated,
+   * persisted, folded, and returned. The CAS is unconditional (WP-104
+   * precedent): every append verifies the store's highest seq still
+   * equals this instance's view of it, atomically with the insert.
    */
-  private appendEvent(
+  #appendEvent(
     requirementId: string,
     event: LedgerEventName,
     payload: Record<string, unknown>,
   ): LedgerEventRecord {
-    this.writerLock?.assertHeld("intent ledger append");
-    if (this.db.inTransaction) {
+    this.#writerLock?.assertHeld("intent ledger append");
+    if (this.#db.inTransaction) {
       throw new Error(
         "intent ledger append must not run inside an enclosing transaction: a rollback would " +
           "undo the row while callers already treated it as durable",
@@ -308,7 +374,7 @@ export class CanonLedgerStore {
         `ledger event payload must be representable as a plain JSON object: ${(error as Error).message}`,
       );
     }
-    const decision = decideLedgerAppend(this.view, {
+    const decision = decideLedgerAppend(this.#view, {
       requirementId,
       event,
       actor: DAVID_ACTOR,
@@ -317,10 +383,10 @@ export class CanonLedgerStore {
     if (!decision.ok) {
       throw new Error(`illegal intent ledger append: ${decision.problem}`);
     }
-    const expectedLastSeq = this.cachedLastSeq;
-    const recordedAt = this.now().toISOString();
-    const runAppend = this.db.transaction((): number => {
-      const lastSeq = this.db
+    const expectedLastSeq = this.#cachedLastSeq;
+    const recordedAt = this.#now().toISOString();
+    const runAppend = this.#db.transaction((): number => {
+      const lastSeq = this.#db
         .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM canon_ledger")
         .get() as { last: number };
       if (lastSeq.last !== expectedLastSeq) {
@@ -329,7 +395,7 @@ export class CanonLedgerStore {
             "a second writer violated the single-writer contract (CAM-STATE-03)",
         );
       }
-      const result = this.insert.run({
+      const result = this.#insert.run({
         requirementId,
         event,
         actor: DAVID_ACTOR,
@@ -347,19 +413,19 @@ export class CanonLedgerStore {
       payload: canonicalPayload,
       recordedAt,
     };
-    applyLedgerRecord(this.view, record);
-    this.cachedLastSeq = seq;
+    applyLedgerRecord(this.#view, record);
+    this.#cachedLastSeq = seq;
     return record;
   }
 
-  private readAll(): LedgerEventRecord[] {
-    const rows = this.db
+  #readAll(): LedgerEventRecord[] {
+    const rows = this.#db
       .prepare("SELECT * FROM canon_ledger ORDER BY seq ASC")
       .all() as LedgerRow[];
-    return rows.map((row) => this.toRecord(row));
+    return rows.map((row) => this.#toRecord(row));
   }
 
-  private toRecord(row: LedgerRow): LedgerEventRecord {
+  #toRecord(row: LedgerRow): LedgerEventRecord {
     // Canonical-form read (WP-104 precedent): every observer sees the
     // stringify/parse round-trip of the stored text, the same form
     // append produces — canonical JSON is the sole authority.

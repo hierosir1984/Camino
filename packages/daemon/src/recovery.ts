@@ -161,21 +161,46 @@ export function openRecoveredState(
       canonFacts,
       report,
       close(): void {
-        openCanonFacts.close();
-        openCanonLedger.close();
-        openJournal.close();
-        openStore.close();
+        // Exception-safe teardown (review round 1, finding 14): one
+        // throwing closer must not strand the later closers or the
+        // lock. Every closer runs; the lock ALWAYS releases; the first
+        // failure surfaces after cleanup finished.
+        const failures = closeAll([
+          () => openCanonFacts.close(),
+          () => openCanonLedger.close(),
+          () => openJournal.close(),
+          () => openStore.close(),
+        ]);
         lock.release();
+        if (failures.length > 0) throw failures[0];
       },
     };
   } catch (error) {
-    canonFacts?.close();
-    canonLedger?.close();
-    journal?.close();
-    eventStore?.close();
+    // Same guarantee on the constructor-refusal path: best-effort close
+    // of everything opened so far, the lock always released, and the
+    // ORIGINAL refusal (not a secondary close failure) rethrown.
+    closeAll([
+      () => canonFacts?.close(),
+      () => canonLedger?.close(),
+      () => journal?.close(),
+      () => eventStore?.close(),
+    ]);
     lock.release();
     throw error;
   }
+}
+
+/** Run every closer, collecting failures instead of aborting the chain. */
+function closeAll(closers: ReadonlyArray<() => void>): unknown[] {
+  const failures: unknown[] = [];
+  for (const closer of closers) {
+    try {
+      closer();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  return failures;
 }
 
 /**

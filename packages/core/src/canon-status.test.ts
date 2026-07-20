@@ -1,10 +1,14 @@
 /**
  * Status-tuple projection tests (WP-109, CAM-CANON-03 acceptance):
  * fixture walks of every tuple transition — including revert and
- * stale-evidence downgrades — asserting the design-specified tuples, with
- * rule coverage anchored the WP-101 way: every expectation names the
- * IMPLEMENTATION_RULES / EVIDENCE_RULES rows it exercises, and a final
- * assertion proves the exercised set IS the declared set.
+ * stale-evidence downgrades — asserting the design-specified tuples.
+ *
+ * Coverage is OBSERVED, not self-reported (review round 1, finding 10):
+ * every expectation goes through `explainRequirementStatus`, each step
+ * asserts the rules it claims actually FIRED for that derivation, and
+ * the final assertion proves the union of fired rules IS the declared
+ * rule set — a rule no walk reaches, or a claim no derivation backs,
+ * fails mechanically.
  *
  * The intent axis is walked exhaustively in canon-intent.test.ts; here
  * every step ALSO asserts the disposition column, proving facts never
@@ -21,10 +25,11 @@ import type {
 } from "@camino/shared";
 import { CANON_FACT_KINDS } from "@camino/shared";
 import { foldLedgerView } from "./canon-intent.js";
-import type { LedgerView } from "./canon-intent.js";
+import type { LedgerView, LedgerViewEntry } from "./canon-intent.js";
 import {
   EVIDENCE_RULES,
   IMPLEMENTATION_RULES,
+  explainRequirementStatus,
   projectRequirementStatus,
   projectStatus,
   renderStatusLine,
@@ -48,12 +53,15 @@ const HM1 = sha("d");
 const HM2 = sha("e");
 const HM3 = sha("f");
 const HM4 = sha("1");
+const BASE1 = sha("2");
+const BASE2 = sha("3");
 
 const main = (headSha: string): StatusContext => ({ kind: "main", headSha });
-const branch = (name: string, headSha: string): StatusContext => ({
+const branch = (name: string, headSha: string, baseSha = BASE1): StatusContext => ({
   kind: "branch",
   branch: name,
   headSha,
+  baseSha,
 });
 
 function ledgerRecord(
@@ -112,18 +120,20 @@ class Walk {
     rules: readonly string[],
     note: string,
   ): void {
-    const tuple = projectRequirementStatus(
-      this.view.get(R) as NonNullable<ReturnType<LedgerView["get"]>>,
-      this.facts,
-      context,
-    );
-    expect(tuple.implementation, `${note} (implementation)`).toEqual(implementation);
-    expect(tuple.evidence, `${note} (evidence)`).toBe(evidence);
+    const entry = this.view.get(R) as LedgerViewEntry;
+    const explained = explainRequirementStatus(entry, this.facts, context);
+    expect(explained.tuple.implementation, `${note} (implementation)`).toEqual(implementation);
+    expect(explained.tuple.evidence, `${note} (evidence)`).toBe(evidence);
     // CAM-CANON-01: no fact sequence moves the disposition.
-    expect(tuple.disposition, `${note} (disposition untouched by facts)`).toBe(
-      this.view.get(R)?.disposition,
+    expect(explained.tuple.disposition, `${note} (disposition untouched by facts)`).toBe(
+      entry.disposition,
     );
-    for (const rule of rules) this.exercised.add(rule);
+    // Coverage is observed: every claimed rule must have actually fired.
+    for (const rule of rules) {
+      expect(explained.fired.has(rule), `${note}: claimed rule ${rule} did not fire`).toBe(true);
+      this.exercised.add(rule);
+    }
+    for (const fired of explained.fired) this.exercised.add(fired);
   }
 }
 
@@ -165,7 +175,7 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       contextKind: "branch",
       branch: M1,
       headSha: HB1,
-      baseSha: H0,
+      baseSha: BASE1,
       outcome: "pass",
     });
     w.expect(
@@ -173,7 +183,7 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       { kind: "present-on", branch: M1 },
       "verified-live",
       ["E2"],
-      "verified at branch head",
+      "verified at the exact (head, base) binding",
     );
     w.expect(
       main(HM1),
@@ -183,13 +193,22 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       "branch verdicts never apply to main",
     );
 
-    // Branch advances without touching R: the verdict binding is old.
+    // Branch advances without touching R: the head binding is old.
     w.expect(
       branch(M1, HB2),
       { kind: "present-on", branch: M1 },
       "stale",
       ["E3"],
       "stale-evidence downgrade on head advance",
+    );
+
+    // Base drift alone also expires the binding (invariant 7 pair).
+    w.expect(
+      branch(M1, HB1, BASE2),
+      { kind: "present-on", branch: M1 },
+      "stale",
+      ["E3"],
+      "stale-evidence downgrade on base drift",
     );
 
     // A later touch invalidates outright: never inherits across branch changes.
@@ -206,7 +225,7 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       contextKind: "branch",
       branch: M1,
       headSha: HB2,
-      baseSha: H0,
+      baseSha: BASE1,
       outcome: "pass",
     });
     w.expect(
@@ -242,6 +261,16 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
     });
     w.expect(main(HM1), { kind: "on-main" }, "verified-live", ["E2"], "verified live on main");
 
+    // A later MAIN verdict must not mask the branch's own exact-binding
+    // proof (review round 1, finding 6 / self-found S1).
+    w.expect(
+      branch(M1, HB2),
+      { kind: "present-on", branch: M1 },
+      "verified-live",
+      ["E2", "E12"],
+      "own verdict outranks the later main verdict",
+    );
+
     // Main advances (someone else's mission): stale, not unverified — R untouched.
     w.expect(main(HM2), { kind: "on-main" }, "stale", ["E3"], "stale-evidence downgrade on main");
 
@@ -251,10 +280,35 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
 
     // Repair lands: on-main again — derived, not hand-maintained.
     w.fact("landed-on-main", { sha: HM4 });
-    w.expect(main(HM4), { kind: "on-main" }, "stale", ["I8"], "repair re-landed");
+    w.expect(main(HM4), { kind: "on-main" }, "stale", ["I3", "I8"], "repair re-landed");
   });
 
-  it("branch inheritance: untouched branches see main's state; touched branches never inherit evidence", () => {
+  it("branch fail-verdict outranks a later main pass (finding 6, fail direction)", () => {
+    const w = new Walk(exercised);
+    w.fact("implementation-recorded", { branch: M1, sha: HB1 });
+    w.fact("verification-verdict", {
+      contextKind: "branch",
+      branch: M1,
+      headSha: HB1,
+      baseSha: BASE1,
+      outcome: "fail",
+    });
+    w.fact("verification-verdict", {
+      contextKind: "main",
+      headSha: HM1,
+      baseSha: H0,
+      outcome: "pass",
+    });
+    w.expect(
+      branch(M1, HB1),
+      { kind: "present-on", branch: M1 },
+      "unverified",
+      ["E8", "E12"],
+      "the branch's own latest run failed; main's later pass cannot mask it",
+    );
+  });
+
+  it("mainline inheritance is fact-attested: landings never leak into branches on their own (finding 7)", () => {
     const w = new Walk(exercised);
     w.fact("landed-on-main", { sha: HM1 });
     w.fact("verification-verdict", {
@@ -264,18 +318,31 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       outcome: "pass",
     });
 
-    // M2 never touched R: main's implementation shows through; main's
-    // evidence applies but a cross-context binding is never live.
+    // A branch with NO branch-scoped facts shows absent — the projection
+    // has no git and must not guess that this branch's tree carries the
+    // landing (an old mission head predating the landing does not).
+    w.expect(
+      branch(M2, HB1),
+      { kind: "absent" },
+      "unverified",
+      ["I10", "E7"],
+      "no mainline-inherited fact: landing does not leak",
+    );
+
+    // Ancestry-aware machinery attests the carry: now on-main shows, and
+    // main evidence applies — as stale at best (cross-context binding).
+    w.fact("mainline-inherited", { branch: M2, sha: HM1 });
     w.expect(
       branch(M2, HB1),
       { kind: "on-main" },
       "stale",
       ["I4", "E5"],
-      "untouched branch inherits, stale at best",
+      "attested carry: on-main + inherited-stale evidence",
     );
 
-    // M3 touched R: the verbatim CAM-CANON-03 sentence — branch version unverified.
+    // A branch that touched R never inherits evidence (verbatim rule).
     w.fact("requirement-touched", { branch: M3, sha: HB3 });
+    w.fact("mainline-inherited", { branch: M3, sha: HM1 });
     w.expect(
       branch(M3, HB3),
       { kind: "on-main" },
@@ -290,35 +357,24 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       contextKind: "branch",
       branch: M3,
       headSha: HB3,
-      baseSha: H0,
+      baseSha: BASE1,
       outcome: "pass",
     });
     w.expect(
       branch(M2, HB2),
       { kind: "on-main" },
       "stale",
-      ["E7"],
+      ["E5"],
       "M3's verdict is invisible to M2",
     );
-    w.expect(
-      main(HM1),
-      { kind: "on-main" },
-      "verified-live",
-      ["E2"],
-      "main unaffected by branch verdicts",
-    );
+    w.expect(main(HM1), { kind: "on-main" }, "verified-live", ["E2"], "main unaffected");
   });
 
-  it("branch revert shadows inherited on-main; re-implementation clears the shadow", () => {
+  it("branch revert clears own presence AND attested inheritance; re-implementation restores", () => {
     const w = new Walk(exercised);
     w.fact("landed-on-main", { sha: HM1 });
-    w.expect(
-      branch(M1, HB1),
-      { kind: "on-main" },
-      "unverified",
-      ["I4"],
-      "inherited before the branch reverts",
-    );
+    w.fact("mainline-inherited", { branch: M1, sha: HM1 });
+    w.expect(branch(M1, HB1), { kind: "on-main" }, "unverified", ["I4"], "carrying the landing");
 
     w.fact("revert-recorded", { contextKind: "branch", branch: M1, sha: HB2 });
     w.expect(
@@ -341,15 +397,16 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       branch(M1, HB3),
       { kind: "present-on", branch: M1 },
       "unverified",
-      ["I7"],
-      "re-implementation clears the shadow",
+      ["I2", "I7"],
+      "re-implementation restores presence",
     );
   });
 
-  it("suspicion: external edits and rescans (CAM-CANON-06 seam)", () => {
+  it("suspicion: external edits and rescans stay context-scoped (CAM-CANON-06 seam)", () => {
     const w = new Walk(exercised);
     w.fact("landed-on-main", { sha: HM1 });
     w.fact("implementation-recorded", { branch: M1, sha: HB1 });
+    w.fact("mainline-inherited", { branch: M2, sha: HM1 });
 
     w.fact("absence-suspected", {
       contextKind: "main",
@@ -362,29 +419,54 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       ["I9"],
       "conservative invalidation until re-scanned",
     );
-    // A branch merely inheriting main's copy shares the doubt; a branch
-    // with its OWN implementation does not.
-    w.expect(
-      branch(M2, HB2),
-      { kind: "suspected-absent" },
-      "unverified",
-      ["I10"],
-      "inheriting branch shares the doubt",
-    );
+    // Main doubt does NOT cross into branches: their trees are their own
+    // (I10) — neither an own implementation nor an attested carry is
+    // doubted by an edit that happened on main.
     w.expect(
       branch(M1, HB1),
       { kind: "present-on", branch: M1 },
       "unverified",
-      ["I11"],
-      "own implementation not doubted",
+      ["I2"],
+      "own implementation not doubted by main suspicion",
+    );
+    w.expect(
+      branch(M2, HB2),
+      { kind: "on-main" },
+      "unverified",
+      ["I4"],
+      "attested carry not doubted by main suspicion (the branch tree is fixed)",
     );
 
     w.fact("absence-resolved", { contextKind: "main", resolution: "present" });
-    w.expect(main(HM2), { kind: "on-main" }, "unverified", ["I12"], "rescan confirms present");
+    w.expect(
+      main(HM2),
+      { kind: "on-main" },
+      "unverified",
+      ["I3", "I11"],
+      "rescan confirms present",
+    );
 
     w.fact("absence-suspected", { contextKind: "main", reason: "failing probe" });
     w.fact("absence-resolved", { contextKind: "main", resolution: "absent" });
-    w.expect(main(HM2), { kind: "absent" }, "unverified", ["I13"], "rescan confirms gone");
+    w.expect(main(HM2), { kind: "absent" }, "unverified", ["I12"], "rescan confirms gone");
+
+    // Branch-scoped suspicion and branch-scoped confirmed absence.
+    w.fact("absence-suspected", { contextKind: "branch", branch: M1, reason: "worktree wiped" });
+    w.expect(
+      branch(M1, HB1),
+      { kind: "suspected-absent" },
+      "unverified",
+      ["I9"],
+      "branch suspicion",
+    );
+    w.fact("absence-resolved", { contextKind: "branch", branch: M1, resolution: "absent" });
+    w.expect(
+      branch(M1, HB1),
+      { kind: "absent" },
+      "unverified",
+      ["I12"],
+      "branch rescan confirms gone — no fall-through to anything (finding 5)",
+    );
   });
 
   it("evidence blocked: quarantined verification wins over unverified/stale, never over live", () => {
@@ -416,7 +498,7 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       main(HM2),
       { kind: "on-main" },
       "verified-live",
-      ["E10"],
+      ["E2", "E10"],
       "a live verdict at head stands despite the block",
     );
 
@@ -427,8 +509,8 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       main(HM3),
       { kind: "on-main" },
       "stale",
-      ["E11"],
-      "block cleared: underlying staleness shows",
+      ["E3", "E11"],
+      "block cleared: staleness shows",
     );
 
     w.fact("verification-verdict", {
@@ -453,16 +535,16 @@ describe("fixture walks of every tuple transition (CAM-CANON-03 accept)", () => 
       branch(M1, HB1),
       { kind: "absent" },
       "blocked",
-      ["E9"],
+      ["E9", "E1"],
       "blocked before any verdict exists",
     );
   });
 
-  it("every declared projection rule was exercised by the walks above, and only declared rules", () => {
+  it("every declared projection rule FIRED in the walks above, and nothing undeclared ever fires", () => {
     const declared = new Set([...IMPLEMENTATION_RULES, ...EVIDENCE_RULES].map((r) => r.rule));
     expect(declared.size).toBe(IMPLEMENTATION_RULES.length + EVIDENCE_RULES.length);
     for (const rule of exercised) {
-      expect(declared.has(rule), `walk exercised undeclared rule ${rule}`).toBe(true);
+      expect(declared.has(rule), `derivations fired undeclared rule ${rule}`).toBe(true);
     }
     expect([...exercised].sort()).toEqual([...declared].sort());
   });
@@ -491,6 +573,14 @@ describe("dispositions and facts stay orthogonal (CAM-CANON-01 over the projecti
       ],
     },
     {
+      name: "resolved-accepted",
+      records: [
+        ledgerRecord(1, "requirement-proposed", { statement: "s", sourceMissionId: "m" }),
+        ledgerRecord(2, "requirement-disputed", { reason: "r", conflictWith: null }),
+        ledgerRecord(3, "dispute-resolved-accepted", { resolution: "keep" }),
+      ],
+    },
+    {
       name: "assumed",
       records: [
         ledgerRecord(1, "requirement-proposed", { statement: "s", sourceMissionId: "m" }),
@@ -511,6 +601,7 @@ describe("dispositions and facts stay orthogonal (CAM-CANON-01 over the projecti
     { kind: "requirement-touched", payload: { branch: M1, sha: HB1 } },
     { kind: "implementation-recorded", payload: { branch: M1, sha: HB1 } },
     { kind: "landed-on-main", payload: { sha: HM1 } },
+    { kind: "mainline-inherited", payload: { branch: M2, sha: HM1 } },
     {
       kind: "verification-verdict",
       payload: { contextKind: "main", headSha: HM1, baseSha: H0, outcome: "pass" },
@@ -522,8 +613,12 @@ describe("dispositions and facts stay orthogonal (CAM-CANON-01 over the projecti
     { kind: "verification-unblocked", payload: { contextKind: "main" } },
   ];
 
-  it("the storm uses every fact kind (else this property proves less than it claims)", () => {
+  it("the storm uses every fact kind and every disposition (else this property proves less than it claims)", () => {
     expect(new Set(stormPayloads.map((s) => s.kind)).size).toBe(CANON_FACT_KINDS.length);
+    const dispositionsCovered = new Set(
+      ledgers.map((l) => foldLedgerView(l.records).get(R)?.disposition),
+    );
+    expect(dispositionsCovered.size).toBe(6);
   });
 
   for (const { name, records } of ledgers) {
@@ -561,6 +656,31 @@ describe("dispositions and facts stay orthogonal (CAM-CANON-01 over the projecti
     expect(tuples.has("CAM-GHOST-99")).toBe(false);
     expect(tuples.get(R)?.implementation).toEqual({ kind: "absent" });
   });
+
+  it("fact order does not matter: the projection sorts by seq (finding 15)", () => {
+    const view = acceptedView();
+    const entry = view.get(R) as LedgerViewEntry;
+    const landing: CanonFactRecord = {
+      seq: 1,
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "a:b",
+      payload: { sha: HM1 },
+      recordedAt: "2026-07-03T00:00:00.000Z",
+    };
+    const revert: CanonFactRecord = {
+      seq: 2,
+      requirementId: R,
+      kind: "revert-recorded",
+      actor: "a:b",
+      payload: { contextKind: "main", sha: HM2 },
+      recordedAt: "2026-07-03T00:00:01.000Z",
+    };
+    const ascending = projectRequirementStatus(entry, [landing, revert], main(HM2));
+    const shuffled = projectRequirementStatus(entry, [revert, landing], main(HM2));
+    expect(ascending.implementation).toEqual({ kind: "absent" });
+    expect(shuffled).toEqual(ascending);
+  });
 });
 
 describe("the design §3.1 example line, verbatim", () => {
@@ -585,11 +705,7 @@ describe("the design §3.1 example line, verbatim", () => {
       },
     ];
     const context = branch(M1, HB1);
-    const tuple = projectRequirementStatus(
-      view.get(R) as NonNullable<ReturnType<LedgerView["get"]>>,
-      facts,
-      context,
-    );
+    const tuple = projectRequirementStatus(view.get(R) as LedgerViewEntry, facts, context);
     expect(renderStatusLine(R, tuple, context)).toBe(
       `${R}: accepted; changed on this branch; branch version unverified`,
     );
@@ -609,6 +725,7 @@ describe("validateCanonFact (shape hygiene)", () => {
       { kind: "requirement-touched", payload: { branch: M1, sha: HB1 } },
       { kind: "implementation-recorded", payload: { branch: M1, sha: HB1 } },
       { kind: "landed-on-main", payload: { sha: HM1 } },
+      { kind: "mainline-inherited", payload: { branch: M1, sha: HM1 } },
       { kind: "revert-recorded", payload: { contextKind: "branch", branch: M1, sha: HB1 } },
       { kind: "revert-recorded", payload: { contextKind: "main", sha: HM1 } },
       { kind: "absence-suspected", payload: { contextKind: "main", reason: "gone" } },
@@ -623,6 +740,7 @@ describe("validateCanonFact (shape hygiene)", () => {
     for (const shape of shapes) {
       expect(validateCanonFact({ ...good, ...shape }), shape.kind).toEqual({ ok: true });
     }
+    expect(new Set(shapes.map((s) => s.kind)).size).toBe(CANON_FACT_KINDS.length);
   });
 
   it("refuses malformed facts", () => {
@@ -639,6 +757,10 @@ describe("validateCanonFact (shape hygiene)", () => {
           kind: "implementation-recorded",
           payload: { branch: "main", sha: HB1 },
         },
+      },
+      {
+        why: "mainline-inherited without a branch",
+        input: { ...good, kind: "mainline-inherited", payload: { sha: HM1 } },
       },
       {
         why: "branch with forbidden characters",
@@ -687,23 +809,34 @@ describe("validateCanonFact (shape hygiene)", () => {
     }
   });
 
-  it("verifyCanonFactLog flags malformed rows and seq regressions", () => {
+  it("is total over hostile objects whose traps throw (finding 15)", () => {
+    const trap = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("getPrototypeOf trap escaped");
+        },
+      },
+    );
+    const verdict = validateCanonFact({ ...good, payload: trap as Record<string, unknown> });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.problem).toMatch(/hostile or exotic input refused/);
+  });
+
+  it("verifyCanonFactLog flags malformed rows, bad timestamps, and seq regressions", () => {
     const rows: CanonFactRecord[] = [
       { seq: 1, ...good, recordedAt: "2026-07-03T00:00:00.000Z" },
-      {
-        seq: 1,
-        ...good,
-        recordedAt: "2026-07-03T00:00:01.000Z",
-      },
-      {
-        seq: 3,
-        ...good,
-        payload: { sha: "tampered" },
-        recordedAt: "2026-07-03T00:00:02.000Z",
-      },
+      { seq: 1, ...good, recordedAt: "2026-07-03T00:00:01.000Z" },
+      { seq: 3, ...good, payload: { sha: "tampered" }, recordedAt: "2026-07-03T00:00:02.000Z" },
+      { seq: 4, ...good, recordedAt: "merge-event/not-an-iso-time" },
+      { seq: 5, ...good, recordedAt: "2026-02-30T00:00:00.000Z" },
+      { seq: 2 ** 53, ...good, recordedAt: "2026-07-03T00:00:03.000Z" },
     ];
     const divergences = verifyCanonFactLog(rows);
     expect(divergences.some((d) => /strictly increasing/.test(d.problem))).toBe(true);
     expect(divergences.some((d) => /sha/.test(d.problem))).toBe(true);
+    expect(divergences.some((d) => /ISO-8601/.test(d.problem))).toBe(true);
+    expect(divergences.some((d) => /not a real instant/.test(d.problem))).toBe(true);
+    expect(divergences.some((d) => /safe/.test(d.problem))).toBe(true);
   });
 });

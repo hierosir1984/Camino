@@ -31,12 +31,21 @@
  *     ledger view. No fact sequence can alter what `renderCanon`
  *     (canon-render.ts) or the disposition column produce.
  *
- * What this does NOT claim: a daemon bug could always write bytes into a
- * SQLite file it owns. The claim is that no CODE PATH exists that turns a
- * merge/revert/abandon event into a ledger mutation — the vocabulary,
- * the decision layer, the schema, and the store's method surface (six
- * named user-action methods, no generic append) would each have to be
- * changed deliberately to create one.
+ * WHAT THE CONSTRUCTION CLAIMS — AND WHAT IT DOES NOT (review round 1,
+ * finding 2 sharpened this): the claim is about EVENTS, exactly as
+ * CAM-CANON-01's accept criterion states it. A merge, revert, or
+ * abandonment EVENT is not expressible as a ledger append: it has no
+ * event name in the vocabulary, no payload schema, no transition row,
+ * and the schema CHECKs refuse it even as raw SQL. What no store can
+ * verify is CALLER INTENT: the six user-action methods are the daemon's
+ * internal surface for relaying the user's decisions (the GUI/approval
+ * flow of later WPs holds them), and a daemon component that invokes a
+ * user-action method WITHOUT a user action is a lying component — the
+ * same single-OS-user, in-process trust boundary every Camino store
+ * lives behind (WP-104 journal-writer trust; WP-003 boundary-naming
+ * precedent). The construction makes the honest path the only
+ * expressible path; it cannot make an in-process liar inexpressible,
+ * and does not claim to.
  */
 import { LEDGER_EVENTS, REQUIREMENT_ID_PATTERN } from "@camino/shared";
 import type {
@@ -71,13 +80,12 @@ export const DISPOSITION_TRANSITIONS: readonly DispositionTransition[] = [
     to: "proposed",
     basis: "§3.1 intake: PRD text surfaces requirements as proposed",
   },
-  {
-    row: "D2",
-    from: "descoped",
-    event: "requirement-proposed",
-    to: "proposed",
-    basis: "stable requirement ids: a later PRD may re-propose a descoped requirement",
-  },
+  // There is deliberately NO descoped → proposed row: the normative
+  // grammar (CAM-CANON-03) gives descoped no outgoing edge, so descoped
+  // is terminal (review round 1, finding 13 — an earlier re-proposal row
+  // was an unlicensed extension). If a later PRD re-introduces a descoped
+  // requirement, that is a change-control question for the user (parked
+  // in PR #51); until amended, intake mints a fresh requirement id.
   {
     row: "D3",
     from: "proposed",
@@ -205,6 +213,32 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
   if (requireNonEmpty && value.length === 0) return `${field} must be non-empty`;
   if (!value.isWellFormed()) return `${field} contains unpaired surrogate code units`;
   if (value.includes("\u0000")) return `${field} contains an embedded NUL`;
+  // Ledger text is SINGLE-LINE by contract: canon renders one line per
+  // requirement, and a statement carrying its own line breaks could
+  // smuggle marker-shaped or list-shaped lines into the rendered file
+  // (review round 1, finding 11).
+  if (/[\n\r]/.test(value))
+    return `${field} must be single-line (canon renders one line per field)`;
+  return null;
+}
+
+/** Exactly the form `Date.prototype.toISOString` produces. */
+const ISO_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * A recorded timestamp must be the canonical toISOString form AND
+ * round-trip through Date.parse unchanged - the regex alone admits
+ * impossible dates that JavaScript silently normalizes (2026-02-30
+ * parses as March 2nd; review round 1, finding 12).
+ */
+export function recordedAtProblem(value: unknown): string | null {
+  if (typeof value !== "string" || !ISO_UTC_PATTERN.test(value)) {
+    return `recordedAt must be an ISO-8601 UTC timestamp (toISOString form), got ${JSON.stringify(value)}`;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed) || new Date(parsed).toISOString() !== value) {
+    return `recordedAt ${JSON.stringify(value)} is not a real instant (does not round-trip through Date)`;
+  }
   return null;
 }
 
@@ -288,14 +322,26 @@ function transitionFor(
 
 /**
  * Decide one ledger append over the folded view. Total: never throws on
- * any input value; every refusal names its reason. Used by the store at
- * write time AND by `verifyLedgerLog` at adoption — one decision path
- * (the WP-101 decide.ts lesson).
+ * any input value — including exotic objects whose traps throw (review
+ * round 1, finding 15) — every refusal names its reason. Used by the
+ * store at write time AND by `verifyLedgerLog` at adoption — one
+ * decision path (the WP-101 decide.ts lesson).
  */
 export function decideLedgerAppend(
   view: LedgerView,
   input: LedgerAppendInput,
 ): LedgerAppendDecision {
+  try {
+    return decideLedgerAppendInner(view, input);
+  } catch (error) {
+    return {
+      ok: false,
+      problem: `payload observation threw (${(error as Error).message}) — hostile or exotic input refused`,
+    };
+  }
+}
+
+function decideLedgerAppendInner(view: LedgerView, input: LedgerAppendInput): LedgerAppendDecision {
   const requirementProblem = ((): string | null => {
     if (typeof input.requirementId !== "string") return "requirementId must be a string";
     if (!REQUIREMENT_ID_PATTERN.test(input.requirementId)) {
@@ -426,14 +472,19 @@ export function verifyLedgerLog(records: readonly LedgerEventRecord[]): LedgerLo
   const view: LedgerView = new Map();
   let lastSeq = 0;
   for (const record of records) {
-    if (!Number.isInteger(record.seq) || record.seq <= lastSeq) {
+    if (!Number.isSafeInteger(record.seq) || record.seq <= lastSeq) {
       divergences.push({
         seq: record.seq,
-        problem: `seq ${record.seq} is not strictly increasing after ${lastSeq}`,
+        problem: `seq ${record.seq} is not a safe, strictly increasing integer after ${lastSeq}`,
       });
       continue;
     }
     lastSeq = record.seq;
+    const timeIssue = recordedAtProblem(record.recordedAt);
+    if (timeIssue !== null) {
+      divergences.push({ seq: record.seq, problem: timeIssue });
+      continue;
+    }
     const decision = decideLedgerAppend(view, {
       requirementId: record.requirementId,
       event: record.event,

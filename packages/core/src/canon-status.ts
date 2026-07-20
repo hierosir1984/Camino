@@ -10,27 +10,35 @@
  * projection recomputes (§3.1). Intent-disposition comes exclusively from
  * the ledger view; no fact can move it (CAM-CANON-01).
  *
- * ORDERING SEMANTICS, stated for review: facts are interpreted in the
- * control plane's recorded observation order (`seq`), not by git
- * ancestry. Camino lands merges serially per repo (WP-103) and records
- * observations as it makes or discovers them; the log's order is the
- * order Camino acts on (the WP-101 philosophy). Undetected external
- * transitions between polls are outside the projection's knowledge —
- * design invariant 3 and CAM-CANON-06 state that limit; the reconciler
- * (later WP) records facts in discovery order.
+ * TREE-HONEST BRANCH CONTEXTS (review round 1, findings 5/7): the
+ * projection has no git, so it never GUESSES ancestry. A branch context
+ * derives exclusively from branch-scoped facts; main landings appear in
+ * a branch's view only through a `mainline-inherited` fact recorded by
+ * the ancestry-aware machinery that verified the landing is in the
+ * branch's tree. Main-context state — landings, suspicions — never
+ * bleeds into a branch on its own.
  *
- * EVIDENCE RULES carried verbatim from CAM-CANON-03/§4.2 (each rule has a
- * named row in EVIDENCE_RULES; the fixture walks assert coverage):
- *  - Verification never inherits across branch changes: a branch that
- *    touched R renders R's branch version unverified, whatever main says.
- *  - `verified-live` requires a passing verdict recorded IN this context
- *    whose head SHA equals the context's current head, with no later
- *    touch of R in this context (invariant 7: evidence binds to SHAs and
- *    expires rather than rebinding).
- *  - A main-context verdict applies to a branch context ONLY if the
- *    branch never touched R, and then always as `stale` at best — a
- *    cross-context binding is never "live" (SHA honesty). Branch-to-
- *    branch inheritance does not exist at all.
+ * ORDERING: facts are folded in recorded observation order (`seq`); the
+ * projection SORTS by seq, so callers may pass reads in any order
+ * (review round 1, finding 15). Undetected external transitions between
+ * polls are outside the projection's knowledge — design invariant 3 and
+ * CAM-CANON-06 state that limit.
+ *
+ * EVIDENCE (review round 1, findings 4/6): verdicts bind to
+ * (head SHA, base SHA) and expire rather than rebind (invariant 7).
+ * `verified-live` requires a verdict IN this context at exactly the
+ * context's current binding with no later touch. Verdicts recorded in
+ * the context itself always take precedence over inherited main
+ * verdicts, whatever their relative order; main evidence reaches a
+ * branch only when the branch has no verdict of its own, never touched
+ * the requirement, and carries the landing (`mainline-inherited`) — and
+ * then as `stale` at best, because a cross-context binding is never
+ * "live".
+ *
+ * Every rule is a named row in IMPLEMENTATION_RULES / EVIDENCE_RULES;
+ * `explainRequirementStatus` reports which rules FIRED, and the fixture
+ * walks assert mechanical coverage over the fired sets — coverage is
+ * observed, not self-reported (review round 1, finding 10).
  */
 import { REQUIREMENT_ID_PATTERN } from "@camino/shared";
 import type {
@@ -43,6 +51,7 @@ import type {
 } from "@camino/shared";
 import { CANON_FACT_KINDS } from "@camino/shared";
 import type { LedgerView, LedgerViewEntry } from "./canon-intent.js";
+import { recordedAtProblem } from "./canon-intent.js";
 
 /** One named projection rule (implementation or evidence axis), for coverage-walked fixtures. */
 export interface ProjectionRule {
@@ -71,7 +80,7 @@ export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
     rule: "I4",
     axis: "implementation",
     statement:
-      "on-main shows through in a branch context when the branch has no own implementation, no revert, and no suspicion",
+      "mainline-inherited(B), recorded by ancestry-aware machinery, ⇒ on-main in context B; a landing NEVER leaks into a branch context without it",
   },
   {
     rule: "I5",
@@ -82,18 +91,18 @@ export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
     rule: "I6",
     axis: "implementation",
     statement:
-      "revert-recorded(B) shadows both present-on(B) and inherited on-main in context B (the branch's tree lacks R)",
+      "revert-recorded(B) clears BOTH branch presence and inherited mainline for B (the branch's tree lacks R)",
   },
   {
     rule: "I7",
     axis: "implementation",
-    statement: "a later implementation-recorded(B) clears a branch revert shadow (re-implemented)",
+    statement: "a later implementation-recorded(B) restores present-on(B) (re-implemented)",
   },
   {
     rule: "I8",
     axis: "implementation",
     statement:
-      "a later landed-on-main clears a main revert (repair landed, re-derived not hand-reversed)",
+      "a later landed-on-main restores on-main in context main (repair landed, re-derived not hand-reversed)",
   },
   {
     rule: "I9",
@@ -105,25 +114,19 @@ export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
     rule: "I10",
     axis: "implementation",
     statement:
-      "outstanding main suspicion also renders suspected-absent in a branch context that is merely inheriting main's copy",
+      "main-context state never crosses into a branch on its own: main suspicion does not doubt a branch's tree, and a landing without mainline-inherited(B) leaves B absent",
   },
   {
     rule: "I11",
     axis: "implementation",
     statement:
-      "a branch's OWN implementation is not doubted by a main suspicion (present-on(B) wins over main doubt)",
+      "absence-resolved(C, present) clears the suspicion and restores the underlying derivation",
   },
   {
     rule: "I12",
     axis: "implementation",
     statement:
-      "absence-resolved(C, present) clears the suspicion and restores the underlying state",
-  },
-  {
-    rule: "I13",
-    axis: "implementation",
-    statement:
-      "absence-resolved(C, absent) clears the suspicion AND the presence for C (confirmed gone ⇒ absent)",
+      "absence-resolved(C, absent) clears the suspicion AND every presence for C — branch presence, inherited mainline, or the main landing — ⇒ absent (confirmed gone)",
   },
 ] as const;
 
@@ -137,43 +140,42 @@ export const EVIDENCE_RULES: readonly ProjectionRule[] = [
     rule: "E2",
     axis: "evidence",
     statement:
-      "a passing verdict in this context at exactly the context head, with no later touch ⇒ verified-live",
+      "the latest same-context verdict, passing, at exactly the context's (head, base) binding, with no later touch ⇒ verified-live",
   },
   {
     rule: "E3",
     axis: "evidence",
     statement:
-      "a passing verdict in this context at an older head, no later touch ⇒ stale (stale-evidence downgrade)",
+      "the latest same-context verdict, passing, at an expired binding (head or base drift), no later touch ⇒ stale (stale-evidence downgrade)",
   },
   {
     rule: "E4",
     axis: "evidence",
     statement:
-      "a touch of R in this context after the verdict ⇒ unverified (verification never inherits across branch changes)",
+      "a touch of R in this context after the governing verdict ⇒ unverified (verification never inherits across branch changes)",
   },
   {
     rule: "E5",
     axis: "evidence",
     statement:
-      "a main verdict applies to a branch that never touched R, as stale at best (cross-context bindings are never live)",
+      "main verdicts reach a branch ONLY with no own verdicts, no touch ever, and mainline-inherited(B) outstanding — and then as stale at best (cross-context bindings are never live)",
   },
   {
     rule: "E6",
     axis: "evidence",
     statement:
-      "a main verdict never applies to a branch that touched R (the CAM-CANON-03 sentence, verbatim)",
+      "a branch that touched R never sees main evidence (the CAM-CANON-03 sentence, verbatim)",
   },
   {
     rule: "E7",
     axis: "evidence",
-    statement:
-      "verdicts recorded on one branch never apply to another branch (no cross-branch inheritance)",
+    statement: "verdicts never cross between branches, nor from a branch into main",
   },
   {
     rule: "E8",
     axis: "evidence",
     statement:
-      "the latest applicable verdict being a FAIL ⇒ unverified (a failure is not evidence of verification)",
+      "the governing verdict being a FAIL ⇒ unverified (a failure is not evidence of verification)",
   },
   {
     rule: "E9",
@@ -185,13 +187,19 @@ export const EVIDENCE_RULES: readonly ProjectionRule[] = [
     rule: "E10",
     axis: "evidence",
     statement:
-      "verified-live at the exact context head stands even while blocked is outstanding (the run already happened)",
+      "verified-live at the exact context binding stands even while blocked is outstanding (the run already happened)",
   },
   {
     rule: "E11",
     axis: "evidence",
     statement:
       "verification-unblocked(C) clears the block and the underlying derivation shows through",
+  },
+  {
+    rule: "E12",
+    axis: "evidence",
+    statement:
+      "same-context verdicts take precedence over inherited main verdicts regardless of recording order (a later main verdict cannot mask a branch's own proof)",
   },
 ] as const;
 
@@ -273,9 +281,22 @@ function expectKeys(
  * Shape-validate one canon fact. Facts have NO transition machine: they
  * are observations of a world Camino does not control, and the projection
  * is total over any recorded sequence. Validation is hygiene only —
- * closed schemas, SHA/branch/requirement grammars, string safety.
+ * closed schemas, SHA/branch/requirement grammars, string safety. Total:
+ * hostile objects whose traps throw are refused, never thrown through
+ * (review round 1, finding 15).
  */
 export function validateCanonFact(input: CanonFactInput): FactValidation {
+  try {
+    return validateCanonFactInner(input);
+  } catch (error) {
+    return {
+      ok: false,
+      problem: `fact observation threw (${(error as Error).message}) — hostile or exotic input refused`,
+    };
+  }
+}
+
+function validateCanonFactInner(input: CanonFactInput): FactValidation {
   if (
     typeof input.requirementId !== "string" ||
     !REQUIREMENT_ID_PATTERN.test(input.requirementId)
@@ -307,6 +328,12 @@ export function validateCanonFact(input: CanonFactInput): FactValidation {
         );
       case "landed-on-main":
         return expectKeys(payload, ["sha"]) ?? shaProblem("sha", payload["sha"]);
+      case "mainline-inherited":
+        return (
+          expectKeys(payload, ["branch", "sha"]) ??
+          branchProblem("branch", payload["branch"]) ??
+          shaProblem("sha", payload["sha"])
+        );
       case "revert-recorded":
         return (
           expectKeys(payload, ["contextKind", "sha"], ["branch"]) ??
@@ -362,14 +389,19 @@ export function verifyCanonFactLog(
   const divergences: Array<{ seq: number; problem: string }> = [];
   let lastSeq = 0;
   for (const record of records) {
-    if (!Number.isInteger(record.seq) || record.seq <= lastSeq) {
+    if (!Number.isSafeInteger(record.seq) || record.seq <= lastSeq) {
       divergences.push({
         seq: record.seq,
-        problem: `seq ${record.seq} is not strictly increasing after ${lastSeq}`,
+        problem: `seq ${record.seq} is not a safe, strictly increasing integer after ${lastSeq}`,
       });
       continue;
     }
     lastSeq = record.seq;
+    const timeIssue = recordedAtProblem(record.recordedAt);
+    if (timeIssue !== null) {
+      divergences.push({ seq: record.seq, problem: timeIssue });
+      continue;
+    }
     const validation = validateCanonFact(record);
     if (!validation.ok) divergences.push({ seq: record.seq, problem: validation.problem });
   }
@@ -385,33 +417,68 @@ function contextKey(context: StatusContext): string {
   return context.kind === "branch" ? context.branch : "main";
 }
 
+/** The projection's full answer: the tuple plus which rules produced it. */
+export interface ExplainedStatus {
+  readonly tuple: StatusTuple;
+  /** Rule ids (from IMPLEMENTATION_RULES / EVIDENCE_RULES) that fired for this derivation. */
+  readonly fired: ReadonlySet<string>;
+}
+
 interface ImplementationFold {
   onMain: boolean;
+  everLanded: boolean;
+  landingRestored: boolean;
   /** Branches with a live own implementation. */
   presentOn: Set<string>;
-  /** Branches whose last revert shadows R (cleared by re-implementation). */
-  revertShadow: Set<string>;
+  /** Branches whose own implementation was restored after a revert (I7 evidence). */
+  presenceRestored: Set<string>;
+  /** Branches attested (by ancestry-aware machinery) to carry R's main landing. */
+  mainlineInherited: Set<string>;
   /** Context keys with an outstanding absence suspicion. */
   suspicion: Set<string>;
+  /** Context keys whose suspicion was cleared by a present-resolution (I11 evidence). */
+  suspicionCleared: Set<string>;
+  /** Context keys confirmed absent by a rescan (I12 evidence). */
+  confirmedAbsent: Set<string>;
+  /** Branches whose facts were cleared by a branch revert (I6 evidence). */
+  branchReverted: Set<string>;
 }
 
 function foldImplementation(facts: readonly CanonFactRecord[]): ImplementationFold {
   const fold: ImplementationFold = {
     onMain: false,
+    everLanded: false,
+    landingRestored: false,
     presentOn: new Set(),
-    revertShadow: new Set(),
+    presenceRestored: new Set(),
+    mainlineInherited: new Set(),
     suspicion: new Set(),
+    suspicionCleared: new Set(),
+    confirmedAbsent: new Set(),
+    branchReverted: new Set(),
   };
   for (const fact of facts) {
     switch (fact.kind) {
       case "implementation-recorded": {
         const branch = fact.payload["branch"] as string;
+        if (fold.branchReverted.has(branch) || fold.confirmedAbsent.has(branch)) {
+          fold.presenceRestored.add(branch); // I7
+        }
         fold.presentOn.add(branch);
-        fold.revertShadow.delete(branch); // I7
+        fold.confirmedAbsent.delete(branch);
         break;
       }
       case "landed-on-main": {
-        fold.onMain = true; // I3 / I8
+        if (fold.everLanded && !fold.onMain) fold.landingRestored = true; // I8
+        fold.onMain = true; // I3
+        fold.everLanded = true;
+        fold.confirmedAbsent.delete("main");
+        break;
+      }
+      case "mainline-inherited": {
+        const branch = fact.payload["branch"] as string;
+        fold.mainlineInherited.add(branch); // I4
+        fold.confirmedAbsent.delete(branch);
         break;
       }
       case "revert-recorded": {
@@ -420,7 +487,8 @@ function foldImplementation(facts: readonly CanonFactRecord[]): ImplementationFo
           fold.onMain = false; // I5
         } else {
           fold.presentOn.delete(key);
-          fold.revertShadow.add(key); // I6
+          fold.mainlineInherited.delete(key); // I6
+          fold.branchReverted.add(key);
         }
         break;
       }
@@ -430,11 +498,18 @@ function foldImplementation(facts: readonly CanonFactRecord[]): ImplementationFo
       }
       case "absence-resolved": {
         const key = factContextKey(fact.payload);
-        fold.suspicion.delete(key); // I12
+        if (fold.suspicion.has(key) && fact.payload["resolution"] === "present") {
+          fold.suspicionCleared.add(key); // I11
+        }
+        fold.suspicion.delete(key);
         if (fact.payload["resolution"] === "absent") {
-          // I13: confirmed gone.
+          // I12: confirmed gone — clear every presence for this context.
+          fold.confirmedAbsent.add(key);
           if (key === "main") fold.onMain = false;
-          else fold.presentOn.delete(key);
+          else {
+            fold.presentOn.delete(key);
+            fold.mainlineInherited.delete(key);
+          }
         }
         break;
       }
@@ -448,92 +523,204 @@ function foldImplementation(facts: readonly CanonFactRecord[]): ImplementationFo
 function deriveImplementation(
   fold: ImplementationFold,
   context: StatusContext,
+  fire: (rule: string) => void,
 ): ImplementationState {
   if (context.kind === "main") {
-    if (fold.suspicion.has("main")) return { kind: "suspected-absent" }; // I9
-    if (fold.onMain) return { kind: "on-main" }; // I3
-    return { kind: "absent" }; // I1 / I5
+    if (fold.suspicion.has("main")) {
+      fire("I9");
+      return { kind: "suspected-absent" };
+    }
+    if (fold.suspicionCleared.has("main")) fire("I11");
+    if (fold.confirmedAbsent.has("main")) fire("I12");
+    if (fold.onMain) {
+      fire("I3");
+      if (fold.landingRestored) fire("I8");
+      return { kind: "on-main" };
+    }
+    if (fold.everLanded) {
+      fire("I5"); // landed once, absent now: a revert or a confirming rescan removed it
+    } else {
+      fire("I1");
+    }
+    return { kind: "absent" };
   }
   const branch = context.branch;
-  if (fold.suspicion.has(branch)) return { kind: "suspected-absent" }; // I9
-  if (fold.revertShadow.has(branch)) return { kind: "absent" }; // I6
-  if (fold.presentOn.has(branch)) return { kind: "present-on", branch }; // I2 / I11
-  if (fold.suspicion.has("main")) return { kind: "suspected-absent" }; // I10 (inheriting a doubted copy)
-  if (fold.onMain) return { kind: "on-main" }; // I4
-  return { kind: "absent" }; // I1
+  if (fold.suspicion.has(branch)) {
+    fire("I9");
+    return { kind: "suspected-absent" };
+  }
+  if (fold.suspicionCleared.has(branch)) fire("I11");
+  if (fold.confirmedAbsent.has(branch)) fire("I12");
+  if (fold.presentOn.has(branch)) {
+    fire("I2");
+    if (fold.presenceRestored.has(branch)) fire("I7");
+    return { kind: "present-on", branch };
+  }
+  if (fold.mainlineInherited.has(branch)) {
+    fire("I4");
+    return { kind: "on-main" };
+  }
+  if (fold.branchReverted.has(branch)) {
+    fire("I6");
+  } else if (fold.onMain || fold.suspicion.has("main")) {
+    // Branch derivation is branch-scoped: a landing or suspicion on main
+    // alone leaves this branch untouched (I10 — the tree argument).
+    fire("I10");
+  } else if (!fold.confirmedAbsent.has(branch)) {
+    fire("I1");
+  }
+  return { kind: "absent" };
 }
 
-function deriveEvidence(facts: readonly CanonFactRecord[], context: StatusContext): EvidenceState {
+function deriveEvidence(
+  facts: readonly CanonFactRecord[],
+  context: StatusContext,
+  fire: (rule: string) => void,
+): EvidenceState {
   const key = contextKey(context);
-  const touchedInContext = (afterSeq: number): boolean =>
-    facts.some(
-      (f) =>
-        f.kind === "requirement-touched" &&
-        (f.payload["branch"] as string) === key &&
-        f.seq > afterSeq,
-    );
-  const everTouchedInContext =
+  const verdicts = facts.filter((f) => f.kind === "verification-verdict");
+  const ownVerdicts = verdicts.filter((f) => factContextKey(f.payload) === key);
+  const everTouched =
     context.kind === "branch" &&
     facts.some((f) => f.kind === "requirement-touched" && (f.payload["branch"] as string) === key);
-
-  // Applicable verdicts: this context's own, plus main's for a branch that
-  // never touched R (E5). Branch-to-branch inheritance does not exist (E7).
-  const applicable = facts.filter((f) => {
-    if (f.kind !== "verification-verdict") return false;
-    const verdictKey = factContextKey(f.payload);
-    if (verdictKey === key) return true;
-    if (context.kind === "branch" && verdictKey === "main" && !everTouchedInContext) return true; // E5/E6
-    return false;
-  });
+  const mainlineCarried =
+    context.kind === "branch" &&
+    ((): boolean => {
+      let carried = false;
+      for (const f of facts) {
+        if (f.kind === "mainline-inherited" && (f.payload["branch"] as string) === key)
+          carried = true;
+        if (f.kind === "revert-recorded" && factContextKey(f.payload) === key) carried = false;
+        if (
+          f.kind === "absence-resolved" &&
+          factContextKey(f.payload) === key &&
+          f.payload["resolution"] === "absent"
+        )
+          carried = false;
+      }
+      return carried;
+    })();
 
   const blockedOutstanding = ((): boolean => {
     let blocked = false;
     for (const f of facts) {
       if (f.kind === "verification-blocked" && factContextKey(f.payload) === key) blocked = true;
-      if (f.kind === "verification-unblocked" && factContextKey(f.payload) === key) blocked = false; // E11
+      if (f.kind === "verification-unblocked" && factContextKey(f.payload) === key) blocked = false;
     }
     return blocked;
   })();
+  const blockedOr = (state: EvidenceState): EvidenceState => {
+    if (blockedOutstanding) {
+      fire("E9");
+      return "blocked";
+    }
+    if (
+      facts.some((f) => f.kind === "verification-unblocked" && factContextKey(f.payload) === key)
+    ) {
+      fire("E11");
+    }
+    return state;
+  };
 
-  const latest = applicable.at(-1);
-  if (latest === undefined) {
-    return blockedOutstanding ? "blocked" : "unverified"; // E9 / E1
+  // Same-context verdicts take absolute precedence (E12). Inherited main
+  // verdicts are considered only when the branch has none of its own,
+  // never touched R, and demonstrably carries the landing (E5/E6/E7).
+  let governing: CanonFactRecord | undefined;
+  let inherited = false;
+  if (ownVerdicts.length > 0) {
+    governing = ownVerdicts.at(-1);
+    if (
+      context.kind === "branch" &&
+      verdicts.some(
+        (f) => factContextKey(f.payload) === "main" && f.seq > (governing as CanonFactRecord).seq,
+      )
+    ) {
+      fire("E12"); // a later main verdict exists and is NOT allowed to mask this one
+    }
+  } else if (context.kind === "branch" && !everTouched && mainlineCarried) {
+    const mainVerdicts = verdicts.filter((f) => factContextKey(f.payload) === "main");
+    governing = mainVerdicts.at(-1);
+    inherited = governing !== undefined;
+    if (inherited) fire("E5");
+  } else if (context.kind === "branch" && everTouched) {
+    if (verdicts.some((f) => factContextKey(f.payload) === "main")) fire("E6");
   }
-  if (latest.payload["outcome"] === "fail") {
-    return blockedOutstanding ? "blocked" : "unverified"; // E8 (+E9)
+  if (
+    governing === undefined &&
+    verdicts.length > 0 &&
+    !(context.kind === "branch" && everTouched)
+  ) {
+    fire("E7"); // verdicts exist, but none crosses into this context
   }
-  const verdictKey = factContextKey(latest.payload);
-  const liveBinding =
-    verdictKey === key &&
-    latest.payload["headSha"] === context.headSha &&
-    !touchedInContext(latest.seq);
-  if (liveBinding) return "verified-live"; // E2 / E10
-  if (touchedInContext(latest.seq)) {
-    // E4: a touch after the verdict invalidates it outright.
-    return blockedOutstanding ? "blocked" : "unverified";
+
+  if (governing === undefined) {
+    fire("E1");
+    return blockedOr("unverified");
   }
-  // Older binding in this context (E3) or an inherited main verdict (E5):
-  // evidence exists but is not bound to this exact head.
-  return blockedOutstanding ? "blocked" : "stale"; // E9
+
+  if (governing.payload["outcome"] === "fail") {
+    fire("E8");
+    return blockedOr("unverified");
+  }
+
+  const touchedAfter =
+    context.kind === "branch" &&
+    facts.some(
+      (f) =>
+        f.kind === "requirement-touched" &&
+        (f.payload["branch"] as string) === key &&
+        f.seq > (governing as CanonFactRecord).seq,
+    );
+  if (touchedAfter) {
+    fire("E4");
+    return blockedOr("unverified");
+  }
+
+  const headMatches = governing.payload["headSha"] === context.headSha;
+  const baseMatches =
+    context.kind === "main" ? true : governing.payload["baseSha"] === context.baseSha;
+  if (!inherited && headMatches && baseMatches) {
+    fire("E2");
+    if (blockedOutstanding) fire("E10");
+    return "verified-live";
+  }
+  fire("E3");
+  return blockedOr("stale");
 }
 
 /**
- * Project one requirement's status tuple for a context. `facts` must be
- * this requirement's facts in ascending seq order (the store's read
- * order); facts for other requirements are the caller's filtering
- * responsibility (`projectStatus` does it for whole views).
+ * Project one requirement's status tuple for a context, reporting which
+ * rules fired. `facts` are this requirement's records in any order (the
+ * projection sorts by seq); facts for other requirements are the
+ * caller's filtering responsibility (`projectStatus` does it for whole
+ * views).
  */
+export function explainRequirementStatus(
+  entry: LedgerViewEntry,
+  facts: readonly CanonFactRecord[],
+  context: StatusContext,
+): ExplainedStatus {
+  const ordered = [...facts].sort((a, b) => a.seq - b.seq);
+  const fired = new Set<string>();
+  const fire = (rule: string): void => {
+    fired.add(rule);
+  };
+  const fold = foldImplementation(ordered);
+  const implementation = deriveImplementation(fold, context, fire);
+  const evidence = deriveEvidence(ordered, context, fire);
+  return {
+    tuple: { disposition: entry.disposition, implementation, evidence },
+    fired,
+  };
+}
+
+/** The tuple alone (most callers). */
 export function projectRequirementStatus(
   entry: LedgerViewEntry,
   facts: readonly CanonFactRecord[],
   context: StatusContext,
 ): StatusTuple {
-  const fold = foldImplementation(facts);
-  return {
-    disposition: entry.disposition,
-    implementation: deriveImplementation(fold, context),
-    evidence: deriveEvidence(facts, context),
-  };
+  return explainRequirementStatus(entry, facts, context).tuple;
 }
 
 /**

@@ -62,11 +62,9 @@ describe("disposition transition walks (fixture walks of every intent transition
   // Each walk is one requirement's ledger history; steps name the row
   // they exercise. Together the walks must cover every declared row.
   const WALKS: Array<{ name: string; rows: string[] }> = [
-    {
-      name: "accept, descope, re-propose, dispute, resolve, descope",
-      rows: ["D1", "D3", "D12", "D2", "D4", "D8", "D13"],
-    },
+    { name: "accept then descope (CAM-CANON-10)", rows: ["D1", "D3", "D12"] },
     { name: "assumed path to descope", rows: ["D1", "D4", "D9", "D14"] },
+    { name: "resolved-accepted then descoped", rows: ["D1", "D4", "D8", "D13"] },
     { name: "dispute answered by descope", rows: ["D1", "D4", "D10"] },
     { name: "proposed declined at intake", rows: ["D1", "D11"] },
     {
@@ -113,6 +111,23 @@ describe("disposition transition walks (fixture walks of every intent transition
   it("every declared row's (from, event) pair is unique (the table is a function)", () => {
     const pairs = DISPOSITION_TRANSITIONS.map((r) => `${String(r.from)}|${r.event}`);
     expect(new Set(pairs).size).toBe(pairs.length);
+  });
+
+  it("descoped is terminal: no outgoing rows, and every event is refused from it (r1 finding 13)", () => {
+    expect(DISPOSITION_TRANSITIONS.some((r) => r.from === "descoped")).toBe(false);
+    const view = foldLedgerView([
+      record(1, R, "requirement-proposed", { statement: "s", sourceMissionId: "m1" }),
+      record(2, R, "requirement-descoped", { reason: "done" }),
+    ]);
+    for (const event of LEDGER_EVENTS) {
+      const decision = decideLedgerAppend(view, {
+        requirementId: R,
+        event,
+        actor: DAVID_ACTOR,
+        payload: payloadFor(event),
+      });
+      expect(decision.ok, `${event} from descoped`).toBe(false);
+    }
   });
 });
 
@@ -168,18 +183,6 @@ describe("fold semantics", () => {
     applyLedgerRecord(view, record(7, R, "requirement-descoped", { reason: "done arguing" }));
     expect(view.get(R)).toMatchObject({
       disposition: "descoped",
-      acceptedStatement: null,
-      assumption: null,
-    });
-
-    // Re-proposal starts a fresh cycle: nothing accepted carries over.
-    applyLedgerRecord(
-      view,
-      record(8, R, "requirement-proposed", { statement: "s3", sourceMissionId: "m2" }),
-    );
-    expect(view.get(R)).toMatchObject({
-      disposition: "proposed",
-      statement: "s3",
       acceptedStatement: null,
       assumption: null,
     });
@@ -367,6 +370,55 @@ describe("decideLedgerAppend refusals", () => {
       });
       expect(decision.ok).toBe(false);
     }
+  });
+
+  it("refuses multi-line text fields — canon renders one line per field (r1 finding 11)", () => {
+    const marker = "<!-- camino:canon rendered-at=2026-07-01T00:00:00.000Z ledger-seq=9 -->";
+    for (const statement of [`line one\n${marker}`, "a\rb", "a\r\nb"]) {
+      const decision = decideLedgerAppend(emptyView, {
+        requirementId: R,
+        event: "requirement-proposed",
+        actor: DAVID_ACTOR,
+        payload: { statement, sourceMissionId: "m1" },
+      });
+      expect(decision.ok, JSON.stringify(statement)).toBe(false);
+      if (!decision.ok) expect(decision.problem).toMatch(/single-line/);
+    }
+  });
+
+  it("is total over hostile objects whose traps throw (r1 finding 15)", () => {
+    const trap = new Proxy(
+      {},
+      {
+        getPrototypeOf() {
+          throw new Error("getPrototypeOf trap escaped");
+        },
+      },
+    );
+    const decision = decideLedgerAppend(emptyView, {
+      requirementId: R,
+      event: "requirement-proposed",
+      actor: DAVID_ACTOR,
+      payload: trap as Record<string, unknown>,
+    });
+    expect(decision.ok).toBe(false);
+    if (!decision.ok) expect(decision.problem).toMatch(/hostile or exotic input refused/);
+
+    const ownKeysTrap = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("ownKeys trap escaped");
+        },
+      },
+    );
+    const decision2 = decideLedgerAppend(emptyView, {
+      requirementId: R,
+      event: "requirement-accepted",
+      actor: DAVID_ACTOR,
+      payload: ownKeysTrap as Record<string, unknown>,
+    });
+    expect(decision2.ok).toBe(false);
   });
 });
 
