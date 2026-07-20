@@ -953,9 +953,17 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
       const spec = buildRegistryForTest({ cliPresent: () => true }).find(
         (s) => s.name === "claude-code",
       )!;
+      // ONE synchronous write (writeFileSync to fd 1), NOT async process.stdout
+      // + process.exit: process.exit does not drain async stdout, so on Linux
+      // the tail — the quota line, written last — is truncated before it
+      // reaches the pipe and the run misclassifies as "succeeded" (green on
+      // macOS, red on CI). A synchronous write lands every byte in the pipe
+      // before exit; the parent-side DRAIN is what this test exercises (reading
+      // the pipe-buffered tail past 'exit'). Same proven pattern as the flood
+      // mock's emitSync.
       const script =
-        `for(let i=0;i<${N};i++)process.stdout.write('{"type":"system","subtype":"init"}\\n');` +
-        `process.stdout.write(${JSON.stringify(claude.quota)}+"\\n");process.exit(0);`;
+        `const s='{"type":"system","subtype":"init"}\\n'.repeat(${N})+${JSON.stringify(claude.quota)}+'\\n';` +
+        `require('fs').writeFileSync(1,s);process.exit(0);`;
       (spec as { plan: AdapterSpec["plan"] }).plan = () => ({
         file: process.execPath,
         args: ["-e", script],
