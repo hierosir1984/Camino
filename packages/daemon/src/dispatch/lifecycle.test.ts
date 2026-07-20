@@ -1026,6 +1026,26 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
     }
   });
 
+  it("a quota failure followed by a generic error/footer stays quota-blocked, not succeeded (round-10 finding 1)", async () => {
+    // codex: item.completed(error, 429) then a generic turn.failed, exit 0. A
+    // terminal turn.failed is NOT recovery — only a success result clears a
+    // pending quota failure. Was mislabeled "succeeded" by the last-event test.
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const codexQuota = PROVIDER_LINES["codex-cli"]!.quota;
+      const turnFailed = '{"type":"turn.failed","error":{"message":"request failed"}}';
+      const rec = await dispatch(schemaEmittingAdapter("codex-cli", [codexQuota, turnFailed], 0), {
+        workdir: ws,
+        prompt: "x",
+      });
+      expect(rec.exitCode).toBe(0);
+      expect(rec.outcome).toBe("quota-blocked"); // the quota failure is not cleared by a generic error
+      expect(rec.quotaSignalSeen).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a RECOVERED quota signal (later events, clean exit) stays succeeded, with the pressure exposed (round-7 finding 2)", async () => {
     // An early rate-limit the worker moved past must not be misread as
     // blocked; the transient signal stays visible to the WP-106 quota-aware

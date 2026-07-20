@@ -507,20 +507,33 @@ export async function dispatch(
     const tailRing: StreamEvent[] = [];
     let totalEvents = 0;
     let anyEventQuota = false;
-    let lastEventQuota = false;
+    // A quota failure is "pending" (unrecovered) until a genuine SUCCESS
+    // terminal clears it. A later NON-quota event (a generic error / footer
+    // like codex turn.failed) is NOT recovery — only a success `result` clears
+    // it, so a quota failure followed by any other failure stays quota-blocked
+    // at exit 0 (round-10 finding 1). Replaces the too-weak "was the LAST event
+    // a quota signal" test.
+    let pendingQuota = false;
     const recordEvent = (ev: StreamEvent) => {
       totalEvents++;
       // Defensive read: a buggy parser could return an event whose quotaSignal
       // is a throwing getter — that must not crash the harness (round-3
       // finding 1; same spirit as the parseLine try/catch).
       let sig = false;
+      let kind: StreamEvent["kind"] | undefined;
       try {
         sig = ev.quotaSignal === true;
+        kind = ev.kind;
       } catch {
         sig = false;
       }
-      if (sig) anyEventQuota = true;
-      lastEventQuota = sig; // reset by every later event: "did the stream END on a quota error?"
+      if (sig) {
+        anyEventQuota = true;
+        pendingQuota = true;
+      } else if (kind === "result") {
+        // A successful terminal result — the worker recovered past the limit.
+        pendingQuota = false;
+      }
       if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);
       else {
         tailRing.push(ev);
@@ -731,13 +744,13 @@ export async function dispatch(
     } else if (killReason === "cancel") {
       outcome = "cancelled";
     } else if (exitCode === 0) {
-      // A stream whose FINAL parsed event carries a quota signal ended on a
-      // terminal quota error — a refusal even when the CLI exits 0 (CLIs do
-      // report error results with zero exits). An EARLIER signal followed by
-      // further events and a clean exit is a recovered, transient limit:
-      // still "succeeded", with the pressure exposed via quotaSignalSeen for
-      // the WP-106 quota-aware scheduler (round-7 finding 2).
-      outcome = lastEventQuota ? "quota-blocked" : "succeeded";
+      // A quota failure not cleared by a later SUCCESS result is terminal — a
+      // refusal even at exit 0 (CLIs report error results with zero exits), and
+      // a subsequent generic error/footer does NOT count as recovery (round-10
+      // finding 1). A quota signal cleared by a genuine success is a recovered
+      // transient limit → "succeeded", with the pressure still exposed via
+      // quotaSignalSeen for the WP-106 quota-aware scheduler (round-7 finding 2).
+      outcome = pendingQuota ? "quota-blocked" : "succeeded";
     } else if (quotaBlocked) {
       outcome = "quota-blocked";
     } else {
