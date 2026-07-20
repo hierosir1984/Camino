@@ -161,31 +161,32 @@ export function openRecoveredState(
       canonFacts,
       report,
       close(): void {
-        // Exception-safe teardown (review round 1, finding 14): one
-        // throwing closer must not strand the later closers or the
-        // lock. Every closer runs; the lock ALWAYS releases; the first
-        // failure surfaces after cleanup finished.
+        // Exception-safe teardown (review round 1 finding 14; round 2
+        // finding 11 folded the lock release itself into the guarded
+        // set): every closer runs, the lock release is itself guarded so
+        // it can neither strand the lock nor mask an earlier failure, and
+        // the first failure surfaces after cleanup finished.
         const failures = closeAll([
           () => openCanonFacts.close(),
           () => openCanonLedger.close(),
           () => openJournal.close(),
           () => openStore.close(),
+          () => lock.release(),
         ]);
-        lock.release();
         if (failures.length > 0) throw failures[0];
       },
     };
   } catch (error) {
     // Same guarantee on the constructor-refusal path: best-effort close
-    // of everything opened so far, the lock always released, and the
-    // ORIGINAL refusal (not a secondary close failure) rethrown.
+    // of everything opened so far INCLUDING the lock release, and the
+    // ORIGINAL refusal (not a secondary close/release failure) rethrown.
     closeAll([
       () => canonFacts?.close(),
       () => canonLedger?.close(),
       () => journal?.close(),
       () => eventStore?.close(),
+      () => lock.release(),
     ]);
-    lock.release();
     throw error;
   }
 }

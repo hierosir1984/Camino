@@ -372,18 +372,51 @@ describe("decideLedgerAppend refusals", () => {
     }
   });
 
-  it("refuses multi-line text fields — canon renders one line per field (r1 finding 11)", () => {
+  it("refuses every line terminator, not just CR/LF (r1 finding 11, r2 finding 9)", () => {
     const marker = "<!-- camino:canon rendered-at=2026-07-01T00:00:00.000Z ledger-seq=9 -->";
-    for (const statement of [`line one\n${marker}`, "a\rb", "a\r\nb"]) {
+    const separators = [
+      "\n",
+      "\r",
+      "\r\n",
+      "\u2028", // LINE SEPARATOR
+      "\u2029", // PARAGRAPH SEPARATOR
+      "\u0085", // NEL
+      "\u000b", // VERTICAL TAB
+      "\u000c", // FORM FEED
+    ];
+    for (const sep of separators) {
+      const statement = `line one${sep}${marker}`;
       const decision = decideLedgerAppend(emptyView, {
         requirementId: R,
         event: "requirement-proposed",
         actor: DAVID_ACTOR,
         payload: { statement, sourceMissionId: "m1" },
       });
-      expect(decision.ok, JSON.stringify(statement)).toBe(false);
+      expect(decision.ok, JSON.stringify(sep)).toBe(false);
       if (!decision.ok) expect(decision.problem).toMatch(/single-line/);
     }
+  });
+
+  it("accepts an expanded-year recordedAt (writer/verifier agree, r2 finding 8)", () => {
+    // A row whose clock produced an expanded-year toISOString must be
+    // adoptable by the same verifier — else the store self-poisons.
+    const expanded = new Date(Date.UTC(10000, 0, 1)).toISOString();
+    expect(expanded.startsWith("+010000")).toBe(true);
+    const divergences = verifyLedgerLog([
+      {
+        ...record(1, R, "requirement-proposed", { statement: "s", sourceMissionId: "m" }),
+        recordedAt: expanded,
+      },
+    ]);
+    expect(divergences).toEqual([]);
+    // But an impossible instant is still refused.
+    const bad = verifyLedgerLog([
+      {
+        ...record(1, R, "requirement-proposed", { statement: "s", sourceMissionId: "m" }),
+        recordedAt: "2026-02-30T00:00:00.000Z",
+      },
+    ]);
+    expect(bad).toHaveLength(1);
   });
 
   it("is total over hostile objects whose traps throw (r1 finding 15)", () => {

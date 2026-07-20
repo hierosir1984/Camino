@@ -106,9 +106,13 @@ export function canonFragment(entry: LedgerViewEntry): string {
 /** Render the canon file content for a ledger view. Deterministic; throws only on caller bugs. */
 export function renderCanon(view: LedgerView, options: RenderCanonOptions): string {
   assertIsoUtc("renderedAt", options.renderedAt);
-  if (!Number.isInteger(options.ledgerSeq) || options.ledgerSeq < 0) {
+  // SAFE integer, not merely integer (review round 2, finding 12):
+  // `Number.isInteger(1e21)` is true but `String(1e21)` is "1e+21",
+  // which the marker parser's `\d+` cannot read back — the rendered seq
+  // must always be plain digits so render→parse round-trips.
+  if (!Number.isSafeInteger(options.ledgerSeq) || options.ledgerSeq < 0) {
     throw new Error(
-      `ledgerSeq must be a non-negative integer, got ${JSON.stringify(options.ledgerSeq)}`,
+      `ledgerSeq must be a non-negative safe integer, got ${JSON.stringify(options.ledgerSeq)}`,
     );
   }
   const header =
@@ -256,7 +260,7 @@ export function computeCanonDivergence(
 export interface StandaloneFoldDecision {
   readonly required: boolean;
   /** Why the fold is due; null when it is not. */
-  readonly reason: "requirement-count" | "age" | null;
+  readonly reason: "requirement-count" | "age" | "body-defect" | null;
 }
 
 /**
@@ -265,12 +269,23 @@ export interface StandaloneFoldDecision {
  * requirements or has stood for more than 7 days. Exactly 5 requirements
  * or exactly 7 days does NOT trigger ("exceeds"). Zero divergence never
  * triggers regardless of file age — there is nothing to fold.
+ *
+ * A FRESHNESS DEFECT is due IMMEDIATELY regardless of count or age
+ * (review round 2, finding 2): if the file could not prove its lineage
+ * (missing/ambiguous marker, foreign marker, or an edited/truncated
+ * body), it is wrong NOW — waiting for five more requirements or seven
+ * days would leave a false-fresh canon in the repo. The empty-ledger
+ * case that used to be inert (nothing to count, so never triggered) is
+ * exactly this: a hostile body over an empty ledger folds on the defect.
  */
 export function standaloneFoldRequired(
   divergence: CanonDivergence,
   nowIso: string,
 ): StandaloneFoldDecision {
   assertIsoUtc("nowIso", nowIso);
+  if (divergence.freshnessDefect !== null) {
+    return { required: true, reason: "body-defect" };
+  }
   const count = divergence.divergedRequirementIds.length;
   if (count > STANDALONE_FOLD_REQUIREMENT_THRESHOLD) {
     return { required: true, reason: "requirement-count" };
@@ -283,4 +298,40 @@ export function standaloneFoldRequired(
     }
   }
   return { required: false, reason: null };
+}
+
+/**
+ * The deterministic decision a fold coordinator makes (review round 2,
+ * finding 1): given the full ledger log, the current canon file text,
+ * and the wall-clock instant, decide whether a standalone intent-only
+ * fold must run and, if so, produce the exact NEW file content to commit.
+ * This is the pure core of the CAM-CANON-02 mechanism; the surface that
+ * SCHEDULES it and RIDES it on a mission PR is the merge-machinery/daemon
+ * loop of a later WP (there is no mission-PR machinery yet to ride). By
+ * separating the decision (here, tested) from the wiring (later), a fold
+ * is never a hidden clock-driven side effect — a caller asks, gets a
+ * plan, and applies it.
+ */
+export interface CanonFoldPlan {
+  readonly foldRequired: boolean;
+  readonly reason: StandaloneFoldDecision["reason"];
+  readonly divergence: CanonDivergence;
+  /** The exact file content a fold would commit; null when no fold is required. */
+  readonly nextCanonText: string | null;
+}
+
+export function planStandaloneFold(
+  records: readonly LedgerEventRecord[],
+  canonText: string,
+  nowIso: string,
+): CanonFoldPlan {
+  assertIsoUtc("nowIso", nowIso);
+  const divergence = computeCanonDivergence(records, canonText);
+  const decision = standaloneFoldRequired(divergence, nowIso);
+  if (!decision.required) {
+    return { foldRequired: false, reason: null, divergence, nextCanonText: null };
+  }
+  const ledgerSeq = records.at(-1)?.seq ?? 0;
+  const nextCanonText = renderCanon(foldLedgerView(records), { ledgerSeq, renderedAt: nowIso });
+  return { foldRequired: true, reason: decision.reason, divergence, nextCanonText };
 }

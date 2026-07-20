@@ -26,6 +26,21 @@
  *    executing this module's SCHEMA in a fresh in-memory database
  *    (review round 1, finding 9 — an inert same-named trigger is a
  *    tampered store).
+ *
+ * TAMPER-EVIDENT, NOT TAMPER-PROOF — the boundary, named (WP-003/WP-104
+ * precedent; review round 2, findings 4/5). These checks detect
+ * accidental corruption, truncation, version drift, and inert-schema
+ * substitution, and they refuse such a file at open. They do NOT defend
+ * against a hostile process that already has WRITE ACCESS to the SQLite
+ * file and uses raw SQLite internals — a rootpage/writable_schema swap
+ * that leaves the (name, sql) rows intact while redirecting storage, or
+ * detaching a trigger from a LIVE store's own connection. A process with
+ * that access can rewrite any byte of any store and is the exact
+ * single-OS-user adversary the state directory's 0700 mode (WP-102) and
+ * the writer lock's stated scope (WP-104) already place OUT of contract;
+ * no in-process integrity check can add to that boundary, and chasing
+ * byte-level tamper-proofing here would be unwinnable. Restart re-runs
+ * adoption verification and refuses a store whose visible schema drifted.
  *  - UTF-8 pin so byte-level NUL CHECKs hold; unsafe-seq refusal at
  *    open (BigInt probe) and at insert (CHECK).
  *  - CAS append inside a transaction (in-process defense-in-depth under

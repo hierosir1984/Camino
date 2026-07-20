@@ -840,3 +840,195 @@ describe("validateCanonFact (shape hygiene)", () => {
     expect(divergences.some((d) => /safe/.test(d.problem))).toBe(true);
   });
 });
+
+describe("round-2 regressions (falsification review findings)", () => {
+  const acc = acceptedView();
+  const entry = acc.get(R) as LedgerViewEntry;
+
+  it("f3b: a branch's OWN implementation merge blocks inherited main evidence (no separate touch fact)", () => {
+    const facts: CanonFactRecord[] = [
+      {
+        seq: 1,
+        requirementId: R,
+        kind: "landed-on-main",
+        actor: "a:b",
+        payload: { sha: HM1 },
+        recordedAt: "2026-07-02T00:00:00.000Z",
+      },
+      {
+        seq: 2,
+        requirementId: R,
+        kind: "verification-verdict",
+        actor: "a:b",
+        payload: { contextKind: "main", headSha: HM1, baseSha: H0, outcome: "pass" },
+        recordedAt: "2026-07-02T00:00:01.000Z",
+      },
+      {
+        seq: 3,
+        requirementId: R,
+        kind: "mainline-inherited",
+        actor: "a:b",
+        payload: { branch: M1, sha: HM1 },
+        recordedAt: "2026-07-02T00:00:02.000Z",
+      },
+      {
+        seq: 4,
+        requirementId: R,
+        kind: "implementation-recorded",
+        actor: "a:b",
+        payload: { branch: M1, sha: HB1 },
+        recordedAt: "2026-07-02T00:00:03.000Z",
+      },
+    ];
+    const explained = explainRequirementStatus(entry, facts, branch(M1, HB1));
+    // The branch changed R itself → present-on, and it does NOT inherit
+    // main's verdict (E6 fires, not E5).
+    expect(explained.tuple.implementation).toEqual({ kind: "present-on", branch: M1 });
+    expect(explained.tuple.evidence).toBe("unverified");
+    expect(explained.fired.has("E6")).toBe(true);
+    expect(explained.fired.has("E5")).toBe(false);
+  });
+
+  it("f4b: a branch context named 'main' is rejected, not silently fed main verdicts", () => {
+    const facts: CanonFactRecord[] = [
+      {
+        seq: 1,
+        requirementId: R,
+        kind: "verification-verdict",
+        actor: "a:b",
+        payload: { contextKind: "main", headSha: HM1, baseSha: H0, outcome: "pass" },
+        recordedAt: "2026-07-02T00:00:00.000Z",
+      },
+    ];
+    expect(() =>
+      projectRequirementStatus(entry, facts, {
+        kind: "branch",
+        branch: "main",
+        headSha: HM1,
+        baseSha: BASE1,
+      }),
+    ).toThrow(/malformed status context/);
+  });
+
+  it("f4/f10: malformed contexts throw a clean domain error", () => {
+    expect(() =>
+      projectRequirementStatus(entry, [], { kind: "main", headSha: "short" } as never),
+    ).toThrow(/malformed status context/);
+    expect(() =>
+      projectRequirementStatus(entry, [], {
+        kind: "branch",
+        branch: M1,
+        headSha: HB1,
+        baseSha: "nope",
+      } as never),
+    ).toThrow(/malformed status context/);
+    expect(() => projectRequirementStatus(entry, [], { kind: "sideways" } as never)).toThrow(
+      /malformed status context/,
+    );
+    // An exotic context whose trap throws becomes the same clean refusal.
+    const trap = new Proxy(
+      { kind: "main", headSha: HM1 },
+      {
+        get(t, p) {
+          if (p === "kind") throw new Error("trap");
+          return (t as never)[p];
+        },
+      },
+    );
+    expect(() => projectRequirementStatus(entry, [], trap as never)).toThrow(
+      /malformed status context/,
+    );
+  });
+
+  it("f10b: duplicate-seq facts are order-independent (deterministic total ordering)", () => {
+    const landing: CanonFactRecord = {
+      seq: 1,
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "a:b",
+      payload: { sha: HM1 },
+      recordedAt: "2026-07-02T00:00:00.000Z",
+    };
+    const revert: CanonFactRecord = {
+      seq: 1,
+      requirementId: R,
+      kind: "revert-recorded",
+      actor: "a:b",
+      payload: { contextKind: "main", sha: HM2 },
+      recordedAt: "2026-07-02T00:00:00.000Z",
+    };
+    const a = projectRequirementStatus(entry, [landing, revert], main(HM2));
+    const b = projectRequirementStatus(entry, [revert, landing], main(HM2));
+    expect(a).toEqual(b);
+  });
+
+  it("f10a: validateCanonFact is total even when the thrown value's .message getter throws", () => {
+    const evil = new Proxy(
+      {},
+      {
+        ownKeys() {
+          const e: Record<string, unknown> = {};
+          Object.defineProperty(e, "message", {
+            get() {
+              throw new Error("nested");
+            },
+          });
+          throw e;
+        },
+      },
+    );
+    const verdict = validateCanonFact({
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "a:b",
+      payload: evil as Record<string, unknown>,
+    });
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.problem).toMatch(/hostile or exotic input refused/);
+  });
+
+  it("f7: I5 fires only for an actual main revert, never for a bare landing", () => {
+    // Landed, never reverted: main is on-main and fires I3 (not I5).
+    const landed = explainRequirementStatus(
+      entry,
+      [
+        {
+          seq: 1,
+          requirementId: R,
+          kind: "landed-on-main",
+          actor: "a:b",
+          payload: { sha: HM1 },
+          recordedAt: "2026-07-02T00:00:00.000Z",
+        },
+      ],
+      main(HM1),
+    );
+    expect(landed.fired.has("I5")).toBe(false);
+    expect(landed.fired.has("I3")).toBe(true);
+    // Landed then reverted: absent, fires I5.
+    const reverted = explainRequirementStatus(
+      entry,
+      [
+        {
+          seq: 1,
+          requirementId: R,
+          kind: "landed-on-main",
+          actor: "a:b",
+          payload: { sha: HM1 },
+          recordedAt: "2026-07-02T00:00:00.000Z",
+        },
+        {
+          seq: 2,
+          requirementId: R,
+          kind: "revert-recorded",
+          actor: "a:b",
+          payload: { contextKind: "main", sha: HM2 },
+          recordedAt: "2026-07-02T00:00:01.000Z",
+        },
+      ],
+      main(HM2),
+    );
+    expect(reverted.tuple.implementation).toEqual({ kind: "absent" });
+    expect(reverted.fired.has("I5")).toBe(true);
+  });
+});

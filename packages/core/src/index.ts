@@ -98,6 +98,7 @@ export {
   decideLedgerAppend,
   foldLedgerView,
   recordedAtProblem,
+  safeErrorLabel,
   verifyLedgerLog,
 } from "./canon-intent.js";
 export type {
@@ -115,6 +116,7 @@ export {
   projectRequirementStatus,
   projectStatus,
   renderStatusLine,
+  statusContextProblem,
   validateCanonFact,
   verifyCanonFactLog,
 } from "./canon-status.js";
@@ -126,11 +128,13 @@ export {
   canonFragment,
   computeCanonDivergence,
   parseCanonMarker,
+  planStandaloneFold,
   renderCanon,
   standaloneFoldRequired,
 } from "./canon-render.js";
 export type {
   CanonDivergence,
+  CanonFoldPlan,
   CanonMarker,
   FreshnessDefect,
   RenderCanonOptions,

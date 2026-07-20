@@ -384,3 +384,34 @@ BEGIN SELECT 1; END;`);
     expect(() => new CanonFactsStore(path)).toThrow(/not a real instant/);
   });
 });
+
+describe("round-2 regressions (falsification review findings)", () => {
+  it("f9: an extra smuggled schema object is refused at open", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    new CanonFactsStore(path).close();
+    const raw = new Database(path);
+    raw.exec("CREATE INDEX extra_smuggled ON canon_facts (actor)");
+    raw.close();
+    expect(() => new CanonFactsStore(path)).toThrow(/schema objects|does not match/);
+  });
+
+  it("f12: an expanded-year recordedAt round-trips", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-facts.sqlite");
+    let tick = 0;
+    const farFuture = () => new Date(Date.UTC(10000, 0, 1, 0, 0, tick++));
+    const store = new CanonFactsStore(path, { now: farFuture });
+    const rec = store.recordFact({
+      requirementId: R,
+      kind: "landed-on-main",
+      actor: "camino:merge",
+      payload: { sha: SHA },
+    });
+    expect(rec.recordedAt.startsWith("+010000")).toBe(true);
+    store.close();
+    const reopened = new CanonFactsStore(path, { now: farFuture });
+    expect(reopened.read()).toHaveLength(1);
+    reopened.close();
+  });
+});

@@ -15,6 +15,7 @@ import {
   canonFragment,
   computeCanonDivergence,
   parseCanonMarker,
+  planStandaloneFold,
   renderCanon,
   standaloneFoldRequired,
 } from "./canon-render.js";
@@ -146,8 +147,26 @@ describe("renderCanon (CAM-CANON-02: canon text = rendered projection of accepte
     ).toThrow(/ISO-8601/);
     expect(() => renderCanon(view, { ledgerSeq: -1, renderedAt: T0 })).toThrow(/non-negative/);
     expect(() => renderCanon(view, { ledgerSeq: 1.5, renderedAt: T0 })).toThrow(
-      /non-negative integer/,
+      /non-negative safe integer/,
     );
+    // A too-large "integer" (1e21) stringifies to "1e+21" — refused so the
+    // marker always round-trips (review round 2, finding 12).
+    expect(() => renderCanon(view, { ledgerSeq: 1e21, renderedAt: T0 })).toThrow(
+      /non-negative safe integer/,
+    );
+    expect(() =>
+      renderCanon(view, { ledgerSeq: Number.MAX_SAFE_INTEGER + 1, renderedAt: T0 }),
+    ).toThrow(/non-negative safe integer/);
+  });
+
+  it("accepts an expanded-year renderedAt is NOT required, but rejects one the marker can't hold", () => {
+    // The marker deliberately restricts renderedAt to the four-digit-year
+    // form so render→parse round-trips; an expanded-year instant is out
+    // of the canon-file's this-millennium scope.
+    const view = foldLedgerView([]);
+    expect(() =>
+      renderCanon(view, { ledgerSeq: 0, renderedAt: "+010000-01-01T00:00:00.000Z" }),
+    ).toThrow(/ISO-8601/);
   });
 });
 
@@ -377,10 +396,24 @@ describe("computeCanonDivergence + standaloneFoldRequired (registry item 17)", (
     expect(divergence.divergedRequirementIds).toEqual(["CAM-DEMO-01"]);
   });
 
-  it("an empty ledger with unprovable freshness has nothing to fold", () => {
-    const divergence = computeCanonDivergence([], "no marker at all\n");
+  it("an empty ledger behind an UNPROVABLE body still folds — to write the correct empty canon (finding 2)", () => {
+    // The pre-fold behavior (nothing to count over an empty ledger, so
+    // never triggered) let a hostile body over an empty ledger stay
+    // false-fresh forever. A freshness defect now folds immediately.
+    const divergence = computeCanonDivergence([], "hand-written garbage, no marker\n");
     expect(divergence.divergedRequirementIds).toEqual([]);
     expect(divergence.freshnessDefect).toBe("no-marker");
+    expect(standaloneFoldRequired(divergence, T0)).toEqual({
+      required: true,
+      reason: "body-defect",
+    });
+  });
+
+  it("an empty ledger behind its OWN faithful empty canon does not fold", () => {
+    const faithfulEmpty = renderCanon(foldLedgerView([]), { ledgerSeq: 0, renderedAt: T0 });
+    const divergence = computeCanonDivergence([], faithfulEmpty);
+    expect(divergence.freshnessDefect).toBeNull();
+    expect(divergence.divergedRequirementIds).toEqual([]);
     expect(standaloneFoldRequired(divergence, T0).required).toBe(false);
   });
 
@@ -402,5 +435,50 @@ describe("canonFragment (the divergence comparison unit)", () => {
     const entry = view.get("CAM-DEMO-01");
     expect(entry).toBeDefined();
     if (entry !== undefined) expect(canonFragment(entry)).toBe("");
+  });
+});
+
+describe("planStandaloneFold (r2 finding 1: the deterministic coordinator decision)", () => {
+  it("no fold when the file is the faithful current rendering", () => {
+    const records = proposeAndAccept(1, "CAM-DEMO-01", "s");
+    const plan = planStandaloneFold(records, faithfulText(records, 2), plusMs(T0, DAY));
+    expect(plan.foldRequired).toBe(false);
+    expect(plan.nextCanonText).toBeNull();
+  });
+
+  it("folds on a body defect and produces the correct next canon text", () => {
+    const records = proposeAndAccept(1, "CAM-DEMO-01", "the real text");
+    const hostile = faithfulText(records, 2).replace("the real text", "tampered");
+    const now = plusMs(T0, DAY);
+    const plan = planStandaloneFold(records, hostile, now);
+    expect(plan.foldRequired).toBe(true);
+    expect(plan.reason).toBe("body-defect");
+    // The produced text is exactly what a fresh render at HEAD would write.
+    expect(plan.nextCanonText).toBe(
+      renderCanon(foldLedgerView(records), { ledgerSeq: 2, renderedAt: now }),
+    );
+    // And it is itself faithful: re-planning against it does not re-fold.
+    const replan = planStandaloneFold(records, plan.nextCanonText as string, plusMs(now, DAY));
+    expect(replan.foldRequired).toBe(false);
+  });
+
+  it("folds on the count threshold and writes the whole current ledger", () => {
+    const base = proposeAndAccept(1, "CAM-DEMO-00", "base");
+    const canon = faithfulText(base, 2);
+    const records = [...base];
+    for (let i = 1; i <= 6; i += 1) {
+      records.push(
+        ...proposeAndAccept(
+          1 + 2 * i,
+          `CAM-DEMO-${String(i).padStart(2, "0")}`,
+          `s${i}`,
+          plusMs(T0, i),
+        ),
+      );
+    }
+    const now = plusMs(T0, DAY);
+    const plan = planStandaloneFold(records, canon, now);
+    expect(plan).toMatchObject({ foldRequired: true, reason: "requirement-count" });
+    expect(plan.nextCanonText).toContain("CAM-DEMO-06");
   });
 });

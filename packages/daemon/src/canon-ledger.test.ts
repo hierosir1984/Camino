@@ -429,3 +429,58 @@ BEGIN SELECT 1; END;`);
     expect(() => new CanonLedgerStore(path)).toThrow(/recordedAt/);
   });
 });
+
+describe("round-2 regressions (falsification review findings)", () => {
+  it("f8: crossing the safe-integer ceiling via sqlite_sequence tampering is refused at insert", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    const store = new CanonLedgerStore(path, { now: fixedClock() });
+    store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" });
+    store.close();
+    const raw = new Database(path);
+    cleanups.push(() => raw.close());
+    // Force the AUTOINCREMENT cursor just below the safe ceiling.
+    raw
+      .prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'canon_ledger'")
+      .run(9007199254740990);
+    // Two auto appends: the first lands at MAX_SAFE, the second would be
+    // MAX_SAFE+1 and the CHECK refuses it.
+    raw
+      .prepare(
+        "INSERT INTO canon_ledger (requirement_id, event, actor, payload, recorded_at) VALUES (?, 'requirement-accepted', 'david', '{}', '2026-07-20T00:00:00.000Z')",
+      )
+      .run(R);
+    expect(() =>
+      raw
+        .prepare(
+          "INSERT INTO canon_ledger (requirement_id, event, actor, payload, recorded_at) VALUES (?, 'requirement-descoped', 'david', ?, '2026-07-20T00:00:00.000Z')",
+        )
+        .run(R, JSON.stringify({ reason: "over the ceiling" })),
+    ).toThrow(/CHECK/);
+  });
+
+  it("f9: an ATTACH/temp extra schema object is caught by the count check", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    new CanonLedgerStore(path).close();
+    const raw = new Database(path);
+    raw.exec("CREATE TABLE extra_smuggled (x INTEGER)");
+    raw.close();
+    expect(() => new CanonLedgerStore(path)).toThrow(/schema objects|does not match/);
+  });
+
+  it("f12: an expanded-year recordedAt round-trips (writer and reader agree)", () => {
+    const dir = tempDir();
+    const path = join(dir, "canon-ledger.sqlite");
+    // A clock at year 10000 produces "+010000-…"; the store must adopt it.
+    let tick = 0;
+    const farFuture = () => new Date(Date.UTC(10000, 0, 1, 0, 0, tick++));
+    const store = new CanonLedgerStore(path, { now: farFuture });
+    const rec = store.proposeRequirement(R, { statement: "s", sourceMissionId: "m1" });
+    expect(rec.recordedAt.startsWith("+010000")).toBe(true);
+    store.close();
+    const reopened = new CanonLedgerStore(path, { now: farFuture });
+    expect(reopened.read()[0]?.recordedAt.startsWith("+010000")).toBe(true);
+    reopened.close();
+  });
+});

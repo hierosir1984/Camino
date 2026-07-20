@@ -208,26 +208,62 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === null || proto === Object.prototype;
 }
 
+/**
+ * A totality-safe error description (review round 2, finding 10): even
+ * reading `error.message` can throw when the thrown value is itself a
+ * hostile object with a trapping getter. A catch clause that builds its
+ * refusal string from `(error as Error).message` therefore re-throws —
+ * the wrapper does not, and neither may this helper.
+ */
+export function safeErrorLabel(error: unknown): string {
+  try {
+    if (error instanceof Error) {
+      const message = error.message;
+      if (typeof message === "string") return message;
+    }
+    const described = String(error);
+    return typeof described === "string" ? described : "unprintable error value";
+  } catch {
+    return "unprintable error value";
+  }
+}
+
 function stringProblem(field: string, value: unknown, requireNonEmpty = true): string | null {
   if (typeof value !== "string") return `${field} must be a string`;
   if (requireNonEmpty && value.length === 0) return `${field} must be non-empty`;
   if (!value.isWellFormed()) return `${field} contains unpaired surrogate code units`;
   if (value.includes("\u0000")) return `${field} contains an embedded NUL`;
   // Ledger text is SINGLE-LINE by contract: canon renders one line per
-  // requirement, and a statement carrying its own line breaks could
-  // smuggle marker-shaped or list-shaped lines into the rendered file
-  // (review round 1, finding 11).
-  if (/[\n\r]/.test(value))
-    return `${field} must be single-line (canon renders one line per field)`;
+  // requirement (review round 1 finding 11; round 2 finding 9 widened
+  // this to every Unicode line terminator so a statement cannot smuggle a
+  // marker-shaped or list-shaped line into the rendered file).
+  if (LINE_TERMINATOR.test(value)) {
+    return `${field} must be single-line (no line terminators \u2014 canon renders one line per field)`;
+  }
   return null;
 }
 
-/** Exactly the form `Date.prototype.toISOString` produces. */
-const ISO_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+/**
+ * Every Unicode line-terminator, not just CR/LF (review round 2, finding
+ * 9): U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR), U+0085 (NEL), and the
+ * legacy VT/FF all render as visual line breaks.
+ */
+// eslint-disable-next-line no-control-regex -- matching control-class line terminators is the point
+const LINE_TERMINATOR = /[\n\r\u0085\u000b\u000c\u2028\u2029]/;
 
 /**
- * A recorded timestamp must be the canonical toISOString form AND
- * round-trip through Date.parse unchanged - the regex alone admits
+ * Exactly the forms `Date.prototype.toISOString` produces: the four-digit
+ * calendar-year form for years 0000-9999, AND the signed six-digit
+ * "expanded year" form for instants outside that range (review round 2,
+ * finding 8 \u2014 `new Date(Date.UTC(10000, 0, 1)).toISOString()` is
+ * `+010000-...`, and a writer using the system clock must produce values
+ * its own verifier accepts).
+ */
+const ISO_UTC_PATTERN = /^([+-]\d{6}|\d{4})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * A recorded timestamp must be a canonical toISOString form AND
+ * round-trip through Date.parse unchanged \u2014 the regex alone admits
  * impossible dates that JavaScript silently normalizes (2026-02-30
  * parses as March 2nd; review round 1, finding 12).
  */
@@ -336,7 +372,7 @@ export function decideLedgerAppend(
   } catch (error) {
     return {
       ok: false,
-      problem: `payload observation threw (${(error as Error).message}) — hostile or exotic input refused`,
+      problem: `payload observation threw (${safeErrorLabel(error)}) — hostile or exotic input refused`,
     };
   }
 }
