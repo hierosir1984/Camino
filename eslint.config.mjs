@@ -170,7 +170,13 @@ export default tseslint.config(
     allowRegex: CORE_TEST_ALLOWLIST_REGEX,
   }),
   {
-    files: ["scripts/**/*.mjs", "spikes/**/*.mjs", "packages/gui/build.mjs"],
+    files: [
+      "scripts/**/*.mjs",
+      "spikes/**/*.mjs",
+      "packages/gui/build.mjs",
+      // The dispatch layer's fake CLI (zero-quota conformance stand-in).
+      "packages/daemon/src/dispatch/adapters/mock-cli.mjs",
+    ],
     languageOptions: {
       globals: {
         process: "readonly",

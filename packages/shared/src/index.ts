@@ -62,6 +62,33 @@ export type {
   GitHubQueryTransport,
 } from "./external-ops.js";
 
+// WP-105: the worker-adapter dispatch contract (CAM-EXEC-01/06, CAM-SEC-06).
+export { GITHUB_CREDENTIAL_MARKERS, isGithubCredentialShapedKey } from "./adapter.js";
+export type {
+  StreamEvent,
+  DispatchOutcome,
+  SpawnPlan,
+  AdapterContext,
+  AdapterSpec,
+  KillConfirmRecord,
+  EnvPostureRecord,
+  LeaseReleaseContext,
+  LeaseHandle,
+  LeaseDisposition,
+  DispatchRecord,
+} from "./adapter.js";
+
+// WP-105: the API-key adapter interface — typed contract + conformance
+// skeleton, implementation [F] (CAM-EXEC-01 interface clause).
+export {
+  CREDENTIAL_ENV_VAR_PATTERN,
+  checkApiKeyAdapterSpec,
+  checkPlanCredentialCustody,
+  checkAdapterPlanCustody,
+  API_KEY_ADAPTER_DISPATCH_OBLIGATIONS,
+} from "./api-key-adapter.js";
+export type { ApiKeyAdapterSpec, ConformanceViolation } from "./api-key-adapter.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,

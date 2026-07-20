@@ -59,3 +59,21 @@ export type {
   SchedulingLane,
   SerializationViolation,
 } from "./serialization-scheduler.js";
+
+// WP-105: the product adapter/dispatch layer (CAM-EXEC-01/06, CAM-SEC-06).
+export {
+  dispatch,
+  killConfirm,
+  processTreeConfirmedGone,
+  DisabledAdapterError,
+  PRODUCTION_KILL_CONFIRM,
+} from "./dispatch/lifecycle.js";
+export type { DispatchOptions, KillConfirmTimings } from "./dispatch/lifecycle.js";
+export { composeWorkerEnv } from "./dispatch/env.js";
+export { classifyByQuotaSignal } from "./dispatch/quota.js";
+export { buildRegistry, cliOnPath, DEFAULT_ATTESTATIONS_PATH } from "./dispatch/registry.js";
+export type { RegistryOptions } from "./dispatch/registry.js";
+export { claudeAdapter } from "./dispatch/adapters/claude.js";
+export { codexAdapter } from "./dispatch/adapters/codex.js";
+export { grokAdapter } from "./dispatch/adapters/grok.js";
+export { committedSince, headSha, makeWorkspace } from "./dispatch/workspace.js";
