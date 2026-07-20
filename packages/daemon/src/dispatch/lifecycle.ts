@@ -519,13 +519,21 @@ export async function dispatch(
       // Defensive read: a buggy parser could return an event whose quotaSignal
       // is a throwing getter — that must not crash the harness (round-3
       // finding 1; same spirit as the parseLine try/catch).
+      // Read the two properties in SEPARATE try blocks: a throwing
+      // terminalSuccess getter must NOT erase an already-read valid quotaSignal
+      // (that would misclassify a rate-limit as requirement-failed, violating
+      // CAM-EXEC-06 — round-12 finding 2).
       let sig = false;
-      let terminalOk = false;
       try {
         sig = ev.quotaSignal === true;
-        terminalOk = ev.terminalSuccess === true;
       } catch {
         sig = false;
+      }
+      let terminalOk = false;
+      try {
+        terminalOk = ev.terminalSuccess === true;
+      } catch {
+        terminalOk = false;
       }
       if (sig) {
         anyEventQuota = true;

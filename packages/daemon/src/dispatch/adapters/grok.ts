@@ -82,9 +82,17 @@ export function grokAdapter(
         return { kind: "other", text: "thought" };
       }
       if (type === "end" || type.includes("result") || type.includes("done")) {
-        // grok is single-turn: `end` is both the final answer and the success
-        // terminal that closes the turn (round-11 finding 1).
-        return { kind: "result", text: data.slice(0, 400), terminalSuccess: true };
+        // kind "result" carries the final answer for finalText. But
+        // terminalSuccess (which clears a pending quota failure) is set ONLY on
+        // the PROVEN single-turn terminal `type === "end"` — the broader
+        // result/done aliases (tool_result, done_progress, result.delta, …) are
+        // NOT terminals, and setting it there wrongly cleared quota
+        // (round-12 finding 1).
+        return {
+          kind: "result",
+          text: data.slice(0, 400),
+          ...(type === "end" ? { terminalSuccess: true as const } : {}),
+        };
       }
       if (type.includes("error")) {
         const text = (data || type).slice(0, 400);

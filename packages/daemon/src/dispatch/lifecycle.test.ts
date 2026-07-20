@@ -2,7 +2,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { AdapterSpec, LeaseHandle, LeaseReleaseContext } from "@camino/shared";
+import type { AdapterSpec, LeaseHandle, LeaseReleaseContext, StreamEvent } from "@camino/shared";
 import {
   dispatch,
   DisabledAdapterError,
@@ -654,6 +654,34 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("a hostile terminalSuccess getter cannot ERASE a valid quota signal (round-12 finding 2)", async () => {
+    // quotaSignal and terminalSuccess are read in SEPARATE try blocks, so a
+    // throwing terminalSuccess getter cannot reset an already-read quota
+    // signal — a rate-limit must never be misclassified requirement-failed
+    // (CAM-EXEC-06).
+    const ws = makeWorkspace();
+    try {
+      const hostile: AdapterSpec = {
+        ...mockAdapter("quota"), // the fake CLI emits a line then exits nonzero
+        parseLine: (): StreamEvent =>
+          ({
+            kind: "error",
+            text: "429 rate limit reached",
+            quotaSignal: true,
+            get terminalSuccess(): boolean {
+              throw new Error("toxic terminalSuccess getter");
+            },
+          }) as StreamEvent,
+      };
+      const rec = await dispatch(hostile, { workdir: ws, prompt: "x" });
+      expect(rec.exitCode).not.toBe(0);
+      expect(rec.outcome).toBe("quota-blocked"); // quota preserved despite the throwing getter
+      expect(rec.quotaSignalSeen).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a throwing transcript sink cannot crash the dispatch; cleanup + lease still run (round-1 finding 2)", async () => {
     const ws = makeWorkspace();
     try {
@@ -1062,6 +1090,28 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
         { workdir: ws, prompt: "x" },
       );
       expect(rec.outcome).toBe("quota-blocked"); // the turn did NOT complete
+      expect(rec.quotaSignalSeen).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("grok: a non-terminal event containing 'result'/'done' does NOT clear pending quota — only `end` is terminal (round-12 finding 1)", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const rec = await dispatch(
+        schemaEmittingAdapter(
+          "grok-build",
+          [
+            PROVIDER_LINES["grok-build"]!.quota,
+            '{"type":"tool_result","data":"ran a tool"}', // includes "result" but is NOT a terminal
+            '{"type":"error","message":"something failed"}',
+          ],
+          0,
+        ),
+        { workdir: ws, prompt: "x" },
+      );
+      expect(rec.outcome).toBe("quota-blocked"); // tool_result must not clear the quota failure
       expect(rec.quotaSignalSeen).toBe(true);
     } finally {
       rmSync(ws, { recursive: true, force: true });
