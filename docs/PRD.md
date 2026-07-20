@@ -119,7 +119,21 @@ Notation: **[P1]** = walking skeleton (phase 1), **[P2]** = pilot phase, **[P3]*
 
 ### 4.6 CAM-CANON — intent ledger, canon, gaps, knowledge
 
-- **CAM-CANON-01 [P1]** The intent ledger lives in the control plane; only user actions (intake confirmations, dispute answers, descope approvals) mutate it. *Accept:* no code path mutates intent from merge/revert/abandon events — enforced by construction and covered by tests. (§3.1)
+> Amended 2026-07-20 (AMEND-9, approved by David in PR #51): CAM-CANON-01's "enforced by
+> construction" is scoped to what a control-plane store can actually guarantee. The
+> code-lifecycle EVENTS (merge / revert / abandon) are inexpressible as ledger mutations — they
+> have no event name in the ledger vocabulary, no payload schema, no transition row, and no
+> schema-permitted form — and the ledger's only write surface is the enumerated user-action
+> methods, actor-bound to the user. What no store can verify is that a real user action, rather
+> than a misbehaving in-process component, drove a legal user-action call; that residual sits
+> inside the same single-OS-user in-process trust boundary the state directory's 0700 mode
+> (WP-102) and the writer lock (WP-104) already define, and a capability token would not close it
+> (its minting authority is itself trusted in-process code, so it moves the boundary rather than
+> removing it). Surfaced by the WP-109 review (rounds 1–4). Raw findings and dispositions are on
+> PR #51; the scoped verify pass ran against the application commit and its record follows in that
+> thread.
+
+- **CAM-CANON-01 [P1]** The intent ledger lives in the control plane; only user actions (intake confirmations, dispute answers, descope approvals) mutate it. *Accept:* no code path can express intent mutation from merge/revert/abandon events — those events have no ledger vocabulary, decision-path, or schema-permitted form, and the ledger's only write surface is the enumerated user-action methods (actor-bound to the user); enforced by construction and covered by tests. The residual in-process caller-intent trust boundary is named (AMEND-9 note above). (§3.1)
 - **CAM-CANON-02 [P1]** Canon text in the repo is the rendered projection of accepted intent, updated by folds riding mission PRs; it carries a rendered-at marker; a standalone intent-only fold triggers when ledger-vs-text divergence exceeds 5 requirements or 7 days. (§3.1, §13)
 - **CAM-CANON-03 [P1]** Status is derived per requirement as the design §3.1 tuple, normative here: intent-disposition (`proposed`→`accepted` | `disputed`→(`resolved-accepted`|`assumed`|`descoped`)) × implementation-state per branch context (`absent` | `present-on(<branch>)` | `on-main` | `suspected-absent`) × evidence-state (`unverified` | `verified-live` | `stale` | `blocked`). Rules carried verbatim: verification never inherits across branch changes (a branch that touched R renders R's branch version unverified); reverts and external edits recompute projections; only user actions move intent-dispositions. Context packs and GUI render the tuple for the reader's context. *Accept:* fixture walks of every transition, including revert and stale-evidence downgrades, produce the design-specified tuples. (§3.1)
 - **CAM-CANON-04 [P2]** Brownfield induction builds a draft canon with per-statement provenance and confidence; conflicts become `disputed` plus a blast-radius-ranked question queue resolved lazily; `assumed` exists for unknowable history; induction also establishes the validatable-repo profile. (§3.3)
