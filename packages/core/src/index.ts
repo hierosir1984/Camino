@@ -62,3 +62,30 @@ export type { AttemptSnapshot, IssueSnapshot, MissionSnapshot, StateView } from 
 
 export { queuedEntrySeqs, fifoOrder, auditActivationOrder } from "./serialization.js";
 export type { ActivationDeviation } from "./serialization.js";
+
+// WP-104: intent lifecycle + reconciliation decision path (CAM-STATE-02/03).
+export {
+  DAVID_ACTOR,
+  INTENT_RESOLUTION_ROUTES,
+  applyIntentRecord,
+  decideIntentAppend,
+  foldIntentView,
+  validateOperationSpec,
+  verifyIntentLog,
+} from "./intent-lifecycle.js";
+export type {
+  IntentAppendDecision,
+  IntentAppendInput,
+  IntentLogDivergence,
+  IntentResolutionRoute,
+  IntentView,
+  IntentViewEntry,
+  SpecValidation,
+} from "./intent-lifecycle.js";
+
+export {
+  decideReconciliation,
+  statusOnlyVerdict,
+  ReconcileFactsMismatchError,
+} from "./reconcile.js";
+export type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "./reconcile.js";
