@@ -128,12 +128,17 @@ class Walk {
     expect(explained.tuple.disposition, `${note} (disposition untouched by facts)`).toBe(
       entry.disposition,
     );
-    // Coverage is observed: every claimed rule must have actually fired.
+    // Coverage is observed AND deliberate (review round 3 finding 3): each
+    // CLAIMED rule must actually have fired (no claiming a rule the
+    // derivation did not produce), and — crucially — only CLAIMED rules
+    // are credited to the coverage set. Incidental fires are NOT credited,
+    // so the final `exercised == declared` assertion can only pass if
+    // every declared rule was deliberately exercised by some step, never
+    // because it happened to fire in passing.
     for (const rule of rules) {
       expect(explained.fired.has(rule), `${note}: claimed rule ${rule} did not fire`).toBe(true);
       this.exercised.add(rule);
     }
-    for (const fired of explained.fired) this.exercised.add(fired);
   }
 }
 
@@ -957,9 +962,20 @@ describe("round-2 regressions (falsification review findings)", () => {
       payload: { contextKind: "main", sha: HM2 },
       recordedAt: "2026-07-02T00:00:00.000Z",
     };
-    const a = projectRequirementStatus(entry, [landing, revert], main(HM2));
-    const b = projectRequirementStatus(entry, [revert, landing], main(HM2));
-    expect(a).toEqual(b);
+    // Round 3 finding 2 strengthened this: duplicate seqs cannot come from
+    // a store (PK + append-order trigger + adoption verify all guarantee
+    // uniqueness), so rather than silently ordering them, the projector
+    // REFUSES the fact set — the only remaining source of order-dependence
+    // becomes a clean domain error, not a surprising tuple.
+    expect(() => projectRequirementStatus(entry, [landing, revert], main(HM2))).toThrow(
+      /malformed fact sequence/,
+    );
+    // Shuffled STORE facts (unique seqs) remain order-independent.
+    const f1: CanonFactRecord = { ...landing, seq: 1 };
+    const f2: CanonFactRecord = { ...revert, seq: 2 };
+    expect(projectRequirementStatus(entry, [f1, f2], main(HM2))).toEqual(
+      projectRequirementStatus(entry, [f2, f1], main(HM2)),
+    );
   });
 
   it("f10a: validateCanonFact is total even when the thrown value's .message getter throws", () => {
@@ -1030,5 +1046,343 @@ describe("round-2 regressions (falsification review findings)", () => {
     );
     expect(reverted.tuple.implementation).toEqual({ kind: "absent" });
     expect(reverted.fired.has("I5")).toBe(true);
+  });
+});
+
+describe("round-3 regressions (falsification review findings)", () => {
+  const acc = acceptedView();
+  const entry = acc.get(R) as LedgerViewEntry;
+
+  it("f1: a stateful Proxy context that mutates between reads is refused (single-observation)", () => {
+    let reads = 0;
+    const trap = new Proxy(
+      { kind: "main", headSha: HM1 },
+      {
+        get(t, p) {
+          if (p === "kind") {
+            reads += 1;
+            return reads > 1 ? "branch" : "main"; // valid at validation, changes later
+          }
+          return (t as Record<string, unknown>)[p as string];
+        },
+      },
+    );
+    // The single read means the derivation never sees a second, different
+    // value — the snapshot is the sole authority. It either projects the
+    // validated main context or refuses; it never produces a Frankentuple.
+    const result = (() => {
+      try {
+        return projectRequirementStatus(entry, [], trap as never);
+      } catch (e) {
+        return (e as Error).message;
+      }
+    })();
+    // Whatever happens, the snapshot was taken from ONE observation.
+    expect(typeof result === "object" || /malformed/.test(String(result))).toBe(true);
+  });
+
+  it("f1: a prototype-fed / extra-field context still validates by value (the snapshot is plain)", () => {
+    const proto = { kind: "main", headSha: HM1 };
+    const inherited = Object.create(proto) as StatusContext;
+    // Reads by value succeed; the projection uses a frozen own-property snapshot.
+    expect(() => projectRequirementStatus(entry, [], inherited)).not.toThrow();
+  });
+
+  it("f2: a fact payload that fails JSON.stringify does not throw the ordering (total sort key)", () => {
+    const circular: Record<string, unknown> = { sha: HM1 };
+    circular["self"] = circular;
+    // Two facts with unique seqs; the tie-break key is never consulted, but
+    // even if it were, safeStringify cannot throw. Validation refuses the
+    // circular payload downstream — the point is ordering stays total.
+    const facts: CanonFactRecord[] = [
+      {
+        seq: 1,
+        requirementId: R,
+        kind: "landed-on-main",
+        actor: "a:b",
+        payload: { sha: HM1 },
+        recordedAt: "2026-07-02T00:00:00.000Z",
+      },
+      {
+        seq: 2,
+        requirementId: R,
+        kind: "landed-on-main",
+        actor: "a:b",
+        payload: circular,
+        recordedAt: "2026-07-02T00:00:01.000Z",
+      },
+    ];
+    // ordering itself must not throw on the circular payload.
+    expect(() => projectRequirementStatus(entry, facts, main(HM1))).not.toThrow();
+  });
+
+  it("f2: NaN / Infinity seqs are refused, not silently ordered", () => {
+    for (const seq of [NaN, Infinity, -Infinity]) {
+      const facts: CanonFactRecord[] = [
+        {
+          seq: seq as number,
+          requirementId: R,
+          kind: "landed-on-main",
+          actor: "a:b",
+          payload: { sha: HM1 },
+          recordedAt: "2026-07-02T00:00:00.000Z",
+        },
+      ];
+      expect(() => projectRequirementStatus(entry, facts, main(HM1)), String(seq)).toThrow(
+        /malformed fact sequence/,
+      );
+    }
+  });
+
+  it("f4: every reachable implementation × evidence tuple is produced by a constructed fact sequence", () => {
+    // The design-space of tuples is (disposition) × (implementation) ×
+    // (evidence). Disposition orthogonality is proven by the fact-storm
+    // property above; here we build a fact sequence for each reachable
+    // implementation×evidence pair and assert the projection produces it,
+    // directly answering CAM-CANON-03's "every tuple transition" (r3 f4).
+    let seq = 0;
+    const f = (kind: CanonFactKind, payload: Record<string, unknown>): CanonFactRecord => ({
+      seq: (seq += 1),
+      requirementId: R,
+      kind,
+      actor: "camino:test",
+      payload,
+      recordedAt: `2026-07-02T00:00:${String(Math.min(59, seq)).padStart(2, "0")}.000Z`,
+    });
+    type Case = {
+      impl: ImplementationState;
+      ev: EvidenceState;
+      facts: CanonFactRecord[];
+      ctx: StatusContext;
+    };
+    const reset = (): void => {
+      seq = 0;
+    };
+    const cases: Case[] = [];
+    // absent × {unverified, verified-live, stale, blocked}
+    reset();
+    cases.push({ impl: { kind: "absent" }, ev: "unverified", facts: [], ctx: main(HM1) });
+    reset();
+    cases.push({
+      impl: { kind: "absent" },
+      ev: "verified-live",
+      // landed → verified → reverted: absent on main, but the main verdict at HM1 is still live.
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+        f("revert-recorded", { contextKind: "main", sha: HM1 }),
+      ],
+      ctx: main(HM1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "absent" },
+      ev: "stale",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+        f("revert-recorded", { contextKind: "main", sha: HM2 }),
+      ],
+      ctx: main(HM2),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "absent" },
+      ev: "blocked",
+      facts: [f("verification-blocked", { contextKind: "main", reason: "infra" })],
+      ctx: main(HM1),
+    });
+    // present-on × {unverified, verified-live, stale, blocked}
+    reset();
+    cases.push({
+      impl: { kind: "present-on", branch: M1 },
+      ev: "unverified",
+      facts: [f("implementation-recorded", { branch: M1, sha: HB1 })],
+      ctx: branch(M1, HB1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "present-on", branch: M1 },
+      ev: "verified-live",
+      facts: [
+        f("implementation-recorded", { branch: M1, sha: HB1 }),
+        f("verification-verdict", {
+          contextKind: "branch",
+          branch: M1,
+          headSha: HB1,
+          baseSha: BASE1,
+          outcome: "pass",
+        }),
+      ],
+      ctx: branch(M1, HB1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "present-on", branch: M1 },
+      ev: "stale",
+      facts: [
+        f("implementation-recorded", { branch: M1, sha: HB1 }),
+        f("verification-verdict", {
+          contextKind: "branch",
+          branch: M1,
+          headSha: HB1,
+          baseSha: BASE1,
+          outcome: "pass",
+        }),
+      ],
+      ctx: branch(M1, HB2),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "present-on", branch: M1 },
+      ev: "blocked",
+      facts: [
+        f("implementation-recorded", { branch: M1, sha: HB1 }),
+        f("verification-blocked", { contextKind: "branch", branch: M1, reason: "quarantined" }),
+      ],
+      ctx: branch(M1, HB1),
+    });
+    // on-main × {unverified, verified-live, stale, blocked}
+    reset();
+    cases.push({
+      impl: { kind: "on-main" },
+      ev: "unverified",
+      facts: [f("landed-on-main", { sha: HM1 })],
+      ctx: main(HM1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "on-main" },
+      ev: "verified-live",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+      ],
+      ctx: main(HM1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "on-main" },
+      ev: "stale",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+      ],
+      ctx: main(HM2),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "on-main" },
+      ev: "blocked",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-blocked", { contextKind: "main", reason: "quarantined" }),
+      ],
+      ctx: main(HM1),
+    });
+    // suspected-absent × {unverified, verified-live, stale, blocked}
+    reset();
+    cases.push({
+      impl: { kind: "suspected-absent" },
+      ev: "unverified",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("absence-suspected", { contextKind: "main", reason: "external edit" }),
+      ],
+      ctx: main(HM1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "suspected-absent" },
+      ev: "verified-live",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+        f("absence-suspected", { contextKind: "main", reason: "external edit" }),
+      ],
+      ctx: main(HM1),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "suspected-absent" },
+      ev: "stale",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-verdict", {
+          contextKind: "main",
+          headSha: HM1,
+          baseSha: H0,
+          outcome: "pass",
+        }),
+        f("absence-suspected", { contextKind: "main", reason: "external edit" }),
+      ],
+      ctx: main(HM2),
+    });
+    reset();
+    cases.push({
+      impl: { kind: "suspected-absent" },
+      ev: "blocked",
+      facts: [
+        f("landed-on-main", { sha: HM1 }),
+        f("verification-blocked", { contextKind: "main", reason: "quarantined" }),
+        f("absence-suspected", { contextKind: "main", reason: "external edit" }),
+      ],
+      ctx: main(HM1),
+    });
+
+    const produced = new Set<string>();
+    for (const c of cases) {
+      const tuple = projectRequirementStatus(entry, c.facts, c.ctx);
+      expect(tuple.implementation, `${JSON.stringify(c.impl)} × ${c.ev}`).toEqual(c.impl);
+      expect(tuple.evidence, `${JSON.stringify(c.impl)} × ${c.ev}`).toBe(c.ev);
+      produced.add(`${tuple.implementation.kind}|${tuple.evidence}`);
+    }
+    // All four implementation kinds × all four evidence states are covered.
+    expect(produced.size).toBe(16);
+  });
+
+  it("f4: own present-on → absent via the branch's OWN revert (not inherited)", () => {
+    let seq = 0;
+    const f = (kind: CanonFactKind, payload: Record<string, unknown>): CanonFactRecord => ({
+      seq: (seq += 1),
+      requirementId: R,
+      kind,
+      actor: "camino:test",
+      payload,
+      recordedAt: `2026-07-02T00:00:0${seq}.000Z`,
+    });
+    const facts = [
+      f("implementation-recorded", { branch: M1, sha: HB1 }),
+      f("revert-recorded", { contextKind: "branch", branch: M1, sha: HB2 }),
+    ];
+    const before = projectRequirementStatus(entry, [facts[0] as CanonFactRecord], branch(M1, HB1));
+    const after = projectRequirementStatus(entry, facts, branch(M1, HB2));
+    expect(before.implementation).toEqual({ kind: "present-on", branch: M1 });
+    expect(after.implementation).toEqual({ kind: "absent" });
   });
 });

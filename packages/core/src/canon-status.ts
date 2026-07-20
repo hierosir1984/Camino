@@ -64,7 +64,8 @@ export const IMPLEMENTATION_RULES: readonly ProjectionRule[] = [
   {
     rule: "I1",
     axis: "implementation",
-    statement: "no facts for a requirement ⇒ absent (in every context)",
+    statement:
+      "no fact establishes R's implementation in this context ⇒ absent (no facts at all, or only evidence-axis facts like requirement-touched)",
   },
   {
     rule: "I2",
@@ -418,56 +419,97 @@ function contextKey(context: StatusContext): string {
 }
 
 /**
- * Validate a reader context (review round 2, findings 4/10): the context
- * comes from a caller (context-pack builder, GUI), not the trusted
- * stores, so a malformed one is a caller bug that must surface as a clean
- * error rather than a leaked trap or a silently-wrong tuple. In
- * particular a BRANCH context may not be named "main" \u2014 that would let it
- * consume main verdicts as its own (finding 4b) \u2014 and both SHAs must be
- * real 40-hex commit ids. Any exotic object whose traps throw is turned
- * into the same clean refusal (finding 10).
+ * Read a reader context EXACTLY ONCE into a validated, frozen plain
+ * snapshot (review round 2 findings 4/10; round 3 finding 1 \u2014 a stateful
+ * Proxy could pass validation then return different values on the
+ * derivation's later reads, so validation must produce the immutable
+ * value the projection then uses \u2014 the WP-101/104 single-observation
+ * principle applied to the context). A malformed context surfaces as a
+ * clean domain error, never a leaked trap or a silently-wrong tuple; a
+ * branch may not be named "main"; both SHAs must be real 40-hex ids.
  */
-export function statusContextProblem(context: StatusContext): string | null {
+function readContext(context: StatusContext): {
+  problem: string | null;
+  snapshot: StatusContext | null;
+} {
   try {
-    if (context === null || typeof context !== "object") return "status context must be an object";
-    const kind = context.kind;
+    if (context === null || typeof context !== "object") {
+      return { problem: "status context must be an object", snapshot: null };
+    }
+    const kind = context.kind; // single read
     if (kind === "main") {
-      return shaProblem("headSha", (context as { headSha: unknown }).headSha);
+      const headSha = (context as { headSha: unknown }).headSha; // single read
+      const problem = shaProblem("headSha", headSha);
+      return problem !== null
+        ? { problem, snapshot: null }
+        : { problem: null, snapshot: Object.freeze({ kind: "main", headSha: headSha as string }) };
     }
     if (kind === "branch") {
-      return (
-        branchProblem("branch", (context as { branch: unknown }).branch) ??
-        shaProblem("headSha", (context as { headSha: unknown }).headSha) ??
-        shaProblem("baseSha", (context as { baseSha: unknown }).baseSha)
-      );
+      const branch = (context as { branch: unknown }).branch; // single read
+      const headSha = (context as { headSha: unknown }).headSha; // single read
+      const baseSha = (context as { baseSha: unknown }).baseSha; // single read
+      const problem =
+        branchProblem("branch", branch) ??
+        shaProblem("headSha", headSha) ??
+        shaProblem("baseSha", baseSha);
+      return problem !== null
+        ? { problem, snapshot: null }
+        : {
+            problem: null,
+            snapshot: Object.freeze({
+              kind: "branch",
+              branch: branch as string,
+              headSha: headSha as string,
+              baseSha: baseSha as string,
+            }),
+          };
     }
-    return 'status context kind must be "main" or "branch"';
+    return { problem: 'status context kind must be "main" or "branch"', snapshot: null };
   } catch (error) {
-    return `malformed status context (${safeErrorLabel(error)})`;
+    return { problem: `malformed status context (${safeErrorLabel(error)})`, snapshot: null };
   }
 }
 
-function assertContext(context: StatusContext): void {
-  const problem = statusContextProblem(context);
-  if (problem !== null) throw new Error(`malformed status context: ${problem}`);
+/** The public predicate (validation only; the projectors use the snapshot form). */
+export function statusContextProblem(context: StatusContext): string | null {
+  return readContext(context).problem;
+}
+
+function snapshotContext(context: StatusContext): StatusContext {
+  const { problem, snapshot } = readContext(context);
+  if (problem !== null || snapshot === null) {
+    throw new Error(`malformed status context: ${problem ?? "unknown"}`);
+  }
+  return snapshot;
 }
 
 /**
- * A TOTAL ordering over facts (review round 2, finding 10): the store
- * guarantees strictly-increasing safe-integer seqs, but the public
- * projector must not return DIFFERENT answers for the same multiset in a
- * different array order. Facts sort by seq, then \u2014 for the
- * cannot-happen-from-a-store case of a duplicate or non-finite seq \u2014 by a
- * stable per-record key, so the result is a function of the SET of facts,
- * never their input permutation. Non-finite seqs sort last,
- * deterministically.
+ * A TOTAL ordering over facts (review round 2 finding 10; round 3 finding
+ * 2). The projector is specified over STORE-PRODUCED facts, which have
+ * strictly-increasing safe-integer seqs (schema PK + append-order trigger
+ * + adoption verify all guarantee it); for those the order is fully
+ * deterministic and collision-free. Two guarantees close the hostile
+ * corners a caller who BYPASSES the store could otherwise hit:
+ *  - the tie-break key never throws (a payload that fails JSON.stringify
+ *    falls back to a sentinel), so ordering is total;
+ *  - the projector REFUSES a fact set whose ordered seqs are not strictly
+ *    increasing safe integers (duplicate / non-finite / NaN), turning the
+ *    only remaining source of order-dependence into a clean domain error.
  */
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "undefined";
+  } catch {
+    return "\u0000unserializable";
+  }
+}
+
 function factSortKey(fact: CanonFactRecord): string {
-  return `${fact.kind}\u0000${fact.actor}\u0000${fact.recordedAt}\u0000${JSON.stringify(fact.payload)}`;
+  return `${fact.kind}\u0000${fact.actor}\u0000${fact.recordedAt}\u0000${safeStringify(fact.payload)}`;
 }
 
 function orderFacts(facts: readonly CanonFactRecord[]): CanonFactRecord[] {
-  return [...facts].sort((a, b) => {
+  const ordered = [...facts].sort((a, b) => {
     const sa = Number.isFinite(a.seq) ? a.seq : Number.POSITIVE_INFINITY;
     const sb = Number.isFinite(b.seq) ? b.seq : Number.POSITIVE_INFINITY;
     if (sa !== sb) return sa < sb ? -1 : 1;
@@ -475,6 +517,17 @@ function orderFacts(facts: readonly CanonFactRecord[]): CanonFactRecord[] {
     const kb = factSortKey(b);
     return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
+  let last = 0;
+  for (const fact of ordered) {
+    if (!Number.isSafeInteger(fact.seq) || fact.seq <= last) {
+      throw new Error(
+        `malformed fact sequence (seq ${String(fact.seq)} is not a safe, strictly increasing ` +
+          `integer after ${String(last)}) \u2014 the projection is defined over store-produced facts (CAM-CANON-03)`,
+      );
+    }
+    last = fact.seq;
+  }
+  return ordered;
 }
 
 /** The projection's full answer: the tuple plus which rules produced it. */
@@ -695,23 +748,27 @@ function deriveEvidence(
       return carried;
     })();
 
+  // E9 fires while a block is outstanding; E11 fires only when a block
+  // that ACTUALLY EXISTED was later cleared (review round 3 finding 3 —
+  // an unblock with no prior block clears nothing and must not fire E11).
+  let everBlocked = false;
   const blockedOutstanding = ((): boolean => {
     let blocked = false;
     for (const f of facts) {
-      if (f.kind === "verification-blocked" && factContextKey(f.payload) === key) blocked = true;
+      if (f.kind === "verification-blocked" && factContextKey(f.payload) === key) {
+        blocked = true;
+        everBlocked = true;
+      }
       if (f.kind === "verification-unblocked" && factContextKey(f.payload) === key) blocked = false;
     }
     return blocked;
   })();
-  const cleared = facts.some(
-    (f) => f.kind === "verification-unblocked" && factContextKey(f.payload) === key,
-  );
   const blockedOr = (state: EvidenceState): EvidenceState => {
     if (blockedOutstanding) {
       fire("E9");
       return "blocked";
     }
-    if (cleared) fire("E11");
+    if (everBlocked) fire("E11"); // a real block was cleared
     return state;
   };
 
@@ -723,13 +780,12 @@ function deriveEvidence(
   let inherited = false;
   if (ownVerdicts.length > 0) {
     governing = ownVerdicts.at(-1);
-    if (
-      context.kind === "branch" &&
-      verdicts.some(
-        (f) => factContextKey(f.payload) === "main" && f.seq > (governing as CanonFactRecord).seq,
-      )
-    ) {
-      fire("E12"); // a later main verdict exists but does NOT mask this one
+    // E12 (same-context precedence) fires whenever precedence is actually
+    // APPLIED over a competing main verdict — in EITHER recording order,
+    // matching the rule's "regardless of order" statement (round 3
+    // finding 3); its absence would make coverage order-dependent.
+    if (context.kind === "branch" && verdicts.some((f) => factContextKey(f.payload) === "main")) {
+      fire("E12");
     }
   } else if (context.kind === "branch" && everTouched) {
     if (verdicts.some((f) => factContextKey(f.payload) === "main")) fire("E6");
@@ -771,7 +827,10 @@ function deriveEvidence(
     if (blockedOutstanding) fire("E10");
     return "verified-live";
   }
-  fire("E3");
+  // Stale. E3 is the SAME-CONTEXT downgrade (its statement); the inherited
+  // case is E5's "as stale at best" (already fired above) — firing E3 for
+  // an inherited verdict would misdescribe it (review round 3 finding 3).
+  if (!inherited) fire("E3");
   return blockedOr("stale");
 }
 
@@ -787,15 +846,15 @@ export function explainRequirementStatus(
   facts: readonly CanonFactRecord[],
   context: StatusContext,
 ): ExplainedStatus {
-  assertContext(context);
+  const snapshot = snapshotContext(context);
   const ordered = orderFacts(facts);
   const fired = new Set<string>();
   const fire = (rule: string): void => {
     fired.add(rule);
   };
   const fold = foldImplementation(ordered);
-  const implementation = deriveImplementation(fold, context, fire);
-  const evidence = deriveEvidence(ordered, context, fire);
+  const implementation = deriveImplementation(fold, snapshot, fire);
+  const evidence = deriveEvidence(ordered, snapshot, fire);
   return {
     tuple: { disposition: entry.disposition, implementation, evidence },
     fired,
@@ -821,7 +880,7 @@ export function projectStatus(
   facts: readonly CanonFactRecord[],
   context: StatusContext,
 ): Map<string, StatusTuple> {
-  assertContext(context);
+  const snapshot = snapshotContext(context);
   const byRequirement = new Map<string, CanonFactRecord[]>();
   for (const fact of facts) {
     const list = byRequirement.get(fact.requirementId);
@@ -832,7 +891,7 @@ export function projectStatus(
   for (const [requirementId, entry] of view) {
     out.set(
       requirementId,
-      projectRequirementStatus(entry, byRequirement.get(requirementId) ?? [], context),
+      projectRequirementStatus(entry, byRequirement.get(requirementId) ?? [], snapshot),
     );
   }
   return out;

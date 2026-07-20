@@ -162,10 +162,16 @@ export function openRecoveredState(
       report,
       close(): void {
         // Exception-safe teardown (review round 1 finding 14; round 2
-        // finding 11 folded the lock release itself into the guarded
-        // set): every closer runs, the lock release is itself guarded so
-        // it can neither strand the lock nor mask an earlier failure, and
-        // the first failure surfaces after cleanup finished.
+        // finding 11 folded the lock release into the guarded set; round
+        // 3 finding 7 corrected the guarantee's wording): every closer
+        // runs to best effort, and the FIRST failure — deterministically
+        // the earliest in list order — surfaces after cleanup finished,
+        // never masked by a later one. WriterLock.release() itself closes
+        // the connection in a `finally`, so the kernel lock is released
+        // even if its rollback throws; the guard here additionally means a
+        // hypothetical throwing release cannot mask an earlier store-close
+        // failure. This is best-effort invocation with deterministic
+        // precedence, not a proof that every underlying handle closed.
         const failures = closeAll([
           () => openCanonFacts.close(),
           () => openCanonLedger.close(),

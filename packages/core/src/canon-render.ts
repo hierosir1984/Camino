@@ -21,7 +21,7 @@
  */
 import type { LedgerEventRecord } from "@camino/shared";
 import { ACCEPTED_FAMILY } from "@camino/shared";
-import { applyLedgerRecord, foldLedgerView } from "./canon-intent.js";
+import { applyLedgerRecord, foldLedgerView, recordedAtProblem } from "./canon-intent.js";
 import type { LedgerView, LedgerViewEntry } from "./canon-intent.js";
 
 /** CAM-CANON-02 verbatim: divergence exceeding five requirements triggers a standalone fold. */
@@ -30,10 +30,11 @@ export const STANDALONE_FOLD_REQUIREMENT_THRESHOLD = 5;
 export const STANDALONE_FOLD_AGE_DAYS = 7;
 
 /** Exactly the form `Date.prototype.toISOString` produces — the only timestamp form stores write. */
-const ISO_UTC_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const ISO_INSTANT = String.raw`(?:[+-]\d{6}|\d{4})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z`;
 
-const MARKER_LINE_PATTERN =
-  /^<!-- camino:canon rendered-at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) ledger-seq=(0|[1-9]\d*) -->$/;
+const MARKER_LINE_PATTERN = new RegExp(
+  `^<!-- camino:canon rendered-at=(${ISO_INSTANT}) ledger-seq=(0|[1-9]\\d*) -->$`,
+);
 
 export interface CanonMarker {
   /** The highest ledger seq the rendering reflects. */
@@ -51,12 +52,8 @@ function assertIsoUtc(field: string, value: string): void {
   // Round-trip identity, not just shape: the regex alone admits
   // impossible dates JavaScript silently normalizes — 2026-02-30 parses
   // as March 2nd (review round 1, finding 12).
-  const parsed = Date.parse(value);
-  if (
-    !ISO_UTC_PATTERN.test(value) ||
-    Number.isNaN(parsed) ||
-    new Date(parsed).toISOString() !== value
-  ) {
+  const problem = recordedAtProblem(value);
+  if (problem !== null) {
     throw new Error(
       `${field} must be a real ISO-8601 UTC instant (toISOString form), got ${JSON.stringify(value)}`,
     );

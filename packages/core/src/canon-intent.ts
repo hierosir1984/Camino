@@ -240,6 +240,14 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
   if (LINE_TERMINATOR.test(value)) {
     return `${field} must be single-line (no line terminators \u2014 canon renders one line per field)`;
   }
+  // Trojan-Source class (review round 3 finding 6): bidi overrides/isolates
+  // and the BOM/ZWNBSP can visually REORDER or hide rendered canon text
+  // while the bytes stay "faithful", so body comparison would only catch
+  // their later removal. Reject them at the source \u2014 canon statements are
+  // plain single-line text.
+  if (BIDI_OR_FORMAT_CONTROL.test(value)) {
+    return `${field} must not contain bidirectional or format control characters`;
+  }
   return null;
 }
 
@@ -250,6 +258,14 @@ function stringProblem(field: string, value: unknown, requireNonEmpty = true): s
  */
 // eslint-disable-next-line no-control-regex -- matching control-class line terminators is the point
 const LINE_TERMINATOR = /[\n\r\u0085\u000b\u000c\u2028\u2029]/;
+
+/**
+ * Bidirectional and format controls that can reorder or hide displayed
+ * text (the Trojan-Source vulnerability class, CVE-2021-42574; review
+ * round 3 finding 6): LRM/RLM, the bidi embeddings/overrides U+202A-E,
+ * the isolates U+2066-9, and the BOM / zero-width no-break space U+FEFF.
+ */
+const BIDI_OR_FORMAT_CONTROL = /[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/;
 
 /**
  * Exactly the forms `Date.prototype.toISOString` produces: the four-digit

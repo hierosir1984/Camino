@@ -159,13 +159,17 @@ describe("renderCanon (CAM-CANON-02: canon text = rendered projection of accepte
     ).toThrow(/non-negative safe integer/);
   });
 
-  it("accepts an expanded-year renderedAt is NOT required, but rejects one the marker can't hold", () => {
-    // The marker deliberately restricts renderedAt to the four-digit-year
-    // form so render→parse round-trips; an expanded-year instant is out
-    // of the canon-file's this-millennium scope.
+  it("accepts an expanded-year renderedAt and round-trips it (r3 finding 5: whole-seam alignment)", () => {
+    // The marker's instant grammar matches the ledger's recordedAt: both
+    // the four-digit and the signed six-digit "expanded year" forms
+    // toISOString produces. Renderer, marker, and planner agree.
     const view = foldLedgerView([]);
+    const expanded = "+010000-01-01T00:00:00.000Z";
+    const text = renderCanon(view, { ledgerSeq: 0, renderedAt: expanded });
+    expect(parseCanonMarker(text)).toEqual({ ledgerSeq: 0, renderedAt: expanded });
+    // Still refuses an impossible instant.
     expect(() =>
-      renderCanon(view, { ledgerSeq: 0, renderedAt: "+010000-01-01T00:00:00.000Z" }),
+      renderCanon(view, { ledgerSeq: 0, renderedAt: "2026-02-30T00:00:00.000Z" }),
     ).toThrow(/ISO-8601/);
   });
 });

@@ -397,6 +397,41 @@ describe("decideLedgerAppend refusals", () => {
     }
   });
 
+  it("rejects bidirectional and format controls (Trojan-Source class, r3 finding 6)", () => {
+    const bidi = [
+      "\u200e",
+      "\u200f",
+      "\u202a",
+      "\u202b",
+      "\u202c",
+      "\u202d",
+      "\u202e",
+      "\u2066",
+      "\u2067",
+      "\u2068",
+      "\u2069",
+      "\ufeff",
+    ];
+    for (const ch of bidi) {
+      const decision = decideLedgerAppend(emptyView, {
+        requirementId: R,
+        event: "requirement-proposed",
+        actor: DAVID_ACTOR,
+        payload: { statement: `a${ch}b`, sourceMissionId: "m1" },
+      });
+      expect(decision.ok, JSON.stringify(ch)).toBe(false);
+      if (!decision.ok) expect(decision.problem).toMatch(/bidirectional or format control/);
+    }
+    // Ordinary text with a ZWJ emoji sequence (U+200D) is NOT rejected.
+    const ok = decideLedgerAppend(emptyView, {
+      requirementId: R,
+      event: "requirement-proposed",
+      actor: DAVID_ACTOR,
+      payload: { statement: "family \u{1f469}\u200d\u{1f467} works", sourceMissionId: "m1" },
+    });
+    expect(ok).toEqual({ ok: true });
+  });
+
   it("accepts an expanded-year recordedAt (writer/verifier agree, r2 finding 8)", () => {
     // A row whose clock produced an expanded-year toISOString must be
     // adoptable by the same verifier — else the store self-poisons.
