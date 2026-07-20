@@ -82,7 +82,9 @@ export function grokAdapter(
         return { kind: "other", text: "thought" };
       }
       if (type === "end" || type.includes("result") || type.includes("done")) {
-        return { kind: "result", text: data.slice(0, 400) }; // the final answer
+        // grok is single-turn: `end` is both the final answer and the success
+        // terminal that closes the turn (round-11 finding 1).
+        return { kind: "result", text: data.slice(0, 400), terminalSuccess: true };
       }
       if (type.includes("error")) {
         const text = (data || type).slice(0, 400);

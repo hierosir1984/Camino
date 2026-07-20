@@ -90,11 +90,12 @@ export function claudeAdapter(
           const text = String(obj["result"] ?? obj["subtype"] ?? "result");
           const isError = obj["is_error"] === true || obj["subtype"] === "error_max_turns";
           // In an ERROR result, trust the provider's exhaustion phrases
-          // ("Credit balance is too low", "usage limit reached").
+          // ("Credit balance is too low", "usage limit reached"). A non-error
+          // result IS the success terminal (claude emits it once, last).
           return {
             kind: isError ? "error" : "result",
             text: text.slice(0, 400),
-            ...(isError ? errText(text) : {}),
+            ...(isError ? errText(text) : { terminalSuccess: true as const }),
           };
         }
         case "error": {

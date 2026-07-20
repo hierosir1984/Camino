@@ -20,6 +20,16 @@ export interface StreamEvent {
   text: string;
   /** Provider rate-limit / quota signal detected on this line, if any. */
   quotaSignal?: boolean;
+  /**
+   * True ONLY on the genuine success TERMINAL of a turn (claude success
+   * `result`, codex `turn.completed`, grok `end`) — distinct from an
+   * intermediate answer that the parser also maps to kind "result" (codex
+   * `agent_message` carries the answer TEXT for finalText but is mid-turn).
+   * The lifecycle clears a pending quota failure only on this, so a quota
+   * error followed by an intermediate answer and then a `turn.failed` stays
+   * quota-blocked (round-11 finding 1).
+   */
+  terminalSuccess?: boolean;
 }
 
 /**

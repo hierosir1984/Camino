@@ -77,7 +77,11 @@ export function codexAdapter(
         const item = (obj["item"] ?? {}) as Record<string, unknown>;
         const itemType = String(item["type"] ?? "");
         const text = String(item["text"] ?? item["message"] ?? itemType).slice(0, 400);
-        if (itemType === "agent_message") return { kind: "result", text }; // the answer, not an error
+        // The answer TEXT (for finalText), but NOT a turn terminal: codex keeps
+        // running after agent_message; only turn.completed confirms success and
+        // turn.failed can still follow (round-11 finding 1). So NO
+        // terminalSuccess here.
+        if (itemType === "agent_message") return { kind: "result", text };
         // codex emits non-fatal warnings as "error" items; that IS an error
         // context, so trust rate-limit / exhaustion signals there.
         if (itemType === "error") {
@@ -92,7 +96,11 @@ export function codexAdapter(
           return { kind: "tool", text: itemType };
         return { kind: "other", text: itemType || "item" };
       }
-      if (type === "turn.completed" || type === "thread.started") {
+      if (type === "turn.completed") {
+        // The genuine success TERMINAL of a codex turn (round-11 finding 1).
+        return { kind: "other", text: type, terminalSuccess: true };
+      }
+      if (type === "thread.started") {
         return { kind: "other", text: type };
       }
       if (type.includes("error")) {

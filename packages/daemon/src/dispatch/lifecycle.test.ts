@@ -1046,6 +1046,50 @@ describe("provider adapters through the real lifecycle (zero quota)", () => {
     }
   });
 
+  it("codex: quota → agent_message → turn.FAILED (exit 0) stays quota-blocked — agent_message is not a terminal (round-11 finding 1)", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const rec = await dispatch(
+        schemaEmittingAdapter(
+          "codex-cli",
+          [
+            PROVIDER_LINES["codex-cli"]!.quota,
+            '{"type":"item.completed","item":{"type":"agent_message","text":"partial answer"}}',
+            '{"type":"turn.failed","error":{"message":"request failed"}}',
+          ],
+          0,
+        ),
+        { workdir: ws, prompt: "x" },
+      );
+      expect(rec.outcome).toBe("quota-blocked"); // the turn did NOT complete
+      expect(rec.quotaSignalSeen).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("codex: quota → agent_message → turn.COMPLETED (exit 0) is a genuine recovery → succeeded (round-11 finding 1)", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "wp105-prov-"));
+    try {
+      const rec = await dispatch(
+        schemaEmittingAdapter(
+          "codex-cli",
+          [
+            PROVIDER_LINES["codex-cli"]!.quota,
+            '{"type":"item.completed","item":{"type":"agent_message","text":"done after retry"}}',
+            '{"type":"turn.completed"}',
+          ],
+          0,
+        ),
+        { workdir: ws, prompt: "x" },
+      );
+      expect(rec.outcome).toBe("succeeded"); // turn.completed IS the success terminal
+      expect(rec.quotaSignalSeen).toBe(true); // pressure still exposed for WP-106
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it("a RECOVERED quota signal (later events, clean exit) stays succeeded, with the pressure exposed (round-7 finding 2)", async () => {
     // An early rate-limit the worker moved past must not be misread as
     // blocked; the transient signal stays visible to the WP-106 quota-aware

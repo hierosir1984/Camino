@@ -520,18 +520,20 @@ export async function dispatch(
       // is a throwing getter — that must not crash the harness (round-3
       // finding 1; same spirit as the parseLine try/catch).
       let sig = false;
-      let kind: StreamEvent["kind"] | undefined;
+      let terminalOk = false;
       try {
         sig = ev.quotaSignal === true;
-        kind = ev.kind;
+        terminalOk = ev.terminalSuccess === true;
       } catch {
         sig = false;
       }
       if (sig) {
         anyEventQuota = true;
         pendingQuota = true;
-      } else if (kind === "result") {
-        // A successful terminal result — the worker recovered past the limit.
+      } else if (terminalOk) {
+        // A genuine SUCCESS TERMINAL (not a mid-turn answer) — the worker
+        // recovered past the limit (round-10 finding 1, corrected round-11:
+        // codex agent_message is NOT terminal; turn.completed is).
         pendingQuota = false;
       }
       if (headEvents.length < EVENT_HEAD_CAP) headEvents.push(ev);

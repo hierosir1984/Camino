@@ -53,7 +53,9 @@ export function mockAdapter(mode?: string): AdapterSpec {
         const text = String(obj.text ?? "").slice(0, 400);
         // Quota is trusted only in an ERROR event (round-3 finding 2).
         const eq = kind === "error" && classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
-        return { kind, text, ...eq };
+        // The mock's `result` event stands in for a success terminal (round-11).
+        const term = kind === "result" ? { terminalSuccess: true as const } : {};
+        return { kind, text, ...eq, ...term };
       } catch {
         return null;
       }
