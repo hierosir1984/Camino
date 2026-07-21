@@ -54,6 +54,7 @@ import type {
   LedgerEventName,
   LedgerEventRecord,
 } from "@camino/shared";
+import { deepFreeze } from "./deep-freeze.js";
 import { DAVID_ACTOR } from "./intent-lifecycle.js";
 
 /**
@@ -72,7 +73,7 @@ export interface DispositionTransition {
   readonly basis: string;
 }
 
-export const DISPOSITION_TRANSITIONS: readonly DispositionTransition[] = [
+export const DISPOSITION_TRANSITIONS: readonly DispositionTransition[] = deepFreeze([
   {
     row: "D1",
     from: null,
@@ -170,7 +171,7 @@ export const DISPOSITION_TRANSITIONS: readonly DispositionTransition[] = [
     to: "descoped",
     basis: "CAM-CANON-10 applies to all accepted-family dispositions",
   },
-] as const;
+] as const);
 
 /** The folded state of one requirement's intent. */
 export interface LedgerViewEntry {

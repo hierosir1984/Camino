@@ -8,19 +8,20 @@
  * once).
  */
 import type { MachineDef, TransitionRow } from "./machine.js";
+import { deepFreeze } from "./deep-freeze.js";
 import { attested, nonEmptyString } from "./machine.js";
 
-export const ATTEMPT_ACTIVE_STATES = ["running", "submitted"] as const;
+export const ATTEMPT_ACTIVE_STATES = deepFreeze(["running", "submitted"] as const);
 
 /** The six A.3 terminal states; each is followed by the single archival step. */
-export const ATTEMPT_TERMINAL_STATES = [
+export const ATTEMPT_TERMINAL_STATES = deepFreeze([
   "succeeded",
   "failed",
   "cancelled",
   "expired",
   "killed-budget",
   "quota-blocked",
-] as const;
+] as const);
 
 /** Post-archival absorbing state (A.4#5). */
 export const ATTEMPT_ARCHIVED_STATE = "archived" as const;
@@ -30,11 +31,11 @@ export type AttemptState =
   | (typeof ATTEMPT_TERMINAL_STATES)[number]
   | typeof ATTEMPT_ARCHIVED_STATE;
 
-export const ATTEMPT_STATES = [
+export const ATTEMPT_STATES = deepFreeze([
   ...ATTEMPT_ACTIVE_STATES,
   ...ATTEMPT_TERMINAL_STATES,
   ATTEMPT_ARCHIVED_STATE,
-] as const;
+] as const);
 
 export type AttemptEvent =
   // A.3#1 — dispatch | lease granted (generation g)
@@ -207,11 +208,11 @@ const attemptRows: readonly AttemptRow[] = [
   }),
 ];
 
-export const attemptMachine: MachineDef<AttemptState, AttemptEvent> = {
+export const attemptMachine: MachineDef<AttemptState, AttemptEvent> = deepFreeze({
   name: "attempt (A.3)",
   states: ATTEMPT_STATES,
   terminalStates: [...ATTEMPT_TERMINAL_STATES, ATTEMPT_ARCHIVED_STATE],
   rows: attemptRows,
-};
+});
 
-export const ATTEMPT_CREATION_EVENTS: readonly string[] = ["attempt-dispatched"];
+export const ATTEMPT_CREATION_EVENTS: readonly string[] = deepFreeze(["attempt-dispatched"]);

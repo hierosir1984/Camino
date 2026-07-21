@@ -13,9 +13,10 @@
  * is routing advice, not a state change — see retryPolicy.
  */
 import type { EnrichmentSpec, MachineDef, TransitionRow } from "./machine.js";
+import { deepFreeze } from "./deep-freeze.js";
 import { attested } from "./machine.js";
 
-export const ISSUE_ACTIVE_STATES = [
+export const ISSUE_ACTIVE_STATES = deepFreeze([
   "waiting-deps",
   "ready",
   "queued-quota",
@@ -26,14 +27,14 @@ export const ISSUE_ACTIVE_STATES = [
   "blocked",
   "escalated",
   "replanning",
-] as const;
+] as const);
 
-export const ISSUE_TERMINAL_STATES = ["merged", "cancelled"] as const;
+export const ISSUE_TERMINAL_STATES = deepFreeze(["merged", "cancelled"] as const);
 
 export type IssueState =
   (typeof ISSUE_ACTIVE_STATES)[number] | (typeof ISSUE_TERMINAL_STATES)[number];
 
-export const ISSUE_STATES = [...ISSUE_ACTIVE_STATES, ...ISSUE_TERMINAL_STATES] as const;
+export const ISSUE_STATES = deepFreeze([...ISSUE_ACTIVE_STATES, ...ISSUE_TERMINAL_STATES] as const);
 
 export type IssueEvent =
   // A.2#1 — plan approved → ready / waiting-deps; A.2#1c — repair issue created ready
@@ -104,10 +105,11 @@ export type IssueEvent =
   | { type: "cleanup-failed"; recorded: boolean };
 
 /** Recorded-context contract (see mission.ts): recorder-enriched fields. */
-export const ISSUE_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> = {
-  "attempt-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
-  "validation-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
-};
+export const ISSUE_CONTEXT_ENRICHMENT: Readonly<Record<string, readonly EnrichmentSpec[]>> =
+  deepFreeze({
+    "attempt-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
+    "validation-failed": [{ field: "failureCount", source: "next-issue-failure-count" }],
+  });
 
 /**
  * Retry policy per A.2#9: retriable until the 4th failure escalates; family
@@ -482,11 +484,11 @@ const issueRows: readonly IssueRow[] = [
   }),
 ];
 
-export const issueMachine: MachineDef<IssueState, IssueEvent> = {
+export const issueMachine: MachineDef<IssueState, IssueEvent> = deepFreeze({
   name: "issue (A.2)",
   states: ISSUE_STATES,
   terminalStates: ISSUE_TERMINAL_STATES,
   rows: issueRows,
-};
+});
 
-export const ISSUE_CREATION_EVENTS: readonly string[] = ["issue-created"];
+export const ISSUE_CREATION_EVENTS: readonly string[] = deepFreeze(["issue-created"]);
