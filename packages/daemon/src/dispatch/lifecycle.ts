@@ -16,7 +16,6 @@
 // (approved 2026-07-20, PR #50): this layer delivers group-gone; WP-107's
 // container completes full-tree containment.
 import { spawn, type ChildProcess } from "node:child_process";
-import { createInterface } from "node:readline";
 import type {
   AdapterContext,
   AdapterSpec,
@@ -128,6 +127,15 @@ function groupAlive(pgid: number): boolean {
 // context and the trailing result run that finalText needs.
 const EVENT_HEAD_CAP = 200;
 const EVENT_TAIL_CAP = 200;
+
+// Per-line byte/char ceiling BEFORE the parser sees a line (round-4 finding
+// 1): a worker emitting one enormous line with no newline would otherwise
+// grow the daemon's line buffer to that line's full size. A line past this cap
+// is truncated (prefix kept + a mark) and the remainder discarded to the next
+// newline. Generous vs. any legitimate JSON event line (parsers truncate to
+// ~400 chars); small vs. a memory-exhaustion attempt.
+const MAX_LINE_CHARS = 1_000_000;
+const LINE_TRUNCATED_MARK = "…[camino:line-truncated]";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -702,58 +710,119 @@ export async function dispatch(
     // descendant still holding the pipe), we can forcibly tear them down —
     // otherwise the readline keeps parsing lines AFTER the record is
     // snapshotted and the inherited pipe pins the process (round-9 finding 3).
-    const consumers: Array<{
-      rl: ReturnType<typeof createInterface>;
-      stream: NodeJS.ReadableStream;
-    }> = [];
+    const consumers: Array<{ close: () => void; stream: NodeJS.ReadableStream }> = [];
+    const handleLine = (channel: "stdout" | "stderr", line: string) => {
+      // The transcript sink is caller code — a throwing sink must not crash
+      // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
+      // an ASYNC sink (declared void but returning a promise) could reject
+      // and become an unhandledRejection crash — swallow that too (round-2
+      // review finding 3).
+      try {
+        const maybePromise = onLine?.(channel, line) as unknown;
+        if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
+          void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
+        }
+      } catch {
+        /* a broken sink is not the worker's fault */
+      }
+      // Quota is decided by the PARSER (structured signatures + provider
+      // exhaustion phrases in an ERROR context), NOT by a raw-line prose scan
+      // — a raw scan over assistant prose manufactured false positives
+      // ("issues 428, 429, 430", "too many requests for new features") and
+      // was removed (round-3 finding 2). A buggy parser must never crash the
+      // harness (bypassing cleanup).
+      let ev: StreamEvent | null = null;
+      try {
+        ev = adapter.parseLine(line, channel);
+      } catch {
+        ev = null;
+      }
+      if (!ev) return;
+      recordEvent(ev);
+      if (!sawFirstEvent) {
+        sawFirstEvent = true;
+        if (cancelAfterMs != null) {
+          cancelTimer = setTimeout(() => requestKill("cancel"), cancelAfterMs);
+        }
+      }
+    };
+    // BOUNDED line reader (round-4 finding 1). readline buffers a WHOLE line
+    // before emitting, so a worker that emits one enormous line (no newline)
+    // grows daemon memory to that line's size before any adapter truncation.
+    // This caps the per-line buffer: a line past MAX_LINE_CHARS is truncated
+    // (its prefix emitted, marked) and the rest discarded until the next
+    // newline — memory per line is bounded regardless of worker output. The
+    // parser truncates to ~400 chars anyway; this only bounds the transient
+    // pre-parse buffer.
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
-      const rl = createInterface({ input: stream });
-      consumers.push({ rl, stream });
+      stream.setEncoding("utf8");
+      let partial = "";
+      let skipping = false; // discarding the tail of an over-long line
+      let closed = false;
+      const emit = (line: string) => {
+        if (closed) return;
+        handleLine(channel, line.endsWith("\r") ? line.slice(0, -1) : line);
+      };
+      const onData = (chunk: string) => {
+        if (closed) return;
+        let data = chunk;
+        for (;;) {
+          const nl = data.indexOf("\n");
+          if (nl === -1) {
+            if (skipping) return; // whole chunk is over-long-line tail
+            const room = MAX_LINE_CHARS - partial.length;
+            if (data.length <= room) {
+              partial += data;
+            } else {
+              emit(partial + data.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
+              partial = "";
+              skipping = true; // discard until the next newline
+            }
+            return;
+          }
+          const seg = data.slice(0, nl);
+          data = data.slice(nl + 1);
+          if (skipping) {
+            skipping = false; // this newline ends the over-long line
+            continue;
+          }
+          const full = partial + seg;
+          partial = "";
+          emit(
+            full.length > MAX_LINE_CHARS
+              ? full.slice(0, MAX_LINE_CHARS) + LINE_TRUNCATED_MARK
+              : full,
+          );
+        }
+      };
+      stream.on("data", onData);
       streamsClosed.push(
         new Promise<void>((resolve) => {
-          rl.once("close", () => resolve());
-          // A stream 'error' also ends the readline; never leave the drain
-          // await pending on a broken pipe.
+          const done = () => {
+            // A final partial line without a trailing newline (readline
+            // parity): emit it once at end.
+            if (!closed && !skipping && partial.length > 0) {
+              const last = partial;
+              partial = "";
+              emit(last);
+            }
+            resolve();
+          };
+          stream.once("end", done);
+          stream.once("close", done);
           stream.once("error", () => resolve());
         }),
       );
-      rl.on("line", (line) => {
-        // The transcript sink is caller code — a throwing sink must not crash
-        // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
-        // an ASYNC sink (declared void but returning a promise) could reject
-        // and become an unhandledRejection crash — swallow that too (round-2
-        // review finding 3).
-        try {
-          const maybePromise = onLine?.(channel, line) as unknown;
-          if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
-            void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
+      consumers.push({
+        close: () => {
+          closed = true;
+          try {
+            stream.removeListener("data", onData);
+          } catch {
+            /* best-effort */
           }
-        } catch {
-          /* a broken sink is not the worker's fault */
-        }
-        // Quota is decided by the PARSER (structured signatures + provider
-        // exhaustion phrases in an ERROR context), NOT by a raw-line prose scan
-        // — a raw scan over assistant prose manufactured false positives
-        // ("issues 428, 429, 430", "too many requests for new features") and
-        // was removed (round-3 finding 2). A buggy parser must never crash the
-        // harness (bypassing cleanup).
-        let ev: StreamEvent | null = null;
-        try {
-          ev = adapter.parseLine(line, channel);
-        } catch {
-          ev = null;
-        }
-        if (!ev) return;
-        recordEvent(ev);
-        if (!sawFirstEvent) {
-          sawFirstEvent = true;
-          // Use the snapshotted plain number, never re-read opts inside this
-          // async callback (the lexical try can't catch a throw here) — round-4
-          // finding 1.
-          if (cancelAfterMs != null) {
-            cancelTimer = setTimeout(() => requestKill("cancel"), cancelAfterMs);
-          }
-        }
+        },
+        stream,
       });
     };
     if (child.stdout) consume("stdout", child.stdout);
@@ -830,9 +899,9 @@ export async function dispatch(
       // the consumers down so no line is parsed after this snapshot and the
       // inherited pipe stops pinning the process (round-9 finding 3). The
       // residual descendant is the named WP-107 container boundary.
-      for (const { rl, stream } of consumers) {
+      for (const { close, stream } of consumers) {
         try {
-          rl.close();
+          close();
         } catch {
           /* already closed */
         }

@@ -155,6 +155,46 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true); // archive evidence retained
   });
 
+  it("an incomplete prior archive (no sidecar) is recovered, not a permanent block (round-4 finding 2)", async () => {
+    const root = tempDir();
+    const issueDir = join(root, "i");
+    mkdirSync(issueDir, { recursive: true });
+    // Simulate a prior run that wrote the archive but crashed before the
+    // sidecar (nothing references it).
+    writeFileSync(join(issueDir, "a.tar.gz"), "stale-incomplete-archive");
+    const record = await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    // The retry SUCCEEDED (removed the stale archive and redid it) rather than
+    // refusing "already exists" forever.
+    expect(record.archivePath).toBe(join(issueDir, "a.tar.gz"));
+    expect(existsSync(join(issueDir, "a.json"))).toBe(true); // now complete
+  });
+
+  it("a COMPLETE prior archive (archive + sidecar) still refuses a second call", async () => {
+    const root = tempDir();
+    await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "archive-write" });
+  });
+
   it("an over-cap compressed archive is refused and the workspace retained (registry item 11)", async () => {
     const ws = makeWorkspace();
     writeFileSync(join(ws, "blob.bin"), incompressible(64 * 1024));

@@ -195,6 +195,21 @@ if (mode === "hang") {
   // the parsers' error channels).
   process.stdout.write("provider error: 429 rate_limit_exceeded, retry later\n");
   process.exit(4);
+} else if (mode === "bigline") {
+  // Emit ONE enormous line with NO newline (MOCK_BIGLINE bytes, default 8 MiB),
+  // then a normal result — exercises the bounded pre-parser line reader
+  // (WP-107 round-4 finding 1): the daemon must not buffer the whole line.
+  const n = Number(process.env.MOCK_BIGLINE ?? String(8 * 1024 * 1024));
+  const chunk = "A".repeat(64 * 1024);
+  let written = 0;
+  while (written < n) {
+    const take = Math.min(chunk.length, n - written);
+    writeSync(1, take === chunk.length ? chunk : chunk.slice(0, take));
+    written += take;
+  }
+  writeSync(1, "\n"); // terminate the giant line
+  emitSync("result", "done after a giant line");
+  process.exit(0);
 } else if (mode === "flood") {
   // Emit many events to exercise the bounded retention cap. Synchronous writes
   // so process.exit() below can't truncate the stream (deterministic count

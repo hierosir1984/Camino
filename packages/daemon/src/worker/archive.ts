@@ -294,11 +294,20 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const seq = resolveSeq(opts.attemptSeq, issueDir, opts.attemptId);
 
   const finalPath = join(issueDir, `${opts.attemptId}.tar.gz`);
+  const sidecarPath = join(issueDir, `${opts.attemptId}.json`);
   const tmpPath = join(issueDir, `.${opts.attemptId}.tar.gz.partial`);
   if (existsSync(finalPath)) {
-    // A.4#5: archival happens exactly once — a second call for the same
-    // attempt is a sequencing bug upstream, refused loudly.
-    throw new ArchivalError("archive-write", `archive already exists at ${finalPath}`);
+    if (existsSync(sidecarPath)) {
+      // A COMPLETE prior archive (archive + sidecar): archival happens exactly
+      // once — a second call for the same attempt is a sequencing bug upstream,
+      // refused loudly.
+      throw new ArchivalError("archive-write", `archive already exists at ${finalPath}`);
+    }
+    // An INCOMPLETE prior run (round-4 finding 2): the archive was written but
+    // its sidecar was not (a prior sidecar-write failure or crash before the
+    // ledger row — nothing references this archive yet). Remove the stale
+    // archive and proceed, so a corrected retry is not blocked forever.
+    rmSync(finalPath, { force: true });
   }
   try {
     execFileSync("tar", ["-czf", tmpPath, "-C", opts.workspaceDir, "."], {
@@ -331,7 +340,21 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     compressedBytes,
     workspaceBytes,
   };
-  writeFileSync(join(issueDir, `${opts.attemptId}.json`), JSON.stringify(sidecar, null, 2) + "\n");
+  // The sidecar write is STAGED like every other sub-step (round-4 finding 2):
+  // an ordinary EACCES/ENOSPC here must throw a routable ArchivalError, not a
+  // raw Error, and must NOT leave an unreferenced archive that blocks the
+  // retry. Roll the archive back on failure — nothing references it yet (the
+  // ledger row is Step 2), so removing it returns to a clean, retriable state.
+  try {
+    writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2) + "\n");
+  } catch (err) {
+    rmSync(finalPath, { force: true });
+    rmSync(sidecarPath, { force: true });
+    throw new ArchivalError(
+      "archive-write",
+      `sidecar write failed after the archive was written (rolled back): ${(err as Error).message.slice(0, 300)} — workspace retained`,
+    );
+  }
 
   // Step 2 — ledger row referencing the archive. A throw retains everything.
   try {

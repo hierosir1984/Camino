@@ -64,9 +64,14 @@ fi
 run_probe github-cred-env sh -c '
   env | grep -Eiq "GITHUB_TOKEN|GH_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_PAT|GIT_ASKPASS|GIT_TOKEN" && echo LEAK || echo clean
 '
-# No stored-credential material on disk anywhere the workload can see.
+# No stored-credential material on disk anywhere the workload can see. The
+# rootfs is scanned with -xdev, but /workspace and the provider-auth mount are
+# SEPARATE filesystems (different devices), which -xdev would skip — so they
+# are passed as explicit start points and each traversed on its own device
+# (round-4 finding 3: -xdev from / alone missed the bind mounts).
 run_probe github-cred-fs sh -c '
-  found=$(find / -xdev \( -name ".git-credentials" -o -name ".netrc" \) 2>/dev/null | head -1)
+  found=$(find / "$CAMINO_WORKSPACE_DIR" "$CAMINO_PROVIDER_AUTH_DIR" -xdev \
+    \( -name ".git-credentials" -o -name ".netrc" -o -name "_netrc" \) 2>/dev/null | head -1)
   [ -z "$found" ] && echo clean || echo "$found"
 '
 

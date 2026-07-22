@@ -901,6 +901,23 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
+  it("bounds a single ENORMOUS line pre-parser — no unbounded buffer (WP-107 round-4 finding 1)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // The mock emits one 8 MiB line (no newline) then a normal result. The
+      // dispatch must succeed WITHOUT any retained event carrying the whole
+      // 8 MiB — the bounded reader truncates the line before the parser.
+      const rec = await dispatch(mockAdapter("bigline"), { workdir: ws, prompt: "bigline" });
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.finalText).toContain("done after a giant line");
+      // No retained event text approaches the emitted size; each is bounded.
+      const maxEventText = Math.max(0, ...rec.events.map((e) => e.text.length));
+      expect(maxEventText).toBeLessThan(1_100_000); // << the 8 MiB emitted
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("spawn failure of a missing binary is reported, not thrown — and the lease is releasable", async () => {
     const ws = makeWorkspace();
     try {
