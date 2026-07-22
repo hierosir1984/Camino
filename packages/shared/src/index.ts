@@ -134,6 +134,50 @@ export type {
   StatusTuple,
 } from "./canon.js";
 
+// WP-106: routing foundation — capability-registry schema + per-project
+// policy table (CAM-ROUTE-01/02). Every value export is deep-frozen at
+// module load; DEFAULT_POLICY_TABLE is built by a constructor that throws
+// on any cross-family constraint failure (defaults cannot load broken).
+export {
+  PROVIDER_FAMILIES,
+  HARNESS_FAMILY,
+  harnessFamily,
+  ROUTING_ROLES,
+  REASONING_TIERS,
+  TASK_TEMPLATES,
+  RISK_TIERS,
+  QUOTA_PAUSE_THRESHOLD,
+  CROSS_FAMILY_CONSTRAINTS,
+  CAPABILITY_CONFIDENCE,
+  DEFAULT_POLICY_TABLE,
+  makeCrossFamilyDefaults,
+  validatePolicyTable,
+  crossFamilyViolations,
+  resolveAssignment,
+  deepFreeze,
+} from "./routing.js";
+export type {
+  ProviderFamily,
+  RoutingRole,
+  ReasoningTier,
+  TaskTemplate,
+  RiskTier,
+  TaskFeatures,
+  PolicyAssignment,
+  PolicyCells,
+  PolicyTable,
+  PolicyViolation,
+  CrossFamilyViolation,
+  RoleRotation,
+  CapabilityConfidence,
+  CapabilityAttribute,
+  ModelInfo,
+  WindowShape,
+  BillingPool,
+  SanctionedPathRecord,
+  ProviderCapabilityRecord,
+} from "./routing.js";
+
 // WP-110: canonical JSON + content hashing (the contract-hash definition).
 export { CanonicalJsonError, canonicalJson, sha256Hex } from "./canonical-json.js";
 

@@ -96,8 +96,13 @@ export function cliOnPath(bin: string, pathValue: string | undefined): boolean {
   return resolveCliPath(bin, pathValue) !== null;
 }
 
-/** The xAI sanctioned-path gate decision, with a precise recorded reason on refusal. */
-function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: string } {
+/**
+ * The xAI sanctioned-path gate decision, with a precise recorded reason on
+ * refusal. Exported (module path, package-internal) so the WP-106
+ * capability registry derives its live sanctioned-path attribute from the
+ * SAME evaluation the gate uses — one parser, no drift (round-6 finding 3).
+ */
+export function xaiSanctioned(attestationsPath: string): { accepted: boolean; reason?: string } {
   let raw: string;
   try {
     raw = readFileSync(attestationsPath, "utf8");
@@ -211,16 +216,22 @@ function gate(
   make: (opts?: {
     enabled?: boolean;
     disabledReason?: string;
+    disabledCause?: "cli-absent" | "sanctioned-path";
     resolvedPath?: string;
   }) => AdapterSpec,
 ): AdapterSpec {
   if (resolvedPath === null) {
-    return make({ enabled: false, disabledReason: `${cliBin} CLI not found on PATH` });
+    return make({
+      enabled: false,
+      disabledReason: `${cliBin} CLI not found on PATH`,
+      disabledCause: "cli-absent",
+    });
   }
   if (!sanctioned.accepted) {
     return make({
       enabled: false,
       disabledReason: sanctioned.reason ?? `${name} sanctioned-path not recorded accepted`,
+      disabledCause: "sanctioned-path",
     });
   }
   const spec = make({ resolvedPath }); // spawn the attested absolute executable
