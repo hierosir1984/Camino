@@ -130,19 +130,21 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
     // OTHER failure (ENOBUFS on an oversized/hostile .git/config.worktree, a git
     // error) must FAIL CLOSED (round-13 finding 4): swallowing it would make a
     // large malicious worktree config INVISIBLE here while git still obeys it.
-    // Recognize ONLY the genuine "extensions.worktreeConfig is not enabled"
-    // message (round-13 finding 4 → round-14 finding 8 → round-15 finding 10): git's
-    // real message names the `worktreeConfig` extension AND says it is (not) enabled
-    // — "unless the config extension worktreeConfig is enabled". Merely containing
-    // "worktreeconfig" is NOT enough: a hostile/injected git on the daemon PATH
-    // emitting e.g. "worktreeConfig backend I/O failure" (round-15 finding 10) or
-    // "worktree transient extension I/O failure" must FAIL CLOSED, not be swallowed
-    // as "no worktree config". So require the extension name TOGETHER with an
-    // enabled/disabled verdict, or the explicit "not enabled".
+    // Recognize ONLY git's genuine "extensions.worktreeConfig is (not) enabled"
+    // phrasing (round-13 f4 → round-14 f8 → round-15 f10 → round-16 finding 8): the
+    // extension name and its enabled/disabled verdict must be ADJACENT (same clause,
+    // no `.`/`;`/newline between), so unrelated text — "worktreeConfig backend I/O
+    // failure; cache disabled", "worktreeConfig permission denied; fallback enabled",
+    // "worktree transient extension I/O failure" — does NOT reopen the swallow; each
+    // FAILS CLOSED. BOUNDARY, stated: this recognizes the HONEST git message; a
+    // hostile git on the daemon PATH emitting a look-alike is a daemon supply-chain
+    // concern (a trusted PATH is a deployment/WP-114 assumption), out of the worker
+    // threat model. Over-strictness fails safe (a genuine but unrecognized phrasing
+    // just refuses attestation, never silently swallows a real worktree config).
     const msg = describeCloneError(err, 400).toLowerCase();
     const notEnabled =
-      (msg.includes("worktreeconfig") && (msg.includes("enabled") || msg.includes("disabled"))) ||
-      (msg.includes("worktree") && msg.includes("not enabled"));
+      /worktreeconfig[^.;\n]*\bis (?:not )?enabled\b/.test(msg) ||
+      /\bworktree\b[^.;\n]*\bnot enabled\b/.test(msg);
     if (!notEnabled) {
       throw new WorkerCloneError(
         `workspace clone worktree config could not be enumerated for attestation — refused (fail-closed): ${describeCloneError(err)}`,

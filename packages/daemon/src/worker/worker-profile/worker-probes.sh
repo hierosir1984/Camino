@@ -130,13 +130,17 @@ run_probe github-cred-content sh -c '
     # github registry (`//npm.pkg.github.com/:_authToken=…`, round-15 finding 5),
     # catching a legacy 40-hex/npm token no prefix rule would. Requires a credential
     # KEY (not a generic `token:` line — round-14 finding 7) AND a value of >=16 token
-    # chars, so a PLACEHOLDER like `oauth_token: example` is NOT a false hit (round-15
-    # finding 9).
+    # chars, so a short PLACEHOLDER (`oauth_token: example`) is not a false hit
+    # (round-15 finding 9). `[^A-Za-z0-9_]*` skips ANY separator/quote before the value
+    # — space, `:`, and BOTH quote styles — so a single-quoted YAML value is not missed
+    # (round-16 finding 3). BOUNDARY: distinguishing a real token from a >=16-char
+    # placeholder by shape is heuristic; this test instrumentation errs toward FLAGGING
+    # (a fixture asserted "clean" must simply not carry a real-looking github token).
     found=$(grep -rIliE "(^|[^a-z0-9-])([a-z0-9-]+\.)*github\.com\.?($|[:/?#@])" $roots 2>/dev/null \
       | while IFS= read -r f; do
           [ -z "$f" ] && continue
           [ "$f" = "$self" ] && continue
-          grep -Iiq -E "(oauth_token|_authtoken)[[:space:]]*[:=][[:space:]\"]*[A-Za-z0-9_]{16,}" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
+          grep -Iiq -E "(oauth_token|_authtoken)[[:space:]]*[:=][^A-Za-z0-9_]*[A-Za-z0-9_]{16,}" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
         done)
   fi
   if [ -z "$found" ]; then

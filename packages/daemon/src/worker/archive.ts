@@ -500,6 +500,35 @@ function readFsIdentity(dir: string): FsIdentity | null {
 }
 
 /**
+ * True iff the file begins with the gzip magic bytes (1f 8b). A cheap sanity
+ * check (round-16 finding 9) that the `tar -cz` output is at least a gzip stream:
+ * a `tar` on PATH that exits 0 but writes non-gzip bytes has violated its
+ * contract. That is a daemon SUPPLY-CHAIN condition — a trusted daemon PATH/tar is
+ * a deployment/WP-114 assumption, outside the worker threat model — but this check
+ * refuses to trade the workspace for such a corrupt archive rather than trust the
+ * exit code blindly.
+ */
+async function isGzipFile(path: string): Promise<boolean> {
+  let fh: FileHandle | undefined;
+  try {
+    fh = await openAsync(path, "r");
+    const buf = Buffer.alloc(2);
+    const { bytesRead } = await fh.read(buf, 0, 2, 0);
+    return bytesRead === 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  } catch {
+    return false;
+  } finally {
+    if (fh !== undefined) {
+      try {
+        await fh.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
  * tar the workspace, streaming tar's STDOUT to `tmpPath`, OFF the daemon loop and
  * BOUNDED to `maxBytes` compressed. Streaming (not `tar -f`) lets us both ignore
  * stderr volume AND cap the write:
@@ -514,9 +543,13 @@ function readFsIdentity(dir: string): FsIdentity | null {
  *    streams — once it passes `maxBytes`, tar is killed and the partial abandoned,
  *    so at most one chunk is ever written past the cap.
  * Backpressure is respected (pause on a full write buffer, resume on drain), so
- * RSS stays ~one chunk regardless of archive size. stderr is drained into a
- * bounded TAIL — the LAST bytes, where a genuine failure's cause sits (round-15
- * finding 8) — used only to describe a non-zero exit.
+ * RSS stays BOUNDED — roughly the write high-water mark plus the OS pipe buffer,
+ * NOT proportional to archive size (round-16 finding 7; not a fixed one chunk).
+ * stderr is drained into a bounded TAIL and the LAST bytes are surfaced — where a
+ * genuine failure's cause sits (round-15 finding 8, round-16 finding 6). The output
+ * file is opened only AFTER tar SPAWNS (round-16 finding 5), so a spawn failure
+ * (e.g. tar not on PATH) can never leave an orphan `.partial`; on any post-spawn
+ * failure the partial is removed once its stream fully closes.
  */
 function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -524,7 +557,7 @@ function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number):
     let stderrTail = "";
     let written = 0;
     let settled = false;
-    const out = createWriteStream(tmpPath);
+    let out: ReturnType<typeof createWriteStream> | undefined;
     const child = spawn("tar", ["-cz", "-C", workspaceReal, "."], {
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -539,7 +572,12 @@ function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number):
       } catch {
         /* already gone */
       }
-      out.destroy();
+      if (out) {
+        // Remove the partial once the stream has fully CLOSED (after any pending
+        // open completes), so a mid-open destroy cannot leave the file behind.
+        out.once("close", () => safeRemove(tmpPath));
+        out.destroy();
+      }
       settle(() => reject(err));
     };
     child.stderr?.on("data", (chunk: Buffer) => {
@@ -547,36 +585,42 @@ function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number):
       // chunk is itself pipe-buffer-bounded (~64 KiB), so the transient is small.
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_CAP);
     });
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      written += chunk.length;
-      if (written > maxBytes) {
-        fail(
-          new ArchivalError(
-            "archive-quota",
-            `archive exceeded the ${maxBytes}-byte compressed cap during write (registry item 11) — tar aborted, workspace retained for escalation`,
-          ),
-        );
-        return;
-      }
-      if (!out.write(chunk)) child.stdout.pause();
-    });
-    out.on("drain", () => {
-      if (!settled) child.stdout.resume();
-    });
-    child.stdout.on("end", () => out.end());
+    // A spawn FAILURE (ENOENT etc.) fires 'error' BEFORE 'spawn', so `out` is
+    // never created and no orphan file appears.
     child.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
-    out.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    child.once("spawn", () => {
+      // The process is running — open the output only now (round-16 finding 5).
+      out = createWriteStream(tmpPath);
+      out.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
+      out.on("drain", () => {
+        if (!settled) child.stdout.resume();
+      });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (settled) return;
+        written += chunk.length;
+        if (written > maxBytes) {
+          fail(
+            new ArchivalError(
+              "archive-quota",
+              `archive exceeded the ${maxBytes}-byte compressed cap during write (registry item 11) — tar aborted, workspace retained for escalation`,
+            ),
+          );
+          return;
+        }
+        if (!out!.write(chunk)) child.stdout.pause();
+      });
+      child.stdout.on("end", () => out!.end());
+    });
     child.on("close", (code) => {
       if (settled) return;
       if (code === 0) {
         // Resolve only once the file stream has flushed everything to disk.
-        if (out.writableFinished) settle(() => resolve());
+        if (!out || out.writableFinished) settle(() => resolve());
         else out.once("finish", () => settle(() => resolve()));
       } else {
         fail(
           new Error(
-            `tar exited ${code ?? "null"}${stderrTail ? `: ${stderrTail.trim().slice(0, 300)}` : ""}`,
+            `tar exited ${code ?? "null"}${stderrTail ? `: ${stderrTail.trim().slice(-300)}` : ""}`,
           ),
         );
       }
@@ -1056,6 +1100,16 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     throw new ArchivalError(
       "archive-write",
       `tar failed: ${describeError(err, 300)} — workspace retained`,
+    );
+  }
+  // Sanity: the output must be a gzip stream (round-16 finding 9). A tar on PATH
+  // that exits 0 with non-gzip bytes has violated its contract; refuse rather than
+  // hash it, record a ledger row, and destroy the workspace for a corrupt archive.
+  if (!(await isGzipFile(tmpPath))) {
+    safeRemove(tmpPath);
+    throw new ArchivalError(
+      "archive-write",
+      `the written archive ${tmpPath} is not a gzip stream (tar exited 0 but did not honor its contract) — workspace retained (fail-closed; a trusted daemon PATH/tar is a deployment/WP-114 assumption)`,
     );
   }
   // STAGE the size + hash reads (round-14 finding 6): sha256File streams the

@@ -57,9 +57,13 @@ export type DispatchOutcome =
   "succeeded" | "requirement-failed" | "quota-blocked" | "cancelled" | "killed" | "killed-budget";
 
 /**
- * Per-attempt budget (CAM-EXEC-03, WP-107): wall-clock ALWAYS; tokens only
- * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach
- * runs the kill-confirm sequence and classifies `killed-budget`.
+ * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock ceiling is always
+ * REQUIRED (tokens only where the vendor stream reports usage,
+ * StreamEvent.tokensTotal). A breach runs the kill-confirm sequence and classifies
+ * `killed-budget`. NB the wall-clock ceiling's ENFORCEMENT is best-effort
+ * in-process (a daemon loop stall can delay it) and authoritative out-of-process
+ * (the container / WP-114 supervisor) — "always" means always part of the budget,
+ * not always reliably enforced by the in-process timer.
  */
 export interface AttemptBudget {
   /** Wall-clock ceiling for the dispatch, in milliseconds. Required. */

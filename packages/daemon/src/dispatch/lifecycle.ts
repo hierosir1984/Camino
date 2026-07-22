@@ -80,7 +80,12 @@ export interface DispatchOptions {
    * `signal`.
    */
   cancelAfterFirstEventMs?: number;
-  /** Hard cap so a real dispatch can never run away. Classified `killed`, never `cancelled`. */
+  /**
+   * In-process cap that classifies `killed` (never `cancelled`) if a dispatch runs
+   * long. Like the wall-clock budget it is a best-effort in-process timer, not an
+   * out-of-process guarantee; the authoritative runaway bound is the container /
+   * WP-114 supervisor.
+   */
   timeoutMs?: number;
   /**
    * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock budget is REQUIRED and
@@ -542,8 +547,10 @@ export async function dispatch(
     // Budget snapshot (one read each, validated plain numbers — same
     // discipline as every other option). Fail-closed coercion: a budget
     // object whose wallClockMs is corrupt clamps to 0 (immediate breach),
-    // never to "unenforced" — wall-clock is ALWAYS enforced when a budget is
-    // supplied (CAM-EXEC-03). A corrupt tokens value likewise becomes 0
+    // never to "unenforced" — wall-clock is always ARMED when a budget is
+    // supplied (CAM-EXEC-03; its enforcement is best-effort in-process and
+    // authoritative out-of-process — see the DispatchOptions.budget boundary). A
+    // corrupt tokens value likewise becomes 0
     // (breach on the first usage report) rather than silently absent.
     const rawBudget = opts.budget; // one read
     let budgetTokens: number | undefined;
@@ -830,17 +837,21 @@ export async function dispatch(
           // bounds RSS but DISCARDS any usage the adapter reports in that SAME JSON
           // object (Claude bundles terminal text + usage), so a giant line could hide
           // token usage and slip past the token budget. Under an ACTIVE token budget,
-          // an over-cap STDOUT line (where usage lives) is a usage report we cannot
-          // verify → fail CLOSED: declare a token breach and kill-and-escalate rather
-          // than silently accept it as under-budget. stdout only (stderr carries no
-          // usage); only when a token budget is set (wall-clock is unaffected).
-          if (channel === "stdout" && budgetTokens !== undefined && !budgetBreach) {
+          // an over-cap line is a usage report we cannot verify → fail CLOSED: declare
+          // a token breach and kill-and-escalate rather than silently accept it as
+          // under-budget. EITHER channel (round-16 finding 1): the adapter contract
+          // permits parseLine to report tokensTotal on stderr too, so an over-cap line
+          // on stdout OR stderr can hide usage. But NOT once another reason already
+          // decided the kill (round-16 finding 2): after a cancel/timeout, a late
+          // over-cap line during kill-grace must NOT manufacture a token breach and
+          // flip `cancelled`/`killed` into a false A.2#10 budget escalation.
+          if (budgetTokens !== undefined && !budgetBreach && !killReason) {
             budgetBreach = {
               kind: "tokens",
               limit: budgetTokens,
               observed: budgetTokens,
               reason:
-                "usage-unverifiable: a stdout line exceeded the reader cap, so its reported token usage could not be parsed (fail-closed)",
+                "usage-unverifiable: a line exceeded the reader cap, so its reported token usage could not be parsed (fail-closed)",
             };
             requestKill("budget");
           }

@@ -14,7 +14,7 @@ The pieces, by requirement:
 | [`clone.ts`](clone.ts)                                          | CAM-EXEC-02    | A **full isolated clone** (`--no-local`, object store stands alone), hooks disabled by config at clone time, and **no GitHub credentials composed into the container** (clean env — no credential-shaped keys; provider auth is the _subscription_ provider's token, mounted read-only) — see the credential-guarantee boundary below. |
 | [`egress.ts`](egress.ts) + [`worker-profile/`](worker-profile/) | CAM-EXEC-02/03 | The hardened `docker run` composer (cap-drop ALL + minimal bootstrap caps, `no-new-privileges`, pids-limit, PID namespace) and the profile image: **default-deny egress with a per-repo allowlist**, provider auth mounted **read-only**.                                                                                              |
 | [`repo-config.ts`](repo-config.ts)                              | CAM-EXEC-03    | The `.camino/config.yml` egress allowlist, parsed **fail-closed** (absent = deny-all; malformed = refusal, never a silent deny).                                                                                                                                                                                                       |
-| [`budget.ts`](budget.ts) + the lifecycle `budget` seam          | CAM-EXEC-03    | Per-attempt budgets (**wall-clock always**, **tokens where reportable**) → `killed-budget` → **kill-and-escalate, never an automatic retry** (Appendix A.3#5 / A.2#10).                                                                                                                                                                |
+| [`budget.ts`](budget.ts) + the lifecycle `budget` seam          | CAM-EXEC-03    | Per-attempt budgets (**wall-clock always required**, **tokens where reportable**) → `killed-budget` → **kill-and-escalate, never an automatic retry** (A.3#5 / A.2#10). The in-process wall-clock timer is best-effort; the authoritative bound is out-of-process (WP-114) — see the budget boundary below.                            |
 | [`archive.ts`](archive.ts)                                      | CAM-EXEC-05    | The **single archival step** (A.4#5): archive under quota → ledger row referencing it → workspace destroyed, strictly ordered and fail-closed; registry-item-11 retention (90 days **or** last 10, whichever more).                                                                                                                    |
 
 Registry item 11's quota values live once in
@@ -50,9 +50,10 @@ established-egress bypass).
 - **Token budgets bind only where the vendor stream reports cumulative usage**
   (claude `result` usage, codex `turn.completed` usage). "Tokens where
   reportable" is literal: a harness that reports nothing is guarded by
-  wall-clock alone (always enforced) — which is exactly why a token-only budget
-  is refused. WP-106's quota-aware routing owns provider window models; this is
-  the per-attempt hard cap, not the window.
+  wall-clock alone (always required, best-effort in-process / authoritative
+  out-of-process — see the budget boundary below) — which is exactly why a
+  token-only budget is refused. WP-106's quota-aware routing owns provider window
+  models; this is the per-attempt hard cap, not the window.
 - **The ledger-row seam is a callback** (`recordLedgerRow`): the durable
   event-store wiring is the caller's (WP-109 store). The archival step
   guarantees the _order_ and the _retention_, and fails closed (workspace

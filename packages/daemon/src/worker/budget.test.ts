@@ -12,6 +12,7 @@ import { attemptMachine, issueMachine, transition } from "@camino/core";
 import type { IssueEvent } from "@camino/core";
 import type { AdapterSpec } from "@camino/shared";
 import { mockAdapter } from "../dispatch/adapters/mock.js";
+import { dispatch } from "../dispatch/lifecycle.js";
 import { BudgetConfigError, dispatchWithBudget, validateAttemptBudget } from "./budget.js";
 
 /**
@@ -127,6 +128,71 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 100 });
     expect(record.budgetBreach?.reason).toMatch(/unverifiable/i);
     expect(escalation).toBeDefined(); // kill-and-escalate, never a silent success
+  }, 30_000);
+
+  it("fails CLOSED for an over-cap STDERR line too — usage can ride either channel (round-16 finding 1)", async () => {
+    // The adapter contract permits parseLine to report tokensTotal on stderr, so an
+    // over-cap line on EITHER stream can hide usage; the fail-closed is not
+    // stdout-only.
+    const bigStderr: AdapterSpec = {
+      name: "bigstderr",
+      enabled: true,
+      plan: () => ({
+        file: process.execPath,
+        args: ["-e", `process.stderr.write("{" + "x".repeat(70000) + "}\\n")`],
+        env: {},
+      }),
+      parseLine: () => null,
+    };
+    const { record } = await dispatchWithBudget(
+      bigStderr,
+      { workdir: workdir(), prompt: "hide usage on stderr" },
+      { wallClockMs: 10_000, tokens: 100 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 100 });
+  }, 30_000);
+
+  it("does NOT manufacture a token breach after a cancel — a late over-cap line stays `cancelled` (round-16 finding 2)", async () => {
+    // The first event arms cancelAfterFirstEventMs; the worker ignores SIGTERM and,
+    // WELL AFTER the cancel has fired (killReason=cancel), emits an over-cap line then
+    // exits. The token fail-closed must NOT flip `cancelled` into a false A.2#10
+    // budget escalation.
+    const lateBigLine: AdapterSpec = {
+      name: "late-bigline",
+      enabled: true,
+      plan: () => ({
+        file: process.execPath,
+        args: [
+          "-e",
+          `process.on("SIGTERM",()=>{});process.stdout.write(JSON.stringify({type:"assistant",text:"hi"})+"\\n");setTimeout(()=>{process.stdout.write("{"+"x".repeat(70000)+"}\\n");process.exit(0)},400)`,
+        ],
+        env: {},
+      }),
+      parseLine: (line: string) => {
+        try {
+          const o = JSON.parse(line) as { type?: string; text?: string };
+          return {
+            kind: o.type === "assistant" ? ("assistant" as const) : ("other" as const),
+            text: o.text ?? "",
+          };
+        } catch {
+          return null;
+        }
+      },
+    };
+    const rec = await dispatch(
+      lateBigLine,
+      { workdir: workdir(), prompt: "cancel then emit a giant line" },
+      {
+        budget: { wallClockMs: 10_000, tokens: 100 },
+        cancelAfterFirstEventMs: 50,
+        killConfirm: FAST_KILL,
+      },
+    );
+    expect(rec.outcome).toBe("cancelled");
+    expect(rec.budgetBreach).toBeUndefined();
   }, 30_000);
 
   it("wall-clock covers the GROUP: a leader that EXITS 0 while an in-group descendant outlives the budget is killed-budget, not succeeded (round-8 finding 1)", async () => {

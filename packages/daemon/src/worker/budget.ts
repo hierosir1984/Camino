@@ -5,10 +5,11 @@
 // lives, so no caller can misclassify a budget kill. THIS module is the
 // policy seam above it:
 //
-//   - it validates the budget shape fail-closed (a wall-clock budget is
-//     REQUIRED — a dispatch without a finite positive wall-clock budget is
-//     refused, since "tokens where reportable" means token budgets alone can
-//     never be the only guard);
+//   - it validates the budget shape fail-closed (a budget SUPPLIED to this seam
+//     must carry a finite positive wall-clock ceiling — "tokens where reportable"
+//     means a token budget alone can never be the only guard; the lower-level
+//     dispatch() primitive may run with no budget where none applies, e.g. an
+//     internal plan-runner step);
 //   - it maps a killed-budget outcome onto the Appendix A events the state
 //     machines consume: A.3#5 (attempt `running → killed-budget`) and A.2#10
 //     (issue `implementing → escalated`);
@@ -17,20 +18,21 @@
 //     no row from a budget breach back to `ready` ("never an automatic
 //     retry", pinned by budget.test.ts walking the tables).
 //
-// BOUNDARY, stated (round-11 findings 4/5/6): the wall-clock guard is an
-// IN-PROCESS event-loop timer plus a reliable POST-REAP exit-handling check. It
-// is authoritative under a HEALTHY event loop. Under a GROSS daemon event-loop
-// stall — which a WORKER cannot induce (the bounded pre-parser line reader caps
-// per-line synchronous work) — its timing is best-effort: a stall can (a) miss a
-// LEADER-ONLY overrun (the leader exits during the stall and is reaped before we
-// observe it), (b) lose same-boundary precedence to a coincident timeout, or (c),
-// if a just-exited zombie leader lingers inside the small on-time window,
-// over-attribute (fail-SAFE: it escalates a run for human review, never silently
-// credits an overrun). The exit-handling check DOES reliably catch DESCENDANT
-// overruns even under a stall. The authoritative out-of-process bound is the
-// container / WP-114 supervisor (kill the container ⇒ reap every pid), the same
-// group-vs-tree boundary this WP states throughout. A daemon-side stall is a
-// daemon-health concern, not a worker-exploitable one.
+// BOUNDARY, stated honestly (round-11 findings 4/5/6, CORRECTED round-15 findings
+// 2/3 + round-16 finding 4): the wall-clock guard is an IN-PROCESS event-loop timer
+// plus a reliable POST-REAP exit-handling check. It is best-effort to within the
+// daemon loop's scheduling latency — and that latency IS worker-influenceable: a
+// worker can make Camino's OWN daemon-side work (N concurrent archival hashes, the
+// synchronous credential scan, a large fsync) delay the timer by tens-to-hundreds
+// of ms and overrun by that much. Camino shrinks its own contribution where cheap
+// (spawned/yielding tar+hash+delete+walk, off-loop fsync, capped candidate reads, a
+// per-line CPU cap), but does NOT claim to bound it — an in-process timer cannot be
+// made immune to concurrent same-process CPU. Under such a stall the guard still
+// fails SAFE (it escalates for human review, never silently credits an overrun),
+// and the exit-handling check reliably catches DESCENDANT overruns. The
+// AUTHORITATIVE out-of-process bound is the container / WP-114 supervisor (kill the
+// container ⇒ reap every pid); this timer is a fast-path best-effort kill, not the
+// guarantee.
 import type { AdapterContext, AdapterSpec, AttemptBudget, DispatchRecord } from "@camino/shared";
 import type { AttemptEvent, IssueEvent } from "@camino/core";
 import {
@@ -47,10 +49,12 @@ export class BudgetConfigError extends Error {
 }
 
 /**
- * Validate an attempt budget fail-closed: wall-clock must be a finite
- * positive number of milliseconds (ALWAYS enforced); tokens, when present,
- * a finite positive count. A malformed budget is a configuration refusal —
- * never a silently unenforced one.
+ * Validate an attempt budget fail-closed: wall-clock must be a finite positive
+ * number of milliseconds — it is always PART OF a valid budget (unlike tokens,
+ * which are conditional on the stream reporting usage); its ENFORCEMENT is
+ * best-effort in-process and authoritative out-of-process (see the module
+ * boundary). Tokens, when present, a finite positive count. A malformed budget is
+ * a configuration refusal — never a silently unenforced one.
  */
 export function validateAttemptBudget(budget: AttemptBudget): void {
   if (!Number.isFinite(budget.wallClockMs) || budget.wallClockMs <= 0) {
