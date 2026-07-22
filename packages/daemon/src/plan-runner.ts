@@ -41,6 +41,14 @@ import { dispatch } from "./dispatch/lifecycle.js";
 import type { DispatchOptions } from "./dispatch/lifecycle.js";
 import { PlanningError, PlanningService } from "./planning.js";
 
+/**
+ * Hard cap on the stream file (code units): with per-record bounds of 4000
+ * chars this is thousands of records — far beyond any human-approvable
+ * plan — and it makes the quadratic tail's operand bounded in code rather
+ * than in prose (r5 finding 7).
+ */
+export const MAX_STREAM_CHARS = 4 * 1024 * 1024;
+
 /** One refused stream line: the line number and the named reason. */
 export interface RefusedLine {
   readonly line: number;
@@ -170,6 +178,18 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
     // Offsets are string (code-unit) indices throughout — the byte size from
     // stat is only an existence probe, never compared against them.
     const text = readFileSync(streamPath, "utf8");
+    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7): a
+    // stream past the cap is a protocol violation, refused by name.
+    if (text.length > MAX_STREAM_CHARS) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          `stream file exceeds the ${MAX_STREAM_CHARS}-character bound — ` +
+          "runaway worker output; further records refused",
+      });
+      return;
+    }
     if (text.length < offset) {
       shrunk = true;
       refused.push({

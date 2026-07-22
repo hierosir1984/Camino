@@ -59,7 +59,10 @@ export interface PrdSegment {
  */
 export function segmentPrd(text: string): PrdSegment[] {
   const lines = text.split(/\r\n|\r|\n/);
-  const blocks: string[] = [];
+  // Blocks CARRY their fenced-ness — re-deriving it from the text would
+  // re-admit the naive prefix test the opener logic just rejected
+  // (r5 finding 5's invalid-opener case).
+  const blocks: Array<{ text: string; fenced: boolean }> = [];
   let current: string[] = [];
   // CommonMark fence semantics (r3 finding 7; r4 finding 4): a fence
   // closes only on a line of the SAME delimiter family, at least the
@@ -68,18 +71,23 @@ export function segmentPrd(text: string): PrdSegment[] {
   // open ```text fence is content.
   let openFence: { family: "`" | "~"; length: number } | null = null;
 
-  const flush = (): void => {
+  const flush = (fenced = false): void => {
     if (current.length > 0) {
-      blocks.push(current.join("\n"));
+      blocks.push({ text: current.join("\n"), fenced });
       current = [];
     }
   };
 
   const fenceOpener = (line: string): { family: "`" | "~"; length: number } | null => {
-    const match = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
     if (match === null) return null;
     const run = match[1] as string;
-    return { family: run[0] as "`" | "~", length: run.length };
+    const family = run[0] as "`" | "~";
+    // CommonMark: a backtick fence's info string may not contain a
+    // backtick — such a line is ordinary paragraph text, not a fence
+    // opener (r5 finding 5). Tilde info strings carry no such rule.
+    if (family === "`" && (match[2] as string).includes("`")) return null;
+    return { family, length: run.length };
   };
 
   const closesFence = (line: string, fence: { family: "`" | "~"; length: number }): boolean => {
@@ -94,7 +102,7 @@ export function segmentPrd(text: string): PrdSegment[] {
       current.push(line);
       if (closesFence(line, openFence)) {
         openFence = null;
-        flush();
+        flush(true);
       }
       continue;
     }
@@ -120,15 +128,15 @@ export function segmentPrd(text: string): PrdSegment[] {
     }
     current.push(line);
   }
-  flush();
+  flush(openFence !== null); // an unclosed fence stays a fence block
 
   const segments: string[] = [];
   for (const block of blocks) {
-    if (/^ {0,3}(```|~~~)/.test(block)) {
-      segments.push(block);
+    if (block.fenced) {
+      segments.push(block.text);
       continue;
     }
-    segments.push(...splitSentences(block.split("\n").join(" ").trim()));
+    segments.push(...splitSentences(block.text.split("\n").join(" ").trim()));
   }
 
   return segments
@@ -550,10 +558,15 @@ export function plantedAmbiguityCoverage(
       .filter((t) => t.length > 0);
   // An anchor token matches a text token exactly OR as a PREFIX when the
   // anchor is at least 4 characters ("header" matches "headers", "retain"
-  // matches "retained") — ordinary inflection must not read as a silent
-  // guess (r4 finding 7), while short anchors stay exact so "cap" cannot
-  // match "capable". Substrings never match ("support" is not prefixed by
-  // "port").
+  // matches "retained"); short anchors stay exact. This is a HEURISTIC
+  // with stated failure modes in both directions (r5 finding 6): a
+  // non-prefix inflection misses ("policy" does not match "policies") and
+  // an unrelated prefix-sharing word matches ("port" matches "portal").
+  // Neither is silently absorbed — the manifest author owns the anchors:
+  // list inflection variants explicitly where prefixing fails, and choose
+  // anchors long or specific enough that prefix collisions do not occur
+  // in the fixture's vocabulary. Coverage remains fixture calibration for
+  // cooperative planners, not adversarial-proof semantics.
   const tokenMatches = (textToken: string, anchorToken: string): boolean =>
     textToken === anchorToken || (anchorToken.length >= 4 && textToken.startsWith(anchorToken));
   const containsTokenSequence = (

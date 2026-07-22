@@ -695,3 +695,55 @@ describe("round-4 falsification regressions (core)", () => {
     expect(coverage.covered).toEqual([]);
   });
 });
+
+describe("round-5 falsification regressions (core)", () => {
+  it("R5-5: a backtick in a backtick fence's info string is not a fence opener", () => {
+    const text = "```bad`info\nSensitive retention. Users may delete.\n```\n";
+    const segments = segmentPrd(text);
+    // Not a fence: the invalid opener is paragraph text (it joins the
+    // following line as prose), the requirements sentence-split instead of
+    // hiding inside one fenced segment, and the second requirement stands
+    // alone. (The trailing ``` opens an unclosed fence of its own.)
+    const texts = segments.map((s) => s.text);
+    expect(texts).toContain("Users may delete.");
+    expect(texts.some((t) => t.includes("Sensitive retention."))).toBe(true);
+    expect(
+      texts.some((t) => t.includes("Sensitive retention.") && t.includes("Users may delete.")),
+    ).toBe(false); // nothing buried
+  });
+
+  it("R5-6: prefix-matching failure modes are the STATED boundary, pinned", () => {
+    const segs: PrdSegment[] = [{ segmentId: "S1", text: "The gateway is configurable." }];
+    const planted = (terms: string[]) => [
+      {
+        id: "A1",
+        segmentText: "The gateway is configurable.",
+        summary: "s",
+        answerKeyTerms: terms,
+      },
+    ];
+    const ask = (question: string) => [
+      {
+        clarificationId: "Q1",
+        question,
+        whyItMatters: "w",
+        assumptionIfUnanswered: "a",
+        relatedSegmentIds: ["S1"],
+        relatedPlanIssueIds: [],
+      },
+    ];
+    // Stated failure mode 1: an unrelated prefix-sharing word covers.
+    expect(
+      plantedAmbiguityCoverage(planted(["port"]), segs, ask("Which portal applies?")).covered,
+    ).toHaveLength(1);
+    // Stated failure mode 2: a non-prefix inflection misses — the manifest
+    // author lists the variant ("policies") explicitly.
+    expect(
+      plantedAmbiguityCoverage(planted(["policy"]), segs, ask("Which policies apply?")).covered,
+    ).toHaveLength(0);
+    expect(
+      plantedAmbiguityCoverage(planted(["policy", "policies"]), segs, ask("Which policies apply?"))
+        .covered,
+    ).toHaveLength(1);
+  });
+});

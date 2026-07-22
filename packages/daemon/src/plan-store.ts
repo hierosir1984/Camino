@@ -419,6 +419,23 @@ export class PlanStore {
             `${context} fails validation — refusing to adopt: ${problems.join("; ")}`,
           );
         }
+        // Class binding at adoption (r4 finding 2; landed in r5 after the
+        // r4 scripted edit silently failed to apply — caught by the r5
+        // review): a raw-written artifact of the wrong review class for
+        // its session's template is refused, not adopted.
+        const sessionTemplate = this.#db
+          .prepare("SELECT template FROM plan_sessions WHERE session_id = ?")
+          .get(row.session_id) as { template: string } | undefined;
+        if (sessionTemplate !== undefined) {
+          const expectedClass =
+            MISSION_TEMPLATES[sessionTemplate.template as MissionTemplateName].reviewClass;
+          if (payload["reviewClass"] !== expectedClass) {
+            throw new Error(
+              `${context} review class ${JSON.stringify(payload["reviewClass"])} does not ` +
+                `match the ${sessionTemplate.template} template — refusing to adopt`,
+            );
+          }
+        }
         continue;
       }
       const problems = planConstructionRecordProblems(payload);
@@ -1304,10 +1321,21 @@ export class PlanStore {
     // session's identical-terms contract does not satisfy this session's
     // completion.
     for (const expected of this.#expectedContractTerms(sessionId, session, state)) {
+      // The freeze this completion marks always produces VERSION 1 —
+      // contract edits (WP-112) happen only after approval completes. A
+      // higher version at completion time means a row this session's
+      // freeze cannot have written (r5 finding 1): refuse, never
+      // substitute the stored version into the rebuild.
       const stored = this.latestContract(expected.issueId);
       if (stored === undefined) {
         throw new Error(
           `plan session ${sessionId} completion refused: no contract stored for ${expected.issueId}`,
+        );
+      }
+      if (stored.version !== expected.version) {
+        throw new Error(
+          `plan session ${sessionId} completion refused: ${expected.issueId} is at ` +
+            `v${stored.version}, but this session's freeze produces v${expected.version}`,
         );
       }
       const owner = this.contractSession(stored.issueId, stored.version);
@@ -1317,7 +1345,7 @@ export class PlanStore {
             `v${stored.version} was frozen by session ${owner ?? "unknown"}`,
         );
       }
-      const rebuilt = contractHash({ ...expected, version: stored.version });
+      const rebuilt = contractHash(expected);
       if (stored.contractHash !== rebuilt) {
         throw new Error(
           `plan session ${sessionId} completion refused: contract ${stored.issueId} ` +

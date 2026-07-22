@@ -595,3 +595,68 @@ describe("round-4 falsification regressions (store)", () => {
     ).toThrow(/no canonical JSON form/);
   });
 });
+
+describe("round-5 falsification regressions (store)", () => {
+  it("R5-1: completion refuses when the latest contract version is not this freeze's v1", () => {
+    const store = openStore(":memory:");
+    seedCoherentSession(store, "session-a");
+    seedCoherentSession(store, "session-b");
+    actEverything(store, "session-a");
+    actEverything(store, "session-b");
+    store.recordApproval("session-a", "david");
+    store.insertContract(sampleContract(), "session-a");
+    store.recordApprovalCompletion("session-a");
+    store.recordApproval("session-b", "david");
+    // Session B inserts a v2 row it could never have frozen (the freeze
+    // always produces v1) and tries to complete on it.
+    const base = sampleContract();
+    const v2Terms: ContractTerms = {
+      schemaVersion: base.schemaVersion,
+      missionId: base.missionId,
+      issueId: base.issueId,
+      version: 2,
+      template: base.template,
+      title: base.title,
+      goal: base.goal,
+      acceptanceCriteria: [...base.acceptanceCriteria],
+      requirementIds: [...base.requirementIds],
+      dependsOn: [...base.dependsOn],
+      interfaces: [...base.interfaces],
+    };
+    store.insertContract(
+      {
+        ...v2Terms,
+        contractHash: contractHash(v2Terms),
+        frozenAt: base.frozenAt,
+        approvedBy: base.approvedBy,
+      },
+      "session-b",
+    );
+    expect(() => store.recordApprovalCompletion("session-b")).toThrow(/freeze produces v1/);
+  });
+
+  it("R5-2: adoption refuses a wrong-class review row WITHOUT any schema tamper", () => {
+    const dir = tempDir();
+    const path = join(dir, "plan.sqlite");
+    const store = openStore(path);
+    seedSession(store); // feature template
+    store.close();
+    // Plain INSERT — the append-only triggers allow it; no trigger is
+    // dropped, so the schema-definition comparison passes and the CLASS
+    // check itself must refuse.
+    const raw = new Database(path);
+    raw
+      .prepare(
+        "INSERT INTO plan_stream (session_id, seq, kind, payload, recorded_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        "plan-m1-1",
+        1,
+        "review-attached",
+        JSON.stringify({ reviewClass: "mini-falsification", reviewer: "codex-cli" }),
+        "2026-07-22T00:00:00.000Z",
+      );
+    raw.close();
+    expect(() => new PlanStore(path)).toThrow(/does not match the feature template/);
+  });
+});
