@@ -756,15 +756,17 @@ export async function dispatch(
     // pre-parse buffer.
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
       stream.setEncoding("utf8");
-      // Line-terminator parity with readline (round-5 finding 3): LF, CR, AND
-      // CRLF all terminate a line. A CR at a chunk boundary is HELD (pendingCR)
-      // until the next chunk resolves whether it is a lone CR or the CR of a
-      // CRLF. `partial` accumulates line CONTENT only (never a terminator), so
-      // the cap counts content, not delimiters (an exactly-MAX line with CRLF
-      // is not falsely truncated).
+      // Line-terminator parity with readline (round-5 finding 3, round-6
+      // finding 2): LF, CR, and CRLF all terminate a line. A CR terminates the
+      // line IMMEDIATELY (so a CR-terminated record is parsed at once, not held
+      // until later output or EOF — the readline behavior); a following LF (a
+      // CRLF, possibly split across chunks) is then SWALLOWED via swallowNextLF
+      // so it does not emit a spurious empty line. `partial` accumulates line
+      // CONTENT only (never a terminator), so the cap counts content, not
+      // delimiters (an exactly-MAX line with CRLF is not falsely truncated).
       let partial = "";
       let skipping = false; // discarding the tail of an over-long line
-      let pendingCR = false; // a CR held at a chunk boundary
+      let swallowNextLF = false; // consume a LF immediately after a CR (CRLF)
       let closed = false;
       const accumulate = (s: string) => {
         if (skipping || s.length === 0) return;
@@ -787,15 +789,15 @@ export async function dispatch(
         partial = "";
         if (!closed) handleLine(channel, line);
       };
-      const onData = (chunk: string) => {
+      const onData = (data: string) => {
         if (closed) return;
-        let data = chunk;
-        if (pendingCR) {
-          pendingCR = false;
-          emitLine(); // the held CR terminated the pending line
-          if (data.charCodeAt(0) === 10) data = data.slice(1); // it was CRLF split across chunks
-        }
         let start = 0;
+        // A LF at the very start of a chunk that continues a CR from the prior
+        // chunk (CRLF split across chunks) is swallowed.
+        if (swallowNextLF && data.charCodeAt(0) === 10) {
+          start = 1;
+        }
+        swallowNextLF = false;
         while (start < data.length) {
           let nl = -1;
           for (let i = start; i < data.length; i++) {
@@ -811,12 +813,13 @@ export async function dispatch(
           }
           accumulate(data.slice(start, nl));
           if (data.charCodeAt(nl) === 13) {
-            // CR: could be lone CR or the start of CRLF.
+            // CR terminates the line NOW (readline parity). If a LF follows —
+            // in this chunk or the next — swallow it (CRLF).
+            emitLine();
             if (nl === data.length - 1) {
-              pendingCR = true; // hold; the next chunk (or end) resolves it
+              swallowNextLF = true; // resolve against the next chunk's first char
               return;
             }
-            emitLine();
             start = data.charCodeAt(nl + 1) === 10 ? nl + 2 : nl + 1;
           } else {
             emitLine(); // LF
@@ -828,12 +831,9 @@ export async function dispatch(
       streamsClosed.push(
         new Promise<void>((resolve) => {
           const done = () => {
-            // A final line without a trailing terminator, or one held by a CR
-            // at the very end (readline parity): emit it once at end.
-            if (!closed && !skipping && (partial.length > 0 || pendingCR)) {
-              pendingCR = false;
-              emitLine();
-            }
+            // A final line without a trailing terminator (readline parity): emit
+            // it once at end. A trailing CR already emitted its line inline.
+            if (!closed && !skipping && partial.length > 0) emitLine();
             resolve();
           };
           stream.once("end", done);

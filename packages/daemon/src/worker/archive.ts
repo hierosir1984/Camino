@@ -133,6 +133,13 @@ export interface ArchiveLedgerRow {
 export interface ArchiveSidecar {
   issueId: string;
   attemptId: string;
+  /**
+   * Absolute path of the workspace this archival is for. Recorded so a
+   * re-invocation can tell a genuine destroy-failure RESUME (this exact
+   * workspace still exists) from a duplicate call with a different workspace
+   * (round-6 finding 1).
+   */
+  workspacePath: string;
   archiveWrittenAt: string;
   /**
    * Durable per-issue monotonic ordinal, assigned at archive time (max
@@ -216,41 +223,87 @@ function safeRemove(p: string): void {
 }
 
 /**
- * Remove `p`, and if the removal ITSELF fails (a non-writable dir, EISDIR),
- * throw a routable ArchivalError rather than letting a raw fs error escape the
- * staged contract (round-5 finding 2).
+ * Read `sidecarPath` and return it iff it is a VALID sidecar for this attempt
+ * (round-5 finding 1) — parses, matches issueId/attemptId, and carries a safe
+ * seq + finite bytes + a parseable archiveWrittenAt. Returns null for a
+ * missing/truncated/malformed/one-byte sidecar. Because the sidecar is written
+ * AFTER the ledger row, a VALID sidecar proves the ledger row was recorded
+ * (round-6 finding 1); its ABSENCE means the ledger state is unknown.
  */
-function removeOrThrow(p: string, context: string): void {
-  try {
-    rmSync(p, { recursive: true, force: true });
-  } catch (err) {
-    throw new ArchivalError(
-      "archive-write",
-      `${context}: could not remove ${p} (${(err as Error).message.slice(0, 200)}) — refused (fail-closed)`,
-    );
-  }
-}
-
-/**
- * Is `sidecarPath` a COMPLETE, valid sidecar for this attempt (round-5 finding
- * 1)? Requires it to parse AND carry the matching issueId/attemptId and a safe
- * seq — a missing, truncated, malformed, or one-byte sidecar reads as
- * INCOMPLETE (so the pre-write recovery redoes the archival), never as "already
- * complete".
- */
-function sidecarIsComplete(sidecarPath: string, issueId: string, attemptId: string): boolean {
+function readValidSidecar(
+  sidecarPath: string,
+  issueId: string,
+  attemptId: string,
+): ArchiveSidecar | null {
   let raw: string;
   try {
     raw = readFileSync(sidecarPath, "utf8");
   } catch {
-    return false; // absent / unreadable
+    return null; // absent / unreadable
   }
   try {
     const s = JSON.parse(raw) as Partial<ArchiveSidecar>;
-    return s.issueId === issueId && s.attemptId === attemptId && Number.isSafeInteger(s.seq);
+    if (
+      s.issueId === issueId &&
+      s.attemptId === attemptId &&
+      typeof s.workspacePath === "string" &&
+      Number.isSafeInteger(s.seq) &&
+      typeof s.archiveWrittenAt === "string" &&
+      Number.isFinite(Date.parse(s.archiveWrittenAt)) &&
+      typeof s.sha256 === "string" &&
+      Number.isFinite(s.compressedBytes) &&
+      Number.isFinite(s.workspaceBytes)
+    ) {
+      return s as ArchiveSidecar;
+    }
+    return null;
   } catch {
-    return false; // malformed
+    return null; // malformed
   }
+}
+
+/** Destroy the workspace, strictly last (A.4#5). Throws a staged, non-retained error on failure. */
+function destroyWorkspaceOrThrow(workspaceDir: string): void {
+  try {
+    rmSync(workspaceDir, { recursive: true, force: true });
+  } catch (err) {
+    throw new ArchivalError(
+      "workspace-destroy",
+      `workspace destroy failed after archive + ledger row (workspace may be partially removed): ${(err as Error).message.slice(0, 300)}`,
+      false,
+    );
+  }
+  if (existsSync(workspaceDir)) {
+    // force:true can mask persistent trees; verify the deletion actually took.
+    throw new ArchivalError(
+      "workspace-destroy",
+      "workspace still present after destroy (partially removed) — janitor must reconcile",
+      false,
+    );
+  }
+}
+
+/** Assemble the A.3#8 archival-completed record from its (strictly-increasing) stamps. */
+function buildArchivalRecord(args: {
+  archivePath: string;
+  sha256: string;
+  compressedBytes: number;
+  workspaceBytes: number;
+  archiveWrittenAt: string;
+  ledgerRowAt: string;
+  workspaceDestroyedAt: string;
+}): ArchivalRecord {
+  return {
+    ...args,
+    attemptEvent: {
+      type: "archival-completed",
+      quotasEnforced: true,
+      ledgerRowReferencesArchive: true,
+      archiveWrittenAt: args.archiveWrittenAt,
+      ledgerRowAt: args.ledgerRowAt,
+      workspaceDestroyedAt: args.workspaceDestroyedAt,
+    },
+  };
 }
 
 /**
@@ -318,7 +371,14 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // symlinked issue dir, or workspaceDir === archiveRoot/issueId, otherwise
   // still self-deletes.
   const issueDir = join(opts.archiveRoot, opts.issueId);
-  mkdirSync(issueDir, { recursive: true });
+  try {
+    mkdirSync(issueDir, { recursive: true }); // STAGED (round-6 finding 3): a raw EACCES here must not escape.
+  } catch (err) {
+    throw new ArchivalError(
+      "archive-write",
+      `could not create archive dir ${issueDir}: ${(err as Error).message.slice(0, 200)} — refused (fail-closed)`,
+    );
+  }
   const wsResolved = realDirPath(opts.workspaceDir);
   const issueResolved = realDirPath(issueDir);
   if (
@@ -346,22 +406,56 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const finalPath = join(issueDir, `${opts.attemptId}.tar.gz`);
   const sidecarPath = join(issueDir, `${opts.attemptId}.json`);
   const tmpPath = join(issueDir, `.${opts.attemptId}.tar.gz.partial`);
-  // The SIDECAR is written LAST — after the ledger row (round-5 finding 1). So
-  // "archive + a VALID sidecar present" proves the ledger row was recorded (a
-  // completed invocation), while "archive without a valid sidecar" is an
-  // INCOMPLETE prior run (tar-then-crash, or a ledger failure) that a retry
-  // must be able to redo. The complete-check PARSES the sidecar rather than
-  // trusting its existence, so a malformed/one-byte sidecar reads as
-  // incomplete, not complete.
-  if (existsSync(finalPath)) {
-    if (sidecarIsComplete(sidecarPath, opts.issueId, opts.attemptId)) {
-      throw new ArchivalError("archive-write", `archive already exists at ${finalPath}`);
+
+  // RE-INVOCATION classification (round-6 finding 1) — never infer the archival
+  // PHASE from mere file presence, and NEVER auto-delete an archive that could
+  // be ledger-referenced. The sidecar is written LAST (after the ledger row),
+  // so a VALID sidecar proves the ledger row was recorded:
+  //   - valid sidecar + workspace GONE  → fully complete → refuse (exactly-once).
+  //   - valid sidecar + workspace PRESENT → only the destroy remains (a prior
+  //     destroy failure) → RESUME the destroy and return; the archive + ledger
+  //     row are durable, so nothing is redone.
+  //   - anything else with an archive present (no/malformed/partial sidecar) →
+  //     the ledger state is UNKNOWN (the ledger runs before the sidecar), so we
+  //     must not delete (may be referenced) nor silently re-archive → route to
+  //     RECONCILIATION (janitor/escalation, A.2 cleanup-failed → blocked).
+  //
+  // BOUNDARY, stated: a partial archival whose ledger state cannot be
+  // determined from durable local files is reconciled by the janitor/scheduler
+  // (which can QUERY the ledger — WP-114), not auto-recovered here. This is
+  // fail-closed: audit material is never deleted to make a retry proceed.
+  if (existsSync(finalPath) || existsSync(sidecarPath)) {
+    const prior = readValidSidecar(sidecarPath, opts.issueId, opts.attemptId);
+    if (prior) {
+      // Resume ONLY the destroy, and ONLY of the RECORDED workspace still
+      // existing — this distinguishes a genuine destroy-failure resume from a
+      // duplicate call with a different workspace (round-6 finding 1). If the
+      // recorded workspace is gone, the attempt is fully complete → refuse.
+      if (!existsSync(prior.workspacePath)) {
+        throw new ArchivalError(
+          "archive-write",
+          `archive already complete for attempt ${opts.attemptId} (archive + ledger row + sidecar durable, workspace destroyed)`,
+        );
+      }
+      // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
+      const archiveWrittenAt = prior.archiveWrittenAt;
+      const ledgerRowAt = nextStamp(now, archiveWrittenAt);
+      destroyWorkspaceOrThrow(prior.workspacePath);
+      const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
+      return buildArchivalRecord({
+        archivePath: finalPath,
+        sha256: prior.sha256,
+        compressedBytes: prior.compressedBytes,
+        workspaceBytes: prior.workspaceBytes,
+        archiveWrittenAt,
+        ledgerRowAt,
+        workspaceDestroyedAt,
+      });
     }
-    // Incomplete: remove the stale archive (+ any partial sidecar) and redo.
-    // GUARDED (round-5 finding 2): a non-writable dir must yield a routable
-    // ArchivalError, never a raw EACCES.
-    removeOrThrow(finalPath, "recovering an incomplete prior archive");
-    removeOrThrow(sidecarPath, "recovering an incomplete prior sidecar");
+    throw new ArchivalError(
+      "archive-write",
+      `a prior PARTIAL archival for attempt ${opts.attemptId} exists (archive/sidecar present, no VALID sidecar) — its ledger state is unknown, so it is neither deleted nor redone; janitor/escalation must reconcile (fail-closed)`,
+    );
   }
   try {
     execFileSync("tar", ["-czf", tmpPath, "-C", opts.workspaceDir, "."], {
@@ -396,9 +490,10 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
 
   // Step 2 — ledger row referencing the archive, BEFORE the sidecar (A.4#5
   // order: archive → ledger → destroy). A throw here leaves the archive with
-  // NO sidecar, so the retry recovers (round-5 finding 1). recordLedgerRow MUST
-  // be idempotent per (issueId, attemptId) — the archival step is retriable and
-  // the WP-104 idempotency contract dedups the row.
+  // NO valid sidecar, so a re-invocation routes to reconciliation (round-6
+  // finding 1), never a blind redo. recordLedgerRow MUST be idempotent per
+  // (issueId, attemptId) — a reconciled retry re-invokes it and the WP-104
+  // idempotency contract dedups the row.
   try {
     await opts.recordLedgerRow({
       issueId: opts.issueId,
@@ -425,6 +520,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const sidecar: ArchiveSidecar = {
     issueId: opts.issueId,
     attemptId: opts.attemptId,
+    workspacePath: resolve(opts.workspaceDir),
     archiveWrittenAt,
     seq,
     sha256,
@@ -440,33 +536,15 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
 
-  // Step 3 — destroy the workspace, strictly last. A failure here is NOT
-  // "retained" — recursive deletion is not transactional, so a mid-way failure
-  // may have removed some files (round-1 finding 4, second part). The archive
-  // and ledger row are already durable, so this is a cleanup-failed teardown
-  // (A.2 "cleanup failure during teardown → blocked"), not a lost archive;
-  // workspaceRetained:false says the workspace is in an indeterminate,
-  // partially-removed state that the janitor must reconcile.
-  try {
-    rmSync(opts.workspaceDir, { recursive: true, force: true });
-  } catch (err) {
-    throw new ArchivalError(
-      "workspace-destroy",
-      `workspace destroy failed after archive + ledger row (workspace may be partially removed): ${(err as Error).message.slice(0, 300)}`,
-      false,
-    );
-  }
-  if (existsSync(opts.workspaceDir)) {
-    // force:true can mask persistent trees; verify the deletion actually took.
-    throw new ArchivalError(
-      "workspace-destroy",
-      "workspace still present after destroy (partially removed) — janitor must reconcile",
-      false,
-    );
-  }
+  // Step 3 — destroy the workspace, strictly last (a failure is a cleanup-failed
+  // teardown, A.2 "cleanup failure during teardown → blocked"; workspaceRetained
+  // :false because recursive deletion is not transactional — round-1 finding 4).
+  // If this fails, a re-invocation RESUMES the destroy (valid sidecar +
+  // workspace present — round-6 finding 1).
+  destroyWorkspaceOrThrow(opts.workspaceDir);
   const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
 
-  return {
+  return buildArchivalRecord({
     archivePath: finalPath,
     sha256,
     compressedBytes,
@@ -474,15 +552,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     archiveWrittenAt,
     ledgerRowAt,
     workspaceDestroyedAt,
-    attemptEvent: {
-      type: "archival-completed",
-      quotasEnforced: true,
-      ledgerRowReferencesArchive: true,
-      archiveWrittenAt,
-      ledgerRowAt,
-      workspaceDestroyedAt,
-    },
-  };
+  });
 }
 
 /**

@@ -157,29 +157,33 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true); // archive evidence retained
   });
 
-  it("an incomplete prior archive (no sidecar) is recovered, not a permanent block (round-4 finding 2)", async () => {
+  it("an INDETERMINATE prior archive (no valid sidecar) is NEVER deleted — routes to reconciliation (round-6 finding 1)", async () => {
     const root = tempDir();
     const issueDir = join(root, "i");
     mkdirSync(issueDir, { recursive: true });
-    // Simulate a prior run that wrote the archive but crashed before the
-    // sidecar (nothing references it).
-    writeFileSync(join(issueDir, "a.tar.gz"), "stale-incomplete-archive");
-    const record = await archiveAttempt({
-      workspaceDir: makeWorkspace(),
-      archiveRoot: root,
-      issueId: "i",
-      attemptId: "a",
-      recordLedgerRow: () => {},
-    });
-    // The retry SUCCEEDED (removed the stale archive and redid it) rather than
-    // refusing "already exists" forever.
-    expect(record.archivePath).toBe(join(issueDir, "a.tar.gz"));
-    expect(existsSync(join(issueDir, "a.json"))).toBe(true); // now complete
+    // A prior run wrote the archive but has no valid sidecar — its LEDGER state
+    // is unknown, so it must NOT be auto-deleted or redone (it may be
+    // ledger-referenced): route to reconciliation, archive preserved.
+    writeFileSync(join(issueDir, "a.tar.gz"), "possibly-ledger-referenced");
+    const before = readFileSync(join(issueDir, "a.tar.gz"), "utf8");
+    let ledgerCalls = 0;
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          ledgerCalls += 1;
+        },
+      }),
+    ).rejects.toMatchObject({ stage: "archive-write" });
+    expect(readFileSync(join(issueDir, "a.tar.gz"), "utf8")).toBe(before); // untouched — never deleted
+    expect(ledgerCalls).toBe(0); // never re-recorded a possibly-existing row
   });
 
-  it("a ledger-row failure leaves NO sidecar, so a retry recovers and records the row (round-5 finding 1)", async () => {
+  it("a ledger-row failure leaves NO valid sidecar, so a re-invocation routes to reconciliation, never a blind redo (round-6 finding 1)", async () => {
     const root = tempDir();
-    let calls = 0;
     // First call: ledger fails AFTER the archive is written.
     await expect(
       archiveAttempt({
@@ -188,19 +192,50 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
         issueId: "i",
         attemptId: "a",
         recordLedgerRow: () => {
-          calls += 1;
           throw new Error("ledger store down");
         },
       }),
     ).rejects.toMatchObject({ stage: "ledger-row" });
-    // The archive exists but NO sidecar (ledger never completed) — so it is NOT
-    // mistaken for a completed invocation.
     expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true);
     expect(existsSync(join(root, "i", "a.json"))).toBe(false);
-    // Retry (ledger now works): it recovers the incomplete archive and records
-    // the row — it does NOT refuse "already exists" forever.
+    const shaBefore = readFileSync(join(root, "i", "a.tar.gz"));
+    // Re-invocation: it does NOT delete/redo the possibly-referenced archive —
+    // it routes to reconciliation (the janitor can query the ledger).
+    let calls = 0;
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          calls += 1;
+        },
+      }),
+    ).rejects.toMatchObject({ stage: "archive-write" });
+    expect(readFileSync(join(root, "i", "a.tar.gz"))).toEqual(shaBefore); // untouched
+    expect(calls).toBe(0);
+  });
+
+  it("RESUMES a destroy when the sidecar is valid but the workspace still exists (round-6 finding 1)", async () => {
+    const root = tempDir();
+    const ws = makeWorkspace();
+    // Complete a normal archival but keep the workspace (simulate a prior
+    // destroy failure): the archive + a valid sidecar are durable, workspace present.
+    await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    expect(existsSync(ws)).toBe(false); // normal path destroyed it
+    // Recreate the workspace to model "destroy failed / didn't run".
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "leftover"), "x");
+    let calls = 0;
     const record = await archiveAttempt({
-      workspaceDir: makeWorkspace(),
+      workspaceDir: ws,
       archiveRoot: root,
       issueId: "i",
       attemptId: "a",
@@ -208,17 +243,14 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
         calls += 1;
       },
     });
+    expect(existsSync(ws)).toBe(false); // resume destroyed it
     expect(record.archivePath).toBe(join(root, "i", "a.tar.gz"));
-    expect(existsSync(join(root, "i", "a.json"))).toBe(true); // now complete
-    expect(calls).toBe(2); // the row write was retried
+    expect(calls).toBe(0); // ledger NOT re-recorded on resume
   });
 
-  it("a cleanup failure during recovery yields a staged ArchivalError, not a raw error (round-5 finding 2)", async () => {
+  it("stages an initial issue-dir mkdir failure, not a raw error (round-6 finding 3)", async () => {
     const root = tempDir();
-    const issueDir = join(root, "i");
-    mkdirSync(issueDir, { recursive: true });
-    writeFileSync(join(issueDir, "a.tar.gz"), "stale-incomplete"); // no sidecar → recovery path
-    chmodSync(issueDir, 0o555); // non-writable: the recovery rm will fail
+    chmodSync(root, 0o555); // non-writable: the issue-dir mkdir will EACCES
     try {
       const err = await archiveAttempt({
         workspaceDir: makeWorkspace(),
@@ -230,29 +262,11 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
       expect(err).toBeInstanceOf(ArchivalError);
       expect((err as ArchivalError).stage).toBe("archive-write");
     } finally {
-      chmodSync(issueDir, 0o755); // restore so afterEach can clean up
+      chmodSync(root, 0o755);
     }
   });
 
-  it("a MALFORMED sidecar reads as incomplete, so a retry recovers (round-5 finding 1)", async () => {
-    const root = tempDir();
-    const issueDir = join(root, "i");
-    mkdirSync(issueDir, { recursive: true });
-    writeFileSync(join(issueDir, "a.tar.gz"), "stale");
-    writeFileSync(join(issueDir, "a.json"), "{"); // one-byte, invalid JSON
-    const record = await archiveAttempt({
-      workspaceDir: makeWorkspace(),
-      archiveRoot: root,
-      issueId: "i",
-      attemptId: "a",
-      recordLedgerRow: () => {},
-    });
-    expect(record.archivePath).toBe(join(issueDir, "a.tar.gz"));
-    const sidecar = JSON.parse(readFileSync(join(issueDir, "a.json"), "utf8")) as ArchiveSidecar;
-    expect(sidecar.attemptId).toBe("a"); // rewritten, now valid
-  });
-
-  it("a COMPLETE prior archive (archive + sidecar) still refuses a second call", async () => {
+  it("a COMPLETE prior archive (valid sidecar, workspace gone) still refuses a second call", async () => {
     const root = tempDir();
     await archiveAttempt({
       workspaceDir: makeWorkspace(),
@@ -537,6 +551,7 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
     const sidecar: ArchiveSidecar = {
       issueId,
       attemptId,
+      workspacePath: `/tmp/seeded-ws/${attemptId}`,
       archiveWrittenAt: new Date(NOW - ageDays * DAY).toISOString(),
       // Default seq correlates with recency (younger age → higher seq), so
       // the age-based cases below order the same by seq. The tie-break test
