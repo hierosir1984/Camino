@@ -662,7 +662,21 @@ export async function dispatch(
     });
 
     if (spawnFailed) {
-      const record = noProcessRecord(adapterName, "requirement-failed", posture, started);
+      // Wall-clock enforced on this early return too (round-3 finding 7): a
+      // plan() that overran the budget then returned an un-spawnable file
+      // reaches here before any timer or the catch path. Charge the elapsed
+      // time; over budget → killed-budget, else requirement-failed.
+      const elapsed = Date.now() - started;
+      if (budgetWallClockMs !== undefined && elapsed >= budgetWallClockMs) {
+        budgetBreach ??= { kind: "wall-clock", limit: budgetWallClockMs, observed: elapsed };
+      }
+      const record = noProcessRecord(
+        adapterName,
+        budgetBreach ? "killed-budget" : "requirement-failed",
+        posture,
+        started,
+        budgetBreach ? { budgetBreach } : {},
+      );
       await settleFor(record); // no process → group trivially gone → released
       return record;
     }

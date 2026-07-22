@@ -139,6 +139,27 @@ describe("renderWorkerRunArgs", () => {
     }
   });
 
+  it("rejects mounts over EVERY bootstrap PATH dir, incl. /usr/local/sbin (round-3 finding 1)", () => {
+    // The entrypoint searches these dirs (PATH) and runs unqualified tools; a
+    // mount over any of them could plant a malicious grep/awk the root
+    // bootstrap runs. /usr/local/sbin was previously unprotected.
+    for (const containerPath of [
+      "/usr/local/sbin",
+      "/usr/local/bin",
+      "/usr/sbin",
+      "/usr/bin",
+      "/sbin",
+      "/bin",
+    ]) {
+      expect(() =>
+        renderWorkerRunArgs(
+          { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
+          ["/bin/true"],
+        ),
+      ).toThrow(/bootstrap path/);
+    }
+  });
+
   it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {
     // The auth source lives INSIDE the workspace tree: its :ro mount would be
     // writable through the rw /workspace alias.

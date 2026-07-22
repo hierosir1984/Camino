@@ -237,28 +237,23 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const quotas = opts.quotas ?? DEFAULT_ARCHIVE_QUOTAS;
   assertSafeId("issueId", opts.issueId);
   assertSafeId("attemptId", opts.attemptId);
-
-  // The archive must NOT live inside the workspace (round-1 finding 4): the
-  // final step destroys the workspace recursively, so an archiveRoot under it
-  // would delete the very archive the ledger row references — reporting
-  // success while the audit record is gone. Refuse before writing anything.
-  // realpath BOTH so a SYMLINK archiveRoot pointing into the workspace is
-  // caught (round-2 finding 3: `resolve()` normalized spelling but did not
-  // follow symlinks). Resolve the deepest existing prefix when a path does not
-  // fully exist yet.
-  const wsResolved = realDirPath(opts.workspaceDir);
-  const rootResolved = realDirPath(opts.archiveRoot);
-  if (rootResolved === wsResolved || rootResolved.startsWith(`${wsResolved}/`)) {
+  // Validate attemptSeq EARLY — BEFORE any archive is written (round-3 finding
+  // 8): validating it only at sidecar time left an orphan .tar.gz that then
+  // failed the retry with "already exists".
+  if (
+    opts.attemptSeq !== undefined &&
+    (!Number.isSafeInteger(opts.attemptSeq) || opts.attemptSeq < 0)
+  ) {
     throw new ArchivalError(
       "id-validation",
-      `archiveRoot ${JSON.stringify(opts.archiveRoot)} resolves inside the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
+      `attemptSeq ${String(opts.attemptSeq)} must be a non-negative safe integer`,
     );
   }
 
   // Step 0 — workspace quota (registry item 11: workspace ≤ 2 GB). An
   // over-quota workspace is an abnormal condition: refusing here routes it to
-  // the cleanup-failed/escalation path with the workspace intact, rather than
-  // silently accepting the breach or blowing the archive cap below.
+  // the cleanup-failed/escalation path with the workspace intact. Checked
+  // FIRST — before creating the issue dir — so a refusal writes nothing at all.
   const workspaceBytes = workspaceSizeBytes(opts.workspaceDir);
   if (workspaceBytes > quotas.workspaceMaxBytes) {
     throw new ArchivalError(
@@ -267,9 +262,37 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
 
-  // Step 1 — archive written under quota.
+  // Step 1 — archive written under quota. Create the issue dir so its REAL path
+  // can be resolved (round-3 finding 2): the containment check must resolve the
+  // ACTUAL output directory (archiveRoot/issueId), not just the root — a
+  // symlinked issue dir, or workspaceDir === archiveRoot/issueId, otherwise
+  // still self-deletes.
   const issueDir = join(opts.archiveRoot, opts.issueId);
   mkdirSync(issueDir, { recursive: true });
+  const wsResolved = realDirPath(opts.workspaceDir);
+  const issueResolved = realDirPath(issueDir);
+  if (
+    issueResolved === wsResolved ||
+    issueResolved.startsWith(`${wsResolved}/`) ||
+    wsResolved.startsWith(`${issueResolved}/`)
+  ) {
+    throw new ArchivalError(
+      "id-validation",
+      `archive output dir ${JSON.stringify(issueDir)} resolves inside/over the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
+    );
+  }
+  // BOUNDARY, stated (round-3 finding 2/3): archiveRoot is a FIXED,
+  // DAEMON-OWNED location (not worker-writable). These realpath checks close
+  // the reachable MISCONFIGURATION (a symlinked archiveRoot/issueDir); an
+  // adversarial symlink SWAP racing between this check and the tar write
+  // presupposes write access to the daemon's own archive tree, which is
+  // outside the worker threat model.
+
+  // Resolve the retention sequence BEFORE writing anything (round-3 finding 8):
+  // a duplicate/overflow refusal must not leave an orphan .tar.gz that then
+  // fails the retry with "already exists".
+  const seq = resolveSeq(opts.attemptSeq, issueDir, opts.attemptId);
+
   const finalPath = join(issueDir, `${opts.attemptId}.tar.gz`);
   const tmpPath = join(issueDir, `.${opts.attemptId}.tar.gz.partial`);
   if (existsSync(finalPath)) {
@@ -303,7 +326,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     issueId: opts.issueId,
     attemptId: opts.attemptId,
     archiveWrittenAt,
-    seq: resolveSeq(opts.attemptSeq, issueDir, opts.attemptId),
+    seq,
     sha256,
     compressedBytes,
     workspaceBytes,
@@ -375,50 +398,59 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
 }
 
 /**
- * The retention sequence for this archival (round-2 finding 6):
- *   - if the caller supplied the attempt's AUTHORITATIVE ordinal, use it — it
- *     is race-free and durable (the WP-114 scheduler owns it), rejected unless
- *     a non-negative safe integer;
- *   - otherwise assign a best-effort dir-scan ordinal (max existing safe seq +
- *     1). The dir-scan is safe under the single-writer-per-issue assumption
- *     documented on ArchiveAttemptOptions.archiveRoot; a corrupt/overflowing
- *     sibling seq is ignored (not treated as the max), so it cannot poison the
- *     next ordinal, and the result is clamped to a safe integer.
+ * The retention sequence for this archival (round-2 finding 6; round-3 finding
+ * 8). `attemptSeq` is already validated as a non-negative safe integer by the
+ * caller (archiveAttempt, early). Reads the issue dir's existing seqs ONCE:
+ *   - authoritative attemptSeq: use it, but REFUSE if a sibling already holds
+ *     that seq — a duplicate ordinal would make retention ambiguous;
+ *   - dir-scan fallback: max existing safe seq + 1; a corrupt/overflowed
+ *     sibling seq is ignored (cannot poison the next ordinal). If a strictly
+ *     greater SAFE seq cannot be assigned (the absurd MAX_SAFE_INTEGER edge),
+ *     REFUSE rather than clamp to a tie.
  */
 function resolveSeq(
   attemptSeq: number | undefined,
   issueDir: string,
   currentAttemptId: string,
 ): number {
-  if (attemptSeq !== undefined) {
-    if (!Number.isSafeInteger(attemptSeq) || attemptSeq < 0) {
-      throw new ArchivalError(
-        "id-validation",
-        `attemptSeq ${String(attemptSeq)} must be a non-negative safe integer`,
-      );
-    }
-    return attemptSeq;
-  }
   let max = -1;
-  let names: string[];
+  const existingSeqs = new Set<number>();
+  let names: string[] = [];
   try {
     names = readdirSync(issueDir);
   } catch {
-    return 0;
+    names = [];
   }
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     if (name === `${currentAttemptId}.json`) continue; // not yet written
     try {
       const sidecar = JSON.parse(readFileSync(join(issueDir, name), "utf8")) as ArchiveSidecar;
-      // Only a valid safe-integer seq counts toward the max — a corrupt or
-      // overflowed sibling cannot drag the next ordinal into a tie.
-      if (Number.isSafeInteger(sidecar.seq) && sidecar.seq > max) max = sidecar.seq;
+      if (Number.isSafeInteger(sidecar.seq)) {
+        existingSeqs.add(sidecar.seq);
+        if (sidecar.seq > max) max = sidecar.seq;
+      }
     } catch {
       /* an unreadable sibling sidecar does not block sequencing */
     }
   }
-  return max + 1 <= Number.MAX_SAFE_INTEGER ? max + 1 : Number.MAX_SAFE_INTEGER;
+  if (attemptSeq !== undefined) {
+    if (existingSeqs.has(attemptSeq)) {
+      throw new ArchivalError(
+        "id-validation",
+        `attemptSeq ${attemptSeq} already exists for this issue — a duplicate ordinal makes retention ambiguous (fail-closed)`,
+      );
+    }
+    return attemptSeq;
+  }
+  const next = max + 1;
+  if (!Number.isSafeInteger(next)) {
+    throw new ArchivalError(
+      "id-validation",
+      "cannot assign a strictly greater safe-integer archival sequence (max reached) — refused (fail-closed)",
+    );
+  }
+  return next;
 }
 
 export interface PruneReport {

@@ -32,10 +32,18 @@ set -eu
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT 2>/dev/null || true
+# Absolute paths for EVERY tool the bootstrap runs (round-3 finding 1):
+# unqualified `grep`/`awk`/`sort` would resolve via PATH, and a mount over a
+# PATH dir could plant a malicious one. The composer also refuses mounts over
+# any PATH dir; absolute paths are the in-container half of that defence. On
+# the alpine base these are busybox applets at these fixed locations.
 IPTABLES=/sbin/iptables
 IP6TABLES=/sbin/ip6tables
 GETENT=/usr/bin/getent
 SU_EXEC=/sbin/su-exec
+AWK=/usr/bin/awk
+GREP=/bin/grep
+SORT=/usr/bin/sort
 
 # Required-but-may-be-empty: ${VAR?} (no colon) fails only when unset.
 : "${CAMINO_EGRESS_ALLOWLIST?CAMINO_EGRESS_ALLOWLIST must be set (space-separated host:port entries; empty string = deny-all)}"
@@ -61,7 +69,7 @@ for entry in $CAMINO_EGRESS_ALLOWLIST; do
   # a dual-stack (--ipv6) network, where `getent hosts` returns the AAAA record
   # first and a v4 filter would find nothing. ahostsv4 emits IPv4 STREAM/DGRAM
   # lines; dedupe them. (getent runs before the rules install.)
-  ips=$("$GETENT" ahostsv4 "$host" | awk '{ print $1 }' | sort -u)
+  ips=$("$GETENT" ahostsv4 "$host" | "$AWK" '{ print $1 }' | "$SORT" -u)
   v4=""
   for ip in $ips; do
     case $ip in
@@ -142,11 +150,11 @@ fi
 # IPv6 too where the stack exists.
 verify_chain() {
   # $1 = binary, $2 = chain
-  "$1" -S "$2" | grep -q -- "^-P $2 DROP$" || {
+  "$1" -S "$2" | "$GREP" -q -- "^-P $2 DROP$" || {
     echo "worker-profile: $1 $2 deny policy missing after install — refusing to start" >&2
     exit 66
   }
-  "$1" -S "$2" | grep -q -- '-j REJECT' || {
+  "$1" -S "$2" | "$GREP" -q -- '-j REJECT' || {
     echo "worker-profile: $1 $2 reject rule missing after install — refusing to start" >&2
     exit 66
   }

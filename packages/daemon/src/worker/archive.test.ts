@@ -292,6 +292,73 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     ).rejects.toMatchObject({ stage: "id-validation" });
   });
 
+  it("validates attemptSeq BEFORE writing — no orphan archive on refusal (round-3 finding 8)", async () => {
+    const root = tempDir();
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "iss",
+        attemptId: "att",
+        attemptSeq: 1.5, // invalid
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+    // No orphan archive was left, so a corrected retry succeeds.
+    expect(existsSync(join(root, "iss", "att.tar.gz"))).toBe(false);
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "iss",
+        attemptId: "att",
+        attemptSeq: 3,
+        recordLedgerRow: () => {},
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("refuses a DUPLICATE authoritative attemptSeq for one issue (round-3 finding 8)", async () => {
+    const root = tempDir();
+    await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "iss",
+      attemptId: "a1",
+      attemptSeq: 5,
+      recordLedgerRow: () => {},
+    });
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "iss",
+        attemptId: "a2",
+        attemptSeq: 5, // duplicate ordinal
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+    expect(existsSync(join(root, "iss", "a2.tar.gz"))).toBe(false); // no orphan
+  });
+
+  it("rejects an archive OUTPUT dir (archiveRoot/issueId) that symlinks into the workspace (round-3 finding 2)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    // Pre-create archiveRoot/issueId as a symlink INTO the workspace.
+    mkdirSync(join(ws, "sink"), { recursive: true });
+    symlinkSync(join(ws, "sink"), join(root, "iss"));
+    await expect(
+      archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: root,
+        issueId: "iss",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+    expect(existsSync(ws)).toBe(true);
+  });
+
   it("assigns a durable per-issue monotonic seq across attempts", async () => {
     const root = tempDir();
     for (const id of ["attempt-a", "attempt-b", "attempt-c"]) {

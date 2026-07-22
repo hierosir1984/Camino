@@ -9,11 +9,13 @@
 #   - the test endpoints and the unrestricted control override the entrypoint,
 #     so no firewall is installed for those roles.
 #
-# BOUNDARY, stated: this image is the ISOLATION HARNESS (entrypoint + rule
-# tools + git for workspace operations). The real worker TOOLCHAIN image
-# (node, vendor CLIs) is layered on top by the attempt runner (WP-114); the
-# profile's guarantees are image-content-independent (caps, mounts, env,
-# entrypoint), so the layering cannot weaken them.
+# BOUNDARY, stated (round-3 finding 13): this image is the ISOLATION HARNESS
+# (entrypoint + rule tools + git for workspace operations). The real worker
+# TOOLCHAIN image (node, vendor CLIs) is layered on top by the attempt runner
+# (WP-114). The run-time guarantees (cap-drop, no-new-privs, pinned entrypoint,
+# refused bootstrap-path mounts) hold for a CAMINO-BUILT image; they do NOT
+# survive a maliciously-BUILT image that replaced the entrypoint binary's
+# contents. Image PROVENANCE is WP-114's build boundary, not the composer's.
 FROM alpine:3.20
 
 # iptables: rule installation; busybox-extras: httpd/nc for the test

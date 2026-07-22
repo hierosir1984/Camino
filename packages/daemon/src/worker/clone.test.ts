@@ -7,7 +7,15 @@
 // credential material — and each must TRIP the attestation, so the fence is
 // proven to fire, not merely believed to.
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -81,6 +89,7 @@ describe("provisionWorkerClone (CAM-EXEC-02 positive path)", () => {
       noCredentialHelper: true,
       remotesCredentialFree: true,
       noHttpExtraheader: true,
+      noSshCommand: true,
       credentialMaterialPaths: [],
     });
   });
@@ -212,6 +221,40 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/credential material/);
   });
 
+  it("rejects a SCOPED credential.<url>.helper and url.insteadOf and sshCommand (round-3 finding 4)", () => {
+    const source = makeSourceRepo();
+    for (const [key, value] of [
+      ["credential.https://github.invalid.helper", "!/tmp/helper.sh"],
+      ["url.https://x-access-token:SECRET@github.invalid/.insteadOf", "https://github.invalid/"],
+      ["core.sshCommand", "ssh -i /tmp/leak"],
+    ] as const) {
+      const dest = cloneDest();
+      provisionWorkerClone({ sourceRepo: source, destDir: dest });
+      git(dest, "config", "--local", key, value);
+      expect(() => assertWorkerCloneIsolation(dest), key).toThrow(WorkerCloneError);
+    }
+  });
+
+  it("rejects a SYMLINKED packed object (nlink 1 but not standalone) — round-3 finding 9", () => {
+    const source = makeSourceRepo();
+    execFileSync("git", ["-C", source, "gc", "--prune=now"], { env: GIT_ENV });
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Replace a real .pack in the clone with a symlink to the source's pack.
+    const packDir = join(dest, ".git", "objects", "pack");
+    const srcPackDir = join(source, ".git", "objects", "pack");
+    const pack = readdirSync(packDir).find((n) => n.endsWith(".pack"))!;
+    rmSync(join(packDir, pack));
+    symlinkSync(join(srcPackDir, pack), join(packDir, pack));
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink|symlink|shares its object/);
+  });
+
+  it("case-folds credential filenames (.NPMRC with a token) — round-3 finding 6", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, ".NPMRC"), "//registry.npmjs.org/:_authToken=npm_SECRET\n");
+    expect(scanForGithubCredentialMaterial(dir)).toEqual([".NPMRC"]);
+  });
+
   it("rejects a plain clone without the hooks-disabling config", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();
@@ -326,6 +369,13 @@ describe("scanForGithubCredentialMaterial", () => {
       "# example config\ngithub.com:\n  oauth_token: gho_real\n",
     );
     expect(scanForGithubCredentialMaterial(real)).toEqual(["hosts.yml"]);
+  });
+
+  it("does NOT flag an INLINE-comment credential mention (round-3 finding 12)", () => {
+    const dir = tempDir();
+    // The oauth_token is inside an inline `#` comment — not a real assignment.
+    writeFileSync(join(dir, "hosts.yml"), "github.com:\n  user: someone # oauth_token: gho_X\n");
+    expect(scanForGithubCredentialMaterial(dir)).toEqual([]);
   });
 
   it("flags a credential-named symlink without following it", () => {

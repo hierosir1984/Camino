@@ -158,21 +158,29 @@ describe("sumUsageTokens (token-budget accounting)", () => {
     expect(total).toBeGreaterThan(1000);
   });
 
-  it("is total over hostile/absent shapes (undefined = not reportable, never a throw)", () => {
+  it("is undefined only when NO recognized field is present, never a throw", () => {
     expect(sumUsageTokens(undefined)).toBeUndefined();
     expect(sumUsageTokens(null)).toBeUndefined();
     expect(sumUsageTokens("nope")).toBeUndefined();
     expect(sumUsageTokens({})).toBeUndefined();
     expect(sumUsageTokens({ other: 5 })).toBeUndefined();
-    // A negative/non-finite field is skipped, not thrown on.
-    expect(
-      sumUsageTokens({ input_tokens: 10, output_tokens: -1, cache_read_input_tokens: NaN }),
-    ).toBe(10);
+  });
+
+  it("fails CLOSED on a hostile field: a present non-finite/negative field caps at MAX_SAFE_INTEGER (round-3 finding 10)", () => {
+    // A PRESENT numeric field that is non-finite or negative must NOT be
+    // silently dropped (that let the other fields sum small and evade the
+    // budget). Any bad field caps the whole figure so it trips any budget.
+    expect(sumUsageTokens({ input_tokens: Infinity, output_tokens: 1 })).toBe(
+      Number.MAX_SAFE_INTEGER,
+    ); // JSON `1e309` parses to Infinity
+    expect(sumUsageTokens({ input_tokens: 10, output_tokens: -1 })).toBe(Number.MAX_SAFE_INTEGER);
+    expect(sumUsageTokens({ input_tokens: 10, cache_read_input_tokens: NaN })).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
   });
 
   it("fails CLOSED on an overflowing sum — clamps to MAX_SAFE_INTEGER, never discards (round-2 finding 9)", () => {
-    // Hostile 1e308 fields sum to Infinity; discarding it would EVADE the
-    // budget. Clamping to MAX_SAFE_INTEGER trips any finite budget instead.
+    // Two finite fields whose SUM leaves the finite range.
     const total = sumUsageTokens({ input_tokens: 1e308, output_tokens: 1e308 });
     expect(total).toBe(Number.MAX_SAFE_INTEGER);
     expect(Number.isFinite(total)).toBe(true);

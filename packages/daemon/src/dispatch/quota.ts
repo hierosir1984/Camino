@@ -107,13 +107,21 @@ const USAGE_TOKEN_FIELDS = [
 export function sumUsageTokens(usage: unknown): number | undefined {
   if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
   const rec = usage as Record<string, unknown>;
-  const nums = USAGE_TOKEN_FIELDS.map((f) => rec[f]).filter(
-    (v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0,
-  );
-  if (nums.length === 0) return undefined;
-  const total = nums.reduce((a, b) => a + b, 0);
-  // Fail-CLOSED on overflow (round-2 finding 9): a sum that leaves the finite
-  // range (hostile 1e308 fields) must not be discarded as "not reportable" —
-  // clamp to MAX_SAFE_INTEGER so it TRIPS any budget rather than evading it.
+  let total = 0;
+  let sawAny = false;
+  for (const field of USAGE_TOKEN_FIELDS) {
+    const v = rec[field];
+    if (typeof v !== "number") continue; // absent / non-numeric → not that field
+    sawAny = true;
+    // Fail-CLOSED on a hostile field (round-3 finding 10): a PRESENT numeric
+    // field that is non-finite (Infinity from JSON `1e309`) or negative must
+    // not be silently DROPPED — that let the other fields sum small and evade
+    // the budget. Any bad field caps the whole figure at MAX_SAFE_INTEGER so
+    // it trips any finite budget.
+    if (!Number.isFinite(v) || v < 0) return Number.MAX_SAFE_INTEGER;
+    total += v;
+  }
+  if (!sawAny) return undefined;
+  // Fail-CLOSED on overflow of the SUM too (round-2 finding 9).
   return Number.isFinite(total) ? total : Number.MAX_SAFE_INTEGER;
 }

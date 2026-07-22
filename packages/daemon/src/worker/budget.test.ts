@@ -154,6 +154,31 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(escalation).toBeDefined();
   }, 30_000);
 
+  it("a plan() that overruns the budget then returns an UNSPAWNABLE file is killed-budget (round-3 finding 7)", async () => {
+    const badSpawnAdapter = {
+      name: "mock:overrun-badspawn",
+      enabled: true,
+      plan() {
+        const until = Date.now() + 120;
+        while (Date.now() < until) {
+          /* block past the 30ms budget */
+        }
+        return { file: "/definitely/missing/camino-worker", args: [] };
+      },
+      parseLine: () => null,
+    };
+    const { record, escalation } = await dispatchWithBudget(
+      badSpawnAdapter,
+      { workdir: workdir(), prompt: "overrun-badspawn" },
+      { wallClockMs: 30 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.spawned).toBe(false);
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 30 });
+    expect(escalation).toBeDefined();
+  }, 30_000);
+
   it("a budget breach at the SAME boundary as a generic timeout classifies killed-budget (round-1 finding 7)", async () => {
     // Equal wall-clock budget and timeout: the budget must win so A.2#10
     // kill-and-escalate fires, never a generic `killed`.

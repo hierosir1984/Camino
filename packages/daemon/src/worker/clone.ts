@@ -57,6 +57,8 @@ export interface WorkerCloneIsolationRecord {
   remotesCredentialFree: boolean;
   /** No http.<url>.extraheader (Authorization channel) in the effective config. */
   noHttpExtraheader: boolean;
+  /** No *.sshCommand (git-op exec channel) in the effective config. */
+  noSshCommand: boolean;
   /** Filesystem scan found no GitHub credential material (see scan). */
   credentialMaterialPaths: string[];
 }
@@ -102,8 +104,14 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
     // operations (fetch/push). Without it, an attacker's included extraheader
     // would be used by git but invisible here (round-2 finding 4).
     raw = gitRaw(dir, ["config", "--local", "--includes", "--list", "-z"]);
-  } catch {
-    return [];
+  } catch (err) {
+    // FAIL CLOSED (round-3 finding 5): a config that cannot be enumerated —
+    // ENOBUFS on an oversized (hostile) config, a git error — must NOT be read
+    // as "no credential channels". A clone whose config is unreadable is
+    // refused. (A benign local config is bytes, not megabytes.)
+    throw new WorkerCloneError(
+      `workspace clone config could not be enumerated for attestation — refused (fail-closed): ${(err as Error).message.slice(0, 200)}`,
+    );
   }
   const out: { key: string; value: string }[] = [];
   for (const chunk of raw.split("\0")) {
@@ -230,22 +238,47 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     );
   }
 
-  // Scan the EFFECTIVE local config (includes resolved) ONCE for every
-  // credential channel Camino could have left in the clone (round-2 finding 4):
-  //   - credential.helper — a non-empty helper value;
-  //   - remote.<name>.url / .pushurl — a url carrying userinfo (fetch OR push);
-  //   - http.<url>.extraheader — an Authorization header channel.
+  // Scan the EFFECTIVE local config (includes resolved) for the git credential
+  // and command-execution channels a clone could carry (round-2 finding 4;
+  // widened round-3 finding 4):
+  //   - credential.helper AND scoped credential.<url>.helper — a helper value;
+  //   - remote.<name>.url / .pushurl — a url with userinfo (fetch OR push);
+  //   - url.<X>.insteadOf / pushInsteadOf — userinfo in the rewrite TARGET X
+  //     (the SUBSECTION, not the value), which injects a credential into a
+  //     clean url;
+  //   - http.<url>.extraheader — an Authorization header channel;
+  //   - *.sshCommand (core.sshCommand and any subsection) — a git-op exec
+  //     channel.
+  //
+  // BOUNDARY, stated (round-3 finding 4; the delegate-to-git-fsck precedent):
+  // git's config surface of credential/exec channels is UNBOUNDED — a finder
+  // can always name the next `core.fsmonitor`, `diff.external`, `*.process`,
+  // etc. This attestation covers the reachable channels; the COMPLETE
+  // guarantee is STRUCTURAL, not from an exhaustive denylist: (a) the worker
+  // container mounts no host HOME and composeWorkerEnv (WP-105) strips the
+  // credential/exec ENV, so no credential exists for a helper/insteadOf to
+  // yield and no attacker PATH steers an exec channel; (b) credentialed git
+  // never runs in worker-touched directories (design §5.1); (c) the clone is
+  // hooks-disabled and Camino-provisioned. A config channel that needs a
+  // credential Camino does not provide, or an exec that needs a binary the
+  // stripped env cannot resolve, cannot leverage anything.
   const config = effectiveGitConfig(dir);
   let noCredentialHelper = true;
   let remotesCredentialFree = true;
   let noHttpExtraheader = true;
+  let noSshCommand = true;
   for (const { key, value } of config) {
     const lk = key.toLowerCase();
-    if (lk === "credential.helper" && value.length > 0) noCredentialHelper = false;
+    if (/^credential\.(.+\.)?helper$/.test(lk) && value.length > 0) noCredentialHelper = false;
     if (/^remote\..+\.(pushurl|url)$/.test(lk) && urlCarriesUserinfo(value)) {
       remotesCredentialFree = false;
     }
+    // url.<X>.insteadof — the secret rides the SUBSECTION X (the rewrite
+    // target), not the value; extract and check X for userinfo.
+    const insteadOf = /^url\.(.+)\.(insteadof|pushinsteadof)$/.exec(lk);
+    if (insteadOf && urlCarriesUserinfo(insteadOf[1]!)) remotesCredentialFree = false;
     if (/^http\.(.+\.)?extraheader$/.test(lk) && value.length > 0) noHttpExtraheader = false;
+    if (/(^|\.)sshcommand$/.test(lk) && value.length > 0) noSshCommand = false;
   }
   if (!noCredentialHelper) {
     throw new WorkerCloneError(
@@ -254,12 +287,17 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
   }
   if (!remotesCredentialFree) {
     throw new WorkerCloneError(
-      "a workspace remote URL (fetch or push) carries userinfo — workers hold zero GitHub credentials (CAM-EXEC-02)",
+      "a workspace remote URL / url.insteadOf carries userinfo — workers hold zero GitHub credentials (CAM-EXEC-02)",
     );
   }
   if (!noHttpExtraheader) {
     throw new WorkerCloneError(
       "workspace clone config carries an http.extraheader (Authorization channel) — refused (CAM-EXEC-02)",
+    );
+  }
+  if (!noSshCommand) {
+    throw new WorkerCloneError(
+      "workspace clone config carries an sshCommand (git-op exec channel) — refused (CAM-EXEC-02)",
     );
   }
 
@@ -278,6 +316,7 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     noCredentialHelper,
     remotesCredentialFree,
     noHttpExtraheader,
+    noSshCommand,
     credentialMaterialPaths,
   };
 }
@@ -290,7 +329,11 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
  * into the clone — round-2 finding 7). Bounded; stops at the first hardlink.
  */
 function hasHardlinkedObject(objectsDir: string): boolean {
-  const anyHardlinkIn = (subDir: string, nameFilter?: RegExp): boolean => {
+  // A standalone object store's files are REAL regular files with link count 1.
+  // A SHARED store shows up as either a hardlink (nlink>1 — a --local clone) OR
+  // a SYMLINK pointing back at the source (round-3 finding 9: a symlinked
+  // .pack has nlink 1 but is not standalone; delete the source and fsck fails).
+  const anySharedIn = (subDir: string): boolean => {
     let names: string[];
     try {
       names = readdirSync(subDir);
@@ -298,9 +341,10 @@ function hasHardlinkedObject(objectsDir: string): boolean {
       return false;
     }
     for (const name of names) {
-      if (nameFilter && !nameFilter.test(name)) continue;
       try {
-        if (lstatSync(join(subDir, name)).nlink > 1) return true;
+        const st = lstatSync(join(subDir, name));
+        if (st.isSymbolicLink()) return true; // object file must not be a symlink
+        if (st.nlink > 1) return true; // hardlinked into another tree
       } catch {
         /* raced/removed object — ignore */
       }
@@ -315,10 +359,10 @@ function hasHardlinkedObject(objectsDir: string): boolean {
   }
   for (const fan of fanoutDirs) {
     if (!/^[0-9a-f]{2}$/.test(fan)) continue; // 2-hex loose fan-out dirs
-    if (anyHardlinkIn(join(objectsDir, fan))) return true;
+    if (anySharedIn(join(objectsDir, fan))) return true;
   }
   // Packed objects: .pack / .idx (and .rev) files under objects/pack.
-  if (anyHardlinkIn(join(objectsDir, "pack"))) return true;
+  if (anySharedIn(join(objectsDir, "pack"))) return true;
   return false;
 }
 
@@ -359,8 +403,14 @@ const PLACEHOLDER_VALUES = new Set([
 /** Does file text carry a credential assignment with a real value (comment-aware)? */
 function contentHasCredential(text: string): boolean {
   for (const rawLine of text.split("\n")) {
-    const line = rawLine.trim();
-    if (line.length === 0 || line.startsWith("#") || line.startsWith(";")) continue; // comment/blank
+    // Strip an INLINE comment (round-3 finding 12): a ` #`/` ;` (whitespace-
+    // preceded, or at line start) begins a comment in yaml/ini/npmrc, so
+    // `user: someone # oauth_token: gho_X` carries no real credential. This
+    // over-strips a `#`/`;` that legitimately appears mid-value after a space
+    // (rare for a token); over-stripping only causes a MISS in this
+    // defense-in-depth scan, and the real guard is the no-host-HOME container.
+    const line = rawLine.replace(/(^|\s)[#;].*$/u, "").trim();
+    if (line.length === 0) continue;
     const m = CREDENTIAL_ASSIGNMENT_RE.exec(line);
     if (m && !PLACEHOLDER_VALUES.has(m[1]!.toLowerCase())) return true; // a real value present
   }
@@ -411,6 +461,13 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
       }
       const absChild = join(abs, name);
       const relChild = rel.length === 0 ? name : `${rel}/${name}`;
+      // Case-FOLD the name before matching (round-3 finding 6): on a
+      // case-insensitive host/mount (macOS, Docker Desktop) `.NPMRC` and
+      // `.npmrc` are the SAME file to a vendor CLI, so the credential-name sets
+      // must match case-insensitively. ASCII lower-casing suffices for these
+      // ASCII names; matching case-insensitively on a case-sensitive host only
+      // OVER-flags (fail-closed), never under.
+      const lname = name.toLowerCase();
       let stat;
       try {
         stat = lstatSync(absChild);
@@ -427,17 +484,17 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
       // never read (no symlink-follow / TOCTOU).
       if (
         stat.isSymbolicLink() &&
-        (CREDENTIAL_FILE_NAMES.has(name) || CREDENTIAL_CONTENT_FILE_NAMES.has(name))
+        (CREDENTIAL_FILE_NAMES.has(lname) || CREDENTIAL_CONTENT_FILE_NAMES.has(lname))
       ) {
         findings.push(`${relChild} (credential-named symlink)`);
         continue;
       }
       if (!stat.isFile()) continue; // other symlinks/special files are not read
-      if (CREDENTIAL_FILE_NAMES.has(name)) {
+      if (CREDENTIAL_FILE_NAMES.has(lname)) {
         findings.push(relChild);
         continue;
       }
-      if (GIT_CONFIG_FILE_NAMES.has(name)) {
+      if (GIT_CONFIG_FILE_NAMES.has(lname)) {
         let text = "";
         try {
           text = readFileSync(absChild, "utf8");
@@ -448,7 +505,7 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
         if (gitConfigOpensCredentialChannel(text)) findings.push(relChild);
         continue;
       }
-      if (CREDENTIAL_CONTENT_FILE_NAMES.has(name)) {
+      if (CREDENTIAL_CONTENT_FILE_NAMES.has(lname)) {
         let text = "";
         try {
           text = readFileSync(absChild, "utf8");

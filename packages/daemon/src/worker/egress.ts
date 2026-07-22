@@ -20,11 +20,19 @@
 //     provider auth (ALWAYS read-only — CAM-EXEC-02) with bootstrap paths
 //     protected from being mounted over.
 //
-// BOUNDARY, stated: the profile image here carries the isolation harness
-// (entrypoint + tools + git). The real worker TOOLCHAIN image (node, vendor
-// CLIs) is layered on top of this profile by the attempt runner (WP-114);
-// every guarantee in this module is image-content-independent (caps, mounts,
-// env, entrypoint), so the layering cannot weaken it.
+// BOUNDARY, stated (round-3 finding 13): the profile image carries the
+// isolation harness (entrypoint + tools + git). The real worker TOOLCHAIN
+// image (node, vendor CLIs) is layered ON TOP of this profile by the attempt
+// runner (WP-114). This module's run-time guarantees — cap-drop, no-new-privs,
+// pids-limit, the pinned entrypoint, and the refusal of mounts over any
+// bootstrap PATH — hold for a CAMINO-BUILT image (the profile or a
+// `FROM camino-worker-profile` derivative). They do NOT make the harness
+// independent of a MALICIOUSLY-BUILT image: pinning the entrypoint PATH cannot
+// pin its CONTENTS, so an attacker-built image that replaced the entrypoint
+// binary would skip the bootstrap. Image PROVENANCE — that the run uses a
+// Camino-built image — is WP-114's image-build boundary; `image` is a
+// Camino-composed run parameter, not untrusted worker input. See
+// WORKER_PROFILE_ENTRYPOINT below.
 //
 // BOUNDARY, stated (round-1 finding 8): this is an IP:port allowlist enforced
 // at L3/L4 (iptables). Per-repo hosts are RESOLVED to IPs at container setup
@@ -75,13 +83,20 @@ export function isValidAllowlistPort(port: number): boolean {
 // is accepted (fail-closed, from WP-005).
 const RESERVED_NETWORKS = new Set(["host", "none", "bridge", "default", "host-gateway"]);
 const RESERVED_ENV_PREFIX = "CAMINO_EGRESS_";
+// EVERY directory on the bootstrap entrypoint's PATH (round-3 finding 1: a
+// mount over `/usr/local/sbin` — a PATH dir the entrypoint searches first —
+// could plant a `grep`/`awk` the root bootstrap runs). Keep this in lockstep
+// with the entrypoint's `PATH=…`. Plus /etc and /lib (config + shared libs the
+// bootstrap and su-exec load). The ancestor-shadow check (assertSafeMountPaths)
+// also rejects mounting any PARENT of these.
 const PROTECTED_MOUNT_TARGETS = [
   "/",
+  "/usr/local/sbin",
   "/usr/local/bin",
-  "/sbin",
   "/usr/sbin",
-  "/bin",
   "/usr/bin",
+  "/sbin",
+  "/bin",
   "/etc",
   "/lib",
 ];
@@ -329,6 +344,17 @@ export function renderWorkerRunArgs(run: WorkerContainerRun, cmd: string[]): str
     args.push("-v", `${run.workspaceHostPath}:${WORKER_WORKSPACE_MOUNT}`);
     args.push("-w", WORKER_WORKSPACE_MOUNT);
   }
+  // BOUNDARY, stated (round-3 finding 3): the workspace and provider-auth
+  // mount SOURCES are both Camino-composed from disjoint, Camino-OWNED host
+  // trees (a fresh clone; the vault's provider-auth dir). The realpath overlap
+  // check below closes the reachable MISCONFIGURATION — a symlinked source that
+  // resolves into the workspace. It does NOT chase two adversarial aliases that
+  // presuppose daemon-level write access: a HARDLINK of an auth file into the
+  // workspace, or a symlink SWAP racing between this check and docker's mount,
+  // both require writing into Camino's own owned trees, which is outside the
+  // worker threat model (the worker gets the composed container; it does not
+  // compose it). Camino never hardlinks auth into a workspace, so no such alias
+  // exists for this check to detect.
   const seenTargets = new Set<string>([WORKER_WORKSPACE_MOUNT]);
   for (const m of run.providerAuthMounts ?? []) {
     const target = assertSafeMountPaths(m.hostPath, m.containerPath);

@@ -190,9 +190,12 @@ beforeAll(async () => {
   // (round-1 finding 12): containers get v6 addresses and reach each other over
   // v6, so the profile's ip6tables DROP is testable without host v6 egress.
   // The ULA subnet is DERIVED FROM RUN_ID so concurrent suite runs do not
-  // collide on the address pool (round-2 finding 10).
-  const v6Group = RUN_ID.slice(0, 4);
-  await dockerOrThrow(["network", "create", "--ipv6", "--subnet", `fd00:107:${v6Group}::/64`, NET]);
+  // collide on the address pool (round-2 finding 10, widened round-3 finding
+  // 11 to use the FULL 8 hex of RUN_ID across two 16-bit groups — a 4-hex
+  // prefix aliased runs whose ids shared their first 4 hex).
+  const g1 = RUN_ID.slice(0, 4);
+  const g2 = RUN_ID.slice(4, 8);
+  await dockerOrThrow(["network", "create", "--ipv6", "--subnet", `fd00:${g1}:${g2}::/64`, NET]);
   await startEndpoint(ALLOWED, ALLOWED_BODY, WRONG_PORT);
   await startEndpoint(DENIED, DENIED_BODY);
   const ipOf = async (name: string): Promise<string> => {
