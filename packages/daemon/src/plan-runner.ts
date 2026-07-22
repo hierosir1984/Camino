@@ -188,11 +188,28 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
 
   const drain = (final: boolean): void => {
     if (shrunk) return;
-    let bytesRead: number;
+    let bytesRead = 0;
     try {
       const fd = openSync(streamPath, "r");
       try {
-        bytesRead = readSync(fd, readBuffer, 0, MAX_STREAM_BYTES + 1, 0);
+        // Loop to EOF or cap+1: readSync may legally return FEWER bytes
+        // than requested (fs.read semantics — network filesystems and
+        // other conditions), and a single call treated a short read as the
+        // whole file, silently losing the unread suffix (r8 verification).
+        // With the loop, "read whole or refuse" is total: an in-cap file
+        // is always read to EOF, so no multi-byte character can be split
+        // anywhere but the over-cap refusal path.
+        while (bytesRead < MAX_STREAM_BYTES + 1) {
+          const chunk = readSync(
+            fd,
+            readBuffer,
+            bytesRead,
+            MAX_STREAM_BYTES + 1 - bytesRead,
+            bytesRead,
+          );
+          if (chunk === 0) break; // EOF
+          bytesRead += chunk;
+        }
       } finally {
         closeSync(fd);
       }
