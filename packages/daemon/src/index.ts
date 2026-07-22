@@ -83,6 +83,32 @@ export { buildRegistry, cliOnPath, DEFAULT_ATTESTATIONS_PATH } from "./dispatch/
 // imports, so this is a real package-boundary constraint, not advice.)
 export { committedSince, headSha, makeWorkspace } from "./dispatch/workspace.js";
 
+// WP-106: routing foundation (CAM-ROUTE-01/02) — seeded capability
+// registry, live registry assembly, quota-window tracker, per-project
+// policy store.
+export { CAPABILITY_SEED, XAI_SANCTIONED_PATH_MEMO } from "./routing/capability-seed.js";
+export { buildCapabilityRegistry } from "./routing/capability-registry.js";
+export type {
+  BuildCapabilityRegistryOptions,
+  CapabilityRegistryView,
+  EnablementView,
+  ProviderCapabilityView,
+} from "./routing/capability-registry.js";
+export { QuotaWindowTracker } from "./routing/window-tracker.js";
+export type {
+  DispatchObservationInput,
+  ProviderWindowState,
+  QuotaWindowTrackerOptions,
+  WindowConsumptionEstimate,
+  WindowObservation,
+} from "./routing/window-tracker.js";
+export { RoutingPolicyStore } from "./routing/policy-store.js";
+export type {
+  EffectivePolicy,
+  RoutingPolicyStoreOptions,
+  SetPolicyResult,
+} from "./routing/policy-store.js";
+
 // WP-109: Living Canon durable stores (CAM-CANON-01/02/03).
 export { CanonLedgerStore } from "./canon-ledger.js";
 export type {

@@ -15,7 +15,12 @@ import { classifyErrorTextForQuota } from "../quota.js";
  * (sanctioned path — CAM-SEC-06); the adapter passes no credential-shaped env.
  */
 export function grokAdapter(
-  opts: { enabled?: boolean; disabledReason?: string; resolvedPath?: string } = {},
+  opts: {
+    enabled?: boolean;
+    disabledReason?: string;
+    disabledCause?: "cli-absent" | "sanctioned-path";
+    resolvedPath?: string;
+  } = {},
 ): AdapterSpec {
   // Spawn the registry-resolved ABSOLUTE executable, not a bare name re-resolved
   // against the worker cwd (round-8 finding 1).
@@ -24,6 +29,7 @@ export function grokAdapter(
     name: "grok-build",
     enabled: opts.enabled ?? true,
     ...(opts.disabledReason ? { disabledReason: opts.disabledReason } : {}),
+    ...(opts.disabledCause ? { disabledCause: opts.disabledCause } : {}),
     plan(ctx: AdapterContext): SpawnPlan {
       const args = [
         "-p",
