@@ -248,6 +248,42 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(calls).toBe(0); // ledger NOT re-recorded on resume
   });
 
+  it("a re-invocation with a DIFFERENT workspace does NOT destroy the recorded one (round-7 finding 1)", async () => {
+    const root = tempDir();
+    const wsA = makeWorkspace();
+    await archiveAttempt({
+      workspaceDir: wsA,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    // Recreate A to model a failed destroy of the RECORDED workspace.
+    mkdirSync(wsA, { recursive: true });
+    writeFileSync(join(wsA, "recorded-leftover"), "keep-me");
+    // Re-invoke the SAME attempt but with a DIFFERENT workspace B.
+    const wsB = makeWorkspace();
+    let calls = 0;
+    await expect(
+      archiveAttempt({
+        workspaceDir: wsB,
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          calls += 1;
+        },
+      }),
+    ).rejects.toMatchObject({ stage: "archive-write" });
+    // NEITHER workspace was touched (the recorded A is not destroyed; B is not either).
+    expect(existsSync(wsA)).toBe(true);
+    expect(existsSync(join(wsA, "recorded-leftover"))).toBe(true);
+    expect(existsSync(wsB)).toBe(true);
+    expect(calls).toBe(0);
+    rmSync(wsA, { recursive: true, force: true });
+    rmSync(wsB, { recursive: true, force: true });
+  });
+
   it("stages an initial issue-dir mkdir failure, not a raw error (round-6 finding 3)", async () => {
     const root = tempDir();
     chmodSync(root, 0o555); // non-writable: the issue-dir mkdir will EACCES

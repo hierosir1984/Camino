@@ -427,10 +427,20 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   if (existsSync(finalPath) || existsSync(sidecarPath)) {
     const prior = readValidSidecar(sidecarPath, opts.issueId, opts.attemptId);
     if (prior) {
-      // Resume ONLY the destroy, and ONLY of the RECORDED workspace still
-      // existing — this distinguishes a genuine destroy-failure resume from a
-      // duplicate call with a different workspace (round-6 finding 1). If the
-      // recorded workspace is gone, the attempt is fully complete → refuse.
+      // A resume-destroy may run ONLY when the SUPPLIED workspace is the exact
+      // one the completed attempt recorded (round-7 finding 1): a re-invocation
+      // that supplies a DIFFERENT workspace is anomalous (the attempt's
+      // workspace is fixed) — refuse and touch NEITHER workspace, so a stray
+      // duplicate call can never destroy the recorded workspace.
+      if (resolve(opts.workspaceDir) !== prior.workspacePath) {
+        throw new ArchivalError(
+          "archive-write",
+          `re-invocation for attempt ${opts.attemptId} supplies workspace ${JSON.stringify(resolve(opts.workspaceDir))} but the recorded one is ${JSON.stringify(prior.workspacePath)} — refusing to touch either (janitor/escalation reconciles)`,
+        );
+      }
+      // Same workspace as recorded. If it is GONE, the attempt is fully
+      // complete → refuse; if it is still present, only the destroy remains
+      // (a prior destroy failure) → RESUME the destroy of that workspace.
       if (!existsSync(prior.workspacePath)) {
         throw new ArchivalError(
           "archive-write",
