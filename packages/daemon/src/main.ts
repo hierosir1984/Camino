@@ -137,8 +137,23 @@ export async function main(): Promise<void> {
       : `GUI token read from ${tokenLoad.path}`,
   );
 
+  // Handle the shutdown signals explicitly and exit 0 once the instance has
+  // closed (its onClose hook releases the stores + writer lock). Relying on the
+  // event loop draining after close() is not portable: on Linux a lingering
+  // native handle left the process alive until the default signal action killed
+  // it, so the exit code was the signal (null), not 0. A daemon told to stop
+  // should exit cleanly.
+  let stopping = false;
   const stop = (): void => {
-    void daemon.app.close();
+    if (stopping) return;
+    stopping = true;
+    daemon.app.close().then(
+      () => process.exit(0),
+      (error) => {
+        console.error(`Error during shutdown: ${(error as Error).message}`);
+        process.exit(1);
+      },
+    );
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
