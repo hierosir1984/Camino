@@ -192,6 +192,7 @@ function renderRow(row, tbody) {
   }
   tr.dataset.provenanceSeqs = row.provenance.map((f) => f.seq).join(",");
   tr.dataset.detectorSeqs = row.detectorFindings.map((f) => f.seq).join(",");
+  tr.dataset.firedRules = row.firedRules.join(",");
   if (row.dispositionRecord !== null) {
     tr.dataset.dispositionRecordSeq = String(row.dispositionRecord.seq);
     tr.dataset.dispositionRecordEvent = row.dispositionRecord.event;
@@ -217,6 +218,11 @@ function renderRow(row, tbody) {
       addLine(provenance, "provenance-fact", provenanceLine(fact));
     }
   }
+  // The fired projection rules are part of the evidence provenance (CAM-CANON-05:
+  // "fact records + fired rules") — the audit trail behind the tuple, not a
+  // restatement of it. Always shown, even with no facts (a rule like I1/E1 fires
+  // to say "nothing bears on this").
+  addLine(provenance, "provenance-rules", `rules: ${row.firedRules.join(", ")}`);
 
   const disposition = cell(tr, "col-disposition");
   addLine(disposition, "disposition-value", row.disposition);

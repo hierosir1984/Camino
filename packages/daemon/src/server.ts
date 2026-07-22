@@ -52,21 +52,27 @@
  * that exists; the headers are guaranteed on every response the application
  * itself produces.
  *
- * KNOWN LIMITATION — loopback-origin service-worker squatting (round 5, finding
- * 1): the daemon's origin (http://127.0.0.1:<port>) is not exclusively owned by
- * the daemon across restarts. A malicious LOCAL process can bind the port while
- * the daemon is stopped and, if the user's browser loads that origin, register a
- * persistent service worker that survives the port returning to the real daemon
- * and can then read the GUI token and drive the API. This needs no filesystem
- * write, so it is outside the token/GUI directory boundaries. Partial mitigation
- * here: `worker-src 'none'` (the legitimate GUI never uses a worker; the token
- * is per-launch). It does NOT evict a worker already registered by a squatter.
- * The complete fix is an origin a squatter cannot pre-seed — an ephemeral
- * per-launch port, or a per-launch path/subdomain nonce — which changes the
- * daemon⇄GUI addressing contract. DECISION (David, 2026-07-19): DEFERRED to the
- * real GUI/launch work (WP-122+), where the addressing contract is designed;
- * this shell keeps the `worker-src 'none'` partial mitigation and the
- * placeholder GUI uses no service worker.
+ * KNOWN LIMITATION — loopback-origin service-worker squatting (WP-102 review
+ * round 5, finding 1): the daemon's origin (http://127.0.0.1:<port>) is not
+ * exclusively owned by the daemon across restarts. A malicious LOCAL process can
+ * bind the port while the daemon is stopped and, if the user's browser loads that
+ * origin, register a persistent service worker that survives the port returning
+ * to the real daemon and can then read the GUI token and drive the API. This
+ * needs no filesystem write, so it is outside the token/GUI directory boundaries.
+ * Partial mitigation here: `worker-src 'none'` (the legitimate GUI never uses a
+ * worker). It does NOT evict a worker already registered by a squatter.
+ *
+ * WP-122 designed the complete fix — see docs/design/18-gui-origin-isolation.md,
+ * which SUPERSEDES the sketch in this paragraph. Two corrections that document
+ * establishes and this comment must not contradict: (1) a per-launch PATH nonce
+ * does NOT isolate — service workers partition by origin, not path — so the
+ * origin itself must rotate (a per-launch `*.localhost` subdomain nonce); (2) the
+ * GUI token is NOT rotated per launch today (`loadOrCreateToken` reuses the
+ * on-disk token), so token rotation is a REQUIRED companion of that design, not
+ * an existing property. DECISION (David, 2026-07-19): the addressing/token
+ * mechanics are DEFERRED to the WP that implements design 18 (placement ruling
+ * pending); this shell keeps the `worker-src 'none'` partial mitigation and the
+ * GUI uses no service worker.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";

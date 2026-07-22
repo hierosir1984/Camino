@@ -250,6 +250,10 @@ async function expectTableMatchesLedger(
     } else {
       await expect(tr.locator(".provenance-empty")).toHaveCount(0);
     }
+    // The fired projection rules are part of the CAM-CANON-05 evidence provenance
+    // (round 5, finding 1) — assert both the attribute and the visible line.
+    await expect(tr).toHaveAttribute("data-fired-rules", row.firedRules.join(","));
+    await expect(tr.locator(".provenance-rules")).toHaveText(`rules: ${row.firedRules.join(", ")}`);
     for (let f = 0; f < row.provenance.length; f += 1) {
       // The WHOLE rendered line, exactly (round 2, finding 9: asserting only
       // seq/kind/actor let a corrupted reason/outcome pass). Mirrors app.js's
