@@ -24,6 +24,7 @@ import {
   ArchivalError,
   DEFAULT_ARCHIVE_QUOTAS,
   archiveAttempt,
+  effectiveArchiveQuotas,
   pruneArchives,
   workspaceSizeBytes,
   type ArchiveLedgerRow,
@@ -207,6 +208,238 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
       expect(existsSync(record.archivePath)).toBe(true);
     } finally {
       process.chdir(prevCwd); // restore before any other test runs
+    }
+  });
+
+  it("canonicalizes the workspace up-front, so a cwd change inside recordLedgerRow cannot misdirect the destroy (round-9 finding 1)", async () => {
+    const runA = tempDir();
+    const runB = tempDir();
+    // The real workspace to archive+destroy, addressed RELATIVELY from runA.
+    mkdirSync(join(runA, "ws"), { recursive: true });
+    writeFileSync(join(runA, "ws", "work.txt"), "attempt output\n");
+    // An UNRELATED workspace at the same relative path under a different cwd.
+    mkdirSync(join(runB, "ws"), { recursive: true });
+    writeFileSync(join(runB, "ws", "victim.txt"), "must-not-be-touched\n");
+    const root = tempDir();
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(runA);
+      await archiveAttempt({
+        workspaceDir: "ws", // RELATIVE — resolved once, up-front
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          // A buggy/hostile ledger callback changes cwd mid-archival. The
+          // destroy must still target the ORIGINAL workspace (resolved before
+          // this ran), never "ws" re-resolved against the new cwd.
+          process.chdir(runB);
+        },
+      });
+    } finally {
+      process.chdir(prevCwd);
+    }
+    expect(existsSync(join(runA, "ws"))).toBe(false); // the intended workspace destroyed
+    expect(existsSync(join(runB, "ws", "victim.txt"))).toBe(true); // the unrelated one untouched
+  });
+
+  it("compares REAL workspace identity, so a rebound symlink parent cannot redirect a resume-destroy onto a victim (round-9 finding 1)", async () => {
+    const realA = tempDir();
+    const realB = tempDir();
+    mkdirSync(join(realA, "ws"));
+    writeFileSync(join(realA, "ws", "a.txt"), "A\n");
+    mkdirSync(join(realB, "ws"));
+    writeFileSync(join(realB, "ws", "victim.txt"), "victim\n");
+    const linkParent = join(tempDir(), "link");
+    symlinkSync(realA, linkParent); // link -> realA
+    const root = tempDir();
+    // First archival via the symlinked parent records the REAL path (realA/ws),
+    // archives, and destroys realA/ws.
+    await archiveAttempt({
+      workspaceDir: join(linkParent, "ws"),
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    // Model a FAILED destroy (workspace present again) AND rebind the symlink
+    // parent to realB, so link/ws now resolves to the VICTIM.
+    mkdirSync(join(realA, "ws"), { recursive: true });
+    writeFileSync(join(realA, "ws", "a.txt"), "A\n");
+    rmSync(linkParent);
+    symlinkSync(realB, linkParent);
+    // Re-invoke: the supplied link/ws now really points at realB/ws (≠ the
+    // recorded realA/ws) → refuse, touch NEITHER.
+    await expect(
+      archiveAttempt({
+        workspaceDir: join(linkParent, "ws"),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "ArchivalError", stage: "archive-write" });
+    expect(existsSync(join(realA, "ws"))).toBe(true); // recorded workspace untouched
+    expect(existsSync(join(realB, "ws", "victim.txt"))).toBe(true); // victim untouched
+  });
+
+  it("a resume REFUSES to destroy the workspace when the referenced archive is MISSING (round-9 finding 3)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    // Model a failed destroy (workspace present again) AND a since-vanished
+    // archive (e.g. a prune interrupted between deleting the .tar.gz and its
+    // sidecar) — a valid sidecar now references a missing archive.
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "recovered.txt"), "still here\n");
+    rmSync(join(root, "i", "a.tar.gz"), { force: true });
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("archive-write");
+    expect((err as Error).message).toMatch(/missing/i);
+    expect(existsSync(ws)).toBe(true); // the workspace — the LAST copy — is retained
+  });
+
+  it("a resume REFUSES to destroy the workspace when the referenced archive fails its CHECKSUM (round-9 finding 3)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "recovered.txt"), "still here\n");
+    // Corrupt the archive in place → its sha256 no longer matches the sidecar.
+    writeFileSync(join(root, "i", "a.tar.gz"), "corrupted-not-the-original-bytes");
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("archive-write");
+    expect((err as Error).message).toMatch(/sha256|match/i);
+    expect(existsSync(ws)).toBe(true);
+  });
+
+  it("an Error whose `message` is a NON-string is still a staged ArchivalError, not a raw TypeError (round-9 finding 5)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {
+        const e = new Error("orig");
+        // A legal-but-hostile Error whose message is a Symbol — `.slice()` on it
+        // previously threw a raw TypeError that escaped the staged contract.
+        Object.defineProperty(e, "message", { value: Symbol("boom"), configurable: true });
+        throw e;
+      },
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("ledger-row");
+    expect((err as Error).message).toContain("Symbol(boom)");
+    expect(existsSync(ws)).toBe(true); // fail-closed: workspace retained
+    expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true); // archive retained
+  });
+
+  it("the pruner treats a sidecar whose identity does not match its archive as UNDATABLE, never deleting it (round-9 finding 6)", () => {
+    const root = tempDir();
+    const issueDir = join(root, "issueX");
+    mkdirSync(issueDir, { recursive: true });
+    // A victim archive whose sidecar CLAIMS a different issue/attempt, spoofed to
+    // look old — a pruner trusting it under retainLast:0 would delete it.
+    writeFileSync(join(issueDir, "victim.tar.gz"), "audit-material");
+    const spoofed: ArchiveSidecar = {
+      issueId: "somewhere-else",
+      attemptId: "somewhere-else",
+      workspacePath: "/gone",
+      archiveWrittenAt: new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString(),
+      seq: 0,
+      sha256: "x",
+      compressedBytes: 1,
+      workspaceBytes: 1,
+    };
+    writeFileSync(join(issueDir, "victim.json"), JSON.stringify(spoofed));
+    const report = pruneArchives({
+      archiveRoot: root,
+      retainLastAttemptsPerIssue: 0,
+      retainDays: 90,
+    });
+    const victim = join(issueDir, "victim.tar.gz");
+    expect(report.deleted).not.toContain(victim);
+    expect(report.undatable).toContain(victim);
+    expect(existsSync(victim)).toBe(true); // audit material preserved (fail-closed)
+  });
+
+  it("effectiveArchiveQuotas clamps an override to the registry ceiling — an override can only TIGHTEN (round-9 finding 7)", () => {
+    const loosened = effectiveArchiveQuotas({
+      workspaceMaxBytes: Number.POSITIVE_INFINITY,
+      archiveMaxCompressedBytes: Number.MAX_SAFE_INTEGER,
+    });
+    expect(loosened.workspaceMaxBytes).toBe(REGISTRY_ITEM_11_QUOTAS.workspace.maxBytes);
+    expect(loosened.archiveMaxCompressedBytes).toBe(
+      REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes,
+    );
+    // A stricter override is preserved (the suite's tiny quotas keep working).
+    expect(
+      effectiveArchiveQuotas({ workspaceMaxBytes: 10, archiveMaxCompressedBytes: 20 }),
+    ).toEqual({ workspaceMaxBytes: 10, archiveMaxCompressedBytes: 20 });
+    // Mixed: only the loosened field is clamped.
+    const mixed = effectiveArchiveQuotas({
+      workspaceMaxBytes: 5,
+      archiveMaxCompressedBytes: Number.POSITIVE_INFINITY,
+    });
+    expect(mixed.workspaceMaxBytes).toBe(5);
+    expect(mixed.archiveMaxCompressedBytes).toBe(
+      REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes,
+    );
+  });
+
+  it("pruneArchives resolves a RELATIVE archiveRoot to absolute report paths (round-9 finding 8)", () => {
+    const runFrom = tempDir();
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(runFrom);
+      mkdirSync(join("vault", "i"), { recursive: true });
+      writeFileSync(join("vault", "i", "a.tar.gz"), "keep-me");
+      const sidecar: ArchiveSidecar = {
+        issueId: "i",
+        attemptId: "a",
+        workspacePath: "/gone",
+        archiveWrittenAt: new Date().toISOString(),
+        seq: 0,
+        sha256: "x",
+        compressedBytes: 1,
+        workspaceBytes: 1,
+      };
+      writeFileSync(join("vault", "i", "a.json"), JSON.stringify(sidecar));
+      const report = pruneArchives({ archiveRoot: "vault" });
+      expect(report.kept).toHaveLength(1);
+      const keptPath = report.kept[0] ?? "";
+      expect(isAbsolute(keptPath)).toBe(true);
+      expect(keptPath.endsWith(join("vault", "i", "a.tar.gz"))).toBe(true);
+    } finally {
+      process.chdir(prevCwd);
     }
   });
 

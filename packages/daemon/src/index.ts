@@ -132,6 +132,7 @@ export type { BudgetBreachEscalation, BudgetedDispatchResult } from "./worker/bu
 export {
   ArchivalError,
   DEFAULT_ARCHIVE_QUOTAS,
+  effectiveArchiveQuotas,
   archiveAttempt,
   pruneArchives,
   workspaceSizeBytes,

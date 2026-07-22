@@ -911,6 +911,11 @@ export async function dispatch(
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child, timings); // never throws; fail-closed
     }
+    // Time the tracked group is confirmed GONE — captured HERE, before the
+    // (bounded, possibly slow) stream drain, so a group-escaped descendant
+    // holding a pipe (the named WP-107 boundary) cannot inflate it. Basis for
+    // the wall-clock backstop below.
+    const groupGoneAt = Date.now();
 
     // Drain stdout/stderr to EOF so a line still buffered when 'exit' fired is
     // parsed and classified (round-8 finding 3) — but BOUNDED: a group-escaped
@@ -977,6 +982,33 @@ export async function dispatch(
     // cancel-requested and exited as separate events and reconciles them rather
     // than forcing a synchronous label; WP-105 keeps the conservative
     // synchronous label at the seam.
+    // Wall-clock BACKSTOP (round-9 finding 4): the in-process budget TIMER can be
+    // delayed past its deadline by event-loop starvation (e.g. a synchronous
+    // transcript/parse callback), so when it finally runs it may observe the
+    // group already gone and record NO breach — letting an over-budget worker
+    // classify `succeeded`. This check does not depend on the timer firing on
+    // time: if the tracked group's lifetime (start → group-gone) exceeded the
+    // wall-clock budget and we did not already kill it for another reason, that
+    // is a wall-clock breach. `groupGoneAt` is the group's actual end (captured
+    // before the drain), so a legitimately in-time worker is never mislabeled.
+    // BOUNDARY, stated: `groupGoneAt` is the daemon's OBSERVATION of group-gone;
+    // under pathological daemon-side loop starvation it can over-attribute — the
+    // fail-safe direction (escalate for review, never silently accept an
+    // overrun; CAM-EXEC-03). A fully out-of-process watchdog is the container's
+    // job (WP-114), the same group-vs-tree boundary this file states throughout.
+    if (
+      !budgetBreach &&
+      killReason == null &&
+      budgetWallClockMs !== undefined &&
+      groupGoneAt - started > budgetWallClockMs
+    ) {
+      budgetBreach = {
+        kind: "wall-clock",
+        limit: budgetWallClockMs,
+        observed: groupGoneAt - started,
+      };
+    }
+
     let outcome: DispatchOutcome;
     if (budgetBreach) {
       // A budget breach outranks every other classification (CAM-EXEC-03:

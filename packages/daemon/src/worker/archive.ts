@@ -30,9 +30,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -77,18 +80,22 @@ function assertSafeId(kind: "issueId" | "attemptId", value: string): void {
 }
 
 /**
- * Stringify ANY thrown value safely (round-8 finding 2): `(err as Error).message`
- * is undefined for a non-Error rejection (`throw "string"`, `throw {}`), and
- * `.slice()` on it threw a raw TypeError that escaped the staged ArchivalError.
+ * Stringify ANY thrown value safely (round-8 finding 2, hardened round-9 finding
+ * 5). `(err as Error).message` is undefined for a non-Error rejection
+ * (`throw "string"`, `throw {}`); worse, an Error whose `message` is a non-string
+ * (`Object.defineProperty(err, "message", { value: Symbol() })`, a throwing
+ * getter) made the `.slice()` throw a raw TypeError that escaped the staged
+ * ArchivalError. EVERYTHING — the property read, the coercion, AND the slice —
+ * is inside the guard, and the value is coerced with `String()` (the one
+ * coercion that also handles Symbol/BigInt) before slicing, so this is TOTAL.
  */
 function describeError(err: unknown, max = 300): string {
-  let s: string;
   try {
-    s = err instanceof Error ? err.message : String(err);
+    const raw = err instanceof Error ? err.message : err;
+    return String(raw).slice(0, max);
   } catch {
-    s = "unstringifiable error";
+    return "unstringifiable error";
   }
-  return s.slice(0, max);
 }
 
 /**
@@ -131,6 +138,27 @@ export const DEFAULT_ARCHIVE_QUOTAS: ArchiveQuotas = Object.freeze({
   workspaceMaxBytes: REGISTRY_ITEM_11_QUOTAS.workspace.maxBytes,
   archiveMaxCompressedBytes: REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes,
 });
+
+/**
+ * Clamp an injected quota override to the registry as a HARD CEILING (round-9
+ * finding 7): an override may only TIGHTEN registry item 11, never loosen it.
+ * `min` keeps the tiny test quotas (stricter) working while making the registry
+ * an unconditional floor — so a caller (or a test) can never archive a
+ * workspace/archive that exceeds the registry and still stamp
+ * `quotasEnforced: true`.
+ */
+export function effectiveArchiveQuotas(override: ArchiveQuotas): ArchiveQuotas {
+  return {
+    workspaceMaxBytes: Math.min(
+      override.workspaceMaxBytes,
+      DEFAULT_ARCHIVE_QUOTAS.workspaceMaxBytes,
+    ),
+    archiveMaxCompressedBytes: Math.min(
+      override.archiveMaxCompressedBytes,
+      DEFAULT_ARCHIVE_QUOTAS.archiveMaxCompressedBytes,
+    ),
+  };
+}
 
 /** The ledger-row payload; the caller persists it (WP-109 event store). */
 export interface ArchiveLedgerRow {
@@ -237,6 +265,38 @@ function safeRemove(p: string): void {
   }
 }
 
+/** fsync a single path (file OR directory); NEVER throws (platform quirks are swallowed). */
+function fsyncPathBestEffort(p: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(p, "r");
+    fsyncSync(fd);
+  } catch {
+    /* best-effort: durability hardening must never break an otherwise-good archival */
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/**
+ * Flush a just-written file's DATA and its parent directory ENTRY to stable
+ * storage (round-9 finding 9): `writeFileSync`/`renameSync` return once the data
+ * reaches the page cache, so a host/power crash could still lose an archive or
+ * sidecar. Fsyncing the file and its containing directory makes the durability
+ * claim true for a crash, not merely a process kill. Best-effort and total: the
+ * WP-109 ledger row remains the authoritative durable record regardless.
+ */
+function syncFileAndParentDir(filePath: string): void {
+  fsyncPathBestEffort(filePath);
+  fsyncPathBestEffort(join(filePath, ".."));
+}
+
 /**
  * Read `sidecarPath` and return it iff it is a VALID sidecar for this attempt
  * (round-5 finding 1) — parses, matches issueId/attemptId, and carries a safe
@@ -274,6 +334,51 @@ function readValidSidecar(
     return null;
   } catch {
     return null; // malformed
+  }
+}
+
+/** The real (symlink-resolved) identity of a workspace dir, or null if it does not exist. */
+function realWorkspaceIdentity(dir: string): string | null {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Before a resume-destroy trades the workspace (its LAST copy) for the archive,
+ * verify that archive is actually present AND intact (round-9 finding 3): a lone
+ * valid sidecar whose `.tar.gz` has since gone (e.g. a prune interrupted between
+ * deleting the archive and its sidecar, or any partial loss) must NOT cause the
+ * workspace to be destroyed on top of it. Missing file, unreadable, or a
+ * sha256 mismatch each REFUSE (staged, workspace retained) → reconciliation.
+ */
+function assertArchiveIntactForResume(
+  finalPath: string,
+  attemptId: string,
+  prior: ArchiveSidecar,
+): void {
+  if (!existsSync(finalPath)) {
+    throw new ArchivalError(
+      "archive-write",
+      `resume for attempt ${attemptId}: the archive ${finalPath} the sidecar references is missing — refusing to destroy the workspace (its last copy); janitor/escalation reconciles (fail-closed)`,
+    );
+  }
+  let actual: string;
+  try {
+    actual = createHash("sha256").update(readFileSync(finalPath)).digest("hex");
+  } catch (err) {
+    throw new ArchivalError(
+      "archive-write",
+      `resume for attempt ${attemptId}: could not read the archive ${finalPath} to verify it: ${describeError(err, 200)} — refusing to destroy the workspace (fail-closed)`,
+    );
+  }
+  if (actual !== prior.sha256) {
+    throw new ArchivalError(
+      "archive-write",
+      `resume for attempt ${attemptId}: the archive ${finalPath} does not match the recorded sha256 (recorded ${prior.sha256}, actual ${actual}) — refusing to destroy the workspace; janitor/escalation reconciles (fail-closed)`,
+    );
   }
 }
 
@@ -352,7 +457,13 @@ function realDirPath(p: string): string {
  */
 export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<ArchivalRecord> {
   const now = opts.now ?? (() => new Date());
-  const quotas = opts.quotas ?? DEFAULT_ARCHIVE_QUOTAS;
+  // Registry item 11 is a HARD CEILING (round-9 finding 7): an injected `quotas`
+  // override may only TIGHTEN the registry limits, never loosen them, so a
+  // caller (or a test) can never archive a workspace/archive that exceeds the
+  // registry and still stamp `quotasEnforced: true`. `min` keeps the tiny test
+  // quotas (which are stricter) working while making the registry an
+  // unconditional floor for the truthful evidence claim.
+  const quotas = effectiveArchiveQuotas(opts.quotas ?? DEFAULT_ARCHIVE_QUOTAS);
   assertSafeId("issueId", opts.issueId);
   assertSafeId("attemptId", opts.attemptId);
   // Validate attemptSeq EARLY — BEFORE any archive is written (round-3 finding
@@ -368,11 +479,28 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
 
+  // Canonicalize the workspace to an ABSOLUTE, REAL path ONCE (round-9 finding
+  // 1). Every later step — size, tar, sidecar identity, the resume comparison,
+  // and the destroy — uses this single value, so none is fooled by a
+  // cwd-relative `workspaceDir` (a `recordLedgerRow` that changes cwd mid-call)
+  // or by a symlinked parent rebound between attempts: identity is the REAL
+  // directory, not a lexical spelling. Falls back to the lexical absolute only
+  // when the workspace does not exist yet, where the size/tar step below raises
+  // the real, clearer error.
+  const workspaceDir = resolve(opts.workspaceDir);
+  const workspaceReal = ((): string => {
+    try {
+      return realpathSync(workspaceDir);
+    } catch {
+      return workspaceDir;
+    }
+  })();
+
   // Step 0 — workspace quota (registry item 11: workspace ≤ 2 GB). An
   // over-quota workspace is an abnormal condition: refusing here routes it to
   // the cleanup-failed/escalation path with the workspace intact. Checked
   // FIRST — before creating the issue dir — so a refusal writes nothing at all.
-  const workspaceBytes = workspaceSizeBytes(opts.workspaceDir);
+  const workspaceBytes = workspaceSizeBytes(workspaceReal);
   if (workspaceBytes > quotas.workspaceMaxBytes) {
     throw new ArchivalError(
       "workspace-quota",
@@ -399,7 +527,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `could not create archive dir ${issueDir}: ${describeError(err, 200)} — refused (fail-closed)`,
     );
   }
-  const wsResolved = realDirPath(opts.workspaceDir);
+  const wsResolved = workspaceReal;
   const issueResolved = realDirPath(issueDir);
   if (
     issueResolved === wsResolved ||
@@ -408,7 +536,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   ) {
     throw new ArchivalError(
       "id-validation",
-      `archive output dir ${JSON.stringify(issueDir)} resolves inside/over the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
+      `archive output dir ${JSON.stringify(issueDir)} resolves inside/over the workspace ${JSON.stringify(workspaceReal)} — workspace teardown would delete the archive (fail-closed)`,
     );
   }
   // BOUNDARY, stated (round-3 finding 2/3): archiveRoot is a FIXED,
@@ -447,26 +575,34 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   if (existsSync(finalPath) || existsSync(sidecarPath)) {
     const prior = readValidSidecar(sidecarPath, opts.issueId, opts.attemptId);
     if (prior) {
-      // A resume-destroy may run ONLY when the SUPPLIED workspace is the exact
-      // one the completed attempt recorded (round-7 finding 1): a re-invocation
-      // that supplies a DIFFERENT workspace is anomalous (the attempt's
-      // workspace is fixed) — refuse and touch NEITHER workspace, so a stray
-      // duplicate call can never destroy the recorded workspace.
-      if (resolve(opts.workspaceDir) !== prior.workspacePath) {
-        throw new ArchivalError(
-          "archive-write",
-          `re-invocation for attempt ${opts.attemptId} supplies workspace ${JSON.stringify(resolve(opts.workspaceDir))} but the recorded one is ${JSON.stringify(prior.workspacePath)} — refusing to touch either (janitor/escalation reconciles)`,
-        );
-      }
-      // Same workspace as recorded. If it is GONE, the attempt is fully
-      // complete → refuse; if it is still present, only the destroy remains
-      // (a prior destroy failure) → RESUME the destroy of that workspace.
+      // The sidecar's recorded workspacePath is a REAL (symlink-resolved) path
+      // (round-9 finding 1). If the recorded workspace is GONE, the attempt is
+      // fully complete → refuse (exactly-once). Checked FIRST, before the
+      // identity comparison, so a post-completion re-invocation (whose supplied
+      // workspace is also gone) is reported as complete, not as a mismatch.
       if (!existsSync(prior.workspacePath)) {
         throw new ArchivalError(
           "archive-write",
           `archive already complete for attempt ${opts.attemptId} (archive + ledger row + sidecar durable, workspace destroyed)`,
         );
       }
+      // Recorded workspace PRESENT → only the destroy remains (a prior destroy
+      // failure). A resume-destroy may run ONLY when the SUPPLIED workspace is
+      // the EXACT SAME REAL directory the completed attempt recorded (round-7
+      // finding 1, hardened round-9 finding 1 to real identity): compare the
+      // supplied workspace's realpath to the recorded real path. A different
+      // real dir — a cwd-relative spelling, a rebound symlink parent, or a stray
+      // duplicate call with another workspace — must touch NEITHER.
+      const suppliedReal = realWorkspaceIdentity(workspaceDir);
+      if (suppliedReal !== prior.workspacePath) {
+        throw new ArchivalError(
+          "archive-write",
+          `re-invocation for attempt ${opts.attemptId} supplies workspace ${JSON.stringify(suppliedReal ?? workspaceDir)} but the recorded one is ${JSON.stringify(prior.workspacePath)} — refusing to touch either (janitor/escalation reconciles)`,
+        );
+      }
+      // Never trade the workspace (its last copy) for an archive that is not
+      // verifiably present and intact (round-9 finding 3).
+      assertArchiveIntactForResume(finalPath, opts.attemptId, prior);
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
       const archiveWrittenAt = prior.archiveWrittenAt;
       const ledgerRowAt = nextStamp(now, archiveWrittenAt);
@@ -488,7 +624,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
   try {
-    execFileSync("tar", ["-czf", tmpPath, "-C", opts.workspaceDir, "."], {
+    execFileSync("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (err) {
@@ -516,6 +652,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `archive install failed: ${describeError(err, 300)} — workspace retained`,
     );
   }
+  syncFileAndParentDir(finalPath); // flush the archive to stable storage (round-9 finding 9)
   const archiveWrittenAt = nextStamp(now, null);
 
   // Step 2 — ledger row referencing the archive, BEFORE the sidecar (A.4#5
@@ -550,7 +687,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const sidecar: ArchiveSidecar = {
     issueId: opts.issueId,
     attemptId: opts.attemptId,
-    workspacePath: resolve(opts.workspaceDir),
+    workspacePath: workspaceReal,
     archiveWrittenAt,
     seq,
     sha256,
@@ -565,13 +702,14 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `sidecar write failed after the ledger row: ${describeError(err, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
     );
   }
+  syncFileAndParentDir(sidecarPath); // flush the sidecar to stable storage (round-9 finding 9)
 
   // Step 3 — destroy the workspace, strictly last (a failure is a cleanup-failed
   // teardown, A.2 "cleanup failure during teardown → blocked"; workspaceRetained
   // :false because recursive deletion is not transactional — round-1 finding 4).
   // If this fails, a re-invocation RESUMES the destroy (valid sidecar +
   // workspace present — round-6 finding 1).
-  destroyWorkspaceOrThrow(opts.workspaceDir);
+  destroyWorkspaceOrThrow(workspaceReal);
   const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
 
   return buildArchivalRecord({
@@ -671,14 +809,18 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
   const cutoffMs = now().getTime() - retainDays * 24 * 60 * 60 * 1000;
   const report: PruneReport = { kept: [], deleted: [], undatable: [] };
 
+  // Resolve to an ABSOLUTE root (round-9 finding 8) so the reported/deleted
+  // paths are cwd-independent, matching archiveAttempt's ledger references.
+  const archiveRoot = resolve(opts.archiveRoot);
+
   let issueDirs: string[];
   try {
-    issueDirs = readdirSync(opts.archiveRoot);
+    issueDirs = readdirSync(archiveRoot);
   } catch {
     return report; // no archive root yet — nothing to prune
   }
   for (const issueId of issueDirs) {
-    const issueDir = join(opts.archiveRoot, issueId);
+    const issueDir = join(archiveRoot, issueId);
     let stat;
     try {
       stat = lstatSync(issueDir);
@@ -700,16 +842,19 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
       const sidecarPath = join(issueDir, `${attemptId}.json`);
       let writtenMs: number | null = null;
       let seq: number | null = null;
-      try {
-        const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as ArchiveSidecar;
+      // Validate the sidecar's OWN identity — issueId (this dir) and attemptId
+      // (this archive's filename) — with the SAME check recovery uses (round-9
+      // finding 6). A sidecar whose content names a different issue/attempt (a
+      // mis-placed or corrupt file) must NOT lend its seq/timestamp to a
+      // neighbour's retention decision; readValidSidecar returns null for it, so
+      // the archive falls through to `undatable` and is never deleted.
+      const sidecar = readValidSidecar(sidecarPath, issueId, attemptId);
+      if (sidecar) {
         const t = Date.parse(sidecar.archiveWrittenAt);
         if (Number.isFinite(t)) writtenMs = t;
-        // Only a SAFE-INTEGER seq is orderable; a corrupt/overflowed seq is
-        // treated as unsequenced → undatable (fail-closed), never deleted
-        // (round-2 finding 6).
-        if (Number.isSafeInteger(sidecar.seq)) seq = sidecar.seq;
-      } catch {
-        writtenMs = null;
+        // readValidSidecar already required a SAFE-INTEGER seq; a corrupt/
+        // overflowed seq made it null → undatable (fail-closed, round-2 finding 6).
+        seq = sidecar.seq;
       }
       // Undatable OR unsequenced → cannot be ordered for the count window;
       // never delete it (fail-closed), only report.

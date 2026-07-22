@@ -145,6 +145,29 @@ if (mode === "hang") {
     emitSync("result", "RAN_AND_EXITED_BEFORE_BUDGET");
     process.exit(0);
   }, 10);
+} else if (mode === "budget-starve-descendant") {
+  // Round-9 finding 4: the leader spawns an in-group descendant that EXITS ON
+  // ITS OWN a fixed time past spawn (ignoring TERM so the post-exit sweep can't
+  // end it early), then emits a STARVE marker line and exits. The paired
+  // starving adapter (in the test) busy-waits synchronously on that marker,
+  // blocking the daemon's event loop long past the budget deadline AND the
+  // descendant's self-exit — so the in-process budget TIMER cannot fire in time
+  // and observes the group already gone. Only the elapsed-since-start BACKSTOP
+  // can then classify killed-budget. The descendant genuinely outlived the
+  // budget (MOCK_STARVE_DESCENDANT_MS > the budget), so that verdict is correct.
+  const marker = join(process.cwd(), ".budget-starve-ready");
+  const liveMs = Number(process.env.MOCK_STARVE_DESCENDANT_MS ?? "400");
+  spawn("sh", ["-c", `trap "" TERM; : > "${marker}"; sleep ${liveMs / 1000}; exit 0`], {
+    stdio: "ignore",
+  });
+  const gateStart = Date.now();
+  const gate = setInterval(() => {
+    if (!existsSync(marker) && Date.now() - gateStart < 10_000) return;
+    clearInterval(gate);
+    emitSync("assistant", "STARVE"); // the line the adapter busy-waits on
+    emitSync("result", "leader exit; an in-group descendant outlives the budget then self-exits");
+    process.exit(0);
+  }, 10);
 } else if (mode === "escaped-stdout-holder") {
   // A descendant that ESCAPES the process group (its own new session) AND
   // inherits stdout, holding the pipe's write end open after the leader exits

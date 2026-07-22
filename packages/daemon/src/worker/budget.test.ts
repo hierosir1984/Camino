@@ -10,8 +10,38 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { attemptMachine, issueMachine, transition } from "@camino/core";
 import type { IssueEvent } from "@camino/core";
+import type { AdapterSpec } from "@camino/shared";
 import { mockAdapter } from "../dispatch/adapters/mock.js";
 import { BudgetConfigError, dispatchWithBudget, validateAttemptBudget } from "./budget.js";
+
+/**
+ * The `budget-starve-descendant` mock wrapped in an adapter whose parseLine
+ * busy-waits synchronously on the STARVE marker line — starving the daemon's
+ * event loop long past the budget deadline AND the descendant's self-exit, so
+ * the in-process budget TIMER can never fire in time (round-9 finding 4).
+ */
+function starvingAdapter(): AdapterSpec {
+  const base = mockAdapter("budget-starve-descendant");
+  return {
+    ...base,
+    name: "mock:budget-starve-descendant",
+    parseLine(line: string, channel: "stdout" | "stderr") {
+      const ev = base.parseLine(line, channel);
+      const text = (ev as { text?: unknown } | null)?.text;
+      if (typeof text === "string" && text.includes("STARVE")) {
+        // Block the loop well past both the 200ms budget AND the descendant's
+        // self-exit (~handshake + 400ms), so under load the timer still can't
+        // fire until the group is gone — leaving only the backstop. Busy-wait is
+        // CPU-bound on Date.now(), so it measures real time regardless of load.
+        const until = Date.now() + 1_500;
+        while (Date.now() < until) {
+          /* deliberate busy-wait: starve the event loop */
+        }
+      }
+      return ev;
+    },
+  };
+}
 
 // Budget kills use short kill-confirm timings so the suite stays fast; the
 // production 30s grace is pinned by the WP-105 lifecycle tests.
@@ -55,7 +85,9 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     );
     expect(record.outcome).toBe("killed-budget");
     expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 700 });
-    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(700);
+    // `observed` (wall clock) can read a hair under the limit vs the timer's
+    // monotonic clock — assert it fired near the budget, tolerating that skew.
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(600);
     expect(record.killConfirm?.groupGone).toBe(true);
     expect(escalation).toBeDefined();
     expect(escalation!.attemptEvent).toEqual({
@@ -71,17 +103,23 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
   }, 30_000);
 
   it("wall-clock covers the GROUP: a leader that EXITS 0 while an in-group descendant outlives the budget is killed-budget, not succeeded (round-8 finding 1)", async () => {
-    // The leader emits its success result and exits 0 well before the 400ms
-    // budget; a same-group descendant ignores SIGTERM and runs past it. The old
+    // The leader emits its success result and exits 0 well before the budget; a
+    // same-group descendant ignores SIGTERM and runs past it. The old
     // leader-gated timer returned early on the leader's exit and let the run
     // classify `succeeded`. The group-scoped timer breaches because the tracked
     // group is still alive at the deadline. Grace is generous so the survivor is
     // still alive when the deadline fires (the post-exit sweep's SIGTERM is
     // ignored); the eventual SIGKILL confirms the group gone.
+    //
+    // The 2s budget is deliberately far larger than the leader's setup+exit
+    // (~tens of ms, bounded by the descendant-readiness handshake) so that even
+    // under heavy parallel CI load the leader has EXITED before the deadline —
+    // the property this test asserts. A tight budget raced the handshake and
+    // flaked (the budget SIGTERM'd the not-yet-exited leader).
     const { record, escalation } = await dispatchWithBudget(
       mockAdapter("budget-descendant"),
       { workdir: workdir(), prompt: "leave a budget-outliving descendant" },
-      { wallClockMs: 400 },
+      { wallClockMs: 2_000 },
       { killConfirm: { graceMs: 2_000, sigkillWaitMs: 2_000 } },
     );
     // The leader genuinely ran to completion and exited 0 — its success result
@@ -89,8 +127,9 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(record.finalText).toContain("RAN_AND_EXITED_BEFORE_BUDGET");
     expect(record.exitCode).toBe(0);
     expect(record.outcome).toBe("killed-budget");
-    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 400 });
-    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(400);
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 2_000 });
+    // Tolerate wall-vs-monotonic clock skew on the observed elapsed (see above).
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(1_900);
     // The surviving descendant required SIGKILL; the group is confirmed gone, so
     // the clean A.3#5 / A.2#10 escalation (not the cleanup-failed path) applies.
     expect(escalation).toBeDefined();
@@ -98,6 +137,27 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
       type: "attempt-budget-breached",
       killConfirmed: true,
     });
+  }, 30_000);
+
+  it("wall-clock BACKSTOP: an over-budget worker is killed-budget even when a synchronous callback starves the event loop so the timer misses the deadline (round-9 finding 4)", async () => {
+    // The worker's leader exits fast; a same-group descendant lives ~400ms past
+    // the 200ms budget then self-exits; the adapter's parseLine busy-waits 800ms
+    // on the STARVE line, so the in-process budget timer cannot fire until the
+    // group is already gone. Only the elapsed-since-start backstop remains —
+    // and it must still classify killed-budget (never silently `succeeded`).
+    const { record, escalation } = await dispatchWithBudget(
+      starvingAdapter(),
+      { workdir: workdir(), prompt: "starve the loop" },
+      { wallClockMs: 200 },
+      { killConfirm: { graceMs: 500, sigkillWaitMs: 1_000 } },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 200 });
+    expect(record.budgetBreach!.observed).toBeGreaterThan(200);
+    // The descendant self-exited, so the group is confirmed gone by the probe →
+    // the clean A.3#5 / A.2#10 escalation applies (not the cleanup-failed path).
+    expect(escalation).toBeDefined();
+    expect(escalation!.attemptEvent.killConfirmed).toBe(true);
   }, 30_000);
 
   it("token breach mid-stream: cumulative usage reports kill the dispatch in flight", async () => {

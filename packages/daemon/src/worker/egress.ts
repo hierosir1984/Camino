@@ -83,12 +83,22 @@ export function isValidAllowlistPort(port: number): boolean {
 // is accepted (fail-closed, from WP-005).
 const RESERVED_NETWORKS = new Set(["host", "none", "bridge", "default", "host-gateway"]);
 const RESERVED_ENV_PREFIX = "CAMINO_EGRESS_";
-// EVERY directory on the bootstrap entrypoint's PATH (round-3 finding 1: a
-// mount over `/usr/local/sbin` — a PATH dir the entrypoint searches first —
-// could plant a `grep`/`awk` the root bootstrap runs). Keep this in lockstep
-// with the entrypoint's `PATH=…`. Plus /etc and /lib (config + shared libs the
-// bootstrap and su-exec load). The ancestor-shadow check (assertSafeMountPaths)
-// also rejects mounting any PARENT of these.
+// BOUNDARY (round-3 finding 1, widened round-9 finding 2): the set of container
+// paths from which the ROOT bootstrap phase EXECUTES or LOADS code/config before
+// isolation is installed. A mount over any of them — or any ancestor
+// (assertSafeMountPaths rejects both directions) — could hand the root phase
+// attacker-controlled code. It is the UNION of three load channels, and nothing
+// the root phase reads code/config from may be left off it:
+//   - executable search (every PATH dir the entrypoint searches);
+//   - config (`/etc`, incl. the dynamic linker's `/etc/ld.so.*`);
+//   - code LOADING — the shared-library and plugin search paths `iptables`,
+//     `getent`, `su-exec` dlopen/link as root. A `:ro` mount blocks WRITES, not
+//     dlopen: a bind at `/usr/lib/xtables` shadows `libxt_conntrack.so` and its
+//     constructor runs as root the moment the bootstrap invokes `iptables`
+//     (round-9 finding 2). `/lib` alone did NOT cover `/usr/lib*` / `/lib64`.
+// The profile bakes its tools+libs into the image precisely so the root phase
+// never depends on a mountable path; this list is the run-time enforcement of
+// that. Keep the PATH entries in lockstep with the entrypoint's `PATH=…`.
 const PROTECTED_MOUNT_TARGETS = [
   "/",
   "/usr/local/sbin",
@@ -99,6 +109,9 @@ const PROTECTED_MOUNT_TARGETS = [
   "/bin",
   "/etc",
   "/lib",
+  "/lib64",
+  "/usr/lib",
+  "/usr/lib64",
 ];
 
 /** Where the workspace clone is mounted (rw) inside the worker container. */

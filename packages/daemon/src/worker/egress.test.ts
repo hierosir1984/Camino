@@ -160,6 +160,26 @@ describe("renderWorkerRunArgs", () => {
     }
   });
 
+  it("rejects mounts over the root-loaded LIBRARY/PLUGIN paths, incl. /usr/lib/xtables (round-9 finding 2)", () => {
+    // A `:ro` bind blocks writes, not dlopen: a mount at /usr/lib/xtables shadows
+    // libxt_conntrack.so, whose constructor runs as ROOT the moment the bootstrap
+    // invokes iptables — before isolation is installed. /lib alone missed the
+    // /usr/lib* / /lib64 search paths the root phase loads code from.
+    for (const containerPath of [
+      "/usr/lib", // ancestor of the iptables plugin dir + the linker search path
+      "/usr/lib/xtables", // the concrete iptables match-module dir
+      "/usr/lib64",
+      "/lib64",
+    ]) {
+      expect(() =>
+        renderWorkerRunArgs(
+          { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
+          ["/bin/true"],
+        ),
+      ).toThrow(/bootstrap path|shadow/);
+    }
+  });
+
   it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {
     // The auth source lives INSIDE the workspace tree: its :ro mount would be
     // writable through the rw /workspace alias.
