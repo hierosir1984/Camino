@@ -833,28 +833,19 @@ export async function dispatch(
             handleLine(channel, partial + s.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
           partial = "";
           skipping = true; // discard until the next terminator
-          // TOKEN-BUDGET INTEGRITY (round-15 finding 1): truncating an over-cap line
-          // bounds RSS but DISCARDS any usage the adapter reports in that SAME JSON
-          // object (Claude bundles terminal text + usage), so a giant line could hide
-          // token usage and slip past the token budget. Under an ACTIVE token budget,
-          // an over-cap line is a usage report we cannot verify → fail CLOSED: declare
-          // a token breach and kill-and-escalate rather than silently accept it as
-          // under-budget. EITHER channel (round-16 finding 1): the adapter contract
-          // permits parseLine to report tokensTotal on stderr too, so an over-cap line
-          // on stdout OR stderr can hide usage. But NOT once another reason already
-          // decided the kill (round-16 finding 2): after a cancel/timeout, a late
-          // over-cap line during kill-grace must NOT manufacture a token breach and
-          // flip `cancelled`/`killed` into a false A.2#10 budget escalation.
-          if (budgetTokens !== undefined && !budgetBreach && !killReason) {
-            budgetBreach = {
-              kind: "tokens",
-              limit: budgetTokens,
-              observed: budgetTokens,
-              reason:
-                "usage-unverifiable: a line exceeded the reader cap, so its reported token usage could not be parsed (fail-closed)",
-            };
-            requestKill("budget");
-          }
+          // BOUNDARY, stated (round-17 findings 2/3, reverting the round-15/16
+          // fail-closed): truncating an over-cap line makes any usage the adapter
+          // bundled in it UNREPORTABLE — it cannot be parsed. Token budgets bind
+          // "where the vendor stream reports usage" (adapter.ts); usage a worker
+          // hides in an oversized line is, like a harness that reports nothing,
+          // outside token accounting — bound by the WALL-CLOCK budget (always
+          // required) and the out-of-process container / WP-114 timeout, not the token
+          // budget. Failing closed HERE proved WORSE than the boundary: a truncated
+          // line is indistinguishable usage-bearing vs diagnostic, so it either
+          // suppressed a genuine overrun during a concurrent cancel/timeout (finding
+          // 2) or manufactured a false breach from a diagnostic-only line (finding 3).
+          // So the truncation records NO budget verdict; the parsed sub-cap usage
+          // (below) and the wall-clock budget remain the guards.
         }
       };
       const emitLine = () => {

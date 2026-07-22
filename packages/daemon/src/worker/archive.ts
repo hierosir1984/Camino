@@ -146,12 +146,26 @@ export function workspaceSizeBytes(dir: string): number {
 }
 
 /**
+ * A DEFENSIVE CARDINALITY BOUND (round-17 finding 1). The byte quota (2 GB) does
+ * NOT bound the FILE COUNT: a worker can create millions of EMPTY files (zero
+ * quota bytes) that impose unbounded traversal + tar + hashing + directory-array
+ * memory — work the daemon does AFTER the worker container has stopped, so neither
+ * the loop-yield (which only keeps timers responsive, not total work finite) nor
+ * the container/WP-114 worker timeout can bound it. Above this count archival is
+ * REFUSED and the workspace retained for escalation. Generous enough for a real
+ * post-`npm install` workspace; a value a worker only exceeds to abuse.
+ */
+const MAX_WORKSPACE_ENTRIES = 1_000_000;
+
+/**
  * Async twin of workspaceSizeBytes used on the archival path (round-13 finding 1):
  * walks with async fs and YIELDS every YIELD_EVERY entries, so sizing a workspace
  * with a huge file count does not monopolize the daemon loop and defeat another
- * attempt's budget. Same accounting (lstat, symlinks not followed).
+ * attempt's budget. Same accounting (lstat, symlinks not followed). Also enforces
+ * MAX_WORKSPACE_ENTRIES (round-17 finding 1), SHORT-CIRCUITING the walk so a
+ * pathological file count cannot drive unbounded work even to reach the refusal.
  */
-async function workspaceSizeBytesAsync(dir: string): Promise<number> {
+async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise<number> {
   const YIELD_EVERY = 2_000;
   let total = 0;
   let seen = 0;
@@ -164,6 +178,12 @@ async function workspaceSizeBytesAsync(dir: string): Promise<number> {
     }
     for (const name of names) {
       if (++seen % YIELD_EVERY === 0) await Promise.resolve(); // yield to the loop
+      if (seen > maxEntries) {
+        throw new ArchivalError(
+          "workspace-quota",
+          `workspace exceeds ${maxEntries} entries — refusing archival (a defensive cardinality bound: empty files evade the byte quota but impose unbounded post-worker traversal/tar/hash the container/WP-114 timeout cannot cover); workspace retained for escalation`,
+        );
+      }
       const child = join(abs, name);
       let stat;
       try {
@@ -183,11 +203,18 @@ async function workspaceSizeBytesAsync(dir: string): Promise<number> {
 export interface ArchiveQuotas {
   workspaceMaxBytes: number;
   archiveMaxCompressedBytes: number;
+  /**
+   * Defensive workspace ENTRY-count ceiling (round-17 finding 1). Optional; the
+   * default is MAX_WORKSPACE_ENTRIES. An override may only TIGHTEN it (a test lowers
+   * it; a caller can never raise it above the module ceiling).
+   */
+  maxWorkspaceEntries?: number;
 }
 
 export const DEFAULT_ARCHIVE_QUOTAS: ArchiveQuotas = Object.freeze({
   workspaceMaxBytes: REGISTRY_ITEM_11_QUOTAS.workspace.maxBytes,
   archiveMaxCompressedBytes: REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes,
+  maxWorkspaceEntries: MAX_WORKSPACE_ENTRIES,
 });
 
 /**
@@ -211,6 +238,11 @@ export function effectiveArchiveQuotas(override: ArchiveQuotas): ArchiveQuotas {
     archiveMaxCompressedBytes: clamp(
       override.archiveMaxCompressedBytes,
       DEFAULT_ARCHIVE_QUOTAS.archiveMaxCompressedBytes,
+    ),
+    // Optional; absent → the module ceiling. An override may only TIGHTEN it.
+    maxWorkspaceEntries: clamp(
+      override.maxWorkspaceEntries ?? MAX_WORKSPACE_ENTRIES,
+      MAX_WORKSPACE_ENTRIES,
     ),
   };
 }
@@ -500,13 +532,14 @@ function readFsIdentity(dir: string): FsIdentity | null {
 }
 
 /**
- * True iff the file begins with the gzip magic bytes (1f 8b). A cheap sanity
- * check (round-16 finding 9) that the `tar -cz` output is at least a gzip stream:
- * a `tar` on PATH that exits 0 but writes non-gzip bytes has violated its
- * contract. That is a daemon SUPPLY-CHAIN condition — a trusted daemon PATH/tar is
- * a deployment/WP-114 assumption, outside the worker threat model — but this check
- * refuses to trade the workspace for such a corrupt archive rather than trust the
- * exit code blindly.
+ * True iff the file begins with the gzip MAGIC bytes (1f 8b). A cheap sanity check
+ * (round-16 finding 9) — NOT full gzip/tar validation (round-17 finding 7): it
+ * catches a `tar` on PATH that exits 0 while writing plainly non-gzip bytes, but a
+ * corrupt stream that merely STARTS with 1f 8b would still pass. Fully validating
+ * the archive (decompress + list) against a maliciously-substituted tar is the
+ * trusted daemon PATH/tar deployment/WP-114 boundary, outside the worker threat
+ * model; this check just refuses the obvious non-archive rather than trust the exit
+ * code blindly.
  */
 async function isGzipFile(path: string): Promise<boolean> {
   let fh: FileHandle | undefined;
@@ -923,7 +956,10 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // over-quota workspace is an abnormal condition: refusing here routes it to
   // the cleanup-failed/escalation path with the workspace intact. Checked
   // FIRST — before creating the issue dir — so a refusal writes nothing at all.
-  const workspaceBytes = await workspaceSizeBytesAsync(workspaceReal);
+  const workspaceBytes = await workspaceSizeBytesAsync(
+    workspaceReal,
+    quotas.maxWorkspaceEntries ?? MAX_WORKSPACE_ENTRIES,
+  );
   if (workspaceBytes > quotas.workspaceMaxBytes) {
     throw new ArchivalError(
       "workspace-quota",
@@ -1097,19 +1133,24 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     // An over-cap-during-write refusal is already a staged ArchivalError
     // (archive-quota) — preserve its stage; only a tar/spawn failure is wrapped.
     if (err instanceof ArchivalError) throw err;
+    // runTarToFile's message is `tar exited N: <last 300 chars of stderr>` — the
+    // failure CAUSE is at the END. describeError front-slices, so cap high enough
+    // (500 > 15 + 300) to keep the whole message and NOT re-truncate the tail again
+    // (round-17 finding 4).
     throw new ArchivalError(
       "archive-write",
-      `tar failed: ${describeError(err, 300)} — workspace retained`,
+      `tar failed: ${describeError(err, 500)} — workspace retained`,
     );
   }
-  // Sanity: the output must be a gzip stream (round-16 finding 9). A tar on PATH
-  // that exits 0 with non-gzip bytes has violated its contract; refuse rather than
-  // hash it, record a ledger row, and destroy the workspace for a corrupt archive.
+  // Sanity: the output must at least BEGIN with the gzip magic bytes (round-16
+  // finding 9; not full validation — round-17 finding 7). A tar on PATH that exits 0
+  // with plainly non-gzip bytes has violated its contract; refuse rather than hash
+  // it, record a ledger row, and destroy the workspace for an obvious non-archive.
   if (!(await isGzipFile(tmpPath))) {
     safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-write",
-      `the written archive ${tmpPath} is not a gzip stream (tar exited 0 but did not honor its contract) — workspace retained (fail-closed; a trusted daemon PATH/tar is a deployment/WP-114 assumption)`,
+      `the written archive ${tmpPath} does not begin with the gzip magic bytes (tar exited 0 but did not honor its contract) — workspace retained (fail-closed; fully validating against a substituted tar is a trusted daemon PATH/tar deployment/WP-114 boundary)`,
     );
   }
   // STAGE the size + hash reads (round-14 finding 6): sha256File streams the

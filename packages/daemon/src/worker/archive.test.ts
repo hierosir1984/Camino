@@ -432,10 +432,15 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(loosened.archiveMaxCompressedBytes).toBe(
       REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes,
     );
-    // A stricter override is preserved (the suite's tiny quotas keep working).
+    // A stricter override is preserved (the suite's tiny quotas keep working);
+    // maxWorkspaceEntries defaults to the module ceiling when not overridden.
     expect(
       effectiveArchiveQuotas({ workspaceMaxBytes: 10, archiveMaxCompressedBytes: 20 }),
-    ).toEqual({ workspaceMaxBytes: 10, archiveMaxCompressedBytes: 20 });
+    ).toEqual({
+      workspaceMaxBytes: 10,
+      archiveMaxCompressedBytes: 20,
+      maxWorkspaceEntries: DEFAULT_ARCHIVE_QUOTAS.maxWorkspaceEntries,
+    });
     // Mixed: only the loosened field is clamped.
     const mixed = effectiveArchiveQuotas({
       workspaceMaxBytes: 5,
@@ -819,6 +824,31 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     } finally {
       for (const s of servers) s.close();
     }
+  });
+
+  it("refuses archival of a workspace whose ENTRY count exceeds the cap — empty files evade the byte quota (round-17 finding 1)", async () => {
+    const ws = tempDir();
+    // 200 EMPTY files: ~0 quota bytes, but 200 entries > the injected 50-entry cap.
+    // The byte quota (huge here) would let this through; the cardinality bound must
+    // refuse it so a worker cannot impose unbounded post-worker archival work.
+    for (let i = 0; i < 200; i++) writeFileSync(join(ws, `f${i}.txt`), "");
+    const root = tempDir();
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      quotas: {
+        workspaceMaxBytes: 1_000_000_000,
+        archiveMaxCompressedBytes: 1_000_000_000,
+        maxWorkspaceEntries: 50,
+      },
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("workspace-quota");
+    expect((err as Error).message).toMatch(/exceeds 50 entries/i);
+    expect(existsSync(ws)).toBe(true); // retained for escalation, never archived/destroyed
   });
 
   it("refuses an over-cap archive DURING the write, not after, and cleans the partial (round-15 finding 6)", async () => {

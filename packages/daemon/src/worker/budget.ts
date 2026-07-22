@@ -28,7 +28,9 @@
 // (spawned/yielding tar+hash+delete+walk, off-loop fsync, capped candidate reads, a
 // per-line CPU cap), but does NOT claim to bound it — an in-process timer cannot be
 // made immune to concurrent same-process CPU. Under such a stall the guard still
-// fails SAFE (it escalates for human review, never silently credits an overrun),
+// fails SAFE (it escalates a DETECTED overrun for review, never credits a detected
+// one; a SUB-STALL overrun it cannot observe may be classified succeeded — the
+// best-effort limit above, bounded authoritatively out-of-process),
 // and the exit-handling check reliably catches DESCENDANT overruns. The
 // AUTHORITATIVE out-of-process bound is the container / WP-114 supervisor (kill the
 // container ⇒ reap every pid); this timer is a fast-path best-effort kill, not the
@@ -59,7 +61,7 @@ export class BudgetConfigError extends Error {
 export function validateAttemptBudget(budget: AttemptBudget): void {
   if (!Number.isFinite(budget.wallClockMs) || budget.wallClockMs <= 0) {
     throw new BudgetConfigError(
-      `attempt budget wallClockMs must be a finite positive number of milliseconds (got ${String(budget.wallClockMs)}) — wall-clock is always enforced (CAM-EXEC-03)`,
+      `attempt budget wallClockMs must be a finite positive number of milliseconds (got ${String(budget.wallClockMs)}) — a wall-clock ceiling is always REQUIRED (CAM-EXEC-03; enforced best-effort in-process, authoritatively out-of-process)`,
     );
   }
   if (budget.tokens !== undefined && (!Number.isFinite(budget.tokens) || budget.tokens <= 0)) {

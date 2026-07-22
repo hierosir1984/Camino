@@ -77,13 +77,6 @@ export interface BudgetBreachRecord {
   kind: "wall-clock" | "tokens";
   limit: number;
   observed: number;
-  /**
-   * Optional human-readable cause when the numeric fields do not tell the whole
-   * story — e.g. a token breach declared because a worker's usage report could
-   * NOT be parsed (an oversized line past the reader cap), so it fails closed
-   * rather than being silently accepted as under-budget (WP-107, round-15 finding 1).
-   */
-  reason?: string;
 }
 
 /** The headless spawn plan an adapter builds for one dispatch. */

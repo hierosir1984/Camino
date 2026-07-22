@@ -1,8 +1,9 @@
-// WP-107 · CAM-EXEC-03 budget fixtures: wall-clock ALWAYS (kill-confirmed
-// mid-flight), tokens WHERE REPORTABLE (mid-stream kill on cumulative usage;
-// over-budget final report never classifies succeeded), breach → the A.2#10 /
-// A.3#5 kill-and-escalate rows with NO automatic retry — pinned against the
-// core tables themselves, not just this module's behavior.
+// WP-107 · CAM-EXEC-03 budget fixtures: wall-clock always REQUIRED (best-effort
+// in-process kill-confirmed mid-flight; authoritative bound is out-of-process /
+// WP-114), tokens WHERE REPORTABLE (mid-stream kill on cumulative usage; a REPORTED
+// over-budget final never classifies succeeded), breach → the A.2#10 / A.3#5
+// kill-and-escalate rows with NO automatic retry — pinned against the core tables
+// themselves, not just this module's behavior.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -60,7 +61,7 @@ afterEach(() => {
 });
 
 describe("validateAttemptBudget", () => {
-  it("requires a finite positive wall-clock (always enforced) and sane tokens", () => {
+  it("requires a finite positive wall-clock (always REQUIRED in a budget) and sane tokens", () => {
     expect(() => validateAttemptBudget({ wallClockMs: 0 })).toThrow(BudgetConfigError);
     expect(() => validateAttemptBudget({ wallClockMs: Number.NaN })).toThrow(BudgetConfigError);
     expect(() => validateAttemptBudget({ wallClockMs: -5 })).toThrow(BudgetConfigError);
@@ -102,12 +103,15 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(issueStep).toEqual({ ok: true, to: "escalated", ref: "A.2#10" });
   }, 30_000);
 
-  it("fails CLOSED when an over-cap stdout line hides usage under a token budget (round-15 finding 1)", async () => {
-    // A worker emits ONE >64 KiB stdout line (no newline until the end), so the
-    // bounded line reader truncates it and any token usage it carried is lost. Under
-    // a token budget that UNVERIFIABLE line must classify killed-budget, never a
-    // silent success. The big line is built at runtime (`.repeat`) so the spawn arg
-    // stays tiny — no E2BIG on Linux CI.
+  it("usage hidden in an OVER-CAP line is unreportable — the token budget does not fire on it (tokens where reportable; round-17 findings 2/3)", async () => {
+    // A worker emits ONE >64 KiB line with no newline until the end; the bounded
+    // reader truncates it, so any usage it bundled is UNPARSEABLE. Token budgets bind
+    // "where the vendor stream reports usage": unreportable usage is NOT a token
+    // breach (a truncated line is indistinguishable usage-bearing vs diagnostic —
+    // the reverted fail-closed misclassified both). Such a worker is bound by
+    // WALL-CLOCK and the out-of-process container, not the token budget; with
+    // wall-clock not breached it simply succeeds. Built at runtime (`.repeat`) so the
+    // spawn arg stays tiny — no E2BIG on Linux CI.
     const bigLineAdapter: AdapterSpec = {
       name: "bigline",
       enabled: true,
@@ -118,47 +122,21 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
       }),
       parseLine: () => null,
     };
-    const { record, escalation } = await dispatchWithBudget(
+    const { record } = await dispatchWithBudget(
       bigLineAdapter,
       { workdir: workdir(), prompt: "hide usage in a giant line" },
       { wallClockMs: 10_000, tokens: 100 },
       { killConfirm: FAST_KILL },
     );
-    expect(record.outcome).toBe("killed-budget");
-    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 100 });
-    expect(record.budgetBreach?.reason).toMatch(/unverifiable/i);
-    expect(escalation).toBeDefined(); // kill-and-escalate, never a silent success
+    expect(record.outcome).toBe("succeeded"); // token budget can't see hidden usage; wall-clock not breached
+    expect(record.budgetBreach).toBeUndefined();
   }, 30_000);
 
-  it("fails CLOSED for an over-cap STDERR line too — usage can ride either channel (round-16 finding 1)", async () => {
-    // The adapter contract permits parseLine to report tokensTotal on stderr, so an
-    // over-cap line on EITHER stream can hide usage; the fail-closed is not
-    // stdout-only.
-    const bigStderr: AdapterSpec = {
-      name: "bigstderr",
-      enabled: true,
-      plan: () => ({
-        file: process.execPath,
-        args: ["-e", `process.stderr.write("{" + "x".repeat(70000) + "}\\n")`],
-        env: {},
-      }),
-      parseLine: () => null,
-    };
-    const { record } = await dispatchWithBudget(
-      bigStderr,
-      { workdir: workdir(), prompt: "hide usage on stderr" },
-      { wallClockMs: 10_000, tokens: 100 },
-      { killConfirm: FAST_KILL },
-    );
-    expect(record.outcome).toBe("killed-budget");
-    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 100 });
-  }, 30_000);
-
-  it("does NOT manufacture a token breach after a cancel — a late over-cap line stays `cancelled` (round-16 finding 2)", async () => {
+  it("a late over-cap line during a cancel is unreportable and does not affect the `cancelled` outcome (round-17 findings 2/3)", async () => {
     // The first event arms cancelAfterFirstEventMs; the worker ignores SIGTERM and,
-    // WELL AFTER the cancel has fired (killReason=cancel), emits an over-cap line then
-    // exits. The token fail-closed must NOT flip `cancelled` into a false A.2#10
-    // budget escalation.
+    // WELL AFTER the cancel has fired, emits an over-cap line then exits. That
+    // truncated (unreportable) line records no budget verdict, so the outcome stays
+    // `cancelled` — the honest kill reason — with no manufactured budget escalation.
     const lateBigLine: AdapterSpec = {
       name: "late-bigline",
       enabled: true,

@@ -130,17 +130,19 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
     // OTHER failure (ENOBUFS on an oversized/hostile .git/config.worktree, a git
     // error) must FAIL CLOSED (round-13 finding 4): swallowing it would make a
     // large malicious worktree config INVISIBLE here while git still obeys it.
-    // Recognize ONLY git's genuine "extensions.worktreeConfig is (not) enabled"
-    // phrasing (round-13 f4 → round-14 f8 → round-15 f10 → round-16 finding 8): the
-    // extension name and its enabled/disabled verdict must be ADJACENT (same clause,
-    // no `.`/`;`/newline between), so unrelated text — "worktreeConfig backend I/O
-    // failure; cache disabled", "worktreeConfig permission denied; fallback enabled",
-    // "worktree transient extension I/O failure" — does NOT reopen the swallow; each
-    // FAILS CLOSED. BOUNDARY, stated: this recognizes the HONEST git message; a
-    // hostile git on the daemon PATH emitting a look-alike is a daemon supply-chain
-    // concern (a trusted PATH is a deployment/WP-114 assumption), out of the worker
-    // threat model. Over-strictness fails safe (a genuine but unrecognized phrasing
-    // just refuses attestation, never silently swallows a real worktree config).
+    // Recognize git's "extensions.worktreeConfig is (not) enabled" phrasing
+    // (round-13 f4 → round-14 f8 → round-15 f10 → round-16 f8 → round-17 finding 6).
+    // The FIRST alternative — the genuine current message (Git 2.45–2.50 verified) —
+    // requires the extension name and its verdict ADJACENT (same clause, no
+    // `.`/`;`/newline between), so unrelated text ("worktreeConfig backend I/O
+    // failure; cache disabled") does NOT match. The SECOND alternative is a broader
+    // FALLBACK for older/generic "worktree … not enabled" phrasings and is
+    // deliberately looser — a hostile look-alike CAN match it, which is acceptable:
+    // (a) end-to-end attestation still refuses, because the earlier `--local` read
+    // hits the same malformed config and throws, and (b) a git BINARY on the daemon
+    // PATH crafting such a message is a trusted-PATH deployment/WP-114 supply-chain
+    // concern, out of the worker threat model. Over-strictness on the first
+    // alternative fails safe (an unrecognized genuine phrasing just refuses).
     const msg = describeCloneError(err, 400).toLowerCase();
     const notEnabled =
       /worktreeconfig[^.;\n]*\bis (?:not )?enabled\b/.test(msg) ||

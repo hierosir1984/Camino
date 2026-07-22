@@ -24,7 +24,7 @@ export const PRODUCTION_KILL_CONFIRM: KillConfirmTimings = {
 export interface DispatchOptions {
   /** Cancel the dispatch this long after the first streamed event (for the cancel test). */
   cancelAfterFirstEventMs?: number;
-  /** Hard cap so a real dispatch can never run away. */
+  /** In-process cap (best-effort; the authoritative runaway bound is out-of-process). */
   timeoutMs?: number;
   killConfirm?: KillConfirmTimings;
   /** Sink for live transcript lines (raw). */

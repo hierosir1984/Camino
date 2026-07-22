@@ -53,7 +53,8 @@ established-egress bypass).
   wall-clock alone (always required, best-effort in-process / authoritative
   out-of-process — see the budget boundary below) — which is exactly why a
   token-only budget is refused. WP-106's quota-aware routing owns provider window
-  models; this is the per-attempt hard cap, not the window.
+  models; this is the per-attempt cap (best-effort in-process / authoritative
+  out-of-process), not the window.
 - **The ledger-row seam is a callback** (`recordLedgerRow`): the durable
   event-store wiring is the caller's (WP-109 store). The archival step
   guarantees the _order_ and the _retention_, and fails closed (workspace
@@ -124,7 +125,11 @@ established-egress bypass).
 - **Token budgets bind only where the vendor reports cumulative usage.** The
   figure sums every consumed-token variant Anthropic reports (input, output,
   cache-creation, cache-read), so a run riding cache-read tokens cannot slip a
-  small budget; wall-clock is always enforced, measured from dispatch start.
+  small budget; the wall-clock ceiling is always required, measured from dispatch
+  start (enforced best-effort in-process / authoritative out-of-process — see the
+  budget boundary above). Usage a worker hides in an OVER-CAP (truncated,
+  unparseable) line is unreportable, so like a nothing-reporting harness it is bound
+  by wall-clock, not the token budget.
 
 ## Running the suites
 
