@@ -70,7 +70,7 @@ import type {
   StatusContext,
   StatusTuple,
 } from "@camino/shared";
-import type { LedgerView } from "./canon-intent.js";
+import type { LedgerView, LedgerViewEntry } from "./canon-intent.js";
 import { recordedAtProblem, safeErrorLabel, singleLineTextProblem } from "./canon-intent.js";
 import { DAVID_ACTOR } from "./intent-lifecycle.js";
 import { explainRequirementStatus, statusContextProblem } from "./canon-status.js";
@@ -198,6 +198,12 @@ export function statusTupleEquals(a: StatusTuple, b: StatusTuple): boolean {
  *   context, so a main-context judgment can never leak onto a branch that
  *   happens to share the tuple.
  * - `reason` — David's single-line text.
+ * - `factAnchorSeq` (fix-queued / disputed only) — the canon-fact store's seq
+ *   when the disposition was recorded (AMEND-11, F8 re-triage): the fold uses
+ *   it to detect that the gap's tuple CHANGED after the judgment and then
+ *   returned, so an old triage never silently governs a new gap episode. A
+ *   waiver does not need it (its `waivedThroughSeq` binding already re-opens on
+ *   a new finding); a reopen sets `open` regardless.
  * - `waivedThroughSeq` (waivers only) — the canon-fact seq of the newest
  *   detector finding the waiver covers.
  *
@@ -209,10 +215,17 @@ export function gapDispositionPayloadProblem(
   event: GapDispositionEventName,
   payload: Record<string, unknown>,
 ): string | null {
-  const allowed =
-    event === "gap-false-positive-waived"
-      ? ["tuple", "contextKey", "reason", "waivedThroughSeq"]
-      : ["tuple", "contextKey", "reason"];
+  const allowed = ((): readonly string[] => {
+    switch (event) {
+      case "gap-false-positive-waived":
+        return ["tuple", "contextKey", "reason", "waivedThroughSeq"];
+      case "gap-fix-queued":
+      case "gap-disputed":
+        return ["tuple", "contextKey", "reason", "factAnchorSeq"];
+      case "gap-reopened":
+        return ["tuple", "contextKey", "reason"];
+    }
+  })();
   for (const key of Object.keys(payload)) {
     if (!allowed.includes(key)) return `unexpected payload field ${JSON.stringify(key)}`;
   }
@@ -229,6 +242,13 @@ export function gapDispositionPayloadProblem(
     const seq = payload["waivedThroughSeq"];
     if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) {
       return "waivedThroughSeq must be a positive safe integer (a canon-fact seq)";
+    }
+  }
+  if (event === "gap-fix-queued" || event === "gap-disputed") {
+    const seq = payload["factAnchorSeq"];
+    // 0 is legal — a disposition recorded when the requirement had no facts yet.
+    if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 0) {
+      return "factAnchorSeq must be a non-negative safe integer (a canon-fact store seq)";
     }
   }
   return null;
@@ -313,6 +333,30 @@ function delivered(tuple: StatusTuple): boolean {
   return tuple.implementation.kind === "on-main" && tuple.evidence === "verified-live";
 }
 
+/**
+ * The highest canon-fact seq at which this requirement's tuple DIFFERED from
+ * `currentTuple`, or 0 if it never diverged (AMEND-11, F8 re-triage). Walks the
+ * requirement's facts in seq order, recomputing the tuple at each prefix — the
+ * tuple only changes AT a fact, so the last prefix that differs pins the last
+ * divergence. Computed only for requirements that carry a non-waiver disposition
+ * (the caller guards), so the O(facts^2) recomputation stays off the common path.
+ */
+function computeLastNonMatchSeq(
+  entry: LedgerViewEntry,
+  requirementFacts: readonly CanonFactRecord[],
+  context: StatusContext,
+  currentTuple: StatusTuple,
+): number {
+  let last = 0;
+  const prefix: CanonFactRecord[] = [];
+  for (const fact of requirementFacts) {
+    prefix.push(fact);
+    const tuple = explainRequirementStatus(entry, prefix, context).tuple;
+    if (!statusTupleEquals(tuple, currentTuple)) last = fact.seq;
+  }
+  return last;
+}
+
 /** The row state a disposition fold binds against (round 1, findings 5/7). */
 interface DispositionBasis {
   readonly tuple: StatusTuple;
@@ -320,27 +364,33 @@ interface DispositionBasis {
   readonly contextKey: string;
   /** The row's current waivable-through seq, or null when not waivable. */
   readonly waivableThroughSeq: number | null;
+  /**
+   * The highest canon-fact seq at which this requirement's tuple DIFFERED from
+   * its current tuple, or 0 if it never diverged (AMEND-11, F8 re-triage). A
+   * non-waiver disposition anchored at or after this seq has watched its gap
+   * hold continuously since; one anchored before it saw the gap change and must
+   * NOT resurrect.
+   */
+  readonly lastNonMatchSeq: number;
 }
 
 /**
  * Fold one requirement's disposition events against its CURRENT row state.
  * Events are hygiene-trusted (the store verified shapes); each APPLIES only
  * while its recorded basis still holds — see the module header. Later events
- * with a non-matching basis are skipped, so a judgment made in a different
- * gap state neither governs nor erases an earlier judgment whose state
- * returned.
+ * with a non-matching basis are skipped.
  *
- * DECISION PENDING (David) — the "state returned" reapplication above: today a
- * non-waiver disposition (fix-queued / disputed) re-applies if a gap's tuple
- * changes and later returns to the IDENTICAL tuple+context, with no fresh user
- * action (waivers are immune — they bind to a detector-finding seq that only
- * climbs). This is a deliberate v1 SEMANTICS CHOICE, not a settled invariant:
- * falsification rounds 2 and 3 flagged that an old judgment can relabel a new
- * gap episode. The recorded recommendation is to REQUIRE RE-TRIAGE (a
- * disposition dies the first time its tuple changes and never resurrects — a
- * merged fact+disposition timeline fold). Pending David's ruling, the current
- * reapplication behavior is what `gap-register.test.ts` pins; if he chooses
- * re-triage, that test and this fold change together.
+ * RE-TRIAGE (AMEND-11, David's F8 ruling 2026-07-22): a non-waiver disposition
+ * (fix-queued / disputed) does NOT resurrect. It governs only while its gap has
+ * held CONTINUOUSLY since the judgment — i.e. its recorded `factAnchorSeq` is at
+ * or after `lastNonMatchSeq` (the last fact seq at which the tuple differed from
+ * now). If the tuple changed after the disposition and later returned to an
+ * identical tuple, the anchor predates that divergence, so the old judgment does
+ * not relabel the new gap episode; the row is `open` until re-dispositioned.
+ * (Earlier this reapplied on identical return — falsification rounds 2/3 flagged
+ * it; David chose re-triage.) Waivers were already non-resurrecting via the
+ * `waivedThroughSeq` binding, and a reopen sets `open` regardless, so only the
+ * non-waiver events carry the anchor.
  *
  * An event binds to THREE things, not one:
  *  - the status tuple it recorded (the visible gap state);
@@ -384,6 +434,11 @@ function foldDisposition(
     if (!statusTupleEquals(event.payload["tuple"] as StatusTuple, basis.tuple)) continue;
     if (event.event === "gap-false-positive-waived") {
       if (event.payload["waivedThroughSeq"] !== basis.waivableThroughSeq) continue;
+    }
+    if (event.event === "gap-fix-queued" || event.event === "gap-disputed") {
+      // Re-triage: the judgment governs only if its gap held continuously since
+      // it was made (anchor at/after the last divergence). No resurrection.
+      if ((event.payload["factAnchorSeq"] as number) < basis.lastNonMatchSeq) continue;
     }
     disposition = EVENT_TO_DISPOSITION[event.event];
     record =
@@ -448,10 +503,21 @@ export function projectGapRegister(
         ? suspicions[suspicions.length - 1]!.seq
         : null;
 
-    const folded = foldDisposition(dispositionsByRequirement.get(requirementId) ?? [], {
+    const requirementDispositions = dispositionsByRequirement.get(requirementId) ?? [];
+    // The re-triage anchor check (AMEND-11) is only needed when a non-waiver
+    // disposition exists; skip the O(facts^2) trajectory walk otherwise.
+    const hasNonWaiverDisposition = requirementDispositions.some(
+      (d) => d.event === "gap-fix-queued" || d.event === "gap-disputed",
+    );
+    const lastNonMatchSeq = hasNonWaiverDisposition
+      ? computeLastNonMatchSeq(entry, requirementFacts, context, explained.tuple)
+      : 0;
+
+    const folded = foldDisposition(requirementDispositions, {
       tuple: explained.tuple,
       contextKey,
       waivableThroughSeq,
+      lastNonMatchSeq,
     });
 
     rows.push({

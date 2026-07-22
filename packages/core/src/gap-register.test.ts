@@ -114,9 +114,23 @@ class FactLog {
   }
 }
 
-/** Default context for fixtures whose payload omits `contextKey`. */
-const withContext = (payload: Record<string, unknown>): Record<string, unknown> =>
-  "contextKey" in payload ? payload : { ...payload, contextKey: "main" };
+/**
+ * Fill the schema-required defaults a fixture payload omits: `contextKey`
+ * ("main") for every event, and `factAnchorSeq` (0) for the non-waiver events
+ * that carry the re-triage anchor (AMEND-11). A fixture that sets either
+ * explicitly keeps its value.
+ */
+const withDefaults = (
+  event: GapDispositionEventName,
+  payload: Record<string, unknown>,
+): Record<string, unknown> => {
+  const filled: Record<string, unknown> = { ...payload };
+  if (!("contextKey" in filled)) filled["contextKey"] = "main";
+  if ((event === "gap-fix-queued" || event === "gap-disputed") && !("factAnchorSeq" in filled)) {
+    filled["factAnchorSeq"] = 0;
+  }
+  return filled;
+};
 
 class DispositionLog {
   readonly records: GapDispositionRecord[] = [];
@@ -138,7 +152,7 @@ class DispositionLog {
       requirementId,
       event,
       actor: DAVID_ACTOR,
-      payload: withContext(payload),
+      payload: withDefaults(event, payload),
       recordedAt,
     };
     const divergences = verifyGapDispositionLog([record]);
@@ -308,12 +322,13 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
     over: Partial<GapDispositionAppendInput> & { payload?: Record<string, unknown> },
   ): GapDispositionAppendInput => {
     const { payload, ...rest } = over;
+    const event = rest.event ?? "gap-fix-queued";
     return {
       requirementId: R2,
       event: "gap-fix-queued",
       actor: DAVID_ACTOR,
       ...rest,
-      payload: withContext(payload ?? { tuple: openTuple(), reason: "queueing a fix" }),
+      payload: withDefaults(event, payload ?? { tuple: openTuple(), reason: "queueing a fix" }),
     };
   };
 
@@ -459,26 +474,37 @@ describe("disposition fold (basis binding: dispositions recompute like everythin
     expect(rows[0]!.dispositionRecord?.reason).toBe("queued");
   });
 
-  it("recomputes to open when a new fact changes the tuple, and re-applies when the state returns", () => {
-    // NOTE: the re-application on identical return is a v1 SEMANTICS CHOICE
-    // pending David's ruling (see foldDisposition's "DECISION PENDING" note).
-    // The recommendation is re-triage (no resurrection); if adopted, this
-    // final expectation flips to "open" and the fold changes with it.
+  it("RE-TRIAGE (AMEND-11): recomputes to open on tuple change, and does NOT resurrect on return", () => {
+    // A fix-queued anchored at facts-seq 0 (no facts yet).
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
     const dispositions = new DispositionLog();
-    dispositions.add(R1, "gap-fix-queued", { tuple: openTuple(), reason: "queued" });
+    dispositions.add(R1, "gap-fix-queued", {
+      tuple: openTuple(),
+      reason: "queued",
+      factAnchorSeq: 0,
+    });
 
+    // The tuple changes → the disposition no longer matches → open.
     const changed = new FactLog();
     changed.add(R1, "absence-suspected", RECONCILER, { contextKind: "main", reason: "doubt" });
     expect(project(view, changed, dispositions)[0]!.disposition).toBe("open");
 
+    // The tuple RETURNS to the identical (accepted, absent, unverified) state.
+    // Under re-triage the old fix-queued (anchor 0, before the divergence) does
+    // NOT resurrect: the row stays open until re-dispositioned.
     const returned = new FactLog();
     returned.add(R1, "absence-suspected", RECONCILER, { contextKind: "main", reason: "doubt" });
     returned.add(R1, "absence-resolved", RECONCILER, {
       contextKind: "main",
       resolution: "present",
     });
-    expect(project(view, returned, dispositions)[0]!.disposition).toBe("fix-queued");
+    expect(project(view, returned, dispositions)[0]!.disposition).toBe("open");
+
+    // A FRESH fix-queued anchored AFTER the divergence (facts-seq 2) is live —
+    // re-triage kills the stale judgment, not the current one.
+    const fresh = new DispositionLog();
+    fresh.add(R1, "gap-fix-queued", { tuple: openTuple(), reason: "re-queued", factAnchorSeq: 2 });
+    expect(project(view, returned, fresh)[0]!.disposition).toBe("fix-queued");
   });
 
   it("a waiver stops governing when a NEW finding arrives, even with an identical tuple", () => {
@@ -595,7 +621,12 @@ describe("round-1 falsification regressions", () => {
       requirementId: R1,
       event: "gap-fix-queued",
       actor: DAVID_ACTOR,
-      payload: { tuple: openTuple(), contextKey: "mission/m1", reason: "wrong context" },
+      payload: {
+        tuple: openTuple(),
+        contextKey: "mission/m1",
+        reason: "wrong context",
+        factAnchorSeq: 0,
+      },
     });
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.problem).toContain("context");
@@ -667,7 +698,7 @@ describe("verifyGapDispositionLog (store adoption hygiene)", () => {
     requirementId: R1,
     event: "gap-fix-queued",
     actor: DAVID_ACTOR,
-    payload: { tuple: openTuple(), contextKey: "main", reason: "queued" },
+    payload: { tuple: openTuple(), contextKey: "main", reason: "queued", factAnchorSeq: 0 },
     recordedAt: "2026-07-03T00:00:00.000Z",
   };
 
@@ -685,7 +716,7 @@ describe("verifyGapDispositionLog (store adoption hygiene)", () => {
         seq: 7,
         payload: { tuple: openTuple(), contextKey: "main", reason: "x", extra: 1 },
       },
-      { ...good, seq: 8, payload: { tuple: openTuple(), reason: "no context" } },
+      { ...good, seq: 8, payload: { tuple: openTuple(), reason: "no context", factAnchorSeq: 0 } },
     ]);
     expect(divergences.map((d) => d.seq)).toEqual([1, 3, 4, 5, 6, 7, 8]);
   });
@@ -753,6 +784,7 @@ describe("payload schema", () => {
         tuple: openTuple(),
         contextKey: "main",
         reason: "r",
+        factAnchorSeq: 0,
       }),
     ).toBeNull();
     expect(
@@ -760,6 +792,7 @@ describe("payload schema", () => {
         tuple: openTuple(),
         contextKey: "main",
         reason: "r",
+        factAnchorSeq: 0,
         waivedThroughSeq: 3,
       }),
     ).not.toBeNull(); // waive-only field on a non-waive event
@@ -786,7 +819,42 @@ describe("payload schema", () => {
         tuple: openTuple(),
         contextKey: "two\nlines",
         reason: "r",
+        factAnchorSeq: 0,
       }),
     ).not.toBeNull(); // contextKey obeys single-line hygiene
+    // factAnchorSeq is required on fix-queued/disputed and must be a
+    // non-negative safe integer (AMEND-11, F8 re-triage).
+    expect(
+      gapDispositionPayloadProblem("gap-fix-queued", {
+        tuple: openTuple(),
+        contextKey: "main",
+        reason: "r",
+      }),
+    ).not.toBeNull(); // missing factAnchorSeq
+    expect(
+      gapDispositionPayloadProblem("gap-disputed", {
+        tuple: openTuple(),
+        contextKey: "main",
+        reason: "r",
+        factAnchorSeq: -1,
+      }),
+    ).not.toBeNull(); // negative anchor
+    // A waiver must NOT carry factAnchorSeq (closed schema); a reopen carries neither.
+    expect(
+      gapDispositionPayloadProblem("gap-false-positive-waived", {
+        tuple: suspectedTuple(),
+        contextKey: "main",
+        reason: "r",
+        waivedThroughSeq: 1,
+        factAnchorSeq: 0,
+      }),
+    ).not.toBeNull();
+    expect(
+      gapDispositionPayloadProblem("gap-reopened", {
+        tuple: openTuple(),
+        contextKey: "main",
+        reason: "r",
+      }),
+    ).toBeNull();
   });
 });

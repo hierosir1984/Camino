@@ -40,10 +40,13 @@ const open = (): GapDispositionsStore => {
   return store;
 };
 
+// gap-fix-queued carries the re-triage anchor (AMEND-11); the store tests use
+// fix-queued/disputed, so include factAnchorSeq. (gap-disputed shares the shape.)
 const payload = (reason = "queued"): Record<string, unknown> => ({
   tuple: TUPLE,
   contextKey: "main",
   reason,
+  factAnchorSeq: 0,
 });
 
 describe("append/read round-trip", () => {
@@ -82,7 +85,7 @@ describe("append/read round-trip", () => {
       s.append({
         requirementId: "CAM-DEMO-01",
         event: "gap-fix-queued",
-        payload: { tuple: TUPLE, contextKey: "main", reason: "two\nlines" },
+        payload: { tuple: TUPLE, contextKey: "main", reason: "two\nlines", factAnchorSeq: 0 },
       }),
     ).toThrow(/single-line/);
     expect(() =>

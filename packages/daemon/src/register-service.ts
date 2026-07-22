@@ -247,6 +247,13 @@ export class RegisterService {
       // click can never be silently waived.
       payload["waivedThroughSeq"] = input.waivedThroughSeq;
     }
+    if (event === "gap-fix-queued" || event === "gap-disputed") {
+      // Re-triage anchor (AMEND-11, F8): the canon-fact seq this judgment was
+      // made against. If the gap's tuple later changes and returns, the anchor
+      // predates the divergence and the projection will not resurrect this
+      // disposition onto the new gap episode.
+      payload["factAnchorSeq"] = snapshot.asOf.factsSeq;
+    }
     const decision = decideGapDisposition(snapshot.rows, contextKey, {
       requirementId,
       event,

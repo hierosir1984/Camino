@@ -139,6 +139,63 @@ describe("disposition actions", () => {
     const row = result.snapshot.rows.find((r) => r.requirementId === R1);
     expect(row?.disposition).toBe("fix-queued");
     expect(gapDispositions.read()).toHaveLength(1);
+    // The re-triage anchor is the store's GLOBAL canon-fact seq at record time
+    // (1 here — the seeded R2 detector fact), not per-requirement.
+    expect(result.record.payload["factAnchorSeq"]).toBe(canonFacts.read().at(-1)?.seq ?? 0);
+    expect(result.record.payload["factAnchorSeq"]).toBe(1);
+  });
+
+  it("RE-TRIAGE (AMEND-11): a fix-queued does not resurrect after its gap changes and returns", () => {
+    // Fix-queue R1 (accepted, absent, unverified), anchored at facts seq 0.
+    const queued = service.recordDisposition(R1, {
+      action: "fix-queued",
+      reason: "queued",
+      asOf: currentAsOf(),
+    });
+    if (!queued.snapshot.available) throw new Error("expected available");
+    expect(queued.snapshot.rows.find((r) => r.requirementId === R1)!.disposition).toBe(
+      "fix-queued",
+    );
+
+    // A reconciler doubt changes R1's tuple to suspected-absent → the fix-queued
+    // no longer matches → open.
+    canonFacts.recordFact({
+      requirementId: R1,
+      kind: "absence-suspected",
+      actor: "camino:reconciler",
+      payload: { contextKind: "main", reason: "external edit" },
+    });
+    const doubted = service.snapshot();
+    if (!doubted.available) throw new Error("expected available");
+    expect(doubted.rows.find((r) => r.requirementId === R1)!.disposition).toBe("open");
+
+    // A rescan resolves it present → R1 returns to (accepted, absent, unverified),
+    // the IDENTICAL tuple. Under re-triage the old fix-queued must NOT resurrect.
+    canonFacts.recordFact({
+      requirementId: R1,
+      kind: "absence-resolved",
+      actor: "camino:reconciler",
+      payload: { contextKind: "main", resolution: "present" },
+    });
+    const returned = service.snapshot();
+    if (!returned.available) throw new Error("expected available");
+    const row = returned.rows.find((r) => r.requirementId === R1)!;
+    expect(row.tuple).toEqual({
+      disposition: "accepted",
+      implementation: { kind: "absent" },
+      evidence: "unverified",
+    });
+    expect(row.disposition).toBe("open"); // re-triage: no resurrection
+
+    // Re-queueing now (anchored after the divergence) is live again.
+    service.recordDisposition(R1, {
+      action: "fix-queued",
+      reason: "re-queued after re-triage",
+      asOf: returned.asOf,
+    });
+    const requeued = service.snapshot();
+    if (!requeued.available) throw new Error("expected available");
+    expect(requeued.rows.find((r) => r.requirementId === R1)!.disposition).toBe("fix-queued");
   });
 
   it("REFUSES waiving a real unmet requirement (CAM-CANON-05) end-to-end", () => {
