@@ -122,6 +122,20 @@ function boundedText(field: string, value: unknown, problems: string[]): void {
   if (value.includes("\u0000")) problems.push(`${field} contains U+0000`);
 }
 
+/**
+ * Sparse-array holes have no canonical JSON form and are skipped by every
+ * iteration method (forEach/map/every), so validators must hunt them by
+ * index or a holed list would validate and then fail (or alias) at the
+ * hash (r1 finding 7).
+ */
+function arrayHoleProblems(field: string, value: readonly unknown[]): string[] {
+  const problems: string[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    if (!(i in value)) problems.push(`${field}[${i}] is a sparse-array hole`);
+  }
+  return problems;
+}
+
 function sortedStringList(
   field: string,
   value: unknown,
@@ -135,6 +149,7 @@ function sortedStringList(
   if (value.length > PLAN_MAX_LIST_LENGTH) {
     problems.push(`${field} exceeds ${PLAN_MAX_LIST_LENGTH} entries`);
   }
+  problems.push(...arrayHoleProblems(field, value));
   let previous: string | undefined;
   value.forEach((entry, i) => {
     if (typeof entry !== "string") {
@@ -196,6 +211,7 @@ export function contractProblems(value: unknown): string[] {
     if (criteria.length > PLAN_MAX_LIST_LENGTH) {
       problems.push(`acceptanceCriteria exceeds ${PLAN_MAX_LIST_LENGTH} entries`);
     }
+    problems.push(...arrayHoleProblems("acceptanceCriteria", criteria));
     criteria.forEach((criterion, i) => {
       boundedText(`acceptanceCriteria[${i}]`, criterion, problems);
     });
@@ -218,6 +234,7 @@ export function contractProblems(value: unknown): string[] {
     if (interfaces.length > PLAN_MAX_LIST_LENGTH) {
       problems.push(`interfaces exceeds ${PLAN_MAX_LIST_LENGTH} entries`);
     }
+    problems.push(...arrayHoleProblems("interfaces", interfaces));
     interfaces.forEach((entry, i) => {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
         problems.push(`interfaces[${i}] must be an object`);
@@ -246,13 +263,19 @@ export function contractProblems(value: unknown): string[] {
     problems.push(`contractHash must match /${SHA256_HEX_PATTERN_SOURCE}/`);
   } else if (problems.length === 0) {
     // Only recompute over a structurally sound record — the cast is licensed
-    // by every check above having passed.
-    const recomputed = contractHash(contractTermsOf(value as IssueContract));
-    if (recomputed !== hash) {
-      problems.push(
-        `contractHash ${hash} does not match the recomputed terms hash ${recomputed} — ` +
-          "the record's terms and its hash disagree",
-      );
+    // by every check above having passed. TOTAL even so: a value the
+    // canonicalizer refuses becomes a named problem, never a throw
+    // (r1 finding 7).
+    try {
+      const recomputed = contractHash(contractTermsOf(value as IssueContract));
+      if (recomputed !== hash) {
+        problems.push(
+          `contractHash ${hash} does not match the recomputed terms hash ${recomputed} — ` +
+            "the record's terms and its hash disagree",
+        );
+      }
+    } catch (error) {
+      problems.push(`terms have no canonical JSON form: ${(error as Error).message}`);
     }
   }
   const allowed = [

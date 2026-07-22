@@ -15,14 +15,29 @@
  * approvals, and rejections are user acts by definition.
  *
  * Contracts are immutable rows keyed (issue_id, version) with a UNIQUE
- * hash; insertContract verifies the full shared validator INCLUDING hash
- * recomputation before writing, re-verifies on open (a tampered or foreign
- * store is refused, never adopted), and treats an identical re-insert as
- * the idempotent no-op the crash-resume path relies on.
+ * hash; insertContract persists a canonical snapshot (one observation — a
+ * caller-side accessor or toJSON cannot make the validated value and the
+ * persisted bytes differ, r1 finding 8), verifies the full shared
+ * validator INCLUDING hash recomputation before writing, re-verifies with
+ * index binding on every read and at adoption, and treats an identical
+ * re-insert as the idempotent no-op the crash-resume path relies on.
+ *
+ * TAMPER-EVIDENCE BOUNDARY, stated plainly (r1 finding 13): the open
+ * check proves the schema DEFINITIONS are this build's and every present
+ * row validates — it is not a completeness proof. A raw writer that drops
+ * a trigger, deletes history, and restores the identical trigger leaves
+ * no schema evidence; row completeness is cross-checked against the event
+ * log at resume (an approval-completion without its contracts, or a
+ * recorded approval the gate refuses, fails loudly there), and the
+ * durable single-writer guarantee is the WP-104 writer lock the
+ * production composition holds — the same posture as every store in this
+ * family.
  */
 import Database from "better-sqlite3";
 import { DAVID_ACTOR } from "@camino/core";
 import {
+  CanonicalJsonError,
+  canonicalJson,
   contractProblems,
   clarificationResponseProblems,
   planConstructionRecordProblems,
@@ -197,6 +212,14 @@ export interface PlanStreamRecord {
   readonly recordedAt: string;
 }
 
+interface ContractRowShape {
+  issue_id: string;
+  version: number;
+  contract_hash: string;
+  mission_id: string;
+  record: string;
+}
+
 export interface ConfirmationRow {
   readonly segmentId: string;
   readonly requirementId: string;
@@ -263,6 +286,10 @@ export class PlanStore {
     // Every refusal path must close the native handle (WP-104 finding 10).
     try {
       this.#db.pragma("journal_mode = WAL");
+      // SQLite leaves declared REFERENCES unenforced unless the pragma is
+      // set per connection — without it an act row for a nonexistent
+      // session would insert silently.
+      this.#db.pragma("foreign_keys = ON");
       const encoding = this.#db.pragma("encoding", { simple: true }) as string;
       if (encoding !== "UTF-8") {
         throw new Error(
@@ -316,27 +343,67 @@ export class PlanStore {
     const streamRows = this.#db
       .prepare("SELECT session_id, seq, kind, payload FROM plan_stream ORDER BY session_id, seq")
       .all() as Array<{ session_id: string; seq: number; kind: string; payload: string }>;
+    const perSession = new Map<
+      string,
+      {
+        issueIds: Set<string>;
+        clarificationIds: Set<string>;
+        segments: Set<string>;
+        complete: boolean;
+      }
+    >();
     for (const row of streamRows) {
-      const payload = this.#parseObject(
-        row.payload,
-        `plan store ${path} stream row ${row.session_id}#${row.seq}`,
-      );
+      const context = `plan store ${path} stream row ${row.session_id}#${row.seq}`;
+      const payload = this.#parseObject(row.payload, context);
       if (row.kind === "review-attached") {
         const problems = reviewArtifactProblems(payload);
         if (problems.length > 0) {
           throw new Error(
-            `plan store ${path} stream row ${row.session_id}#${row.seq} fails validation — ` +
-              `refusing to adopt: ${problems.join("; ")}`,
+            `${context} fails validation — refusing to adopt: ${problems.join("; ")}`,
           );
         }
-      } else {
-        const problems = planConstructionRecordProblems(payload);
-        if (problems.length > 0) {
-          throw new Error(
-            `plan store ${path} stream row ${row.session_id}#${row.seq} fails validation — ` +
-              `refusing to adopt: ${problems.join("; ")}`,
-          );
+        continue;
+      }
+      const problems = planConstructionRecordProblems(payload);
+      if (problems.length > 0) {
+        throw new Error(`${context} fails validation — refusing to adopt: ${problems.join("; ")}`);
+      }
+      if (payload["kind"] !== row.kind) {
+        throw new Error(`${context} kind column disagrees with its payload — refusing to adopt`);
+      }
+      // Cross-record coherence per session (the r1 finding-1 ingest-bypass
+      // class): duplicates and post-completion records are refused at
+      // adoption exactly as appendStream refuses them at write time.
+      const session = perSession.get(row.session_id) ?? {
+        issueIds: new Set<string>(),
+        clarificationIds: new Set<string>(),
+        segments: new Set<string>(),
+        complete: false,
+      };
+      perSession.set(row.session_id, session);
+      if (session.complete) {
+        throw new Error(`${context} follows construction-complete — refusing to adopt`);
+      }
+      if (row.kind === "issue") {
+        const id = (payload["issue"] as { planIssueId: string }).planIssueId;
+        if (session.issueIds.has(id)) {
+          throw new Error(`${context} duplicates issue ${id} — refusing to adopt`);
         }
+        session.issueIds.add(id);
+      } else if (row.kind === "clarification") {
+        const id = (payload["clarification"] as { clarificationId: string }).clarificationId;
+        if (session.clarificationIds.has(id)) {
+          throw new Error(`${context} duplicates clarification ${id} — refusing to adopt`);
+        }
+        session.clarificationIds.add(id);
+      } else if (row.kind === "checklist-row") {
+        const id = (payload["row"] as { segmentId: string }).segmentId;
+        if (session.segments.has(id)) {
+          throw new Error(`${context} duplicates checklist segment ${id} — refusing to adopt`);
+        }
+        session.segments.add(id);
+      } else if (row.kind === "construction-complete") {
+        session.complete = true;
       }
     }
     const ackRows = this.#db
@@ -356,8 +423,14 @@ export class PlanStore {
       }
     }
     const contractRows = this.#db
-      .prepare("SELECT issue_id, version, contract_hash, record FROM contracts")
-      .all() as Array<{ issue_id: string; version: number; contract_hash: string; record: string }>;
+      .prepare("SELECT issue_id, version, contract_hash, mission_id, record FROM contracts")
+      .all() as Array<{
+      issue_id: string;
+      version: number;
+      contract_hash: string;
+      mission_id: string;
+      record: string;
+    }>;
     for (const row of contractRows) {
       const record = this.#parseObject(
         row.record,
@@ -374,7 +447,8 @@ export class PlanStore {
       if (
         contract.contractHash !== row.contract_hash ||
         contract.issueId !== row.issue_id ||
-        contract.version !== row.version
+        contract.version !== row.version ||
+        contract.missionId !== row.mission_id
       ) {
         throw new Error(
           `plan store ${path} contract ${row.issue_id} v${row.version} disagrees with its ` +
@@ -466,15 +540,69 @@ export class PlanStore {
   // The construction stream
   // -------------------------------------------------------------------------
 
+  /**
+   * Append one stream record. The store enforces its OWN invariants
+   * (r1 finding 1 — a first-party caller reaching past the service must
+   * not be able to persist rows the service would refuse): the payload is
+   * canonically snapshotted and validated against its kind, the session
+   * must exist and be open (no rejection, no approval), and after
+   * construction-complete only review-attached records may follow.
+   * Cross-record semantics (duplicate ids, reference checks, template
+   * bounds) remain the planning service's; both layers verify on open.
+   */
   appendStream(
     sessionId: string,
     kind: PlanStreamKind,
     payload: PlanConstructionRecord | Record<string, unknown>,
   ): PlanStreamRecord {
     this.#assertWritable("plan store appendStream");
+    if (this.session(sessionId) === undefined) {
+      throw new Error(`plan session ${sessionId} does not exist`);
+    }
+    if (this.rejection(sessionId) !== undefined || this.approval(sessionId) !== undefined) {
+      throw new Error(`plan session ${sessionId} is closed to stream appends`);
+    }
+    let serialized: string;
+    try {
+      serialized = canonicalJson(payload);
+    } catch (error) {
+      if (error instanceof CanonicalJsonError) {
+        throw new Error(`stream payload has no canonical JSON form: ${error.message}`);
+      }
+      throw error;
+    }
+    // Single observation: validate the parsed snapshot, persist its bytes.
+    const snapshot = JSON.parse(serialized) as Record<string, unknown>;
+    if (kind === "review-attached") {
+      const problems = reviewArtifactProblems(snapshot);
+      if (problems.length > 0) {
+        throw new Error(`review artifact refused: ${problems.join("; ")}`);
+      }
+    } else {
+      const problems = planConstructionRecordProblems(snapshot);
+      if (problems.length > 0) {
+        throw new Error(`construction record refused: ${problems.join("; ")}`);
+      }
+      if (snapshot["kind"] !== kind) {
+        throw new Error(
+          `stream kind ${kind} does not match the record's kind ${JSON.stringify(snapshot["kind"])}`,
+        );
+      }
+    }
     const recordedAt = this.#now().toISOString();
-    const serialized = JSON.stringify(payload);
     const insert = this.#db.transaction((): number => {
+      if (kind !== "review-attached") {
+        const complete = this.#db
+          .prepare(
+            "SELECT 1 FROM plan_stream WHERE session_id = ? AND kind = 'construction-complete' LIMIT 1",
+          )
+          .get(sessionId);
+        if (complete !== undefined) {
+          throw new Error(
+            `plan session ${sessionId} construction is complete; only review-attached records may follow`,
+          );
+        }
+      }
       const last = this.#db
         .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM plan_stream WHERE session_id = ?")
         .get(sessionId) as { last: number };
@@ -488,12 +616,7 @@ export class PlanStore {
       return seq;
     });
     const seq = insert.immediate();
-    return {
-      seq,
-      kind,
-      payload: JSON.parse(serialized) as Record<string, unknown>,
-      recordedAt,
-    };
+    return { seq, kind, payload: snapshot, recordedAt };
   }
 
   streamRecords(sessionId: string): PlanStreamRecord[] {
@@ -702,16 +825,31 @@ export class PlanStore {
    */
   insertContract(contract: IssueContract, sessionId: string): IssueContract {
     this.#assertWritable("plan store insertContract");
-    const problems = contractProblems(contract);
+    // ONE observation (r1 finding 8): canonically serialize FIRST, then
+    // validate the parsed snapshot, then persist those exact bytes — a
+    // caller object whose accessors or toJSON produce different values per
+    // read cannot make the validated value and the stored record differ
+    // (functions, exotica, and holes are refused by the canonicalizer).
+    let serialized: string;
+    try {
+      serialized = canonicalJson(contract);
+    } catch (error) {
+      if (error instanceof CanonicalJsonError) {
+        throw new Error(`refusing to store a contract with no canonical form: ${error.message}`);
+      }
+      throw error;
+    }
+    const snapshot = JSON.parse(serialized) as IssueContract;
+    const problems = contractProblems(snapshot);
     if (problems.length > 0) {
       throw new Error(`refusing to store an invalid contract: ${problems.join("; ")}`);
     }
-    const existing = this.contract(contract.issueId, contract.version);
+    const existing = this.contract(snapshot.issueId, snapshot.version);
     if (existing !== undefined) {
-      if (existing.contractHash === contract.contractHash) return existing;
+      if (existing.contractHash === snapshot.contractHash) return existing;
       throw new Error(
-        `contract ${contract.issueId} v${contract.version} already exists with hash ` +
-          `${existing.contractHash}; refusing to overwrite it with ${contract.contractHash} ` +
+        `contract ${snapshot.issueId} v${snapshot.version} already exists with hash ` +
+          `${existing.contractHash}; refusing to overwrite it with ${snapshot.contractHash} ` +
           "(contract versions are immutable — edits create v(n+1), CAM-PLAN-05/WP-112)",
       );
     }
@@ -721,58 +859,79 @@ export class PlanStore {
          VALUES (@issueId, @version, @contractHash, @missionId, @sessionId, @record, @recordedAt)`,
       )
       .run({
-        issueId: contract.issueId,
-        version: contract.version,
-        contractHash: contract.contractHash,
-        missionId: contract.missionId,
+        issueId: snapshot.issueId,
+        version: snapshot.version,
+        contractHash: snapshot.contractHash,
+        missionId: snapshot.missionId,
         sessionId,
-        record: JSON.stringify(contract),
+        record: serialized,
         recordedAt: this.#now().toISOString(),
       });
-    return contract;
+    return snapshot;
   }
 
   contract(issueId: string, version: number): IssueContract | undefined {
     const row = this.#db
-      .prepare("SELECT record FROM contracts WHERE issue_id = ? AND version = ?")
-      .get(issueId, version) as { record: string } | undefined;
-    return row === undefined ? undefined : this.#toContract(row.record);
+      .prepare(
+        "SELECT issue_id, version, contract_hash, mission_id, record FROM contracts WHERE issue_id = ? AND version = ?",
+      )
+      .get(issueId, version) as ContractRowShape | undefined;
+    return row === undefined ? undefined : this.#toContract(row);
   }
 
   /** The highest contract version for an issue, or undefined. */
   latestContract(issueId: string): IssueContract | undefined {
     const row = this.#db
-      .prepare("SELECT record FROM contracts WHERE issue_id = ? ORDER BY version DESC LIMIT 1")
-      .get(issueId) as { record: string } | undefined;
-    return row === undefined ? undefined : this.#toContract(row.record);
+      .prepare(
+        "SELECT issue_id, version, contract_hash, mission_id, record FROM contracts WHERE issue_id = ? ORDER BY version DESC LIMIT 1",
+      )
+      .get(issueId) as ContractRowShape | undefined;
+    return row === undefined ? undefined : this.#toContract(row);
   }
 
   contractByHash(contractHash: string): IssueContract | undefined {
     const row = this.#db
-      .prepare("SELECT record FROM contracts WHERE contract_hash = ?")
-      .get(contractHash) as { record: string } | undefined;
-    return row === undefined ? undefined : this.#toContract(row.record);
+      .prepare(
+        "SELECT issue_id, version, contract_hash, mission_id, record FROM contracts WHERE contract_hash = ?",
+      )
+      .get(contractHash) as ContractRowShape | undefined;
+    return row === undefined ? undefined : this.#toContract(row);
   }
 
   contractsForMission(missionId: string): IssueContract[] {
     const rows = this.#db
-      .prepare("SELECT record FROM contracts WHERE mission_id = ? ORDER BY issue_id, version")
-      .all(missionId) as Array<{ record: string }>;
-    return rows.map((row) => this.#toContract(row.record));
+      .prepare(
+        "SELECT issue_id, version, contract_hash, mission_id, record FROM contracts WHERE mission_id = ? ORDER BY issue_id, version",
+      )
+      .all(missionId) as ContractRowShape[];
+    return rows.map((row) => this.#toContract(row));
   }
 
   /**
-   * Re-validate on every read (hash recomputation): a row edited behind the
-   * store's back — even with triggers dropped by a raw writer — is refused
-   * at the read seam, never served.
+   * Re-validate on every read: hash recomputation via contractProblems PLUS
+   * index binding — the record's own issueId/version/hash/missionId must
+   * equal the row columns it was found by (r1 finding 8: a raw writer that
+   * swaps a valid record under a different index key is refused, so a
+   * lookup can never return a contract other than the one its key names).
    */
-  #toContract(record: string): IssueContract {
-    const parsed = JSON.parse(record) as unknown;
+  #toContract(row: ContractRowShape): IssueContract {
+    const parsed = JSON.parse(row.record) as unknown;
     const problems = contractProblems(parsed);
     if (problems.length > 0) {
       throw new Error(`stored contract fails validation on read: ${problems.join("; ")}`);
     }
     const contract = parsed as IssueContract;
+    if (
+      contract.issueId !== row.issue_id ||
+      contract.version !== row.version ||
+      contract.contractHash !== row.contract_hash ||
+      contract.missionId !== row.mission_id
+    ) {
+      throw new Error(
+        `stored contract ${row.issue_id} v${row.version} disagrees with its index columns — ` +
+          "refusing to serve a re-keyed record",
+      );
+    }
     // Belt over braces: contractProblems already recomputed the hash; keep
     // the deep-frozen copy from escaping mutation by callers.
     return Object.freeze({

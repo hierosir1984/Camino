@@ -110,7 +110,7 @@ function newHarness(fixture: Fixture): Harness {
   const recorder = new TransitionRecorder(events);
   const intake = new MissionIntake(domain, recorder, events);
   const scheduler = new SerializationScheduler(domain, recorder, events);
-  const service = new PlanningService(planStore, domain, recorder, ledger, scheduler);
+  const service = new PlanningService(planStore, domain, recorder, events, ledger, scheduler);
   const project = domain.createProject("fixtures");
   const repo = domain.createRepo(project.id, fixture.name);
   const result = intake.createFromText({

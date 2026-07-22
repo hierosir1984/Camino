@@ -96,3 +96,22 @@ describe("sha256Hex", () => {
     expect(sha256Hex("é")).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+describe("sparse arrays (r1 finding 7)", () => {
+  it("refuses holes instead of skipping them (collision and non-JSON output class)", () => {
+    // Array.map skipped holes: [ ,1 ] and [1] serialized identically, and
+    // a two-hole array emitted "[,]", which is not JSON at all.
+    const holeAtZero: unknown[] = new Array<unknown>(2);
+    holeAtZero[1] = 1;
+    expect(() => canonicalJson(holeAtZero)).toThrow(CanonicalJsonError);
+    expect(() => canonicalJson(new Array(2))).toThrow(CanonicalJsonError);
+    const holeInMiddle: unknown[] = [1];
+    holeInMiddle[2] = 3;
+    expect(() => canonicalJson({ list: holeInMiddle })).toThrow(/\$\.list\[1\]/);
+    expect(() => canonicalJson(new Array(1))).toThrow(/sparse-array hole/);
+  });
+
+  it("still serializes dense arrays containing null", () => {
+    expect(canonicalJson([null, 1])).toBe("[null,1]");
+  });
+});

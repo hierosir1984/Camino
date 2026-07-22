@@ -46,8 +46,9 @@ import {
   segmentPrd,
   templateProblems,
 } from "@camino/core";
-import type { ApprovalRefusal, PlanGateInput, PrdSegment } from "@camino/core";
+import type { ApprovalRefusal, GateAttestedFacts, PlanGateInput, PrdSegment } from "@camino/core";
 import {
+  ACCEPTED_FAMILY,
   CONTRACT_SCHEMA_VERSION,
   MISSION_TEMPLATES,
   clarificationResponseProblems,
@@ -62,6 +63,7 @@ import type {
   ClarificationResponse,
   ClarifyingItemDraft,
   ContractTerms,
+  EventStore,
   IssueContract,
   MissionRecord,
   MissionTemplateName,
@@ -159,6 +161,7 @@ export interface ResumeReport {
   readonly completedApprovals: string[];
   readonly completedLedgerWrites: string[];
   readonly recordedConstructedTransitions: string[];
+  readonly completedRejections: string[];
 }
 
 export interface DependencyInterfaceView {
@@ -173,6 +176,7 @@ export class PlanningService {
   readonly #store: PlanStore;
   readonly #domain: SqliteDomainStore;
   readonly #recorder: TransitionRecorder;
+  readonly #events: EventStore;
   readonly #ledger: CanonLedgerStore;
   readonly #scheduler: SerializationScheduler;
   readonly #now: () => Date;
@@ -181,6 +185,7 @@ export class PlanningService {
     store: PlanStore,
     domain: SqliteDomainStore,
     recorder: TransitionRecorder,
+    events: EventStore,
     ledger: CanonLedgerStore,
     scheduler: SerializationScheduler,
     options: PlanningServiceOptions = {},
@@ -188,6 +193,7 @@ export class PlanningService {
     this.#store = store;
     this.#domain = domain;
     this.#recorder = recorder;
+    this.#events = events;
     this.#ledger = ledger;
     this.#scheduler = scheduler;
     this.#now = options.now ?? (() => new Date());
@@ -480,13 +486,31 @@ export class PlanningService {
     this.#store.recordFlagAcknowledgment(sessionId, flagged, actor);
   }
 
-  /** David rejects the plan: mission returns to draft; the session closes. */
+  /**
+   * David rejects the plan: the session closes and the mission returns to
+   * draft. ORDER MATTERS (r1 finding 4): the rejection ROW lands first —
+   * it is the durable record of David's act — and the mission event
+   * second; a crash between the two leaves a closed session that
+   * resumePendingWork completes with the missing event. The reverse order
+   * left a window where recovery re-recorded plan-constructed and
+   * resurrected a rejected plan.
+   */
   rejectPlan(sessionId: string, actor: string = DAVID_ACTOR): void {
     const state = this.#planState(sessionId);
     this.#assertSessionOpen(state);
+    if (this.#recorder.currentState("mission", state.mission.id) !== "planned") {
+      throw new PlanningError(`mission ${state.mission.id} is not in planned; nothing to reject`);
+    }
+    this.#store.recordRejection(sessionId, actor);
+    this.#completeRejection(sessionId, state.mission.id, actor);
+  }
+
+  /** The mission-event half of a rejection; idempotent by state check. */
+  #completeRejection(sessionId: string, missionId: string, actor: string): void {
+    if (this.#recorder.currentState("mission", missionId) !== "planned") return;
     const outcome = this.#recorder.record({
       entityKind: "mission",
-      entityId: state.mission.id,
+      entityId: missionId,
       event: "plan-rejected",
       actor,
       cause: `plan session ${sessionId} rejected`,
@@ -495,7 +519,6 @@ export class PlanningService {
     if (!outcome.ok) {
       throw new PlanningError(`plan-rejected was refused: ${outcome.code}`);
     }
-    this.#store.recordRejection(sessionId, actor);
   }
 
   // -------------------------------------------------------------------------
@@ -548,15 +571,27 @@ export class PlanningService {
   /**
    * The idempotent freeze: every step checks state before writing, so a
    * crash at any point is completed by re-running (resumePendingWork).
-   * Order: contracts → mission plan-approved (scheduler computes the slot
-   * fact) → issue-created per contract with its ContractRef fields →
-   * completion marker.
+   * Order: ledger heal → contracts → mission plan-approved (scheduler
+   * computes the slot fact) → issue-created per contract with its
+   * ContractRef fields → completion marker.
    */
   #completeApproval(
     state: PlanState,
     actor: string,
     facts: Parameters<SerializationScheduler["approvePlan"]>[2],
   ): IssueContract[] {
+    // Step 0 (r1 finding 3): approval never completes over confirmations
+    // whose accepted ledger entries are missing — a confirmation whose
+    // ledger pair an in-process failure interrupted is healed HERE, before
+    // anything freezes, so "confirmed" and "accepted in the ledger" cannot
+    // diverge past this point.
+    for (const confirmation of this.#store.confirmations(state.session.sessionId)) {
+      this.#writeLedgerEntries(
+        confirmation.requirementId,
+        confirmation.statement,
+        state.mission.id,
+      );
+    }
     const contracts = this.#buildContracts(state, actor);
     for (const contract of contracts) {
       this.#store.insertContract(contract, state.session.sessionId);
@@ -577,7 +612,26 @@ export class PlanningService {
       );
     }
     for (const contract of contracts) {
-      if (this.#recorder.currentState("issue", contract.issueId) !== undefined) continue;
+      if (this.#recorder.currentState("issue", contract.issueId) !== undefined) {
+        // A pre-existing issue is only the resume no-op if its creation
+        // record carries THIS contract's reference — an issue created some
+        // other way is refused, never blessed (r1 finding 5).
+        const created = this.#events
+          .read({ entityKind: "issue", entityId: contract.issueId })
+          .find((r) => r.event === "issue-created" && r.outcome === "applied");
+        const payload = created?.payload ?? {};
+        if (
+          payload["contractVersion"] !== contract.version ||
+          payload["contractHash"] !== contract.contractHash
+        ) {
+          throw new PlanningError(
+            `issue ${contract.issueId} already exists but its creation record does not ` +
+              `reference contract ${contract.contractHash} v${contract.version} — refusing ` +
+              "to complete approval over a foreign issue record",
+          );
+        }
+        continue;
+      }
       const outcome = this.#recorder.record({
         entityKind: "issue",
         entityId: contract.issueId,
@@ -647,6 +701,7 @@ export class PlanningService {
       completedApprovals: [],
       completedLedgerWrites: [],
       recordedConstructedTransitions: [],
+      completedRejections: [],
     };
     // 1. Confirmations whose ledger pair a crash interrupted.
     const view = this.#ledger.currentView();
@@ -661,7 +716,21 @@ export class PlanningService {
       );
       report.completedLedgerWrites.push(confirmation.requirementId);
     }
-    // 2. Constructed-but-unrecorded mission transitions.
+    // 2. Rejection acts whose mission event a crash interrupted — completed
+    // BEFORE the constructed-transition sweep, which already excludes
+    // rejected sessions, so a rejected plan can never be resurrected
+    // (r1 finding 4).
+    for (const mission of this.#domain.listAllMissions()) {
+      for (const sessionRow of this.#store.sessionsForMission(mission.id)) {
+        const rejection = this.#store.rejection(sessionRow.sessionId);
+        if (rejection === undefined) continue;
+        if (this.#recorder.currentState("mission", mission.id) === "planned") {
+          this.#completeRejection(sessionRow.sessionId, mission.id, rejection.actor);
+          report.completedRejections.push(sessionRow.sessionId);
+        }
+      }
+    }
+    // 3. Constructed-but-unrecorded mission transitions.
     for (const sessionRow of this.#allOpenSessions()) {
       const state = this.#planState(sessionRow.sessionId);
       if (
@@ -673,28 +742,53 @@ export class PlanningService {
         report.recordedConstructedTransitions.push(sessionRow.sessionId);
       }
     }
-    // 3. Approval acts whose freeze never completed.
+    // 4. Approval acts whose freeze never completed. The gate is RE-RUN
+    // over the durable state before anything is blessed (r1 finding 1): a
+    // legitimately interrupted approval always re-passes (its inputs are
+    // durable and the gate is deterministic), so a recorded approval the
+    // gate now refuses means the store's rows are not the rows that
+    // approval was granted over — refused loudly, never adopted.
     for (const sessionRow of this.#store.pendingApprovalSessions()) {
       const state = this.#planState(sessionRow.sessionId);
       const approval = this.#store.approval(sessionRow.sessionId) as { actor: string };
-      const facts = this.#resumeFacts(state);
+      const decision = decidePlanApproval(this.#gateInput(state));
+      if (!decision.ok) {
+        throw new PlanningError(
+          `session ${sessionRow.sessionId} has a recorded approval the gate refuses ` +
+            `(${decision.refusals.map((r) => r.kind).join(", ")}) — refusing to complete ` +
+            "an approval the durable state does not support",
+        );
+      }
+      const facts = this.#resumeFacts(state, decision.attested);
       this.#completeApproval(state, approval.actor, facts);
       report.completedApprovals.push(sessionRow.sessionId);
     }
     return report;
   }
 
-  /** Rebuild the approval facts for a resume run (the gate already passed once). */
-  #resumeFacts(state: PlanState): Parameters<SerializationScheduler["approvePlan"]>[2] {
+  /** Rebuild the approval facts for a resume run (the gate re-passed above). */
+  #resumeFacts(
+    state: PlanState,
+    attested: GateAttestedFacts,
+  ): Parameters<SerializationScheduler["approvePlan"]>[2] {
     if (state.session.template === "quick-task") {
       const artifact = state.reviewArtifacts.at(-1) ?? {};
+      const missing = ["riskTierLow", "neutralConcurred"].filter(
+        (field) => typeof artifact[field] !== "boolean",
+      );
+      if (missing.length > 0) {
+        throw new PlanningError(
+          `session ${state.session.sessionId} has a recorded approval but its review ` +
+            `artifact lacks ${missing.join(", ")} — refusing to complete`,
+        );
+      }
       return {
         riskTierLow: artifact["riskTierLow"] === true,
         neutralConcurred: artifact["neutralConcurred"] === true,
         singleIssue: state.issues.length === 1,
       };
     }
-    return { checklistApproved: true, dagAcyclic: true };
+    return attested;
   }
 
   #allOpenSessions(): PlanSessionRow[] {
@@ -786,11 +880,27 @@ export class PlanningService {
    * The declared interfaces of an issue's dependencies — what WP-113
    * renders into the dependent's context pack (CAM-PLAN-11 "declared
    * interfaces … visible to dependents' context packs").
+   *
+   * The DEPENDENT side is version-pinned: pass the contract version the
+   * attempt executes (WP-113 binds packs to the attempt's contract) or
+   * omit it for the latest. Each dependency resolves to ITS latest
+   * contract by design — which dependency version an in-flight dependent
+   * should see after an edit is WP-112's change-control decision
+   * (conservative default: revalidate), so this query reports the current
+   * truth with each dependency's own (version, hash) identity attached
+   * for the pack to cite (r1 finding 12).
    */
-  dependencyInterfacesFor(issueId: string): DependencyInterfaceView[] {
-    const contract = this.#store.latestContract(issueId);
+  dependencyInterfacesFor(issueId: string, contractVersion?: number): DependencyInterfaceView[] {
+    const contract =
+      contractVersion === undefined
+        ? this.#store.latestContract(issueId)
+        : this.#store.contract(issueId, contractVersion);
     if (contract === undefined) {
-      throw new PlanningError(`issue ${issueId} has no contract`);
+      throw new PlanningError(
+        contractVersion === undefined
+          ? `issue ${issueId} has no contract`
+          : `issue ${issueId} has no contract v${contractVersion}`,
+      );
     }
     return contract.dependsOn.map((depId) => {
       const dep = this.#store.latestContract(depId);
@@ -921,12 +1031,23 @@ export class PlanningService {
     }
     const view = this.#ledger.currentView();
     for (const entry of view.values()) {
-      if (
-        entry.statement === statement &&
-        (entry.disposition === "accepted" || entry.disposition === "resolved-accepted")
-      ) {
-        return entry.requirementId;
+      if (entry.statement !== statement) continue;
+      if (!(ACCEPTED_FAMILY as readonly string[]).includes(entry.disposition)) continue;
+      // The whole accepted family reuses — `assumed` included (r1 finding
+      // 11): a signed-off assumption IS accepted intent, and minting a
+      // sibling id would duplicate it. A cross-AREA statement match is
+      // REFUSED rather than silently reused or duplicated: David decides
+      // whether to re-confirm under the existing area or revise the
+      // statement — either way an active choice, never an aliased id.
+      const existingArea = parseRequirementId(entry.requirementId).area;
+      if (existingArea !== area) {
+        throw new PlanningError(
+          `statement already exists in the ledger as ${entry.requirementId} ` +
+            `(area ${existingArea}, disposition ${entry.disposition}); confirm this row under ` +
+            `area ${existingArea} or revise the statement — refusing to alias intent across areas`,
+        );
       }
+      return entry.requirementId;
     }
     const used = new Set<number>();
     for (const requirementId of view.keys()) {

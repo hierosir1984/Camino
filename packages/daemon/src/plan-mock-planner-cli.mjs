@@ -82,5 +82,11 @@ for (const segment of segments.slice(1)) {
     row: { segmentId: segment.segmentId, disposition: "unmapped", reason: "context" },
   });
 }
-emit({ kind: "construction-complete" });
+if (process.env.MOCK_PLANNER_MODE === "no-trailing-newline") {
+  // The final record ends at EOF with no newline — the runner's final
+  // drain must still ingest it (r1 finding 10).
+  appendFileSync(STREAM, JSON.stringify({ kind: "construction-complete" }));
+} else {
+  emit({ kind: "construction-complete" });
+}
 process.exit(0);

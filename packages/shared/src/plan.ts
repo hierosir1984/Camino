@@ -275,6 +275,15 @@ function textProblems(field: string, value: unknown, required: boolean): string[
   return [];
 }
 
+/** Sparse holes dodge forEach/map — hunt them by index (r1 finding 7). */
+function holeProblems(field: string, value: readonly unknown[]): string[] {
+  const problems: string[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    if (!(i in value)) problems.push(`${field}[${i}] is a sparse-array hole`);
+  }
+  return problems;
+}
+
 function idListProblems(
   field: string,
   value: unknown,
@@ -285,7 +294,7 @@ function idListProblems(
   if (value.length > PLAN_MAX_LIST_LENGTH) {
     return [`${field} exceeds ${PLAN_MAX_LIST_LENGTH} entries`];
   }
-  const problems: string[] = [];
+  const problems: string[] = holeProblems(field, value);
   const seen = new Set<string>();
   value.forEach((entry, i) => {
     if (typeof entry !== "string" || !isValid(entry)) {
@@ -347,6 +356,7 @@ function plannedIssueProblems(value: unknown): string[] {
   } else if (criteria.length > PLAN_MAX_LIST_LENGTH) {
     problems.push(`issue.acceptanceCriteria exceeds ${PLAN_MAX_LIST_LENGTH} entries`);
   } else {
+    problems.push(...holeProblems("issue.acceptanceCriteria", criteria));
     criteria.forEach((criterion, i) => {
       problems.push(...textProblems(`issue.acceptanceCriteria[${i}]`, criterion, true));
     });
@@ -365,6 +375,7 @@ function plannedIssueProblems(value: unknown): string[] {
   } else if (interfaces.length > PLAN_MAX_LIST_LENGTH) {
     problems.push(`issue.interfaces exceeds ${PLAN_MAX_LIST_LENGTH} entries`);
   } else {
+    problems.push(...holeProblems("issue.interfaces", interfaces));
     interfaces.forEach((entry, i) => {
       problems.push(...declaredInterfaceProblems(`issue.interfaces[${i}]`, entry));
     });

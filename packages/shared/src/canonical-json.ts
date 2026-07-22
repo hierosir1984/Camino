@@ -61,7 +61,16 @@ function serialize(value: unknown, path: string, seen: Set<object>): string {
   seen.add(obj);
   try {
     if (Array.isArray(obj)) {
-      const parts = obj.map((element, i) => serialize(element, `${path}[${i}]`, seen));
+      // Explicit index walk: Array.prototype.map SKIPS holes, which would
+      // serialize [ ,1 ] and [1] identically (or emit non-JSON like "[,]").
+      // A hole has no JSON form — refuse it with its path (r1 finding 7).
+      const parts: string[] = [];
+      for (let i = 0; i < obj.length; i += 1) {
+        if (!(i in obj)) {
+          throw new CanonicalJsonError(`${path}[${i}]`, "sparse-array hole");
+        }
+        parts.push(serialize(obj[i], `${path}[${i}]`, seen));
+      }
       return `[${parts.join(",")}]`;
     }
     if (!isPlainObject(obj)) {

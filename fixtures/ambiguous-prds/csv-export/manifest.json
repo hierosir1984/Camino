@@ -8,21 +8,24 @@
       "segmentText": "Users can export their records.",
       "summary": "The exported column set is never specified.",
       "exampleQuestion": "Which record fields does the export include?",
-      "exampleAssumption": "All visible list columns, in list order."
+      "exampleAssumption": "All visible list columns, in list order.",
+      "answerKeyTerms": ["fields", "columns"]
     },
     {
       "id": "A2",
       "segmentText": "Exports open correctly in common spreadsheet software.",
       "summary": "Encoding and locale behavior is unstated (Excel needs a BOM).",
       "exampleQuestion": "What encoding and delimiter should the file use?",
-      "exampleAssumption": "UTF-8 with BOM, comma-delimited."
+      "exampleAssumption": "UTF-8 with BOM, comma-delimited.",
+      "answerKeyTerms": ["encoding", "utf-8", "delimiter"]
     },
     {
       "id": "A3",
       "segmentText": "Large exports should not break the app.",
       "summary": "\"Large\" names no size bound or behavior at the bound.",
       "exampleQuestion": "What is the row bound, and what happens above it?",
-      "exampleAssumption": "Cap at 100000 rows with a stated truncation notice."
+      "exampleAssumption": "Cap at 100000 rows with a stated truncation notice.",
+      "answerKeyTerms": ["row bound", "truncat", "cap at"]
     }
   ],
   "requirementSegments": [

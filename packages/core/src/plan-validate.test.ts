@@ -55,10 +55,29 @@ describe("segmentPrd", () => {
     expect((segments[1] as PrdSegment).text).toContain("first. second. third.");
   });
 
-  it("does not split on decimals or lowercase continuations", () => {
-    const segments = segmentPrd("The budget is 3.5 days. the follow-up is informal.");
-    // "3.5" must not split; the lowercase "the" after "days." must not split.
+  it("never splits inside a decimal (no whitespace follows the point)", () => {
+    const segments = segmentPrd("The budget is 3.5 days for the first pass.");
     expect(segments).toHaveLength(1);
+  });
+
+  it("splits before a lowercase sentence start — under-splitting is the dangerous direction (r1 finding 6)", () => {
+    // The reviewer's counterexample: requiring an uppercase next token let
+    // the second requirement hide inside the first one's segment.
+    const segments = segmentPrd("Data must be encrypted. iOS users can delete their accounts.");
+    expect(segments.map((s) => s.text)).toEqual([
+      "Data must be encrypted.",
+      "iOS users can delete their accounts.",
+    ]);
+  });
+
+  it("over-splits abbreviations rather than under-splitting sentences (stated direction)", () => {
+    const segments = segmentPrd("Limits apply, e.g. the size bound. Retries are capped.");
+    // "e.g." splits — a finer checklist row, never a buried requirement.
+    expect(segments.map((s) => s.text)).toEqual([
+      "Limits apply, e.g.",
+      "the size bound.",
+      "Retries are capped.",
+    ]);
   });
 
   it("splits multi-line paragraphs joined by single newlines as one flow", () => {
@@ -137,6 +156,24 @@ describe("dependency graph (CAM-PLAN-11)", () => {
     const a = findDependencyCycle([issue("I2", ["I1"]), issue("I1", ["I2"]), issue("I3")]);
     const b = findDependencyCycle([issue("I3"), issue("I1", ["I2"]), issue("I2", ["I1"])]);
     expect(a).toEqual(b);
+  });
+
+  it("names a cycle through thousands of issues without exhausting the stack (r1 finding 9)", () => {
+    // A 6000-issue chain closed into one loop: the recursive walk this
+    // replaced crashed with RangeError instead of refusing with the cycle.
+    const n = 6000;
+    const big = Array.from({ length: n }, (_, i) =>
+      issue(`I${i + 1}`, [i + 1 < n ? `I${i + 2}` : "I1"]),
+    );
+    const cycle = findDependencyCycle(big);
+    expect(cycle).not.toBeNull();
+    expect(cycle).toHaveLength(n + 1);
+    expect(cycle?.[0]).toBe(cycle?.at(-1));
+    // And an equally deep ACYCLIC chain resolves to null, also iteratively.
+    const chain = Array.from({ length: n }, (_, i) =>
+      issue(`I${i + 1}`, i + 1 < n ? [`I${i + 2}`] : []),
+    );
+    expect(findDependencyCycle(chain)).toBeNull();
   });
 });
 
@@ -400,13 +437,23 @@ describe("plantedAmbiguityCoverage", () => {
     { segmentId: "S1", text: "Users can export their data." },
     { segmentId: "S2", text: "Exports should be fast." },
   ];
+  const plantedFast = {
+    id: "A1",
+    segmentText: "Exports should be fast.",
+    summary: "fast is unquantified",
+    answerKeyTerms: ["fast", "latency", "seconds"],
+  };
+  const fastClarification: ClarifyingItemDraft = {
+    clarificationId: "Q1",
+    question: "How fast is fast — is there a latency target?",
+    whyItMatters: "The PRD gives no number to validate against.",
+    assumptionIfUnanswered: "Under 5 seconds for 10k records.",
+    relatedSegmentIds: ["S2"],
+    relatedPlanIssueIds: ["I1"],
+  };
 
-  it("reports covered ambiguities with the clarifications touching them", () => {
-    const coverage = plantedAmbiguityCoverage(
-      [{ id: "A1", segmentText: "Exports should be fast.", summary: "fast is unquantified" }],
-      segments,
-      [{ ...Q1, relatedSegmentIds: ["S2"] }],
-    );
+  it("covers an ambiguity when a clarification touches its segment AND names an answer-key term", () => {
+    const coverage = plantedAmbiguityCoverage([plantedFast], segments, [fastClarification]);
     expect(coverage.covered).toEqual([
       { plantedId: "A1", segmentId: "S2", clarificationIds: ["Q1"] },
     ]);
@@ -415,21 +462,54 @@ describe("plantedAmbiguityCoverage", () => {
   });
 
   it("SILENT GUESS FAILS: an untouched planted ambiguity lands in uncovered", () => {
-    const coverage = plantedAmbiguityCoverage(
-      [{ id: "A1", segmentText: "Exports should be fast.", summary: "fast is unquantified" }],
-      segments,
-      [{ ...Q1, relatedSegmentIds: ["S1"] }], // the plan asks about something else
-    );
+    const coverage = plantedAmbiguityCoverage([plantedFast], segments, [
+      { ...fastClarification, relatedSegmentIds: ["S1"] }, // the plan asks about something else
+    ]);
     expect(coverage.uncovered).toEqual([{ plantedId: "A1", segmentId: "S2" }]);
+  });
+
+  it("an IRRELEVANT question on the same segment does not count (r1 finding 2)", () => {
+    // The reviewer's counterexample: a question that merely touches the
+    // planted segment but asks about something unrelated must not cover.
+    const coverage = plantedAmbiguityCoverage([plantedFast], segments, [
+      {
+        ...fastClarification,
+        question: "What color should the export button be?",
+        whyItMatters: "Design consistency.",
+        assumptionIfUnanswered: "The primary theme color.",
+      },
+    ]);
+    expect(coverage.covered).toEqual([]);
+    expect(coverage.uncovered).toEqual([{ plantedId: "A1", segmentId: "S2" }]);
+  });
+
+  it("answer-key terms match case-insensitively across question, rationale, and assumption", () => {
+    const coverage = plantedAmbiguityCoverage([plantedFast], segments, [
+      {
+        ...fastClarification,
+        question: "What is acceptable here?",
+        whyItMatters: "Unbounded expectations.",
+        assumptionIfUnanswered: "LATENCY under one second.",
+      },
+    ]);
+    expect(coverage.covered).toHaveLength(1);
   });
 
   it("manifest drift is loud: unmatched segmentText lands in unlocatable", () => {
     const coverage = plantedAmbiguityCoverage(
-      [{ id: "A1", segmentText: "This sentence is not in the PRD.", summary: "drifted" }],
+      [{ ...plantedFast, segmentText: "This sentence is not in the PRD." }],
       segments,
       [],
     );
     expect(coverage.unlocatable).toEqual(["A1"]);
+  });
+
+  it("an empty answer key is manifest drift, not a free pass", () => {
+    const coverage = plantedAmbiguityCoverage([{ ...plantedFast, answerKeyTerms: [] }], segments, [
+      fastClarification,
+    ]);
+    expect(coverage.unlocatable).toEqual(["A1"]);
+    expect(coverage.covered).toEqual([]);
   });
 
   it("an ambiguous (duplicate) segmentText is unlocatable, not guessed", () => {
@@ -438,7 +518,7 @@ describe("plantedAmbiguityCoverage", () => {
       { segmentId: "S2", text: "Same text." },
     ];
     const coverage = plantedAmbiguityCoverage(
-      [{ id: "A1", segmentText: "Same text.", summary: "dup" }],
+      [{ ...plantedFast, segmentText: "Same text." }],
       dupes,
       [],
     );

@@ -63,7 +63,7 @@ function newHarness(): Harness {
   const recorder = new TransitionRecorder(events);
   const intake = new MissionIntake(domain, recorder, events);
   const scheduler = new SerializationScheduler(domain, recorder, events);
-  const service = new PlanningService(planStore, domain, recorder, ledger, scheduler);
+  const service = new PlanningService(planStore, domain, recorder, events, ledger, scheduler);
   const project = domain.createProject("demo");
   const repo = domain.createRepo(project.id, "demo");
   const result = intake.createFromText({
@@ -183,5 +183,29 @@ describe("plannerPrompt", () => {
     expect(prompt).toContain('"kind":"construction-complete"');
     expect(prompt).toContain("Do not silently guess");
     expect(prompt).toContain("plan-input/segments.json");
+  });
+});
+
+describe("stream-tail robustness (r1 finding 10)", () => {
+  it("ingests a final record that ends at EOF without a trailing newline", async () => {
+    const h = newHarness();
+    const run = runPlannerCompile({
+      adapter: mockPlannerAdapter("no-trailing-newline"),
+      service: h.service,
+      sessionId: h.sessionId,
+      workdirRoot: h.workdirRoot,
+      pollMs: 25,
+      timeoutMs: 60_000,
+    });
+    await until(() => h.service.planView(h.sessionId).issues.length === 1, "first issue");
+    const workspace = workspaceIn(h.workdirRoot);
+    await until(() => existsSync(join(workspace, "waiting-for-ack")), "handshake");
+    writeFileSync(join(workspace, "ack"), "");
+    const record = await run;
+    expect(record.outcome).toBe("succeeded");
+    expect(record.refused).toEqual([]);
+    // The unterminated construction-complete at EOF still landed.
+    expect(record.constructionComplete).toBe(true);
+    expect(h.service.planView(h.sessionId).status).toBe("constructed");
   });
 });

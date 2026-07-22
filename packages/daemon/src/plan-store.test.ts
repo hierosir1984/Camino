@@ -285,3 +285,122 @@ describe("reviewArtifactProblems", () => {
     expect(reviewArtifactProblems([])).not.toEqual([]);
   });
 });
+
+describe("appendStream store-level guards (r1 finding 1)", () => {
+  it("refuses payloads the validators reject and kind/payload mismatches", () => {
+    const store = openStore(":memory:");
+    seedSession(store);
+    expect(() =>
+      store.appendStream("plan-m1-1", "issue", { kind: "issue", issue: { bogus: true } }),
+    ).toThrow(/construction record refused/);
+    expect(() =>
+      store.appendStream("plan-m1-1", "clarification", { kind: "construction-complete" }),
+    ).toThrow(/does not match the record's kind/);
+    expect(() =>
+      store.appendStream("plan-m1-1", "review-attached", { reviewClass: "casual" }),
+    ).toThrow(/review artifact refused/);
+  });
+
+  it("refuses appends to unknown or closed sessions and after construction-complete", () => {
+    const store = openStore(":memory:");
+    seedSession(store);
+    expect(() =>
+      store.appendStream("missing", "construction-complete", { kind: "construction-complete" }),
+    ).toThrow(/does not exist/);
+    store.appendStream("plan-m1-1", "construction-complete", { kind: "construction-complete" });
+    expect(() =>
+      store.appendStream("plan-m1-1", "construction-complete", { kind: "construction-complete" }),
+    ).toThrow(/only review-attached records may follow/);
+    // review-attached is still allowed after completion…
+    store.appendStream("plan-m1-1", "review-attached", {
+      reviewClass: "full-falsification",
+      reviewer: "codex-cli",
+    });
+    // …but nothing lands once the session is closed by an approval act.
+    store.recordApproval("plan-m1-1", "david");
+    expect(() =>
+      store.appendStream("plan-m1-1", "review-attached", {
+        reviewClass: "full-falsification",
+        reviewer: "codex-cli",
+      }),
+    ).toThrow(/closed to stream appends/);
+  });
+
+  it("adoption refuses a stream with duplicates or post-completion records (raw-writer class)", () => {
+    const dir = tempDir();
+    const path = join(dir, "plan.sqlite");
+    const store = openStore(path);
+    seedSession(store);
+    store.appendStream("plan-m1-1", "construction-complete", { kind: "construction-complete" });
+    store.close();
+    const raw = new Database(path);
+    raw
+      .prepare(
+        "INSERT INTO plan_stream (session_id, seq, kind, payload, recorded_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        "plan-m1-1",
+        2,
+        "issue",
+        JSON.stringify({
+          kind: "issue",
+          issue: {
+            planIssueId: "I1",
+            title: "Smuggled after completion",
+            goal: "g",
+            acceptanceCriteria: ["c"],
+            dependsOn: [],
+            interfaces: [],
+          },
+        }),
+        "2026-07-22T00:00:00.000Z",
+      );
+    raw.close();
+    expect(() => new PlanStore(path)).toThrow(/follows construction-complete/);
+  });
+});
+
+describe("contract index binding (r1 finding 8)", () => {
+  it("refuses a record re-keyed under a foreign hash index", () => {
+    const dir = tempDir();
+    const path = join(dir, "plan.sqlite");
+    const store = openStore(path);
+    seedSession(store);
+    const contract = sampleContract();
+    store.insertContract(contract, "plan-m1-1");
+    store.close();
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER contracts_append_only_update");
+    // Re-key the row: valid record, foreign index hash.
+    raw
+      .prepare("UPDATE contracts SET contract_hash = ? WHERE issue_id = 'm1.I1'")
+      .run("f".repeat(64));
+    raw.close();
+    // The dropped trigger fails adoption outright (definition comparison).
+    expect(() => new PlanStore(path)).toThrow(/tampered or foreign store/);
+  });
+
+  it("insertContract snapshots canonically — accessor tricks cannot split validate and persist", () => {
+    const store = openStore(":memory:");
+    seedSession(store);
+    const base = sampleContract();
+    let reads = 0;
+    const shifty = Object.defineProperty({ ...base }, "title", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? base.title : "Different on second read";
+      },
+    }) as typeof base;
+    // ONE observation: the getter is read exactly once (by the canonical
+    // snapshot), so what validated is byte-for-byte what persisted — the
+    // shifting second value never exists anywhere. The stored record is
+    // self-consistent and re-validates on read.
+    const inserted = store.insertContract(shifty, "plan-m1-1");
+    expect(inserted.title).toBe(base.title);
+    expect(reads).toBe(1);
+    const served = store.contract("m1.I1", 1);
+    expect(served?.title).toBe(base.title);
+    expect(served?.contractHash).toBe(base.contractHash);
+  });
+});

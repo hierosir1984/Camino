@@ -58,7 +58,7 @@ function newHarness(): Harness {
   const recorder = new TransitionRecorder(events);
   const intake = new MissionIntake(domain, recorder, events);
   const scheduler = new SerializationScheduler(domain, recorder, events);
-  const service = new PlanningService(planStore, domain, recorder, ledger, scheduler);
+  const service = new PlanningService(planStore, domain, recorder, events, ledger, scheduler);
   const project = domain.createProject("demo");
   const repo = domain.createRepo(project.id, "demo");
   return {
@@ -680,5 +680,134 @@ describe("crash resume (the WP-104 idempotency posture)", () => {
     const report = h.service.resumePendingWork();
     expect(report.recordedConstructedTransitions).toEqual([session.sessionId]);
     expect(h.recorder.currentState("mission", mission.id)).toBe("planned");
+  });
+});
+
+describe("round-1 falsification regressions", () => {
+  it("F1: resume REFUSES a recorded approval the gate does not support (no blessing bare rows)", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    // A first-party caller writes the approval row straight into the store,
+    // skipping every acknowledgment. Resume must refuse, not complete.
+    h.planStore.recordApproval(session.sessionId, "david");
+    expect(() => h.service.resumePendingWork()).toThrow(/gate refuses/);
+    expect(h.service.contractsForMission(mission.id)).toEqual([]);
+    expect(h.recorder.currentState("mission", mission.id)).toBe("planned");
+  });
+
+  it("F3: approval heals a confirmation whose ledger pair an in-process failure lost", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    h.service.acknowledgeClarification(session.sessionId, "Q1", { kind: "assumption-confirmed" });
+    // The confirmation rows land without their ledger writes (the injected-
+    // failure window the review demonstrated).
+    h.planStore.recordConfirmation(
+      session.sessionId,
+      { segmentId: "S2", requirementId: "CAM-APP-01", statement: "s2 statement" },
+      "david",
+    );
+    h.planStore.recordConfirmation(
+      session.sessionId,
+      { segmentId: "S3", requirementId: "CAM-APP-02", statement: "s3 statement" },
+      "david",
+    );
+    h.service.acknowledgeFlaggedRows(session.sessionId, ["S1", "S4"]);
+    expect(h.ledger.currentView().size).toBe(0);
+    const outcome = h.service.approvePlan(session.sessionId);
+    expect(outcome.ok).toBe(true);
+    // Approval could not complete while confirmed intent had no accepted entry.
+    expect(h.ledger.entry("CAM-APP-01")?.disposition).toBe("accepted");
+    expect(h.ledger.entry("CAM-APP-02")?.disposition).toBe("accepted");
+  });
+
+  it("F4: a rejection interrupted before its mission event is completed, never resurrected", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    // The crash window: the rejection ROW landed, the mission event did not.
+    h.planStore.recordRejection(session.sessionId, "david");
+    expect(h.recorder.currentState("mission", mission.id)).toBe("planned");
+    const report = h.service.resumePendingWork();
+    expect(report.completedRejections).toEqual([session.sessionId]);
+    expect(h.recorder.currentState("mission", mission.id)).toBe("draft");
+    // No resurrection: the constructed-transition sweep skipped the
+    // rejected session, and the mission stays in draft on a second resume.
+    expect(h.service.resumePendingWork().recordedConstructedTransitions).toEqual([]);
+    expect(h.recorder.currentState("mission", mission.id)).toBe("draft");
+    expect(h.service.planView(session.sessionId).status).toBe("rejected");
+  });
+
+  it("F5: resume refuses a pre-existing issue whose creation record lacks the contract reference", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    // A foreign issue record occupies the durable id, created without the
+    // contract-reference payload the freeze would have written.
+    const foreign = h.recorder.record({
+      entityKind: "issue",
+      entityId: `${mission.id}.I1`,
+      event: "issue-created",
+      actor: "camino:planner",
+      cause: "foreign creation without contract reference",
+      payload: { origin: "plan-approval", unmetDependencies: 0 },
+    });
+    expect(foreign.ok).toBe(true);
+    h.planStore.recordApproval(session.sessionId, "david");
+    expect(() => h.service.resumePendingWork()).toThrow(/does not reference contract/);
+  });
+
+  it("F11: an identical statement signed off as an ASSUMPTION is reused, not duplicated", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    h.ledger.proposeRequirement("CAM-APP-05", {
+      statement: "The system sends a daily summary email.",
+      sourceMissionId: mission.id,
+    });
+    h.ledger.disputeRequirement("CAM-APP-05", { reason: "channel unstated", conflictWith: null });
+    h.ledger.resolveDisputeAssumed("CAM-APP-05", { assumption: "Email, pending confirmation." });
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    h.service.confirmMappedRows(session.sessionId, ["S2"]);
+    const confirmation = h.planStore.confirmations(session.sessionId)[0];
+    expect(confirmation?.requirementId).toBe("CAM-APP-05");
+    // No second entry with the same statement exists.
+    expect(h.ledger.currentView().size).toBe(1);
+  });
+
+  it("F11: an identical statement under a DIFFERENT area refuses instead of aliasing", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    h.ledger.proposeRequirement("CAM-UI-01", {
+      statement: "The system sends a daily summary email.",
+      sourceMissionId: mission.id,
+    });
+    h.ledger.acceptRequirement("CAM-UI-01");
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId); // proposes area APP for S2
+    expect(() => h.service.confirmMappedRows(session.sessionId, ["S2"])).toThrow(
+      /refusing to alias intent across areas/,
+    );
+  });
+
+  it("F12: dependency interfaces resolve against a version-pinned dependent contract", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    expect(h.service.approvePlan(session.sessionId).ok).toBe(true);
+    const pinned = h.service.dependencyInterfacesFor(`${mission.id}.I2`, 1);
+    expect(pinned).toHaveLength(1);
+    expect(pinned[0]?.issueId).toBe(`${mission.id}.I1`);
+    expect(() => h.service.dependencyInterfacesFor(`${mission.id}.I2`, 7)).toThrow(
+      /no contract v7/,
+    );
   });
 });

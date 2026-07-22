@@ -33,12 +33,19 @@ export interface PrdSegment {
  * not a linguistic one. Guarantees: every non-blank piece of PRD text lands
  * in exactly one segment, in document order, and identical input always
  * yields identical segments — that totality is what the checklist diff's
- * "every PRD sentence appears exactly once" rests on. Non-guarantees: an
- * abbreviation ("e.g. the size") may split a sentence in two, and a
- * sentence missing terminal punctuation joins its block; over-splitting
- * yields finer checklist rows, under-splitting a coarser row — neither
- * loses text. Headings, list items, table rows, and fenced code blocks are
- * their own segments (a fence is never sentence-split).
+ * "every PRD sentence appears exactly once" rests on. The error DIRECTION
+ * is chosen deliberately (r1 finding 6): the splitter over-splits rather
+ * than under-splits, because an over-split only yields a finer checklist
+ * row while an under-split can bury a second requirement inside a segment
+ * whose row maps only the first. So every sentence terminator followed by
+ * whitespace splits — abbreviations ("e.g. the size") split too, and a
+ * sentence starting lowercase ("iOS users…") still gets its own segment.
+ * Decimal points never split (no whitespace follows them). Non-guarantee
+ * that remains: a mapped row's STATEMENT covering less than its segment's
+ * text is a semantic judgment no mechanical check can close — that is what
+ * checklist review and the cross-family plan review (WP-111) exist for.
+ * Headings, list items, table rows, and fenced code blocks are their own
+ * segments (a fence is never sentence-split).
  */
 export function segmentPrd(text: string): PrdSegment[] {
   const lines = text.split(/\r\n|\r|\n/);
@@ -101,7 +108,13 @@ export function segmentPrd(text: string): PrdSegment[] {
     .map((s, i) => ({ segmentId: `S${i + 1}`, text: s }));
 }
 
-/** Split after [.!?] (+ optional closing quotes/brackets) before a capital/digit/quote. */
+/**
+ * Split after every [.!?] (+ optional closing quotes/brackets) that is
+ * followed by whitespace and any further text. No next-character class:
+ * requiring an uppercase/digit start let "… encrypted. iOS users …" hide a
+ * second requirement in the first one's segment (r1 finding 6) — the
+ * over-split direction is the safe one.
+ */
 function splitSentences(block: string): string[] {
   const out: string[] = [];
   let start = 0;
@@ -113,11 +126,9 @@ function splitSentences(block: string): string[] {
     let k = j;
     while (k < block.length && (block[k] === " " || block[k] === "\t")) k += 1;
     if (k === j || k >= block.length) continue; // no whitespace boundary → not a split point
-    if (/[A-Z0-9"'([]/.test(block[k] as string)) {
-      out.push(block.slice(start, j));
-      start = k;
-      i = k - 1;
-    }
+    out.push(block.slice(start, j));
+    start = k;
+    i = k - 1;
   }
   out.push(block.slice(start));
   return out;
@@ -159,38 +170,42 @@ export function dependencyGraphProblems(issues: readonly PlannedIssueDraft[]): s
  * are ignored here rather than guessed at.
  */
 export function findDependencyCycle(issues: readonly PlannedIssueDraft[]): string[] | null {
+  const ids = new Set(issues.map((i) => i.planIssueId));
   const edges = new Map<string, string[]>();
   for (const issue of [...issues].sort((a, b) => (a.planIssueId < b.planIssueId ? -1 : 1))) {
-    edges.set(
-      issue.planIssueId,
-      [...issue.dependsOn].filter((dep) => issues.some((i) => i.planIssueId === dep)).sort(),
-    );
+    edges.set(issue.planIssueId, [...issue.dependsOn].filter((dep) => ids.has(dep)).sort());
   }
+  // ITERATIVE DFS with an explicit frame stack: plans are unbounded on the
+  // feature template, and a recursive walk overflows the call stack on a
+  // few thousand issues — turning the named-cycle refusal into a crash
+  // (r1 finding 9).
   const state = new Map<string, "visiting" | "done">();
-  const stack: string[] = [];
-
-  const visit = (id: string): string[] | null => {
-    state.set(id, "visiting");
-    stack.push(id);
-    for (const dep of edges.get(id) ?? []) {
+  const path: string[] = [];
+  for (const root of edges.keys()) {
+    if (state.has(root)) continue;
+    const frames: Array<{ id: string; next: number }> = [{ id: root, next: 0 }];
+    state.set(root, "visiting");
+    path.push(root);
+    while (frames.length > 0) {
+      const frame = frames[frames.length - 1] as { id: string; next: number };
+      const neighbors = edges.get(frame.id) ?? [];
+      if (frame.next >= neighbors.length) {
+        frames.pop();
+        path.pop();
+        state.set(frame.id, "done");
+        continue;
+      }
+      const dep = neighbors[frame.next] as string;
+      frame.next += 1;
       const seen = state.get(dep);
       if (seen === "done") continue;
       if (seen === "visiting") {
-        const from = stack.indexOf(dep);
-        return [...stack.slice(from), dep];
+        const from = path.indexOf(dep);
+        return [...path.slice(from), dep];
       }
-      const cycle = visit(dep);
-      if (cycle !== null) return cycle;
-    }
-    stack.pop();
-    state.set(id, "done");
-    return null;
-  };
-
-  for (const id of edges.keys()) {
-    if (!state.has(id)) {
-      const cycle = visit(id);
-      if (cycle !== null) return cycle;
+      state.set(dep, "visiting");
+      path.push(dep);
+      frames.push({ id: dep, next: 0 });
     }
   }
   return null;
@@ -431,6 +446,13 @@ export interface PlantedAmbiguity {
   /** The exact segment text the ambiguity lives in (located by exact match). */
   readonly segmentText: string;
   readonly summary: string;
+  /**
+   * The answer key's anchor terms: a clarification counts as surfacing THIS
+   * ambiguity only if it mentions at least one (case-insensitive), so an
+   * unrelated question that merely touches the same segment cannot game
+   * coverage (r1 finding 2). Lowercase in the manifest.
+   */
+  readonly answerKeyTerms: readonly string[];
 }
 
 export interface AmbiguityCoverage {
@@ -453,11 +475,17 @@ export interface AmbiguityCoverage {
  * The fixture-set mechanism behind CAM-PLAN-01's accept criterion, and its
  * BOUNDARY, stated plainly: planted ambiguities are known only in
  * fixtures, so this check CALIBRATES planners against PRDs with known
- * answer keys — a plan that silently guesses fails here. At runtime on
- * real PRDs no answer key exists; there the enforcement is the approval
- * gate above, which forces an active acknowledgment for every ambiguity
- * the planner DID surface. The two are complementary: this check measures
- * surfacing, the gate enforces acknowledgment.
+ * answer keys — a plan that silently guesses fails here. A clarification
+ * covers a planted ambiguity only if it BOTH references the ambiguity's
+ * segment AND mentions one of the answer key's anchor terms in its
+ * question, rationale, or recorded assumption — an unrelated question on
+ * the same sentence does not count (r1 finding 2). Anchor matching is a
+ * deterministic keyword heuristic, not semantics; the manifest author
+ * chooses terms that any genuine surfacing of the ambiguity must name.
+ * At runtime on real PRDs no answer key exists; there the enforcement is
+ * the approval gate above, which forces an active acknowledgment for
+ * every ambiguity the planner DID surface. The two are complementary:
+ * this check measures surfacing, the gate enforces acknowledgment.
  */
 export function plantedAmbiguityCoverage(
   planted: readonly PlantedAmbiguity[],
@@ -472,14 +500,25 @@ export function plantedAmbiguityCoverage(
   const uncovered: Array<{ plantedId: string; segmentId: string }> = [];
   const unlocatable: string[] = [];
   for (const ambiguity of planted) {
+    if (ambiguity.answerKeyTerms.length === 0) {
+      // An empty answer key would make coverage vacuously gameable —
+      // manifest drift, reported loudly rather than skipped.
+      unlocatable.push(ambiguity.id);
+      continue;
+    }
     const matches = segments.filter((s) => s.text === ambiguity.segmentText);
     if (matches.length !== 1) {
       unlocatable.push(ambiguity.id);
       continue;
     }
     const segmentId = (matches[0] as PrdSegment).segmentId;
+    const terms = ambiguity.answerKeyTerms.map((t) => t.toLowerCase());
     const touching = clarifications
-      .filter((c) => c.relatedSegmentIds.includes(segmentId))
+      .filter((c) => {
+        if (!c.relatedSegmentIds.includes(segmentId)) return false;
+        const text = `${c.question} ${c.whyItMatters} ${c.assumptionIfUnanswered}`.toLowerCase();
+        return terms.some((term) => text.includes(term));
+      })
       .map((c) => c.clarificationId);
     if (touching.length > 0) {
       covered.push({ plantedId: ambiguity.id, segmentId, clarificationIds: touching });

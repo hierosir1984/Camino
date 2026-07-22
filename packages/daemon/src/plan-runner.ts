@@ -110,43 +110,72 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
   let lineNumber = 0;
   const streamPath = join(workdir, PLAN_STREAM_FILENAME);
 
-  const drain = (): void => {
-    let size: number;
+  let shrunk = false;
+
+  const ingestLine = (line: string): void => {
+    lineNumber += 1;
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return;
+    let parsed: unknown;
     try {
-      size = statSync(streamPath).size;
+      parsed = JSON.parse(trimmed);
+    } catch {
+      refused.push({ line: lineNumber, problem: "not valid JSON" });
+      return;
+    }
+    try {
+      service.ingest(sessionId, parsed);
+      ingested += 1;
+    } catch (error) {
+      if (error instanceof PlanningError) {
+        refused.push({ line: lineNumber, problem: error.message });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  /**
+   * Drain the unseen suffix. Mid-run only COMPLETE (newline-terminated)
+   * lines are consumed; on the FINAL drain — after the worker exited, so
+   * the file can no longer grow — an unterminated last line is a finished
+   * record and is ingested too (r1 finding 10: an EOF record without a
+   * trailing newline must not be silently dropped). A file that SHRINKS
+   * below the consumed offset is a protocol violation (the worker rewrote
+   * history): refused by name once, then ignored — never silently re-read.
+   */
+  const drain = (final: boolean): void => {
+    if (shrunk) return;
+    try {
+      statSync(streamPath);
     } catch {
       return; // not created yet
     }
-    if (size <= offset) return;
-    // Read the whole file once per poll and slice the unseen suffix; the
-    // worker only ever appends (enforced by re-reading from a fixed offset —
-    // a shrinking file would surface as JSON refusals, never silent loss).
+    // Offsets are string (code-unit) indices throughout — the byte size from
+    // stat is only an existence probe, never compared against them.
     const text = readFileSync(streamPath, "utf8");
+    if (text.length < offset) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          `stream file shrank from consumed offset ${offset} to ${text.length} — ` +
+          "the worker rewrote history; further records refused",
+      });
+      return;
+    }
     const unseen = text.slice(offset);
     const lastNewline = unseen.lastIndexOf("\n");
-    if (lastNewline === -1) return; // no complete line yet
-    const complete = unseen.slice(0, lastNewline);
-    offset += lastNewline + 1;
-    for (const line of complete.split("\n")) {
-      lineNumber += 1;
-      const trimmed = line.trim();
-      if (trimmed.length === 0) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        refused.push({ line: lineNumber, problem: "not valid JSON" });
-        continue;
-      }
-      try {
-        service.ingest(sessionId, parsed);
-        ingested += 1;
-      } catch (error) {
-        if (error instanceof PlanningError) {
-          refused.push({ line: lineNumber, problem: error.message });
-          continue;
-        }
-        throw error;
+    const complete = lastNewline === -1 ? "" : unseen.slice(0, lastNewline);
+    if (lastNewline !== -1) {
+      offset += lastNewline + 1;
+      for (const line of complete.split("\n")) ingestLine(line);
+    }
+    if (final) {
+      const tail = text.slice(offset);
+      if (tail.trim().length > 0) {
+        offset = text.length;
+        ingestLine(tail);
       }
     }
   };
@@ -184,11 +213,11 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
       },
     );
     while (!settled) {
-      drain();
+      drain(false);
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
     const record = await settle;
-    drain(); // final drain after exit — the tail written between polls
+    drain(true); // final drain after exit — including an unterminated last record
     return {
       outcome: record.outcome,
       ingested,

@@ -194,3 +194,32 @@ describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {
     expect(Object.isFrozen(CONTRACT_REFERENCE_OBLIGATIONS)).toBe(true);
   });
 });
+
+describe("total validation over sparse arrays (r1 finding 7)", () => {
+  it("names a sparse acceptanceCriteria hole instead of throwing", () => {
+    const holed = contract();
+    const criteria: unknown[] = ["A criterion."];
+    criteria[2] = "Another.";
+    const candidate = { ...holed, acceptanceCriteria: criteria };
+    const problems = contractProblems(candidate);
+    expect(Array.isArray(problems)).toBe(true);
+    expect(problems.some((p) => p.includes("sparse-array hole"))).toBe(true);
+  });
+
+  it("names holes in requirementIds and interfaces too", () => {
+    const ids: unknown[] = [];
+    ids[1] = "CAM-APP-01";
+    expect(
+      contractProblems({ ...contract(), requirementIds: ids }).some((p) =>
+        p.includes("sparse-array hole"),
+      ),
+    ).toBe(true);
+    const ifaces: unknown[] = [];
+    ifaces[1] = { name: "x", kind: "api", description: "y" };
+    expect(
+      contractProblems({ ...contract(), interfaces: ifaces }).some((p) =>
+        p.includes("sparse-array hole"),
+      ),
+    ).toBe(true);
+  });
+});

@@ -8,28 +8,32 @@
       "segmentText": "Members get a digest of workspace activity.",
       "summary": "The delivery channel is never stated (email, in-app, chat).",
       "exampleQuestion": "Which channel delivers the digest?",
-      "exampleAssumption": "Email to the member's account address."
+      "exampleAssumption": "Email to the member's account address.",
+      "answerKeyTerms": ["channel", "email"]
     },
     {
       "id": "A2",
       "segmentText": "The digest arrives daily.",
       "summary": "Daily at what time, and in whose timezone?",
       "exampleQuestion": "What send time and timezone does daily mean?",
-      "exampleAssumption": "08:00 in each member's profile timezone."
+      "exampleAssumption": "08:00 in each member's profile timezone.",
+      "answerKeyTerms": ["timezone", "send time"]
     },
     {
       "id": "A3",
       "segmentText": "Members can opt out.",
       "summary": "Opt-out scope is unstated: per workspace or account-wide.",
       "exampleQuestion": "Does opting out apply per workspace or to the whole account?",
-      "exampleAssumption": "Per workspace."
+      "exampleAssumption": "Per workspace.",
+      "answerKeyTerms": ["opt out", "opting out", "opt-out"]
     },
     {
       "id": "A4",
       "segmentText": "Old digests are cleaned up eventually.",
       "summary": "\"Eventually\" names no retention period.",
       "exampleQuestion": "How long are past digests retained?",
-      "exampleAssumption": "90 days."
+      "exampleAssumption": "90 days.",
+      "answerKeyTerms": ["retain", "retention", "90 days"]
     }
   ],
   "requirementSegments": [
