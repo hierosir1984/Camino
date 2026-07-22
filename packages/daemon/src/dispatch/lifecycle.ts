@@ -83,13 +83,15 @@ export interface DispatchOptions {
   /** Hard cap so a real dispatch can never run away. Classified `killed`, never `cancelled`. */
   timeoutMs?: number;
   /**
-   * Per-attempt budget (CAM-EXEC-03, WP-107): wall-clock ALWAYS enforced;
-   * tokens enforced where the vendor stream reports usage
-   * (StreamEvent.tokensTotal). A breach runs kill-confirm and classifies
-   * `killed-budget` — distinct from `cancelled` (user decision) and `killed`
-   * (harness runaway cap) so the state machine's kill-and-escalate row
-   * (A.2#10/A.3#5) fires on exactly the budget case, never an auto-retry.
-   * Classification stays HERE, centralized, per the WP-105 principle.
+   * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock budget is REQUIRED and
+   * enforced under a healthy event loop (see the boundary in budget.ts: under a
+   * gross daemon stall — which a worker cannot induce — timing is best-effort and
+   * the container/WP-114 supervisor is the out-of-process bound); tokens enforced
+   * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach runs
+   * kill-confirm and classifies `killed-budget` — distinct from `cancelled` (user
+   * decision) and `killed` (harness runaway cap) so the state machine's
+   * kill-and-escalate row (A.2#10/A.3#5) fires on exactly the budget case, never
+   * an auto-retry. Classification stays HERE, centralized, per the WP-105 principle.
    *
    * By design (round-2 finding 5): a CANCEL already terminates the worker
    * within the bounded kill-confirm window, so a wall-clock deadline that
@@ -128,14 +130,22 @@ function groupAlive(pgid: number): boolean {
 const EVENT_HEAD_CAP = 200;
 const EVENT_TAIL_CAP = 200;
 
-// Per-line byte/char ceiling BEFORE the parser sees a line (round-4 finding
-// 1): a worker emitting one enormous line with no newline would otherwise
-// grow the daemon's line buffer to that line's full size. A line past this cap
-// is truncated (prefix kept + a mark) and the remainder discarded to the next
-// newline. Generous vs. any legitimate JSON event line (parsers truncate to
-// ~400 chars); small vs. a memory-exhaustion attempt.
-const MAX_LINE_CHARS = 1_000_000;
+// Per-line char ceiling BEFORE the parser sees a line (round-4 finding 1): a
+// worker emitting one enormous line (no newline) would otherwise grow the
+// daemon's line buffer to that line's full size. A line past this cap is
+// truncated (prefix kept + a mark) and the remainder discarded to the next
+// newline. Kept SMALL (round-12 finding 1): an adapter's parseLine JSON.parses
+// this line and can String()-EXPAND a value, so a large line is not just memory
+// but per-line CPU that could STALL the loop past the budget's on-time window —
+// a WORKER-induced stall, which the budget's boundary must not permit. 64 KiB is
+// ~160× a legitimate JSON event line (parsers truncate to ~400 chars) yet keeps
+// per-line parse work to a few ms, well under STALL_GRACE_MS.
+const MAX_LINE_CHARS = 64 * 1024;
 const LINE_TRUNCATED_MARK = "…[camino:line-truncated]";
+
+// Cap on the parsed TEXT retained per event (round-12 finding 1): bounds daemon
+// RSS across retained events regardless of whether the adapter truncated.
+const MAX_EVENT_TEXT_CHARS = 8 * 1024;
 
 // A budget timer that fires more than this far past its deadline was delayed by a
 // daemon event-loop STALL. Within it (normal timer jitter), the breach fires
@@ -602,7 +612,12 @@ export async function dispatch(
       let text = "";
       try {
         const t = ev.text;
-        if (typeof t === "string") text = t;
+        // CAP the retained text per event (round-12 finding 1): an adapter that
+        // does not truncate (e.g. String()-expands a large JSON value) must not
+        // let a worker grow daemon RSS through retained events. Bounded here
+        // regardless of the adapter; assembleFinalText/parsers use ≤400 anyway.
+        if (typeof t === "string")
+          text = t.length > MAX_EVENT_TEXT_CHARS ? t.slice(0, MAX_EVENT_TEXT_CHARS) : t;
       } catch {
         text = "";
       }

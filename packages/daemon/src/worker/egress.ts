@@ -167,12 +167,16 @@ export interface WorkerContainerRun {
   name?: string;
 }
 
-// An image reference: [HOST[:PORT]/]NAME[:TAG][@sha256:DIGEST]. It MUST start with
-// an alphanumeric (round-11 finding 1): `docker run` parses options until the
-// first non-option arg (the image), so an OPTION-SHAPED image like `--entrypoint`
-// is consumed as another flag and a later token becomes the image — the pinned
-// `--entrypoint` is skipped and the workload runs as root with no bootstrap.
-// docker run has no `--` terminator before the image, so the shape must be fenced.
+// An OPTION-SMUGGLING FENCE for the image argument, NOT a complete Docker image-
+// reference validator (round-11 finding 1, scoped round-12 finding 8). The
+// SECURITY property: `docker run` parses options until the first non-option arg
+// (the image), and has no `--` terminator before it, so an OPTION-SHAPED image
+// like `--entrypoint` is consumed as a flag and a later token becomes the image —
+// skipping the pinned `--entrypoint` (root, no bootstrap). Requiring a leading
+// alphanumeric + image-ref charset closes that. It intentionally rejects some
+// otherwise-valid but exotic references (e.g. an IPv6-literal registry
+// `[2001:db8::1]:5000/img`); Camino composes the image and does not use those, so
+// the trade-off favours the tighter fence.
 const IMAGE_REF_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:@/-]*$/;
 
 function assertSafeImage(image: string): void {

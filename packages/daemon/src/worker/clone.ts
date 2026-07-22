@@ -97,30 +97,58 @@ function git(cwd: string | null, args: string[]): string {
  * git (subsection case preserved). (round-2 finding 4)
  */
 function effectiveGitConfig(dir: string): { key: string; value: string }[] {
+  // `--includes` is REQUIRED: git defaults include-expansion OFF for inspection,
+  // yet FOLLOWS includes during normal operations (fetch/push). Without it, an
+  // attacker's included extraheader would be used by git but invisible here
+  // (round-2 finding 4).
+  //
+  // Read the REPO-SCOPED config in BOTH scopes git obeys: `--local` (.git/config)
+  // AND `--worktree` (.git/config.worktree). A scope-less read would ALSO pull in
+  // the host's system/global config (which GIT_CONFIG_SYSTEM/GLOBAL=/dev/null does
+  // not fully neutralize on every platform, e.g. a macOS credential.helper), so we
+  // enumerate exactly the two repo scopes. `--local` alone MISSED worktree scope,
+  // which git uses for hooks/creds/exec when extensions.worktreeConfig is set — an
+  // attestation bypass (round-12 finding 7). Worktree scope is appended AFTER local
+  // so its last-wins precedence is preserved.
   let raw: string;
   try {
-    // `--includes` is REQUIRED: for an explicit scope (--local) git defaults
-    // include-expansion OFF for inspection, yet FOLLOWS includes during normal
-    // operations (fetch/push). Without it, an attacker's included extraheader
-    // would be used by git but invisible here (round-2 finding 4).
-    raw = gitRaw(dir, ["config", "--local", "--includes", "--list", "-z"]);
-  } catch (err) {
     // FAIL CLOSED (round-3 finding 5): a config that cannot be enumerated —
     // ENOBUFS on an oversized (hostile) config, a git error — must NOT be read
-    // as "no credential channels". A clone whose config is unreadable is
-    // refused. (A benign local config is bytes, not megabytes.)
+    // as "no credential channels".
+    raw = gitRaw(dir, ["config", "--local", "--includes", "--list", "-z"]);
+  } catch (err) {
     throw new WorkerCloneError(
-      `workspace clone config could not be enumerated for attestation — refused (fail-closed): ${(err as Error).message.slice(0, 200)}`,
+      `workspace clone config could not be enumerated for attestation — refused (fail-closed): ${describeCloneError(err)}`,
     );
   }
+  let worktreeRaw = "";
+  try {
+    worktreeRaw = gitRaw(dir, ["config", "--worktree", "--includes", "--list", "-z"]);
+  } catch {
+    // `--worktree` errors when extensions.worktreeConfig is not enabled — then
+    // there IS no worktree-scoped config, so an empty result is correct. (Any
+    // other git error here would also mean no readable worktree config.)
+    worktreeRaw = "";
+  }
   const out: { key: string; value: string }[] = [];
-  for (const chunk of raw.split("\0")) {
-    if (chunk.length === 0) continue;
-    const nl = chunk.indexOf("\n");
-    if (nl === -1) out.push({ key: chunk, value: "" });
-    else out.push({ key: chunk.slice(0, nl), value: chunk.slice(nl + 1) });
+  for (const raw2 of [raw, worktreeRaw]) {
+    for (const chunk of raw2.split("\0")) {
+      if (chunk.length === 0) continue;
+      const nl = chunk.indexOf("\n");
+      if (nl === -1) out.push({ key: chunk, value: "" });
+      else out.push({ key: chunk.slice(0, nl), value: chunk.slice(nl + 1) });
+    }
   }
   return out;
+}
+
+/** Stringify ANY thrown value safely for clone-attestation error messages. */
+function describeCloneError(err: unknown, max = 200): string {
+  try {
+    return String(err instanceof Error ? err.message : err).slice(0, max);
+  } catch {
+    return "unstringifiable error";
+  }
 }
 
 /** Does a git URL / path carry userinfo (a `user[:secret]@` segment)? */

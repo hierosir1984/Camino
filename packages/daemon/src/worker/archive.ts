@@ -264,11 +264,13 @@ export interface ArchivalRecord {
  * completing within one millisecond would otherwise stamp equal ISO strings.
  * The ORDER is real (each stamp is taken after its step completes); this
  * helper only guarantees the millisecond evidence never collapses two
- * genuinely ordered steps into an equal pair.
+ * genuinely ordered steps into an equal pair. Takes the ONE clock value
+ * validated at entry (round-12 finding 3) — it never re-reads the clock, so a
+ * clock that drifts to the max Date between sub-steps cannot make a stamp AFTER
+ * the destroy throw a raw RangeError.
  */
-function nextStamp(now: () => Date, prev: string | null): string {
-  const t = now().getTime();
-  const floor = prev === null ? t : Math.max(t, Date.parse(prev) + 1);
+function nextStamp(baseMs: number, prev: string | null): string {
+  const floor = prev === null ? baseMs : Math.max(baseMs, Date.parse(prev) + 1);
   return new Date(floor).toISOString();
 }
 
@@ -577,6 +579,16 @@ function realDirPath(p: string): string {
 /**
  * The single archival step (A.4#5). See the module header for the order and
  * failure semantics. Returns only after the workspace is destroyed.
+ *
+ * CALLER PRECONDITION — WORKSPACE QUIESCENCE (round-12 finding 2): the caller MUST
+ * have STOPPED the worker (its container/process group gone — the CAM-EXEC-06
+ * teardown) BEFORE calling this. The workspace is mounted rw to the worker, so a
+ * still-running worker could write to it AFTER the tar snapshot, and that content
+ * would be archived neither here (the tar already ran) nor recoverable (the
+ * workspace is then destroyed). This step archives a SNAPSHOT; it does not, and
+ * cannot, freeze a live writer. The scheduler (WP-114) wires stop→archive under
+ * the WP-104 single-writer lock; until then no production caller archives a live
+ * worker.
  */
 export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<ArchivalRecord> {
   const now = opts.now ?? (() => new Date());
@@ -775,20 +787,27 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       // Beyond the pathname, the workspace at that path must still be the EXACT
       // SAME INODE the attempt archived (round-11 finding 3): a directory
       // rm+recreated at the same path is a different (dev,ino) and must NOT be
-      // destroyed. Enforced when the sidecar recorded the identity. Checked LAST,
+      // destroyed. The inode identity is REQUIRED for a resume-destroy (round-12
+      // finding 4): a sidecar WITHOUT it (a legacy/pre-round-11 sidecar) cannot
+      // prove the directory is unchanged, so it is INDETERMINATE → refuse and
+      // reconcile rather than destroy on the pathname alone. Checked LAST,
       // immediately before the destroy.
-      if (prior.workspaceDev !== undefined && prior.workspaceIno !== undefined) {
-        assertWorkspaceUnchanged(
-          workspaceReal,
-          { dev: prior.workspaceDev, ino: prior.workspaceIno },
-          opts.attemptId,
+      if (prior.workspaceDev === undefined || prior.workspaceIno === undefined) {
+        throw new ArchivalError(
+          "archive-write",
+          `resume for attempt ${opts.attemptId}: the sidecar has no recorded workspace inode identity — cannot prove the directory is unchanged; refusing to destroy (janitor/escalation reconciles, fail-closed)`,
         );
       }
+      assertWorkspaceUnchanged(
+        workspaceReal,
+        { dev: prior.workspaceDev, ino: prior.workspaceIno },
+        opts.attemptId,
+      );
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
       const archiveWrittenAt = prior.archiveWrittenAt;
-      const ledgerRowAt = nextStamp(now, archiveWrittenAt);
+      const ledgerRowAt = nextStamp(nowMs, archiveWrittenAt);
       destroyWorkspaceOrThrow(prior.workspacePath);
-      const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
+      const workspaceDestroyedAt = nextStamp(nowMs, ledgerRowAt);
       return buildArchivalRecord({
         archivePath: finalPath,
         sha256: prior.sha256,
@@ -834,7 +853,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
   syncFileAndParentDir(finalPath); // flush the archive to stable storage (round-9 finding 9)
-  const archiveWrittenAt = nextStamp(now, null);
+  const archiveWrittenAt = nextStamp(nowMs, null);
 
   // Step 2 — ledger row referencing the archive, BEFORE the sidecar (A.4#5
   // order: archive → ledger → destroy). A throw here leaves the archive with
@@ -858,7 +877,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `ledger row failed after the archive was written: ${describeError(err, 300)} — archive (no sidecar) and workspace retained; retry recovers`,
     );
   }
-  const ledgerRowAt = nextStamp(now, archiveWrittenAt);
+  const ledgerRowAt = nextStamp(nowMs, archiveWrittenAt);
 
   // Sidecar written AFTER the ledger row. On failure DON'T roll back the
   // archive — the ledger row already references it durably; removing it would
@@ -904,7 +923,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // If this fails, a re-invocation RESUMES the destroy (valid sidecar +
   // workspace present — round-6 finding 1).
   destroyWorkspaceOrThrow(workspaceReal);
-  const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
+  const workspaceDestroyedAt = nextStamp(nowMs, ledgerRowAt);
 
   return buildArchivalRecord({
     archivePath: finalPath,
@@ -995,11 +1014,27 @@ export interface PruneOptions {
  * unreadable cannot be dated and is NEVER deleted (fail-closed), only
  * reported.
  */
+/** Retention override → at least the registry floor; non-finite/negative → the floor. */
+function clampRetentionFloor(override: number | undefined, floor: number): number {
+  if (override === undefined || !Number.isFinite(override) || override < 0) return floor;
+  return Math.max(override, floor);
+}
+
 export function pruneArchives(opts: PruneOptions): PruneReport {
   const now = opts.now ?? (() => new Date());
-  const retainDays = opts.retainDays ?? REGISTRY_ITEM_11_QUOTAS.archive.retainDays;
-  const retainLast =
-    opts.retainLastAttemptsPerIssue ?? REGISTRY_ITEM_11_QUOTAS.archive.retainLastAttemptsPerIssue;
+  // Registry item 11 is a retention FLOOR (round-12 finding 5): an override may
+  // only make retention MORE generous, never delete below the registry minimum.
+  // A non-finite/negative override falls back to the registry (never weaker), and
+  // `max` keeps a larger override. So `retainDays:0`/`retainLast:0` cannot delete
+  // a within-registry archive.
+  const retainDays = clampRetentionFloor(
+    opts.retainDays,
+    REGISTRY_ITEM_11_QUOTAS.archive.retainDays,
+  );
+  const retainLast = clampRetentionFloor(
+    opts.retainLastAttemptsPerIssue,
+    REGISTRY_ITEM_11_QUOTAS.archive.retainLastAttemptsPerIssue,
+  );
   const cutoffMs = now().getTime() - retainDays * 24 * 60 * 60 * 1000;
   const report: PruneReport = { kept: [], deleted: [], undatable: [] };
 

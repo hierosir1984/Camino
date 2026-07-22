@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -599,6 +600,68 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(report.deleted).not.toContain(fresh);
     expect(report.kept).toContain(fresh);
     expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("a resume REFUSES a legacy sidecar with no recorded inode identity — reconcile, not destroy (round-12 finding 4)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    const issueDir = join(root, "i");
+    mkdirSync(issueDir, { recursive: true });
+    // Build a valid archive + a LEGACY sidecar (pre-round-11: no workspaceDev/Ino),
+    // with the workspace still present.
+    execFileSync("tar", ["-czf", join(issueDir, "a.tar.gz"), "-C", ws, "."]);
+    const buf = readFileSync(join(issueDir, "a.tar.gz"));
+    const legacy = {
+      issueId: "i",
+      attemptId: "a",
+      workspacePath: realpathSync(ws), // real path so the pathname check passes and reaches the inode check
+      archiveWrittenAt: new Date().toISOString(),
+      seq: 0,
+      sha256: createHash("sha256").update(buf).digest("hex"),
+      compressedBytes: buf.length,
+      workspaceBytes: 10,
+    };
+    writeFileSync(join(issueDir, "a.json"), JSON.stringify(legacy));
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as Error).message).toMatch(/inode identity/i);
+    expect(existsSync(ws)).toBe(true); // not destroyed on the pathname alone
+  });
+
+  it("retention overrides cannot delete below the registry floor (round-12 finding 5)", () => {
+    const root = tempDir();
+    const issueDir = join(root, "issueZ");
+    mkdirSync(issueDir, { recursive: true });
+    writeFileSync(join(issueDir, "only.tar.gz"), "recent-archive"); // mtime = now
+    writeFileSync(
+      join(issueDir, "only.json"),
+      JSON.stringify({
+        issueId: "issueZ",
+        attemptId: "only",
+        workspacePath: "/gone",
+        archiveWrittenAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+        seq: 0,
+        sha256: "x",
+        compressedBytes: 1,
+        workspaceBytes: 1,
+      }),
+    );
+    // A caller passing retainDays:0 + retainLast:0 must NOT delete a 1-day-old,
+    // within-registry archive — the registry values are a floor.
+    const report = pruneArchives({
+      archiveRoot: root,
+      retainDays: 0,
+      retainLastAttemptsPerIssue: 0,
+    });
+    const only = join(issueDir, "only.tar.gz");
+    expect(report.deleted).not.toContain(only);
+    expect(existsSync(only)).toBe(true);
   });
 
   it("an INDETERMINATE prior archive (no valid sidecar) is NEVER deleted — routes to reconciliation (round-6 finding 1)", async () => {

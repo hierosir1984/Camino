@@ -194,6 +194,19 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hooks/i);
   });
 
+  it("catches a WORKTREE-scoped core.hooksPath that a --local read would miss (round-12 finding 7)", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Enable worktree config and set core.hooksPath in the WORKTREE scope
+    // (.git/config.worktree) — git obeys it, but `git config --local` does not
+    // read it. The attestation must enumerate worktree scope too.
+    git(dest, "config", "--local", "extensions.worktreeConfig", "true");
+    git(dest, "config", "--worktree", "core.hooksPath", ".attacker-hooks");
+    expect(git(dest, "config", "--get", "core.hooksPath")).toBe(".attacker-hooks"); // effective value
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hooks/i);
+  });
+
   it("rejects a clone whose objects dir is a SYMLINK to an external store — not self-contained (round-10 finding 6)", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();

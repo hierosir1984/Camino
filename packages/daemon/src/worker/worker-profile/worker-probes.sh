@@ -65,9 +65,12 @@ if [ -n "${CAMINO_PROBE_ALLOWED_V6:-}" ]; then
 fi
 
 # --- zero GitHub credentials, asserted in-container (CAM-EXEC-02) ------------
-# No credential-shaped env key survives into the workload environment.
+# No credential-shaped env KEY, and no GitHub-token-shaped VALUE under ANY key
+# (round-12 finding 6), survives into the workload environment.
 run_probe github-cred-env sh -c '
-  env | grep -Eiq "GITHUB_TOKEN|GH_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_PAT|GIT_ASKPASS|GIT_TOKEN" && echo LEAK || echo clean
+  env | grep -Eiq "GITHUB_TOKEN|GH_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_PAT|GIT_ASKPASS|GIT_TOKEN" && { echo LEAK; exit 0; }
+  env | grep -Eq "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}" && { echo LEAK; exit 0; }
+  echo clean
 '
 # No stored-credential material on disk ANYWHERE the workload can see —
 # including EVERY bind mount, whatever their number or paths (round-4 finding
@@ -97,17 +100,25 @@ run_probe github-cred-content sh -c '
   done
   [ -z "$roots" ] && { echo clean; exit 0; }
   self="${CAMINO_PROBE_SELF:-/nonexistent}"
-  # Modern gh token prefixes anywhere; OR a github.com URL carrying userinfo
-  # (user:secret@github.com — catches a legacy 40-hex token as the password).
-  found=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|://[^/@[:space:]]+:[^/@[:space:]]+@github\.com" $roots 2>/dev/null | grep -vxF "$self" | head -1)
+  # Pass 1: a modern gh token prefix anywhere; OR a userinfo URL to the github.com
+  # HOST — case-INSENSITIVE host (GitHub.com), and BOUNDED so github.com.evil.tld
+  # does NOT match; catches a legacy 40-hex token as the URL password (round-12
+  # finding 6). `-l` lists matching files one per line; `while IFS= read -r`
+  # reads each WHOLE line, so a path with spaces is preserved (no `-Z`, which the
+  # profile grep does not support). A filename containing a newline is not covered.
+  found=$(grep -rIliE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|://[^/@[:space:]]+:[^/@[:space:]]+@github\.com([:/]|$)" $roots 2>/dev/null \
+    | while IFS= read -r f; do
+        [ -n "$f" ] && [ "$f" != "$self" ] && { printf "%s" "$f"; break; }
+      done)
   if [ -z "$found" ]; then
-    # A github.com host stanza (gh hosts.yml) that also carries a token line.
-    for f in $(grep -rIlF "github.com" $roots 2>/dev/null | grep -vxF "$self"); do
-      if grep -qiE "oauth_token|(^|[^a-z])token[[:space:]]*[:=]" "$f" 2>/dev/null; then
-        found=$f
-        break
-      fi
-    done
+    # Pass 2: a github.com HOST stanza (bounded, case-insensitive) that also
+    # carries a token line — the gh hosts.yml shape.
+    found=$(grep -rIliE "(^|[^a-z0-9.])github\.com($|[:/])" $roots 2>/dev/null \
+      | while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ "$f" = "$self" ] && continue
+          grep -Iiq -E "oauth_token|(^|[^a-z])token[[:space:]]*[:=]" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
+        done)
   fi
   [ -z "$found" ] && echo clean || echo "$found"
 '

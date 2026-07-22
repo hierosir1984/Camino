@@ -58,13 +58,17 @@ established-egress bypass).
   guarantees the _order_ and the _retention_, and fails closed (workspace
   retained) if the row is not recorded.
 - **Container parameters are Camino-composed, not worker-supplied.** The
-  composer refuses the reachable bootstrap-subversion shapes: a shared network;
-  a mount that covers **or shadows an ancestor of** a bootstrap path
-  (canonicalized, so `/tmp/../usr/local/bin` and mounting `/usr` are both
-  rejected); a reserved or credential-shaped env key; a mount source that
-  **resolves** (realpath, following symlinks) into the rw workspace and would
-  alias a `:ro` mount; and an image whose ENTRYPOINT could skip the profile
-  (the entrypoint is **pinned**). Image PROVENANCE — that the run uses a
+  composer refuses the reachable bootstrap-subversion shapes: a reserved network
+  **name** (`host`/`none`/`bridge`/…) and a malformed one; a mount **outside**
+  Camino's own roots (an allowlist — the workspace and the `/auth` subtree — so
+  no system/library/PATH path can be shadowed, canonically); a reserved or
+  credential-shaped env key; a mount source that **resolves** (realpath,
+  following symlinks) into the rw workspace and would alias a `:ro` mount; and an
+  option-shaped image that could skip the pinned `--entrypoint`. **What the
+  composer does NOT do** (a stated boundary): it cannot tell an owned-network
+  NAME from a built-in network's ID/prefix by shape, so a network's driver and
+  ownership (an isolated Camino-created bridge) are attested by the network's
+  **creator** (WP-005/WP-114), not here. Image PROVENANCE — that the run uses a
   Camino-built image (the profile or a `FROM camino-worker-profile` toolchain
   image) rather than an attacker-supplied one — is **WP-114's image-build
   boundary**: pinning the entrypoint path defeats an ENTRYPOINT override, not a
