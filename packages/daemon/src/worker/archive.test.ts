@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
 import { attemptMachine, transition } from "@camino/core";
@@ -155,6 +155,59 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     ).rejects.toMatchObject({ name: "ArchivalError", stage: "ledger-row" });
     expect(existsSync(ws)).toBe(true); // workspace retained
     expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true); // archive evidence retained
+  });
+
+  it("a NON-Error ledger rejection is still a staged ArchivalError, not a raw TypeError (round-8 finding 2)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    // `throw "string"` is legal JavaScript: `(err as Error).message` is
+    // undefined and `.slice()` on it threw a TypeError that ESCAPED the staged
+    // contract — losing the cleanup-stage routing and the fail-closed retention.
+    // describeError() must stringify ANY thrown value and keep the staging.
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {
+        throw "ledger unavailable";
+      },
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("ledger-row");
+    expect((err as ArchivalError).workspaceRetained).toBe(true);
+    // The non-Error value was captured into the staged message, not swallowed.
+    expect((err as Error).message).toContain("ledger unavailable");
+    expect(existsSync(ws)).toBe(true); // fail-closed: workspace retained
+    expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true); // archive retained
+  });
+
+  it("resolves a RELATIVE archiveRoot to an ABSOLUTE path so the ledger reference is cwd-independent (round-8 finding 3)", async () => {
+    const ws = makeWorkspace();
+    const runFrom = tempDir(); // an isolated 'install dir' to run the relative root from
+    const prevCwd = process.cwd();
+    let ledgerPath = "";
+    try {
+      process.chdir(runFrom);
+      const record = await archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: "vault", // RELATIVE — a bare join would record "vault/i/a.tar.gz"
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: (row) => {
+          ledgerPath = row.archivePath;
+        },
+      });
+      // Both the returned record AND the ledger row reference an ABSOLUTE path,
+      // resolved under the archive root — never the cwd-relative "vault/...".
+      expect(isAbsolute(record.archivePath)).toBe(true);
+      expect(isAbsolute(ledgerPath)).toBe(true);
+      expect(ledgerPath).toBe(record.archivePath);
+      expect(record.archivePath.endsWith(join("vault", "i", "a.tar.gz"))).toBe(true);
+      expect(existsSync(record.archivePath)).toBe(true);
+    } finally {
+      process.chdir(prevCwd); // restore before any other test runs
+    }
   });
 
   it("an INDETERMINATE prior archive (no valid sidecar) is NEVER deleted — routes to reconciliation (round-6 finding 1)", async () => {

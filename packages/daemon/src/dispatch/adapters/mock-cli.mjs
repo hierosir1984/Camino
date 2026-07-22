@@ -16,6 +16,13 @@
 //   linger-descendant   — leader exits 0 SUCCESSFULLY leaving a background
 //                         descendant running → proves the post-exit group
 //                         sweep (a finished dispatch must not leak workers).
+//   budget-descendant   — leader exits 0 SUCCESSFULLY leaving an in-group
+//                         descendant that IGNORES SIGTERM and runs far past the
+//                         wall-clock budget → the budget must still breach
+//                         (group alive at the deadline), classify killed-budget,
+//                         and SIGKILL the survivor (WP-107, CAM-EXEC-03,
+//                         round-8 finding 1: the budget covers the GROUP, not
+//                         just the leader).
 //   graceful-cancel     — on SIGTERM, stop cleanly within the grace window.
 //   quota               — emit a rate-limit event and exit nonzero.
 //   quota-raw           — rate-limit signal on a non-JSON line only.
@@ -112,6 +119,30 @@ if (mode === "hang") {
     clearInterval(gate);
     emitSync("assistant", "work done; a background descendant is still running");
     emitSync("result", "finished while leaving a lingering descendant");
+    process.exit(0);
+  }, 10);
+} else if (mode === "budget-descendant") {
+  // Round-8 finding 1: the LEADER exits 0 (emits a success result) while an
+  // in-group descendant IGNORES SIGTERM and runs far past the wall-clock
+  // budget. The budget must still breach — the tracked GROUP is alive at the
+  // deadline — and the descendant is reaped by SIGKILL. Readiness marker (as in
+  // `orphan`): the descendant writes it only AFTER its TERM-ignoring trap is
+  // active, and the leader exits only after seeing it, so the post-exit SIGTERM
+  // cannot beat the trap into place. The shell (not `exec sleep`) stays the trap
+  // holder so the ignore actually applies.
+  const marker = join(process.cwd(), ".budget-descendant-ready");
+  spawn("sh", ["-c", `trap "" TERM; : > "${marker}"; while :; do sleep 1; done`], {
+    stdio: "ignore",
+  });
+  const gateStart = Date.now();
+  const gate = setInterval(() => {
+    if (!existsSync(marker) && Date.now() - gateStart < 10_000) return;
+    clearInterval(gate);
+    emitSync(
+      "assistant",
+      "leader done; an in-group descendant ignores TERM and outlives the budget",
+    );
+    emitSync("result", "RAN_AND_EXITED_BEFORE_BUDGET");
     process.exit(0);
   }, 10);
 } else if (mode === "escaped-stdout-holder") {

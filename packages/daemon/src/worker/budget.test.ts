@@ -70,6 +70,36 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(issueStep).toEqual({ ok: true, to: "escalated", ref: "A.2#10" });
   }, 30_000);
 
+  it("wall-clock covers the GROUP: a leader that EXITS 0 while an in-group descendant outlives the budget is killed-budget, not succeeded (round-8 finding 1)", async () => {
+    // The leader emits its success result and exits 0 well before the 400ms
+    // budget; a same-group descendant ignores SIGTERM and runs past it. The old
+    // leader-gated timer returned early on the leader's exit and let the run
+    // classify `succeeded`. The group-scoped timer breaches because the tracked
+    // group is still alive at the deadline. Grace is generous so the survivor is
+    // still alive when the deadline fires (the post-exit sweep's SIGTERM is
+    // ignored); the eventual SIGKILL confirms the group gone.
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("budget-descendant"),
+      { workdir: workdir(), prompt: "leave a budget-outliving descendant" },
+      { wallClockMs: 400 },
+      { killConfirm: { graceMs: 2_000, sigkillWaitMs: 2_000 } },
+    );
+    // The leader genuinely ran to completion and exited 0 — its success result
+    // is in the transcript — yet the budget still classifies killed-budget.
+    expect(record.finalText).toContain("RAN_AND_EXITED_BEFORE_BUDGET");
+    expect(record.exitCode).toBe(0);
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 400 });
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(400);
+    // The surviving descendant required SIGKILL; the group is confirmed gone, so
+    // the clean A.3#5 / A.2#10 escalation (not the cleanup-failed path) applies.
+    expect(escalation).toBeDefined();
+    expect(escalation!.attemptEvent).toEqual({
+      type: "attempt-budget-breached",
+      killConfirmed: true,
+    });
+  }, 30_000);
+
   it("token breach mid-stream: cumulative usage reports kill the dispatch in flight", async () => {
     const { record, escalation } = await dispatchWithBudget(
       mockAdapter("tokens-stream"),

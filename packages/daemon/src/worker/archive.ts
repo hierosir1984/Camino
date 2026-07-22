@@ -77,6 +77,21 @@ function assertSafeId(kind: "issueId" | "attemptId", value: string): void {
 }
 
 /**
+ * Stringify ANY thrown value safely (round-8 finding 2): `(err as Error).message`
+ * is undefined for a non-Error rejection (`throw "string"`, `throw {}`), and
+ * `.slice()` on it threw a raw TypeError that escaped the staged ArchivalError.
+ */
+function describeError(err: unknown, max = 300): string {
+  let s: string;
+  try {
+    s = err instanceof Error ? err.message : String(err);
+  } catch {
+    s = "unstringifiable error";
+  }
+  return s.slice(0, max);
+}
+
+/**
  * Total size in bytes of a workspace tree (files + symlink entries
  * themselves; targets are NOT followed — a symlink out of the workspace must
  * not bill someone else's bytes to this quota, nor loop the walk).
@@ -269,7 +284,7 @@ function destroyWorkspaceOrThrow(workspaceDir: string): void {
   } catch (err) {
     throw new ArchivalError(
       "workspace-destroy",
-      `workspace destroy failed after archive + ledger row (workspace may be partially removed): ${(err as Error).message.slice(0, 300)}`,
+      `workspace destroy failed after archive + ledger row (workspace may be partially removed): ${describeError(err, 300)}`,
       false,
     );
   }
@@ -365,18 +380,23 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
 
+  // Resolve archiveRoot to an ABSOLUTE path (round-8 finding 3): a relative
+  // archiveRoot would make the recorded ledger `archivePath` cwd-dependent,
+  // though it is documented absolute.
+  const archiveRoot = resolve(opts.archiveRoot);
+
   // Step 1 — archive written under quota. Create the issue dir so its REAL path
   // can be resolved (round-3 finding 2): the containment check must resolve the
   // ACTUAL output directory (archiveRoot/issueId), not just the root — a
   // symlinked issue dir, or workspaceDir === archiveRoot/issueId, otherwise
   // still self-deletes.
-  const issueDir = join(opts.archiveRoot, opts.issueId);
+  const issueDir = join(archiveRoot, opts.issueId);
   try {
     mkdirSync(issueDir, { recursive: true }); // STAGED (round-6 finding 3): a raw EACCES here must not escape.
   } catch (err) {
     throw new ArchivalError(
       "archive-write",
-      `could not create archive dir ${issueDir}: ${(err as Error).message.slice(0, 200)} — refused (fail-closed)`,
+      `could not create archive dir ${issueDir}: ${describeError(err, 200)} — refused (fail-closed)`,
     );
   }
   const wsResolved = realDirPath(opts.workspaceDir);
@@ -475,7 +495,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-write",
-      `tar failed: ${(err as Error).message.slice(0, 300)} — workspace retained`,
+      `tar failed: ${describeError(err, 300)} — workspace retained`,
     );
   }
   const compressedBytes = statSync(tmpPath).size;
@@ -493,7 +513,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-write",
-      `archive install failed: ${(err as Error).message.slice(0, 300)} — workspace retained`,
+      `archive install failed: ${describeError(err, 300)} — workspace retained`,
     );
   }
   const archiveWrittenAt = nextStamp(now, null);
@@ -517,7 +537,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   } catch (err) {
     throw new ArchivalError(
       "ledger-row",
-      `ledger row failed after the archive was written: ${(err as Error).message.slice(0, 300)} — archive (no sidecar) and workspace retained; retry recovers`,
+      `ledger row failed after the archive was written: ${describeError(err, 300)} — archive (no sidecar) and workspace retained; retry recovers`,
     );
   }
   const ledgerRowAt = nextStamp(now, archiveWrittenAt);
@@ -542,7 +562,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   } catch (err) {
     throw new ArchivalError(
       "ledger-row",
-      `sidecar write failed after the ledger row: ${(err as Error).message.slice(0, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
+      `sidecar write failed after the ledger row: ${describeError(err, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
     );
   }
 

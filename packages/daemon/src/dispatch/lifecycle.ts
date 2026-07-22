@@ -868,8 +868,18 @@ export async function dispatch(
       const limit = budgetWallClockMs;
       const remaining = Math.max(0, limit - (Date.now() - started));
       budgetTimer = setTimeout(() => {
-        if (exited || killReason) return;
+        if (killReason) return;
+        // The budget covers the worker's whole process GROUP, not just the
+        // leader (round-8 finding 1): a leader can exit fast while an in-group
+        // descendant runs past the budget. Breach whenever ANY group member is
+        // still alive at the deadline — not merely "leader still running". If
+        // the group is already gone, the worker finished in time: no breach.
+        const pid = child?.pid;
+        const groupStillAlive = pid != null && groupAlive(pid);
+        if (!groupStillAlive) return;
         budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
+        // requestKill is a no-op once the leader exited; the post-exit group
+        // sweep reaps the descendant, and budgetBreach classifies killed-budget.
         requestKill("budget");
       }, remaining);
     }
