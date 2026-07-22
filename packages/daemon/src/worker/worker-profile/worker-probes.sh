@@ -101,8 +101,10 @@ run_probe github-cred-content sh -c '
   [ -z "$roots" ] && { echo clean; exit 0; }
   self="${CAMINO_PROBE_SELF:-/nonexistent}"
   # Pass 0: a gh token in a FILE NAME (round-13 finding 6) — content scans miss an
-  # empty file whose basename IS the token. The path carries the basename.
-  found=$(find $roots -type f 2>/dev/null \
+  # empty file whose basename IS the token. The path carries the basename. Include
+  # SYMLINKS as well as regular files (round-14 finding 4): a token-NAMED symlink
+  # (the worker can enumerate and read it) was excluded by a plain -type f.
+  found=$(find $roots \( -type f -o -type l \) 2>/dev/null \
     | grep -E "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}" \
     | while IFS= read -r f; do
         [ -n "$f" ] && [ "$f" != "$self" ] && { printf "%s" "$f"; break; }
@@ -110,23 +112,29 @@ run_probe github-cred-content sh -c '
   if [ -z "$found" ]; then
     # Pass 1: a modern gh token prefix anywhere; OR a userinfo URL to the GitHub
     # HOST — case-INSENSITIVE, allowing SUBDOMAINS (api.github.com) but BOUNDED so
-    # github.com.evil.tld does NOT match, and honoring ?/# URL delimiters (round-13
-    # finding 6); catches a legacy 40-hex token as the URL password. `-l` lists
-    # files one per line; `while IFS= read -r` preserves paths with spaces (no
-    # `-Z`, unsupported by the profile grep). A newline in a filename is not covered.
-    found=$(grep -rIliE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|://[^/@[:space:]]+:[^/@[:space:]]+@([a-z0-9-]+\.)*github\.com([:/?#]|$)" $roots 2>/dev/null \
+    # github.com.evil.tld does NOT match, honoring ?/# URL delimiters AND an optional
+    # FQDN trailing dot `github.com.` (round-13 finding 6; trailing dot round-14
+    # finding 4 — curl reaches it, so the regex must too); catches a legacy 40-hex
+    # token as the URL password. `-l` lists files one per line; `while IFS= read -r`
+    # preserves paths with spaces (no `-Z`, unsupported by the profile grep). A
+    # newline in a filename is not covered.
+    found=$(grep -rIliE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|://[^/@[:space:]]+:[^/@[:space:]]+@([a-z0-9-]+\.)*github\.com\.?([:/?#]|$)" $roots 2>/dev/null \
       | while IFS= read -r f; do
           [ -n "$f" ] && [ "$f" != "$self" ] && { printf "%s" "$f"; break; }
         done)
   fi
   if [ -z "$found" ]; then
-    # Pass 2: a GitHub HOST stanza (subdomains allowed, bounded, case-insensitive)
-    # that also carries a token line — the gh hosts.yml shape.
-    found=$(grep -rIliE "(^|[^a-z0-9-])([a-z0-9-]+\.)*github\.com($|[:/?#@])" $roots 2>/dev/null \
+    # Pass 2: a GitHub HOST stanza (subdomains + optional trailing dot allowed,
+    # bounded, case-insensitive) that also carries the gh `oauth_token` key — the gh
+    # hosts.yml shape, catching a legacy 40-hex token no prefix rule would. Requires
+    # oauth_token SPECIFICALLY, not a generic `token:` line (round-14 finding 7): a
+    # non-GitHub provider-auth file that merely mentions github.com in a doc comment
+    # AND has its own `token:` line is NOT a GitHub credential and must not false-hit.
+    found=$(grep -rIliE "(^|[^a-z0-9-])([a-z0-9-]+\.)*github\.com\.?($|[:/?#@])" $roots 2>/dev/null \
       | while IFS= read -r f; do
           [ -z "$f" ] && continue
           [ "$f" = "$self" ] && continue
-          grep -Iiq -E "oauth_token|(^|[^a-z])token[[:space:]]*[:=]" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
+          grep -Iiq -E "oauth_token" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
         done)
   fi
   [ -z "$found" ] && echo clean || echo "$found"

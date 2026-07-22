@@ -18,6 +18,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -657,7 +658,7 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
       recordLedgerRow: () => {},
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ArchivalError);
-    expect((err as Error).message).toMatch(/inode identity/i);
+    expect((err as Error).message).toMatch(/\(dev,ino,birthtime\) identity/i);
     expect(existsSync(ws)).toBe(true); // not destroyed on the pathname alone
   });
 
@@ -783,6 +784,40 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(existsSync(ws)).toBe(false); // resume destroyed the SAME-inode workspace
     expect(record.archivePath).toBe(join(root, "i", "a.tar.gz"));
     expect(calls).toBe(0); // ledger NOT re-recorded on resume
+  });
+
+  it("archives a workspace of sockets — tar WARNS (nonzero stderr) but exits 0, and stderr volume must not fail a valid archive (round-14 finding 5)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    // Plant UNIX-domain sockets: tar cannot pack them, so it emits a warning per
+    // entry to stderr yet still EXITS 0 with a valid archive. The old execFile path
+    // aborted tar once that stderr passed maxBuffer, refusing a good archive; spawn
+    // + exit-code success (never stderr volume) must archive normally. (30 keeps the
+    // test within any fd limit; the >1 MiB stderr case is covered by the review
+    // receipt — the point here is that exit-0-with-warnings is a SUCCESS.)
+    const servers: ReturnType<typeof createServer>[] = [];
+    for (let i = 0; i < 30; i++) {
+      const s = createServer();
+      await new Promise<void>((res) => s.listen(join(ws, `sock-${i}.sock`), () => res()));
+      servers.push(s);
+    }
+    try {
+      let recorded = false;
+      const record = await archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          recorded = true;
+        },
+      });
+      expect(recorded).toBe(true); // ledger row written — the archive succeeded
+      expect(existsSync(record.archivePath)).toBe(true);
+      expect(existsSync(ws)).toBe(false); // archived AND destroyed, not refused
+    } finally {
+      for (const s of servers) s.close();
+    }
   });
 
   it("a resume REFUSES a workspace RECREATED at the same pathname (different inode) — round-11 finding 3", async () => {

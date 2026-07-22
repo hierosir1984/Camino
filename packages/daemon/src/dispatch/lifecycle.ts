@@ -84,9 +84,17 @@ export interface DispatchOptions {
   timeoutMs?: number;
   /**
    * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock budget is REQUIRED and
-   * enforced under a healthy event loop (see the boundary in budget.ts: under a
-   * gross daemon stall — which a worker cannot induce — timing is best-effort and
-   * the container/WP-114 supervisor is the out-of-process bound); tokens enforced
+   * enforced within the event loop's scheduling latency. BOUNDARY, stated (round-14
+   * findings 1/2): the in-process timer is best-effort to within the daemon loop's
+   * worst-case stall — a worker that overruns by LESS than that stall may be
+   * classified `succeeded`. Camino's own concurrent work is bounded NOT to induce a
+   * stall past STALL_GRACE_MS (archival tars via spawn and hashes/deletes/walks in
+   * yielding chunks — archive.ts; clone attestation reads candidate files capped and
+   * bounded — clone.ts; the pre-parser caps per-line CPU — below), so a worker
+   * cannot manufacture a stall THROUGH those paths. A GROSS stall from outside
+   * Camino's control (OS scheduling, a stop-the-world GC, swap) is the residual; the
+   * authoritative wall-clock bound against it is the OUT-OF-PROCESS container/WP-114
+   * supervisor, not this timer. Tokens enforced
    * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach runs
    * kill-confirm and classifies `killed-budget` — distinct from `cancelled` (user
    * decision) and `killed` (harness runaway cap) so the state machine's
@@ -623,7 +631,11 @@ export async function dispatch(
           // behind a small visible slice, so a bounded visible length can still
           // hold megabytes. Copy the ≤8 KiB through a Buffer into a fresh FLAT
           // string, so retained memory is the visible length, not the backing.
-          text = Buffer.from(capped, "utf8").toString("utf8");
+          // utf16le, not utf8 (round-14 finding 9): utf16le round-trips EVERY JS
+          // string exactly (2 bytes per code unit), so a lone/unpaired surrogate in
+          // worker output is preserved verbatim rather than replaced with U+FFFD as
+          // a utf8 round-trip would; the copy is still flat and backing-detached.
+          text = Buffer.from(capped, "utf16le").toString("utf16le");
         }
       } catch {
         text = "";

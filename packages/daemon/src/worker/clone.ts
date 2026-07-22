@@ -16,7 +16,7 @@
 // posture is composeWorkerEnv (WP-105), asserted again inside the container
 // by the worker suite.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, readdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 
 /** A provisioning or isolation-attestation failure. Always fail-closed. */
@@ -130,9 +130,15 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
     // OTHER failure (ENOBUFS on an oversized/hostile .git/config.worktree, a git
     // error) must FAIL CLOSED (round-13 finding 4): swallowing it would make a
     // large malicious worktree config INVISIBLE here while git still obeys it.
+    // Recognize ONLY the genuine "extensions.worktreeConfig is not enabled"
+    // message (round-14 finding 8 tightened round-13's predicate): git names the
+    // `worktreeConfig` extension explicitly, or says the worktree extension is "not
+    // enabled". A generic message that merely contains "worktree" and "extension"
+    // (e.g. "worktree transient extension I/O failure") is NOT this case and must
+    // FAIL CLOSED, not be swallowed as "no worktree config".
     const msg = describeCloneError(err, 400).toLowerCase();
     const notEnabled =
-      msg.includes("worktree") && (msg.includes("not enabled") || msg.includes("extension"));
+      msg.includes("worktreeconfig") || (msg.includes("worktree") && msg.includes("not enabled"));
     if (!notEnabled) {
       throw new WorkerCloneError(
         `workspace clone worktree config could not be enumerated for attestation — refused (fail-closed): ${describeCloneError(err)}`,
@@ -475,6 +481,26 @@ function contentHasCredential(text: string): boolean {
 const SCAN_MAX_DEPTH = 32;
 const SCAN_MAX_ENTRIES = 200_000;
 
+// A legitimate git config / .npmrc / gh hosts.yml is at most a few KB; a much
+// larger one is hostile padding. Read at most this many bytes when scanning file
+// CONTENT so a 64 MiB candidate cannot block the daemon loop (round-14 finding 2):
+// a real credential channel or token sits near the top and well within the cap.
+// A token pushed past the cap by megabytes of leading padding is a self-committed
+// secret behind the DEFENSE-IN-DEPTH boundary below, not a Camino credential.
+const CREDENTIAL_FILE_READ_CAP = 1 << 20; // 1 MiB
+
+/** Read at most CREDENTIAL_FILE_READ_CAP bytes of a file as UTF-8 — never buffers more. */
+function readFileCapped(path: string): string {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.allocUnsafe(CREDENTIAL_FILE_READ_CAP);
+    const n = readSync(fd, buf, 0, CREDENTIAL_FILE_READ_CAP, 0);
+    return buf.toString("utf8", 0, n);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Walk the workspace for GitHub credential MATERIAL (the CAM-EXEC-02
  * filesystem assertion): stored-credential files by name, git config files
@@ -549,7 +575,7 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
       if (GIT_CONFIG_FILE_NAMES.has(lname)) {
         let text = "";
         try {
-          text = readFileSync(absChild, "utf8");
+          text = readFileCapped(absChild);
         } catch {
           findings.push(`${relChild} (unreadable git config — not scanned)`);
           continue;
@@ -560,7 +586,7 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
       if (CREDENTIAL_CONTENT_FILE_NAMES.has(lname)) {
         let text = "";
         try {
-          text = readFileSync(absChild, "utf8");
+          text = readFileCapped(absChild);
         } catch {
           findings.push(`${relChild} (unreadable credential-candidate — not scanned)`);
           continue;

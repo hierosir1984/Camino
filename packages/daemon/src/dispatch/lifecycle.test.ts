@@ -971,6 +971,31 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   }, 30_000);
 
+  it("retained event text preserves a lone surrogate exactly (utf16le detach — round-14 finding 9)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // The backing-detach copy must round-trip EVERY JS string verbatim. A utf8
+      // round-trip replaces an unpaired surrogate with U+FFFD; utf16le preserves it.
+      const lone = `A${String.fromCharCode(0xd800)}B`; // unpaired high surrogate
+      const adapter = {
+        name: "surrogate",
+        enabled: true,
+        plan: () => ({
+          file: process.execPath,
+          args: ["-e", `process.stdout.write("x\\n")`],
+          env: {},
+        }),
+        parseLine: () => ({ kind: "result" as const, text: lone, terminalSuccess: true as const }),
+      };
+      const rec = await dispatch(adapter, { workdir: ws, prompt: "s" }, {});
+      const ev = rec.events.find((e) => e.text.length > 0);
+      expect(ev?.text).toBe(lone); // exact code units, NOT the U+FFFD a utf8 copy yields
+      expect(ev?.text.charCodeAt(1)).toBe(0xd800);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("splits CR, LF, and CRLF records (readline parity — round-5 finding 3)", async () => {
     const ws = makeWorkspace();
     try {

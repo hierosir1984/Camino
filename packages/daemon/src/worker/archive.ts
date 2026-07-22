@@ -27,7 +27,7 @@
 // last 10 attempts per issue (whichever more)" — the UNION of the windows.
 // pruneArchives deletes an archive only when it is BOTH older than 90 days
 // AND outside the issue's newest 10.
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -47,16 +47,15 @@ import {
 } from "node:fs";
 import { lstat as lstatAsync, readdir as readdirAsync, rm as rmAsync } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
+import type { AttemptEvent } from "@camino/core";
 
 // Archival runs on the daemon's SHARED event loop, concurrently with other
 // attempts' dispatch/budget timers. Its heavy I/O (tar, hashing, recursive
 // delete, the size walk) MUST be async and yield — a synchronous archival of a
 // pathological workspace (a worker can create many files) would monopolize the
-// loop and defeat ANOTHER attempt's wall-clock budget (round-13 finding 1).
-const execFileP = promisify(execFile);
-import type { AttemptEvent } from "@camino/core";
+// loop and defeat ANOTHER attempt's wall-clock budget (round-13 finding 1,
+// hardened round-14 findings 1/5: tar via spawn, hashing yields per chunk).
 
 /** Which sub-step failed — drives the cleanup-failed record (A.2 row). */
 export type ArchivalStage =
@@ -236,12 +235,20 @@ export interface ArchiveSidecar {
    */
   workspacePath: string;
   /**
-   * The workspace's stable (dev,ino) at archive time. A resume-destroy compares
+   * The workspace's stable identity at archive time. A resume-destroy compares
    * against this, not just the pathname (round-11 finding 3): a directory
-   * rm+recreated at the same path is a DIFFERENT inode and must not be destroyed.
+   * rm+recreated at the same path must not be destroyed. `(dev,ino)` alone is
+   * defeated by Linux inode reuse (round-14 finding 3), so `workspaceBirthtimeNs`
+   * (the inode BIRTH time, decimal-string nanoseconds — JSON has no BigInt) is
+   * REQUIRED for a resume-destroy: a fresh `mkdir` at a reused inode number still
+   * has a new birth time, while a benign chmod on the genuine same directory leaves
+   * it unchanged. A sidecar lacking any of the three cannot prove the directory
+   * unchanged across a process restart → reconcile, never destroy on the pathname
+   * alone.
    */
   workspaceDev?: number;
   workspaceIno?: number;
+  workspaceBirthtimeNs?: string;
   archiveWrittenAt: string;
   /**
    * Durable per-issue monotonic ordinal, assigned at archive time (max
@@ -418,24 +425,98 @@ function realWorkspaceIdentity(dir: string): string | null {
   }
 }
 
-/** A filesystem object's (dev, ino) — its stable identity, immune to pathname reuse. */
+/**
+ * A workspace directory's identity for the destroy re-check. `(dev, ino)` alone
+ * is NOT sufficient (round-14 finding 3): on Linux an `rmdir`+`mkdir` at the same
+ * pathname commonly REUSES the freed inode number, so a rm+recreated directory
+ * presents the SAME (dev, ino) and defeats the check (the two archive-identity
+ * tests failed on Linux CI for exactly this reason). `birthtimeNs` — the inode's
+ * BIRTH (creation) time — closes it: `mkdir` stamps a FRESH birth time on the new
+ * inode even when the inode NUMBER is reused, so a rm+recreate changes birthtimeNs
+ * even when (dev, ino) is unchanged. Crucially birthtime is IMMUTABLE after
+ * creation, so a benign `chmod`/`chown`/content change on the SAME directory does
+ * NOT change it (ctime would, giving a false "replaced" on a genuine resume).
+ * Any of the three differing means the directory was replaced.
+ *
+ * RESIDUAL, stated: a filesystem without birth-time (btime) support reports 0 for
+ * both, so a rm+recreate that also REUSES the inode number degrades to the
+ * (dev, ino)-only behavior there. ext4 (Linux CI), xfs, and APFS/HFS+ (dev)
+ * populate btime, so the exercised platforms are covered.
+ */
 interface FsIdentity {
   dev: number;
   ino: number;
+  birthtimeNs: bigint;
 }
 
 /**
  * sha256 of a file, STREAMED asynchronously — never buffers the whole file
- * (round-10 finding 5) and YIELDS to the event loop between chunks so hashing a
- * large archive does not stall other attempts' budgets (round-13 finding 1).
+ * (round-10 finding 5) and YIELDS the event loop between chunks so hashing a
+ * large archive does not stall other attempts' budget timers (round-13 finding
+ * 1, hardened round-14 finding 1). The stream is PAUSED after each chunk and
+ * resumed on a `setImmediate`, so at most one 1 MiB chunk is hashed per loop
+ * turn — a pending budget timer fires within a chunk's worth of CPU (~ms), well
+ * under STALL_GRACE_MS, instead of being starved for tens of ms while `data`
+ * events arrive back-to-back from the page cache.
  */
 function sha256File(path: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash("sha256");
-    const stream = createReadStream(path, { highWaterMark: 1 << 16 });
-    stream.on("data", (chunk) => hash.update(chunk));
+    const stream = createReadStream(path, { highWaterMark: 1 << 20 });
+    stream.on("data", (chunk) => {
+      hash.update(chunk);
+      stream.pause();
+      setImmediate(() => stream.resume());
+    });
     stream.on("error", reject);
     stream.on("end", () => resolve(hash.digest("hex")));
+  });
+}
+
+/** The (dev, ino, birthtimeNs) identity of a directory, or null if it cannot be statted. */
+function readFsIdentity(dir: string): FsIdentity | null {
+  try {
+    const s = statSync(dir, { bigint: true });
+    return { dev: Number(s.dev), ino: Number(s.ino), birthtimeNs: s.birthtimeNs };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * tar the workspace to `tmpPath`, OFF the daemon loop. Uses `spawn` (not
+ * execFile) so tar's STDERR VOLUME can never turn a SUCCESSFUL archive into a
+ * refusal (round-14 finding 5): a worker can fill its workspace with entries tar
+ * only WARNS about — e.g. UNIX sockets, one "socket ignored" line each — emitting
+ * megabytes of stderr while tar still exits 0 with a valid archive. execFile's
+ * `maxBuffer` would abort tar on that stderr and reject a good archive. Here
+ * success is decided by the EXIT CODE alone; stderr is drained (never buffered
+ * unbounded) into a bounded TAIL used only to describe a genuine non-zero failure.
+ */
+function runTarToFile(tmpPath: string, workspaceReal: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const STDERR_TAIL_CAP = 8 * 1024;
+    let stderrTail = "";
+    const child = spawn("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      // Keep only a bounded tail; the rest is consumed (flowing mode) and
+      // discarded, so a multi-MB warning stream cannot grow daemon RSS.
+      if (stderrTail.length < STDERR_TAIL_CAP) {
+        stderrTail += chunk.toString("utf8", 0, STDERR_TAIL_CAP - stderrTail.length);
+      }
+    });
+    child.once("error", reject); // spawn failure (e.g. tar not on PATH)
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else
+        reject(
+          new Error(
+            `tar exited ${code ?? "null"}${stderrTail ? `: ${stderrTail.trim().slice(0, 300)}` : ""}`,
+          ),
+        );
+    });
   });
 }
 
@@ -523,28 +604,34 @@ function describeFileType(st: { isDirectory(): boolean; isSymbolicLink(): boolea
 
 /**
  * Confirm the workspace to be destroyed is STILL the exact directory we archived,
- * by (dev, ino) — a pathname comparison is TOCTOU (round-10 finding 3): a
- * recordLedgerRow callback that `rm`s and recreates the path leaves an unrelated
- * victim at the same spelling. Refuses (workspace retained) on any change.
+ * by (dev, ino, birthtimeNs) — a pathname comparison is TOCTOU (round-10 finding
+ * 3): a recordLedgerRow callback that `rm`s and recreates the path leaves an
+ * unrelated victim at the same spelling. (dev, ino) alone is defeated by Linux
+ * inode REUSE (round-14 finding 3); birthtimeNs distinguishes a freshly-created
+ * directory even at the same inode number, while ignoring benign metadata changes
+ * (a chmod on the genuine same directory during a resume). Refuses (workspace
+ * retained) on any change.
  */
 function assertWorkspaceUnchanged(
   workspaceReal: string,
   baseline: FsIdentity,
   attemptId: string,
 ): void {
-  let st;
-  try {
-    st = statSync(workspaceReal);
-  } catch {
+  const st = readFsIdentity(workspaceReal);
+  if (st === null) {
     throw new ArchivalError(
       "archive-write",
       `attempt ${attemptId}: the workspace ${workspaceReal} vanished before the destroy — refusing (janitor/escalation reconciles)`,
     );
   }
-  if (st.dev !== baseline.dev || st.ino !== baseline.ino) {
+  if (
+    st.dev !== baseline.dev ||
+    st.ino !== baseline.ino ||
+    st.birthtimeNs !== baseline.birthtimeNs
+  ) {
     throw new ArchivalError(
       "archive-write",
-      `attempt ${attemptId}: the directory at ${workspaceReal} was REPLACED (inode changed) since archival — refusing to destroy it; it is no longer the workspace we archived (janitor/escalation reconciles)`,
+      `attempt ${attemptId}: the directory at ${workspaceReal} was REPLACED (inode/birthtime changed) since archival — refusing to destroy it; it is no longer the workspace we archived (janitor/escalation reconciles)`,
     );
   }
 }
@@ -703,18 +790,16 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       return workspaceDir;
     }
   })();
-  // Capture the workspace's STABLE identity (dev, ino) up-front, BEFORE the
-  // recordLedgerRow callback can run — the destroy re-confirms against this so a
-  // callback that rm+recreates the pathname cannot redirect it (round-10 finding
-  // 3). A sentinel when absent; the size/tar step raises the real error.
-  const workspaceIdentity: FsIdentity = ((): FsIdentity => {
-    try {
-      const s = statSync(workspaceReal);
-      return { dev: s.dev, ino: s.ino };
-    } catch {
-      return { dev: -1, ino: -1 };
-    }
-  })();
+  // Capture the workspace's STABLE identity (dev, ino, ctimeNs) up-front, BEFORE
+  // the recordLedgerRow callback can run — the destroy re-confirms against this so
+  // a callback that rm+recreates the pathname cannot redirect it (round-10 finding
+  // 3; ctimeNs added round-14 finding 3 for Linux inode reuse). A sentinel when
+  // absent; the size/tar step raises the real error.
+  const workspaceIdentity: FsIdentity = readFsIdentity(workspaceReal) ?? {
+    dev: -1,
+    ino: -1,
+    birthtimeNs: -1n,
+  };
 
   // Step 0 — workspace quota (registry item 11: workspace ≤ 2 GB). An
   // over-quota workspace is an abnormal condition: refusing here routes it to
@@ -838,15 +923,28 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       // prove the directory is unchanged, so it is INDETERMINATE → refuse and
       // reconcile rather than destroy on the pathname alone. Checked LAST,
       // immediately before the destroy.
-      if (prior.workspaceDev === undefined || prior.workspaceIno === undefined) {
+      if (
+        prior.workspaceDev === undefined ||
+        prior.workspaceIno === undefined ||
+        prior.workspaceBirthtimeNs === undefined
+      ) {
         throw new ArchivalError(
           "archive-write",
-          `resume for attempt ${opts.attemptId}: the sidecar has no recorded workspace inode identity — cannot prove the directory is unchanged; refusing to destroy (janitor/escalation reconciles, fail-closed)`,
+          `resume for attempt ${opts.attemptId}: the sidecar has no recorded workspace (dev,ino,birthtime) identity — cannot prove the directory is unchanged; refusing to destroy (janitor/escalation reconciles, fail-closed)`,
+        );
+      }
+      let priorBirthtimeNs: bigint;
+      try {
+        priorBirthtimeNs = BigInt(prior.workspaceBirthtimeNs);
+      } catch {
+        throw new ArchivalError(
+          "archive-write",
+          `resume for attempt ${opts.attemptId}: the sidecar's recorded workspace birthtime ${JSON.stringify(prior.workspaceBirthtimeNs)} is not a valid integer — cannot prove the directory is unchanged; refusing to destroy (janitor/escalation reconciles, fail-closed)`,
         );
       }
       assertWorkspaceUnchanged(
         workspaceReal,
-        { dev: prior.workspaceDev, ino: prior.workspaceIno },
+        { dev: prior.workspaceDev, ino: prior.workspaceIno, birthtimeNs: priorBirthtimeNs },
         opts.attemptId,
       );
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
@@ -871,10 +969,10 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   }
   try {
     // ASYNC tar (round-13 finding 1): execFileSync would BLOCK the daemon loop for
-    // the whole tar of a pathological workspace; await lets other attempts' timers run.
-    await execFileP("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
-      maxBuffer: 1 << 20, // tar writes to the file; stdout/stderr are small (bounded)
-    });
+    // the whole tar of a pathological workspace; await lets other attempts' timers
+    // run. spawn + exit-code success (round-14 finding 5): tar stderr volume never
+    // converts a successful archive into a refusal.
+    await runTarToFile(tmpPath, workspaceReal);
   } catch (err) {
     safeRemove(tmpPath);
     throw new ArchivalError(
@@ -882,7 +980,21 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `tar failed: ${describeError(err, 300)} — workspace retained`,
     );
   }
-  const compressedBytes = statSync(tmpPath).size;
+  // STAGE the size + hash reads (round-14 finding 6): sha256File streams the
+  // just-written partial, so an EACCES/EIO there is a real failure mode — it must
+  // throw a STAGED ArchivalError and clean up the partial, not escape as a raw
+  // Error leaving an orphan .partial (the "every failure is staged" claim).
+  let compressedBytes: number;
+  let sha256: string;
+  try {
+    compressedBytes = statSync(tmpPath).size;
+  } catch (err) {
+    safeRemove(tmpPath);
+    throw new ArchivalError(
+      "archive-write",
+      `could not stat the written archive ${tmpPath}: ${describeError(err, 200)} — workspace retained`,
+    );
+  }
   if (compressedBytes > quotas.archiveMaxCompressedBytes) {
     safeRemove(tmpPath);
     throw new ArchivalError(
@@ -890,7 +1002,15 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `archive is ${compressedBytes} bytes compressed, over the ${quotas.archiveMaxCompressedBytes}-byte cap (registry item 11) — workspace retained for escalation`,
     );
   }
-  const sha256 = await sha256File(tmpPath); // streaming, async — never buffer/block on up to 500 MB
+  try {
+    sha256 = await sha256File(tmpPath); // streaming, async — never buffer/block on up to 500 MB
+  } catch (err) {
+    safeRemove(tmpPath);
+    throw new ArchivalError(
+      "archive-write",
+      `could not hash the written archive ${tmpPath}: ${describeError(err, 200)} — workspace retained`,
+    );
+  }
   try {
     renameSync(tmpPath, finalPath);
   } catch (err) {
@@ -938,6 +1058,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     workspacePath: workspaceReal,
     workspaceDev: workspaceIdentity.dev,
     workspaceIno: workspaceIdentity.ino,
+    workspaceBirthtimeNs: workspaceIdentity.birthtimeNs.toString(),
     archiveWrittenAt,
     seq,
     sha256,
