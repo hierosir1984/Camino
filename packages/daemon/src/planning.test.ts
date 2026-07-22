@@ -6,6 +6,10 @@
  * hash references on every issue-created event, dependency cycles named,
  * and crash-resume for every interruptible seam.
  */
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, afterEach } from "vitest";
 import { contractHash, contractTermsOf } from "@camino/shared";
 import type { ClarifyingItemDraft, MissionRecord, PlannedIssueDraft } from "@camino/shared";
@@ -593,7 +597,11 @@ describe("crash resume (the WP-104 idempotency posture)", () => {
     // ledger pair never ran (recorded directly against the store).
     h.planStore.recordConfirmation(
       session.sessionId,
-      { segmentId: "S2", requirementId: "CAM-APP-01", statement: "s2 statement" },
+      {
+        segmentId: "S2",
+        requirementId: "CAM-APP-01",
+        statement: "The system sends a daily summary email.",
+      },
       "david",
     );
     expect(h.ledger.currentView().size).toBe(0);
@@ -611,11 +619,15 @@ describe("crash resume (the WP-104 idempotency posture)", () => {
     constructPlan(h, session.sessionId);
     h.planStore.recordConfirmation(
       session.sessionId,
-      { segmentId: "S2", requirementId: "CAM-APP-01", statement: "s2 statement" },
+      {
+        segmentId: "S2",
+        requirementId: "CAM-APP-01",
+        statement: "The system sends a daily summary email.",
+      },
       "david",
     );
     h.ledger.proposeRequirement("CAM-APP-01", {
-      statement: "s2 statement",
+      statement: "The system sends a daily summary email.",
       sourceMissionId: mission.id,
     });
     h.service.resumePendingWork();
@@ -684,17 +696,71 @@ describe("crash resume (the WP-104 idempotency posture)", () => {
 });
 
 describe("round-1 falsification regressions", () => {
-  it("F1: resume REFUSES a recorded approval the gate does not support (no blessing bare rows)", () => {
+  it("F1: the store itself refuses an approval act without its acts (defense in depth)", () => {
     const h = newHarness();
     const mission = newMission(h);
     const session = h.service.startSession(mission.id, "feature");
     constructPlan(h, session.sessionId);
-    // A first-party caller writes the approval row straight into the store,
-    // skipping every acknowledgment. Resume must refuse, not complete.
-    h.planStore.recordApproval(session.sessionId, "david");
-    expect(() => h.service.resumePendingWork()).toThrow(/gate refuses/);
+    // A first-party caller reaching past the service cannot record the
+    // approval act while acknowledgments are missing.
+    expect(() => h.planStore.recordApproval(session.sessionId, "david")).toThrow(
+      /approval act refused.*unacknowledged/,
+    );
     expect(h.service.contractsForMission(mission.id)).toEqual([]);
     expect(h.recorder.currentState("mission", mission.id)).toBe("planned");
+  });
+
+  it("F1: a bare completion marker is refused by the store (no substance, no approval)", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    expect(() => h.planStore.recordApprovalCompletion(session.sessionId)).toThrow(
+      /no approval act/,
+    );
+    expect(h.service.planView(session.sessionId).status).toBe("constructed");
+  });
+
+  it("F1: resume REFUSES a raw-forged approval row the gate does not support", () => {
+    // The store guards block the API path; forge the row with a raw second
+    // connection (file-backed store) and prove resume still refuses.
+    const dir = mkdtempSync(join(tmpdir(), "camino-plan-f1-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const storePath = join(dir, "plan.sqlite");
+    const domain = new SqliteDomainStore(":memory:");
+    const events = new SqliteEventStore(":memory:");
+    const ledger = new CanonLedgerStore(":memory:");
+    const planStore = new PlanStore(storePath);
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+      ledger.close();
+      planStore.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const scheduler = new SerializationScheduler(domain, recorder, events);
+    const service = new PlanningService(planStore, domain, recorder, events, ledger, scheduler);
+    const project = domain.createProject("demo");
+    const repo = domain.createRepo(project.id, "demo");
+    const result = intake.createFromText({
+      repoId: repo.id,
+      title: "Daily summary",
+      content: PRD,
+      actor: "david",
+    });
+    if (!result.ok) throw new Error(result.reason);
+    const session = service.startSession(result.mission.id, "feature");
+    const h = { service, recorder, intake, ledger, planStore } as unknown as Harness;
+    constructPlan(h, session.sessionId);
+    const raw = new Database(storePath);
+    raw
+      .prepare("INSERT INTO plan_approvals (session_id, actor, recorded_at) VALUES (?, ?, ?)")
+      .run(session.sessionId, "david", "2026-07-22T12:00:00.000Z");
+    raw.close();
+    expect(() => service.resumePendingWork()).toThrow(/gate refuses/);
+    expect(service.contractsForMission(result.mission.id)).toEqual([]);
+    expect(recorder.currentState("mission", result.mission.id)).toBe("planned");
   });
 
   it("F3: approval heals a confirmation whose ledger pair an in-process failure lost", () => {
@@ -707,12 +773,16 @@ describe("round-1 falsification regressions", () => {
     // failure window the review demonstrated).
     h.planStore.recordConfirmation(
       session.sessionId,
-      { segmentId: "S2", requirementId: "CAM-APP-01", statement: "s2 statement" },
+      {
+        segmentId: "S2",
+        requirementId: "CAM-APP-01",
+        statement: "The system sends a daily summary email.",
+      },
       "david",
     );
     h.planStore.recordConfirmation(
       session.sessionId,
-      { segmentId: "S3", requirementId: "CAM-APP-02", statement: "s3 statement" },
+      { segmentId: "S3", requirementId: "CAM-APP-02", statement: "The summary lists new items." },
       "david",
     );
     h.service.acknowledgeFlaggedRows(session.sessionId, ["S1", "S4"]);
@@ -809,5 +879,145 @@ describe("round-1 falsification regressions", () => {
     expect(() => h.service.dependencyInterfacesFor(`${mission.id}.I2`, 7)).toThrow(
       /no contract v7/,
     );
+  });
+});
+
+describe("round-2 falsification regressions", () => {
+  it("R2-2: acts are refused once the approval act exists (state cannot shift under an approval)", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    h.planStore.recordApproval(session.sessionId, "david"); // the crash window, pre-completion
+    expect(() =>
+      h.service.acknowledgeClarification(session.sessionId, "Q1", { kind: "assumption-confirmed" }),
+    ).toThrow(/recorded approval/);
+    expect(() => h.service.confirmMappedRows(session.sessionId, ["S2"])).toThrow(
+      /recorded approval/,
+    );
+    expect(() => h.service.acknowledgeFlaggedRows(session.sessionId, ["S1", "S4"])).toThrow(
+      /recorded approval/,
+    );
+  });
+
+  it("R2-5: a rejection is refused while an approval is pending (deterministic conflict resolution)", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    h.planStore.recordApproval(session.sessionId, "david");
+    expect(() => h.service.rejectPlan(session.sessionId)).toThrow(/recorded approval/);
+    // Resume completes the approval instead — no irreconcilable state.
+    const report = h.service.resumePendingWork();
+    expect(report.completedApprovals).toEqual([session.sessionId]);
+    expect(h.recorder.currentState("mission", mission.id)).toBe("approved");
+  });
+
+  it("R2-4: quick-task approval refuses BEFORE the act when reviewer facts are not true", () => {
+    const h = newHarness();
+    const result = h.intake.createQuickTask({
+      repoId: h.repoId,
+      title: "Fix the footer link",
+      description: "Point the footer link at the new docs page.",
+      urgent: false,
+      actor: "david",
+    });
+    if (!result.ok) throw new Error(result.reason);
+    const session = h.service.startSession(result.mission.id, "quick-task");
+    const segments = h.service.planView(session.sessionId).segments;
+    h.service.ingest(session.sessionId, issue("I1"));
+    segments.forEach((segment, i) => {
+      h.service.ingest(
+        session.sessionId,
+        i === 0
+          ? mappedRow(segment.segmentId, "The footer link points at the new docs page.", ["I1"])
+          : unmappedRow(segment.segmentId, "context"),
+      );
+    });
+    h.service.ingest(session.sessionId, { kind: "construction-complete" });
+    h.service.attachReview(session.sessionId, {
+      reviewClass: "mini-falsification",
+      reviewer: "codex-cli",
+      observabilityAdjudicated: true,
+      riskTierLow: false, // NOT low risk — the A.1b#3 gate cannot pass
+      neutralConcurred: true,
+    });
+    const first = h.service.planView(session.sessionId).segments[0]?.segmentId as string;
+    h.service.confirmMappedRows(session.sessionId, [first]);
+    const flagged = h.service.planView(session.sessionId).flaggedSegmentIds;
+    if (flagged.length > 0) h.service.acknowledgeFlaggedRows(session.sessionId, flagged);
+    const outcome = h.service.approvePlan(session.sessionId);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusals).toContainEqual({
+      kind: "quick-task-review-facts-missing",
+      missing: ["riskTierLow"],
+    });
+    // Nothing froze, nothing is wedged: no approval act, no contracts.
+    expect(h.planStore.approval(session.sessionId)).toBeUndefined();
+    expect(h.service.contractsForMission(result.mission.id)).toEqual([]);
+    expect(() => h.service.resumePendingWork()).not.toThrow();
+  });
+
+  it("R2-7: a confirmed requirement descoped since confirmation blocks approval by name", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId); // ledger now holds accepted entries
+    h.ledger.disputeRequirement("CAM-APP-01", { reason: "reconsidering", conflictWith: null });
+    h.ledger.descopeRequirement("CAM-APP-01", { reason: "descoped after review" });
+    const outcome = h.service.approvePlan(session.sessionId);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusals).toContainEqual({
+      kind: "confirmed-requirement-not-accepted",
+      requirementIds: ["CAM-APP-01"],
+    });
+    expect(h.service.contractsForMission(mission.id)).toEqual([]);
+  });
+
+  it("R2-3: resume reconciliation refuses a completed approval whose contracts were deleted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "camino-plan-r2f3-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const storePath = join(dir, "plan.sqlite");
+    const domain = new SqliteDomainStore(":memory:");
+    const events = new SqliteEventStore(":memory:");
+    const ledger = new CanonLedgerStore(":memory:");
+    const planStore = new PlanStore(storePath);
+    cleanups.push(() => {
+      domain.close();
+      events.close();
+      ledger.close();
+      planStore.close();
+    });
+    const recorder = new TransitionRecorder(events);
+    const intake = new MissionIntake(domain, recorder, events);
+    const scheduler = new SerializationScheduler(domain, recorder, events);
+    const service = new PlanningService(planStore, domain, recorder, events, ledger, scheduler);
+    const project = domain.createProject("demo");
+    const repo = domain.createRepo(project.id, "demo");
+    const result = intake.createFromText({
+      repoId: repo.id,
+      title: "Daily summary",
+      content: PRD,
+      actor: "david",
+    });
+    if (!result.ok) throw new Error(result.reason);
+    const session = service.startSession(result.mission.id, "feature");
+    const h = { service, recorder, intake, ledger, planStore } as unknown as Harness;
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    expect(service.approvePlan(session.sessionId).ok).toBe(true);
+    expect(() => service.resumePendingWork()).not.toThrow(); // coherent state reconciles
+    // History deleted behind the triggers: the completed approval loses its
+    // contracts while its marker survives.
+    const raw = new Database(storePath);
+    raw.exec("DROP TRIGGER contracts_append_only_delete");
+    raw.exec("DELETE FROM contracts");
+    raw.close();
+    expect(() => service.resumePendingWork()).toThrow(/no stored contract/);
   });
 });

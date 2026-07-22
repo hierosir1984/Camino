@@ -483,7 +483,7 @@ describe("plantedAmbiguityCoverage", () => {
     expect(coverage.uncovered).toEqual([{ plantedId: "A1", segmentId: "S2" }]);
   });
 
-  it("answer-key terms match case-insensitively across question, rationale, and assumption", () => {
+  it("answer-key terms match case-insensitively in the question or the assumption", () => {
     const coverage = plantedAmbiguityCoverage([plantedFast], segments, [
       {
         ...fastClarification,
@@ -492,6 +492,40 @@ describe("plantedAmbiguityCoverage", () => {
         assumptionIfUnanswered: "LATENCY under one second.",
       },
     ]);
+    expect(coverage.covered).toHaveLength(1);
+  });
+
+  it("a term appearing ONLY in the rationale does not cover (r2 finding 6)", () => {
+    const coverage = plantedAmbiguityCoverage([plantedFast], segments, [
+      {
+        ...fastClarification,
+        question: "What color should the export button be?",
+        whyItMatters: "Users mentioned fast exports in passing.",
+        assumptionIfUnanswered: "The primary theme color.",
+      },
+    ]);
+    expect(coverage.covered).toEqual([]);
+    expect(coverage.uncovered).toEqual([{ plantedId: "A1", segmentId: "S2" }]);
+  });
+
+  it("blank answer-key terms are manifest drift, not universal matchers (r2 finding 6)", () => {
+    const coverage = plantedAmbiguityCoverage(
+      [{ ...plantedFast, answerKeyTerms: ["  ", ""] }],
+      segments,
+      [fastClarification],
+    );
+    expect(coverage.unlocatable).toEqual(["A1"]);
+  });
+
+  it("NFC-normalizes both sides so composed and decomposed forms match (r2 finding 6)", () => {
+    const composed = "d\u00e9lai"; // NFC
+    const decomposed = "de\u0301lai"; // NFD (e + combining acute)
+    expect(composed).not.toBe(decomposed);
+    const coverage = plantedAmbiguityCoverage(
+      [{ ...plantedFast, answerKeyTerms: [composed] }],
+      segments,
+      [{ ...fastClarification, question: `Quel ${decomposed} est acceptable?` }],
+    );
     expect(coverage.covered).toHaveLength(1);
   });
 

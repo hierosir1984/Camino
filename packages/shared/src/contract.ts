@@ -131,7 +131,7 @@ function boundedText(field: string, value: unknown, problems: string[]): void {
 function arrayHoleProblems(field: string, value: readonly unknown[]): string[] {
   const problems: string[] = [];
   for (let i = 0; i < value.length; i += 1) {
-    if (!(i in value)) problems.push(`${field}[${i}] is a sparse-array hole`);
+    if (!Object.hasOwn(value, i)) problems.push(`${field}[${i}] is a sparse-array hole`);
   }
   return problems;
 }

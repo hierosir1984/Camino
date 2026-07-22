@@ -34,21 +34,31 @@
  * family.
  */
 import Database from "better-sqlite3";
-import { DAVID_ACTOR } from "@camino/core";
+import {
+  DAVID_ACTOR,
+  dependencyGraphProblems,
+  findDependencyCycle,
+  formatCycle,
+  templateProblems,
+} from "@camino/core";
 import {
   CanonicalJsonError,
   canonicalJson,
   contractProblems,
   clarificationResponseProblems,
+  isRequirementId,
   planConstructionRecordProblems,
 } from "@camino/shared";
 import type {
+  ChecklistRowDraft,
   ClarificationResponse,
+  ClarifyingItemDraft,
   IssueContract,
   MissionTemplateName,
   PlanConstructionRecord,
+  PlannedIssueDraft,
 } from "@camino/shared";
-import { MISSION_TEMPLATE_NAMES } from "@camino/shared";
+import { MISSION_TEMPLATES, MISSION_TEMPLATE_NAMES } from "@camino/shared";
 import type { HeldWriterLock } from "./writer-lock.js";
 
 const SCHEMA_VERSION = 1;
@@ -141,7 +151,7 @@ CREATE TABLE IF NOT EXISTS contracts (
   version       INTEGER NOT NULL CHECK (version >= 1),
   contract_hash TEXT NOT NULL UNIQUE CHECK (typeof(contract_hash) = 'text' AND length(contract_hash) = 64),
   mission_id    TEXT NOT NULL CHECK (${NUL_FREE("mission_id")}),
-  session_id    TEXT NOT NULL CHECK (${NUL_FREE("session_id")}),
+  session_id    TEXT NOT NULL REFERENCES plan_sessions(session_id) CHECK (${NUL_FREE("session_id")}),
   record        TEXT NOT NULL CHECK (typeof(record) = 'text'),
   recorded_at   TEXT NOT NULL CHECK (${NUL_FREE("recorded_at")}),
   PRIMARY KEY (issue_id, version)
@@ -422,13 +432,47 @@ export class PlanStore {
         );
       }
     }
+    // Confirmation and flag-acknowledgment rows validate at adoption too
+    // (r2 finding 10): malformed ids or non-array flag payloads written by
+    // a raw writer are refused, not adopted.
+    const confirmationRows = this.#db
+      .prepare("SELECT session_id, segment_id, requirement_id FROM plan_confirmations")
+      .all() as Array<{ session_id: string; segment_id: string; requirement_id: string }>;
+    for (const row of confirmationRows) {
+      if (!isRequirementId(row.requirement_id)) {
+        throw new Error(
+          `plan store ${path} confirmation ${row.session_id}/${row.segment_id} holds a ` +
+            `malformed requirement id — refusing to adopt`,
+        );
+      }
+    }
+    const flagRows = this.#db
+      .prepare("SELECT session_id, id, flagged_segment_ids FROM plan_flag_acknowledgments")
+      .all() as Array<{ session_id: string; id: number; flagged_segment_ids: string }>;
+    for (const row of flagRows) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.flagged_segment_ids);
+      } catch {
+        parsed = null;
+      }
+      if (!Array.isArray(parsed) || parsed.some((s) => typeof s !== "string")) {
+        throw new Error(
+          `plan store ${path} flag acknowledgment ${row.session_id}#${row.id} is not a ` +
+            `string array — refusing to adopt`,
+        );
+      }
+    }
     const contractRows = this.#db
-      .prepare("SELECT issue_id, version, contract_hash, mission_id, record FROM contracts")
+      .prepare(
+        "SELECT issue_id, version, contract_hash, mission_id, session_id, record FROM contracts",
+      )
       .all() as Array<{
       issue_id: string;
       version: number;
       contract_hash: string;
       mission_id: string;
+      session_id: string;
       record: string;
     }>;
     for (const row of contractRows) {
@@ -453,6 +497,20 @@ export class PlanStore {
         throw new Error(
           `plan store ${path} contract ${row.issue_id} v${row.version} disagrees with its ` +
             "indexed columns — refusing to adopt a tampered store",
+        );
+      }
+      // Session custody (r2 finding 10): the contract's session must exist
+      // and belong to the contract's mission — a ghost or re-routed
+      // session_id is refused (new writes are FK-enforced; this closes the
+      // raw-writer path at adoption).
+      const custodySession = this.#db
+        .prepare("SELECT mission_id FROM plan_sessions WHERE session_id = ?")
+        .get(row.session_id) as { mission_id: string } | undefined;
+      if (custodySession === undefined || custodySession.mission_id !== row.mission_id) {
+        throw new Error(
+          `plan store ${path} contract ${row.issue_id} v${row.version} names session ` +
+            `${row.session_id}, which does not exist under mission ${row.mission_id} — ` +
+            "refusing to adopt",
         );
       }
     }
@@ -578,6 +636,16 @@ export class PlanStore {
       if (problems.length > 0) {
         throw new Error(`review artifact refused: ${problems.join("; ")}`);
       }
+      // Class binding (r2 finding 2): a full-route plan cannot carry a mini
+      // review and vice versa — the template decides.
+      const session = this.session(sessionId) as PlanSessionRow;
+      const expected = MISSION_TEMPLATES[session.template].reviewClass;
+      if (snapshot["reviewClass"] !== expected) {
+        throw new Error(
+          `review artifact class ${JSON.stringify(snapshot["reviewClass"])} does not match the ` +
+            `${session.template} template's ${expected}`,
+        );
+      }
     } else {
       const problems = planConstructionRecordProblems(snapshot);
       if (problems.length > 0) {
@@ -619,23 +687,107 @@ export class PlanStore {
     return { seq, kind, payload: snapshot, recordedAt };
   }
 
+  /**
+   * Read the stream, RE-VALIDATING every row (r2 finding 10): a row a raw
+   * writer slipped past the triggers is refused at the read seam with its
+   * position named, never served downstream.
+   */
   streamRecords(sessionId: string): PlanStreamRecord[] {
     const rows = this.#db
       .prepare(
         "SELECT seq, kind, payload, recorded_at FROM plan_stream WHERE session_id = ? ORDER BY seq",
       )
       .all(sessionId) as Array<{ seq: number; kind: string; payload: string; recorded_at: string }>;
-    return rows.map((row) => ({
-      seq: row.seq,
-      kind: row.kind as PlanStreamKind,
-      payload: JSON.parse(row.payload) as Record<string, unknown>,
-      recordedAt: row.recorded_at,
-    }));
+    return rows.map((row) => {
+      const payload = JSON.parse(row.payload) as Record<string, unknown>;
+      const problems =
+        row.kind === "review-attached"
+          ? reviewArtifactProblems(payload)
+          : planConstructionRecordProblems(payload);
+      if (problems.length > 0) {
+        throw new Error(
+          `stored stream row ${sessionId}#${row.seq} fails validation on read: ${problems.join("; ")}`,
+        );
+      }
+      if (row.kind !== "review-attached" && payload["kind"] !== row.kind) {
+        throw new Error(
+          `stored stream row ${sessionId}#${row.seq} kind column disagrees with its payload`,
+        );
+      }
+      return {
+        seq: row.seq,
+        kind: row.kind as PlanStreamKind,
+        payload,
+        recordedAt: row.recorded_at,
+      };
+    });
   }
 
   // -------------------------------------------------------------------------
   // David's acts
+  //
+  // The store enforces its OWN act invariants (r2 findings 1–2): acts bind
+  // to stream entities that exist, statements bind to their checklist rows,
+  // nothing lands after an approval or rejection act (so the state the
+  // approval gate re-derives at resume is EXACTLY the state David approved
+  // over), and the approval/completion markers require the derivable gate
+  // conditions. The service performs the same checks with richer typed
+  // refusals; both layers verify so a first-party caller reaching past the
+  // service cannot persist rows the service would refuse.
   // -------------------------------------------------------------------------
+
+  /** The stream-derived plan shape the act guards check against. */
+  #streamStateFor(sessionId: string): {
+    issues: PlannedIssueDraft[];
+    clarifications: ClarifyingItemDraft[];
+    checklist: ChecklistRowDraft[];
+    constructionComplete: boolean;
+    reviewArtifacts: Array<Record<string, unknown>>;
+  } {
+    const issues: PlannedIssueDraft[] = [];
+    const clarifications: ClarifyingItemDraft[] = [];
+    const checklist: ChecklistRowDraft[] = [];
+    const reviewArtifacts: Array<Record<string, unknown>> = [];
+    let constructionComplete = false;
+    for (const record of this.streamRecords(sessionId)) {
+      switch (record.kind) {
+        case "issue":
+          issues.push((record.payload as unknown as { issue: PlannedIssueDraft }).issue);
+          break;
+        case "clarification":
+          clarifications.push(
+            (record.payload as unknown as { clarification: ClarifyingItemDraft }).clarification,
+          );
+          break;
+        case "checklist-row":
+          checklist.push((record.payload as unknown as { row: ChecklistRowDraft }).row);
+          break;
+        case "construction-complete":
+          constructionComplete = true;
+          break;
+        case "review-attached":
+          reviewArtifacts.push(record.payload);
+          break;
+      }
+    }
+    return { issues, clarifications, checklist, constructionComplete, reviewArtifacts };
+  }
+
+  /** Acts are refused once an approval or rejection act closed the session. */
+  #assertActsOpen(sessionId: string, act: string): void {
+    if (this.session(sessionId) === undefined) {
+      throw new Error(`plan session ${sessionId} does not exist`);
+    }
+    if (this.rejection(sessionId) !== undefined) {
+      throw new Error(`plan session ${sessionId} is rejected; ${act} refused`);
+    }
+    if (this.approval(sessionId) !== undefined) {
+      throw new Error(
+        `plan session ${sessionId} has a recorded approval; ${act} refused — acts after ` +
+          "approval would change the state the approval was granted over",
+      );
+    }
+  }
 
   recordAcknowledgment(
     sessionId: string,
@@ -644,6 +796,15 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordAcknowledgment");
+    this.#assertActsOpen(sessionId, "acknowledgment");
+    const problems = clarificationResponseProblems(response);
+    if (problems.length > 0) {
+      throw new Error(`acknowledgment response refused: ${problems.join("; ")}`);
+    }
+    const state = this.#streamStateFor(sessionId);
+    if (!state.clarifications.some((c) => c.clarificationId === clarificationId)) {
+      throw new Error(`clarification ${clarificationId} does not exist in ${sessionId}`);
+    }
     this.#db
       .prepare(
         `INSERT INTO plan_acknowledgments (session_id, clarification_id, response, actor, recorded_at)
@@ -663,7 +824,17 @@ export class PlanStore {
       .prepare("SELECT clarification_id, response FROM plan_acknowledgments WHERE session_id = ?")
       .all(sessionId) as Array<{ clarification_id: string; response: string }>;
     return new Map(
-      rows.map((row) => [row.clarification_id, JSON.parse(row.response) as ClarificationResponse]),
+      rows.map((row) => {
+        const response = JSON.parse(row.response) as ClarificationResponse;
+        const problems = clarificationResponseProblems(response);
+        if (problems.length > 0) {
+          throw new Error(
+            `stored acknowledgment ${sessionId}/${row.clarification_id} fails validation on ` +
+              `read: ${problems.join("; ")}`,
+          );
+        }
+        return [row.clarification_id, response];
+      }),
     );
   }
 
@@ -673,6 +844,31 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordConfirmation");
+    this.#assertActsOpen(sessionId, "confirmation");
+    if (!isRequirementId(confirmation.requirementId)) {
+      throw new Error(
+        `confirmation requirement id ${JSON.stringify(confirmation.requirementId)} is not CAM-AREA-NN`,
+      );
+    }
+    // Statement binding (r2 finding 2): a confirmation confirms EXACTLY the
+    // proposed statement of its mapped checklist row — a forged statement
+    // never becomes accepted intent through this seam.
+    const state = this.#streamStateFor(sessionId);
+    const row = state.checklist.find((r) => r.segmentId === confirmation.segmentId);
+    if (row === undefined) {
+      throw new Error(`segment ${confirmation.segmentId} has no checklist row in ${sessionId}`);
+    }
+    if (row.disposition !== "mapped") {
+      throw new Error(
+        `segment ${confirmation.segmentId} is flagged unmapped; confirmation refused`,
+      );
+    }
+    if (row.proposedStatement !== confirmation.statement) {
+      throw new Error(
+        `confirmation statement does not match the checklist row's proposed statement for ` +
+          `${confirmation.segmentId} — refusing to bind foreign text to accepted intent`,
+      );
+    }
     this.#db
       .prepare(
         `INSERT INTO plan_confirmations (session_id, segment_id, requirement_id, statement, actor, recorded_at)
@@ -732,6 +928,18 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordFlagAcknowledgment");
+    this.#assertActsOpen(sessionId, "flag acknowledgment");
+    const state = this.#streamStateFor(sessionId);
+    const flagged = state.checklist
+      .filter((r) => r.disposition === "unmapped")
+      .map((r) => r.segmentId)
+      .sort();
+    const named = [...flaggedSegmentIds].sort();
+    if (JSON.stringify(named) !== JSON.stringify(flagged)) {
+      throw new Error(
+        `flag acknowledgment must name the current unmapped set exactly [${flagged.join(", ")}]`,
+      );
+    }
     this.#db
       .prepare(
         `INSERT INTO plan_flag_acknowledgments (session_id, flagged_segment_ids, actor, recorded_at)
@@ -739,7 +947,7 @@ export class PlanStore {
       )
       .run({
         sessionId,
-        flaggedSegmentIds: JSON.stringify([...flaggedSegmentIds].sort()),
+        flaggedSegmentIds: JSON.stringify(named),
         actor,
         recordedAt: this.#now().toISOString(),
       });
@@ -759,8 +967,15 @@ export class PlanStore {
     };
   }
 
+  /**
+   * Deterministic conflict resolution (r2 finding 5): a rejection cannot
+   * land once an approval act exists — a granted approval completes (or is
+   * refused loudly at resume); it is never raced by a rejection into
+   * irreconcilable state.
+   */
   recordRejection(sessionId: string, actor: string): void {
     this.#assertWritable("plan store recordRejection");
+    this.#assertActsOpen(sessionId, "rejection");
     this.#db
       .prepare("INSERT INTO plan_rejections (session_id, actor, recorded_at) VALUES (?, ?, ?)")
       .run(sessionId, actor, this.#now().toISOString());
@@ -773,8 +988,66 @@ export class PlanStore {
     return row === undefined ? undefined : { actor: row.actor, recordedAt: row.recorded_at };
   }
 
+  /**
+   * The approval act requires every gate condition DERIVABLE from this
+   * store's own rows (r2 finding 1): construction complete, a review
+   * artifact of the template's class (with true reviewer facts on the
+   * quick-task route), every clarification acknowledged, every mapped row
+   * confirmed, the flagged set acknowledged, the dependency graph sound
+   * and acyclic, and the template bounds met. Checklist TOTALITY is the
+   * one gate condition this store cannot derive (segments come from the
+   * mission's PRD content, which lives in the domain store) — the
+   * service's pure gate covers it, and the resume path re-runs that gate
+   * before completing any approval.
+   */
   recordApproval(sessionId: string, actor: string): void {
     this.#assertWritable("plan store recordApproval");
+    this.#assertActsOpen(sessionId, "approval");
+    const session = this.session(sessionId) as PlanSessionRow;
+    const state = this.#streamStateFor(sessionId);
+    const problems: string[] = [];
+    if (!state.constructionComplete) problems.push("construction is not complete");
+    const template = MISSION_TEMPLATES[session.template];
+    const artifact = state.reviewArtifacts.at(-1);
+    if (artifact === undefined) {
+      problems.push("no review artifact is attached");
+    } else if (session.template === "quick-task") {
+      for (const fact of ["riskTierLow", "neutralConcurred", "observabilityAdjudicated"]) {
+        if (artifact[fact] !== true) problems.push(`quick-task review fact ${fact} is not true`);
+      }
+    }
+    problems.push(...templateProblems(template, state.issues));
+    problems.push(...dependencyGraphProblems(state.issues));
+    const cycle = findDependencyCycle(state.issues);
+    if (cycle !== null) problems.push(`dependency cycle ${formatCycle(cycle)}`);
+    const acknowledged = this.acknowledgments(sessionId);
+    for (const clarification of state.clarifications) {
+      if (!acknowledged.has(clarification.clarificationId)) {
+        problems.push(`clarification ${clarification.clarificationId} is unacknowledged`);
+      }
+    }
+    const confirmed = new Set(this.confirmations(sessionId).map((c) => c.segmentId));
+    const flagged: string[] = [];
+    for (const row of state.checklist) {
+      if (row.disposition === "mapped") {
+        if (!confirmed.has(row.segmentId))
+          problems.push(`mapped row ${row.segmentId} is unconfirmed`);
+      } else {
+        flagged.push(row.segmentId);
+      }
+    }
+    if (flagged.length > 0) {
+      const latest = this.latestFlagAcknowledgment(sessionId);
+      if (
+        latest === null ||
+        JSON.stringify([...latest.segmentIds].sort()) !== JSON.stringify(flagged.sort())
+      ) {
+        problems.push(`flagged rows [${flagged.join(", ")}] are unacknowledged`);
+      }
+    }
+    if (problems.length > 0) {
+      throw new Error(`approval act refused: ${problems.join("; ")}`);
+    }
     this.#db
       .prepare("INSERT INTO plan_approvals (session_id, actor, recorded_at) VALUES (?, ?, ?)")
       .run(sessionId, actor, this.#now().toISOString());
@@ -787,8 +1060,28 @@ export class PlanStore {
     return row === undefined ? undefined : { actor: row.actor, recordedAt: row.recorded_at };
   }
 
+  /**
+   * The completion marker requires its substance (r2 findings 1 and 3): an
+   * approval act (also FK-enforced) and one stored contract per streamed
+   * issue, under the session's mission. A bare marker cannot make a plan
+   * read as approved.
+   */
   recordApprovalCompletion(sessionId: string): void {
     this.#assertWritable("plan store recordApprovalCompletion");
+    if (this.approval(sessionId) === undefined) {
+      throw new Error(`plan session ${sessionId} has no approval act; completion refused`);
+    }
+    const session = this.session(sessionId) as PlanSessionRow;
+    const state = this.#streamStateFor(sessionId);
+    const missing = state.issues
+      .map((issue) => `${session.missionId}.${issue.planIssueId}`)
+      .filter((issueId) => this.latestContract(issueId) === undefined);
+    if (missing.length > 0) {
+      throw new Error(
+        `plan session ${sessionId} completion refused: no contract stored for ` +
+          `[${missing.join(", ")}]`,
+      );
+    }
     this.#db
       .prepare("INSERT INTO plan_approval_completions (session_id, recorded_at) VALUES (?, ?)")
       .run(sessionId, this.#now().toISOString());
@@ -799,6 +1092,14 @@ export class PlanStore {
       .prepare("SELECT recorded_at FROM plan_approval_completions WHERE session_id = ?")
       .get(sessionId) as { recorded_at: string } | undefined;
     return row === undefined ? undefined : { recordedAt: row.recorded_at };
+  }
+
+  /** Completed approvals — the resume reconciliation sweep's worklist (r2 finding 3). */
+  completedApprovalSessions(): PlanSessionRow[] {
+    const rows = this.#db
+      .prepare("SELECT session_id FROM plan_approval_completions ORDER BY recorded_at, session_id")
+      .all() as Array<{ session_id: string }>;
+    return rows.map((r) => this.session(r.session_id) as PlanSessionRow);
   }
 
   /** Approval acts whose freeze never completed — the crash-resume worklist. */

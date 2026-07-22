@@ -151,7 +151,11 @@ export interface PlanView {
 
 export type ServiceApprovalRefusal =
   | ApprovalRefusal
-  | { readonly kind: "quick-task-review-facts-missing"; readonly missing: readonly string[] };
+  | { readonly kind: "quick-task-review-facts-missing"; readonly missing: readonly string[] }
+  | {
+      readonly kind: "confirmed-requirement-not-accepted";
+      readonly requirementIds: readonly string[];
+    };
 
 export type ApprovePlanOutcome =
   | { readonly ok: true; readonly contracts: readonly IssueContract[] }
@@ -534,38 +538,57 @@ export class PlanningService {
   approvePlan(sessionId: string, actor: string = DAVID_ACTOR): ApprovePlanOutcome {
     const state = this.#planState(sessionId);
     this.#assertSessionOpen(state);
-    if (this.#store.approval(sessionId) !== undefined) {
-      throw new PlanningError(
-        `session ${sessionId} already has a recorded approval; resumePendingWork completes it`,
-      );
-    }
     const decision = decidePlanApproval(this.#gateInput(state));
     if (!decision.ok) {
       return { ok: false, refusals: decision.refusals };
     }
+    // Confirmed intent must still stand in the ledger (r2 finding 7): a
+    // requirement descoped or disputed since its confirmation blocks
+    // approval by name — the checklist no longer reflects accepted intent.
+    const dispositionProblems = this.#confirmedDispositionProblems(state);
+    if (dispositionProblems.length > 0) {
+      return {
+        ok: false,
+        refusals: [
+          { kind: "confirmed-requirement-not-accepted", requirementIds: dispositionProblems },
+        ],
+      };
+    }
     let facts: Parameters<SerializationScheduler["approvePlan"]>[2];
     if (state.session.template === "quick-task") {
+      // The A.1b#3 guard requires these facts attested TRUE; recording the
+      // approval act with false ones would freeze contracts and then wedge
+      // on a scheduler refusal every resume (r2 finding 4) — refuse BEFORE
+      // the act instead, naming what is not satisfied.
       const artifact = state.reviewArtifacts.at(-1) ?? {};
-      const missing = ["riskTierLow", "neutralConcurred"].filter(
-        (field) => typeof artifact[field] !== "boolean",
-      );
-      if (missing.length > 0) {
+      const unmet = ["riskTierLow", "neutralConcurred"].filter((field) => artifact[field] !== true);
+      if (state.issues.length !== 1) unmet.push("singleIssue");
+      if (unmet.length > 0) {
         return {
           ok: false,
-          refusals: [{ kind: "quick-task-review-facts-missing", missing }],
+          refusals: [{ kind: "quick-task-review-facts-missing", missing: unmet }],
         };
       }
-      facts = {
-        riskTierLow: artifact["riskTierLow"] === true,
-        neutralConcurred: artifact["neutralConcurred"] === true,
-        singleIssue: state.issues.length === 1,
-      };
+      facts = { riskTierLow: true, neutralConcurred: true, singleIssue: true };
     } else {
       facts = decision.attested;
     }
     this.#store.recordApproval(sessionId, actor);
     const contracts = this.#completeApproval(state, actor, facts);
     return { ok: true, contracts };
+  }
+
+  /** Confirmed requirement ids whose ledger disposition left the accepted family. */
+  #confirmedDispositionProblems(state: PlanState): string[] {
+    const problems: string[] = [];
+    for (const confirmation of this.#store.confirmations(state.session.sessionId)) {
+      const entry = this.#ledger.entry(confirmation.requirementId);
+      if (entry === undefined || entry.disposition === "proposed") continue; // healed at freeze
+      if (!(ACCEPTED_FAMILY as readonly string[]).includes(entry.disposition)) {
+        problems.push(confirmation.requirementId);
+      }
+    }
+    return problems.sort();
   }
 
   /**
@@ -749,6 +772,15 @@ export class PlanningService {
     // gate now refuses means the store's rows are not the rows that
     // approval was granted over — refused loudly, never adopted.
     for (const sessionRow of this.#store.pendingApprovalSessions()) {
+      if (this.#store.rejection(sessionRow.sessionId) !== undefined) {
+        // Both acts on one session cannot arise through this service (a
+        // pending approval closes the session to rejection and the store
+        // refuses it too) — a store carrying both is foreign state.
+        throw new PlanningError(
+          `session ${sessionRow.sessionId} carries both an approval and a rejection act — ` +
+            "refusing to adopt incoherent state",
+        );
+      }
       const state = this.#planState(sessionRow.sessionId);
       const approval = this.#store.approval(sessionRow.sessionId) as { actor: string };
       const decision = decidePlanApproval(this.#gateInput(state));
@@ -759,11 +791,71 @@ export class PlanningService {
             "an approval the durable state does not support",
         );
       }
+      const dispositionProblems = this.#confirmedDispositionProblems(state);
+      if (dispositionProblems.length > 0) {
+        throw new PlanningError(
+          `session ${sessionRow.sessionId} has a recorded approval but confirmed ` +
+            `requirement(s) ${dispositionProblems.join(", ")} left the accepted family — ` +
+            "refusing to complete",
+        );
+      }
       const facts = this.#resumeFacts(state, decision.attested);
       this.#completeApproval(state, approval.actor, facts);
       report.completedApprovals.push(sessionRow.sessionId);
     }
+    // 5. Reconcile COMPLETED approvals (r2 finding 3): a completion marker
+    // must still be backed by its substance — the gate over the durable
+    // state, one contract per issue with the recomputed terms hash, and
+    // the mission/issue records the freeze wrote. History deleted behind
+    // restored triggers fails HERE, loudly, instead of reading as
+    // approved.
+    for (const sessionRow of this.#store.completedApprovalSessions()) {
+      this.#verifyCompletedApproval(sessionRow.sessionId);
+    }
     return report;
+  }
+
+  /** Fail-closed verification of one completed approval's substance. */
+  #verifyCompletedApproval(sessionId: string): void {
+    const state = this.#planState(sessionId);
+    const decision = decidePlanApproval(this.#gateInput(state));
+    if (!decision.ok) {
+      throw new PlanningError(
+        `completed approval ${sessionId} fails the gate over the durable state ` +
+          `(${decision.refusals.map((r) => r.kind).join(", ")}) — refusing to adopt`,
+      );
+    }
+    const approval = this.#store.approval(sessionId) as { actor: string };
+    const expected = this.#buildContracts(state, approval.actor);
+    for (const contract of expected) {
+      const stored = this.#store.contract(contract.issueId, contract.version);
+      if (stored === undefined) {
+        throw new PlanningError(
+          `completed approval ${sessionId} has no stored contract for ${contract.issueId} ` +
+            `v${contract.version} — refusing to adopt`,
+        );
+      }
+      if (stored.contractHash !== contract.contractHash) {
+        throw new PlanningError(
+          `completed approval ${sessionId} stored contract ${contract.issueId} v${contract.version} ` +
+            `hash ${stored.contractHash} does not match the terms rebuilt from the durable plan ` +
+            `state (${contract.contractHash}) — refusing to adopt`,
+        );
+      }
+      const missionState = this.#recorder.currentState("mission", state.mission.id);
+      if (missionState === "draft" || missionState === "planned" || missionState === undefined) {
+        throw new PlanningError(
+          `completed approval ${sessionId} but mission ${state.mission.id} is ` +
+            `${missionState ?? "unrecorded"} — refusing to adopt`,
+        );
+      }
+      if (this.#recorder.currentState("issue", contract.issueId) === undefined) {
+        throw new PlanningError(
+          `completed approval ${sessionId} but issue ${contract.issueId} was never created — ` +
+            "refusing to adopt",
+        );
+      }
+    }
   }
 
   /** Rebuild the approval facts for a resume run (the gate re-passed above). */
@@ -997,6 +1089,15 @@ export class PlanningService {
     if (this.#store.approvalCompletion(sessionId) !== undefined) {
       throw new PlanningError(`plan session ${sessionId} is approved and frozen`);
     }
+    // A pending approval also closes the session to further acts (r2
+    // findings 2 and 5): acts after the approval act would change the state
+    // the approval was granted over, and a rejection would race the freeze
+    // into irreconcilable state — resume completes the approval instead.
+    if (this.#store.approval(sessionId) !== undefined) {
+      throw new PlanningError(
+        `plan session ${sessionId} has a recorded approval; resumePendingWork completes it`,
+      );
+    }
   }
 
   #gateInput(state: PlanState): PlanGateInput {
@@ -1093,7 +1194,17 @@ export class PlanningService {
     }
     if (entry.disposition === "proposed") {
       this.#ledger.acceptRequirement(requirementId);
+      return;
     }
-    // accepted / resolved-accepted: nothing to write (resume no-op).
+    if (!(ACCEPTED_FAMILY as readonly string[]).includes(entry.disposition)) {
+      // descoped or disputed since the confirmation (r2 finding 7): the
+      // confirmation no longer reflects standing intent — refused loudly,
+      // never silently treated as accepted.
+      throw new PlanningError(
+        `requirement ${requirementId} is ${entry.disposition} in the ledger; its confirmation ` +
+          "no longer stands — resolve the dispute or re-plan before approval",
+      );
+    }
+    // accepted family: nothing to write (resume no-op).
   }
 }

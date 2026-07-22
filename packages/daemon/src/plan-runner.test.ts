@@ -209,3 +209,29 @@ describe("stream-tail robustness (r1 finding 10)", () => {
     expect(h.service.planView(h.sessionId).status).toBe("constructed");
   });
 });
+
+describe("in-place rewrite detection (r2 finding 11)", () => {
+  it("refuses a same-length rewrite of consumed content by name", async () => {
+    const h = newHarness();
+    const run = runPlannerCompile({
+      adapter: mockPlannerAdapter("rewrite-history"),
+      service: h.service,
+      sessionId: h.sessionId,
+      workdirRoot: h.workdirRoot,
+      pollMs: 25,
+      timeoutMs: 60_000,
+    });
+    await until(() => h.service.planView(h.sessionId).issues.length === 1, "first issue");
+    const workspace = workspaceIn(h.workdirRoot);
+    await until(() => existsSync(join(workspace, "waiting-for-ack")), "handshake");
+    writeFileSync(join(workspace, "ack"), "");
+    const record = await run;
+    // The mock rewrote the already-consumed I1 record in place (same byte
+    // length). The consumed-prefix hash catches it: everything after the
+    // rewrite is refused by name, never silently lost or double-ingested.
+    expect(record.refused.some((r) => r.problem.includes("rewritten in place"))).toBe(true);
+    expect(record.constructionComplete).toBe(false);
+    // What was ingested before the rewrite is exactly what the view holds.
+    expect(h.service.planView(h.sessionId).issues.map((i) => i.planIssueId)).toEqual(["I1"]);
+  });
+});

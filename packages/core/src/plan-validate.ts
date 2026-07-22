@@ -24,7 +24,12 @@ import type {
 export interface PrdSegment {
   /** "S1"… in document order. */
   readonly segmentId: string;
-  /** The segment's text, verbatim (heading markers and list bullets kept). */
+  /**
+   * The segment's text: source characters with heading markers and list
+   * bullets kept, single-newline line joins normalized to one space, and
+   * leading/trailing whitespace trimmed. Totality is over non-whitespace
+   * text — no visible character is ever lost or reordered.
+   */
   readonly text: string;
 }
 
@@ -38,9 +43,14 @@ export interface PrdSegment {
  * than under-splits, because an over-split only yields a finer checklist
  * row while an under-split can bury a second requirement inside a segment
  * whose row maps only the first. So every sentence terminator followed by
- * whitespace splits — abbreviations ("e.g. the size") split too, and a
- * sentence starting lowercase ("iOS users…") still gets its own segment.
- * Decimal points never split (no whitespace follows them). Non-guarantee
+ * whitespace splits — abbreviations ("e.g. the size") split too, a
+ * sentence starting lowercase ("iOS users…") still gets its own segment,
+ * semicolon-joined requirements split, Unicode whitespace (no-break space
+ * included) counts as a boundary, and typographic closing quotes ride
+ * with their sentence. Decimal points never split (no whitespace follows
+ * them); a colon deliberately never splits ("Note: …" labels are
+ * ubiquitous), so colon-joined independent requirements share one row —
+ * a finer-grained mapping is the checklist author's call. Non-guarantee
  * that remains: a mapped row's STATEMENT covering less than its segment's
  * text is a semantic judgment no mechanical check can close — that is what
  * checklist review and the cross-family plan review (WP-111) exist for.
@@ -109,22 +119,28 @@ export function segmentPrd(text: string): PrdSegment[] {
 }
 
 /**
- * Split after every [.!?] (+ optional closing quotes/brackets) that is
- * followed by whitespace and any further text. No next-character class:
- * requiring an uppercase/digit start let "… encrypted. iOS users …" hide a
- * second requirement in the first one's segment (r1 finding 6) — the
- * over-split direction is the safe one.
+ * Split after every sentence terminator (+ optional closing quotes or
+ * brackets) that is followed by whitespace and further text. No
+ * next-character class: requiring an uppercase/digit start let
+ * "… encrypted. iOS users …" hide a second requirement in the first one's
+ * segment (r1 finding 6). Round-2 hardening (r2 finding 8): terminators
+ * include the semicolon (requirement-joining prose) and CJK/fullwidth
+ * forms; closers include typographic quotes; the whitespace test is
+ * Unicode (\s), so a no-break space no longer buries a sentence.
  */
+const SENTENCE_TERMINATORS = new Set([".", "!", "?", ";", "。", "！", "？", "；"]);
+const CLOSER_RE = /["')\]”’»›」』]/;
+const WHITESPACE_RE = /\s/;
+
 function splitSentences(block: string): string[] {
   const out: string[] = [];
   let start = 0;
   for (let i = 0; i < block.length; i += 1) {
-    const ch = block[i] as string;
-    if (ch !== "." && ch !== "!" && ch !== "?") continue;
+    if (!SENTENCE_TERMINATORS.has(block[i] as string)) continue;
     let j = i + 1;
-    while (j < block.length && /["')\]]/.test(block[j] as string)) j += 1;
+    while (j < block.length && CLOSER_RE.test(block[j] as string)) j += 1;
     let k = j;
-    while (k < block.length && (block[k] === " " || block[k] === "\t")) k += 1;
+    while (k < block.length && WHITESPACE_RE.test(block[k] as string)) k += 1;
     if (k === j || k >= block.length) continue; // no whitespace boundary → not a split point
     out.push(block.slice(start, j));
     start = k;
@@ -478,10 +494,14 @@ export interface AmbiguityCoverage {
  * answer keys — a plan that silently guesses fails here. A clarification
  * covers a planted ambiguity only if it BOTH references the ambiguity's
  * segment AND mentions one of the answer key's anchor terms in its
- * question, rationale, or recorded assumption — an unrelated question on
- * the same sentence does not count (r1 finding 2). Anchor matching is a
- * deterministic keyword heuristic, not semantics; the manifest author
- * chooses terms that any genuine surfacing of the ambiguity must name.
+ * QUESTION or recorded ASSUMPTION — the decision-carrying fields; a term
+ * appearing only in the free-text rationale does not count, and an
+ * unrelated question on the same sentence does not count (r1 finding 2,
+ * r2 finding 6). Anchor matching is a deterministic keyword heuristic,
+ * not semantics — it calibrates COOPERATIVE planners against known answer
+ * keys and cannot certify relevance against an adversarial one; the
+ * manifest author chooses terms that any genuine surfacing of the
+ * ambiguity must name, and blank terms are manifest drift.
  * At runtime on real PRDs no answer key exists; there the enforcement is
  * the approval gate above, which forces an active acknowledgment for
  * every ambiguity the planner DID surface. The two are complementary:
@@ -499,10 +519,13 @@ export function plantedAmbiguityCoverage(
   }> = [];
   const uncovered: Array<{ plantedId: string; segmentId: string }> = [];
   const unlocatable: string[] = [];
+  const canon = (text: string): string => text.normalize("NFC").toLowerCase();
   for (const ambiguity of planted) {
-    if (ambiguity.answerKeyTerms.length === 0) {
-      // An empty answer key would make coverage vacuously gameable —
-      // manifest drift, reported loudly rather than skipped.
+    const terms = ambiguity.answerKeyTerms.map(canon).filter((t) => t.trim().length > 0);
+    if (terms.length === 0) {
+      // An empty or blank answer key would make coverage vacuously
+      // gameable ("" is a substring of everything) — manifest drift,
+      // reported loudly rather than skipped (r2 finding 6).
       unlocatable.push(ambiguity.id);
       continue;
     }
@@ -512,11 +535,14 @@ export function plantedAmbiguityCoverage(
       continue;
     }
     const segmentId = (matches[0] as PrdSegment).segmentId;
-    const terms = ambiguity.answerKeyTerms.map((t) => t.toLowerCase());
     const touching = clarifications
       .filter((c) => {
         if (!c.relatedSegmentIds.includes(segmentId)) return false;
-        const text = `${c.question} ${c.whyItMatters} ${c.assumptionIfUnanswered}`.toLowerCase();
+        // Match only the DECISION-carrying fields — the question asked and
+        // the assumption recorded. A stray term in the free-text rationale
+        // must not cover (r2 finding 6); both sides NFC-normalize so
+        // canonically equivalent Unicode cannot false-negative.
+        const text = canon(`${c.question} ${c.assumptionIfUnanswered}`);
         return terms.some((term) => text.includes(term));
       })
       .map((c) => c.clarificationId);

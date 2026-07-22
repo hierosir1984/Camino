@@ -36,7 +36,17 @@ function isPlainObject(value: object): boolean {
   return proto === Object.prototype || proto === null;
 }
 
-function serialize(value: unknown, path: string, seen: Set<object>): string {
+/**
+ * Nesting bound (r2 finding 9): legitimate contract/plan values are a few
+ * levels deep; unbounded recursion turns pathological input into a raw
+ * RangeError instead of a named refusal.
+ */
+const MAX_DEPTH = 256;
+
+function serialize(value: unknown, path: string, seen: Set<object>, depth: number): string {
+  if (depth > MAX_DEPTH) {
+    throw new CanonicalJsonError(path, `nesting exceeds ${MAX_DEPTH} levels`);
+  }
   switch (typeof value) {
     case "string":
       return JSON.stringify(value);
@@ -60,16 +70,34 @@ function serialize(value: unknown, path: string, seen: Set<object>): string {
   }
   seen.add(obj);
   try {
+    // Symbol-keyed properties have no JSON form and would otherwise vanish
+    // silently, hashing two different values alike (r2 finding 9).
+    if (Object.getOwnPropertySymbols(obj).length > 0) {
+      throw new CanonicalJsonError(path, "symbol-keyed properties have no JSON form");
+    }
     if (Array.isArray(obj)) {
-      // Explicit index walk: Array.prototype.map SKIPS holes, which would
-      // serialize [ ,1 ] and [1] identically (or emit non-JSON like "[,]").
-      // A hole has no JSON form — refuse it with its path (r1 finding 7).
+      // Explicit index walk with Object.hasOwn: iteration methods SKIP
+      // holes, and the `in` operator sees INHERITED numeric properties —
+      // a polluted Array.prototype[0] would silently fill a hole and
+      // collide two different arrays (r1 finding 7; r2 finding 9). A hole
+      // has no JSON form — refuse it with its path.
       const parts: string[] = [];
       for (let i = 0; i < obj.length; i += 1) {
-        if (!(i in obj)) {
+        if (!Object.hasOwn(obj, i)) {
           throw new CanonicalJsonError(`${path}[${i}]`, "sparse-array hole");
         }
-        parts.push(serialize(obj[i], `${path}[${i}]`, seen));
+        parts.push(serialize(obj[i], `${path}[${i}]`, seen, depth + 1));
+      }
+      // Non-index own properties on an array (arr.note = "x") would be
+      // silently discarded by JSON — refuse them instead.
+      for (const key of Object.keys(obj)) {
+        const index = Number(key);
+        if (!Number.isInteger(index) || index < 0 || index >= obj.length) {
+          throw new CanonicalJsonError(
+            `${path}.${key}`,
+            "arrays with non-index own properties have no JSON form",
+          );
+        }
       }
       return `[${parts.join(",")}]`;
     }
@@ -83,7 +111,7 @@ function serialize(value: unknown, path: string, seen: Set<object>): string {
     const parts: string[] = [];
     for (const key of keys) {
       const element: unknown = (obj as Record<string, unknown>)[key];
-      parts.push(`${JSON.stringify(key)}:${serialize(element, `${path}.${key}`, seen)}`);
+      parts.push(`${JSON.stringify(key)}:${serialize(element, `${path}.${key}`, seen, depth + 1)}`);
     }
     return `{${parts.join(",")}}`;
   } finally {
@@ -97,7 +125,7 @@ function serialize(value: unknown, path: string, seen: Set<object>): string {
  * equal values (after key ordering) always produce identical bytes.
  */
 export function canonicalJson(value: unknown): string {
-  return serialize(value, "$", new Set());
+  return serialize(value, "$", new Set(), 0);
 }
 
 /** SHA-256 (lowercase hex) of the UTF-8 encoding of `text`. */

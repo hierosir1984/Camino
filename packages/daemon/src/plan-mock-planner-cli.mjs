@@ -54,6 +54,13 @@ if (process.env.MOCK_PLANNER_MODE === "malformed") {
   emit({ kind: "issue", issue: { planIssueId: "bogus id" } });
 }
 
+if (process.env.MOCK_PLANNER_MODE === "rewrite-history") {
+  // Same-length in-place rewrite of already-consumed content (r2 finding
+  // 11): the runner's consumed-prefix hash must refuse everything after.
+  const current = readFileSync(STREAM, "utf8");
+  writeFileSync(STREAM, current.replace('"I1"', '"I7"'));
+}
+
 const first = segments[0].segmentId;
 emit({
   kind: "clarification",

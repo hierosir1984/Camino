@@ -221,10 +221,65 @@ describe("PlanStore fail-closed adoption", () => {
   });
 });
 
+/**
+ * Build a session whose stream satisfies every store-derivable gate
+ * condition: one issue, Q1, S1 mapped (statement "s"), completion, review.
+ */
+function seedCoherentSession(store: PlanStore, sessionId = "plan-m1-1"): void {
+  seedSession(store, sessionId);
+  store.appendStream(sessionId, "issue", {
+    kind: "issue",
+    issue: {
+      planIssueId: "I1",
+      title: "Deliver the exporter",
+      goal: "CSV export works.",
+      acceptanceCriteria: ["Export downloads a CSV."],
+      dependsOn: [],
+      interfaces: [],
+    },
+  });
+  store.appendStream(sessionId, "clarification", {
+    kind: "clarification",
+    clarification: {
+      clarificationId: "Q1",
+      question: "Which fields?",
+      whyItMatters: "Unstated.",
+      assumptionIfUnanswered: "All visible fields.",
+      relatedSegmentIds: ["S1"],
+      relatedPlanIssueIds: ["I1"],
+    },
+  });
+  store.appendStream(sessionId, "checklist-row", {
+    kind: "checklist-row",
+    row: {
+      segmentId: "S1",
+      disposition: "mapped",
+      proposedStatement: "s",
+      proposedArea: "APP",
+      mappedPlanIssueIds: ["I1"],
+    },
+  });
+  store.appendStream(sessionId, "construction-complete", { kind: "construction-complete" });
+  store.appendStream(sessionId, "review-attached", {
+    reviewClass: "full-falsification",
+    reviewer: "codex-cli",
+  });
+}
+
+/** David's acts over the coherent session, ready for a valid approval act. */
+function actEverything(store: PlanStore, sessionId = "plan-m1-1"): void {
+  store.recordAcknowledgment(sessionId, "Q1", { kind: "assumption-confirmed" }, "david");
+  store.recordConfirmation(
+    sessionId,
+    { segmentId: "S1", requirementId: "CAM-APP-01", statement: "s" },
+    "david",
+  );
+}
+
 describe("PlanStore user-act constraints", () => {
   it("CHECK-pins act actors to david (the canon-ledger precedent)", () => {
     const store = openStore(":memory:");
-    seedSession(store);
+    seedCoherentSession(store);
     expect(() =>
       store.recordAcknowledgment(
         "plan-m1-1",
@@ -233,12 +288,13 @@ describe("PlanStore user-act constraints", () => {
         "camino:planner",
       ),
     ).toThrow(/CHECK/);
+    actEverything(store);
     expect(() => store.recordApproval("plan-m1-1", "camino:scheduler")).toThrow(/CHECK/);
   });
 
   it("keeps one acknowledgment per clarification and one confirmation per segment", () => {
     const store = openStore(":memory:");
-    seedSession(store);
+    seedCoherentSession(store);
     store.recordAcknowledgment("plan-m1-1", "Q1", { kind: "assumption-confirmed" }, "david");
     expect(() =>
       store.recordAcknowledgment("plan-m1-1", "Q1", { kind: "assumption-confirmed" }, "david"),
@@ -257,13 +313,65 @@ describe("PlanStore user-act constraints", () => {
     ).toThrow(/UNIQUE|PRIMARY/);
   });
 
-  it("tracks pending approvals until completion lands", () => {
+  it("tracks pending approvals until completion lands, and completion demands contracts", () => {
     const store = openStore(":memory:");
-    seedSession(store);
+    seedCoherentSession(store);
+    actEverything(store);
     store.recordApproval("plan-m1-1", "david");
     expect(store.pendingApprovalSessions().map((s) => s.sessionId)).toEqual(["plan-m1-1"]);
+    // Completion without the issue's contract refuses (r2 findings 1/3).
+    expect(() => store.recordApprovalCompletion("plan-m1-1")).toThrow(/no contract stored/);
+    store.insertContract(sampleContract(), "plan-m1-1");
     store.recordApprovalCompletion("plan-m1-1");
     expect(store.pendingApprovalSessions()).toEqual([]);
+    expect(store.completedApprovalSessions().map((s) => s.sessionId)).toEqual(["plan-m1-1"]);
+  });
+
+  it("acts recorded once the approval act exists are refused (r2 finding 2)", () => {
+    const store = openStore(":memory:");
+    seedCoherentSession(store);
+    actEverything(store);
+    store.recordApproval("plan-m1-1", "david");
+    expect(() =>
+      store.recordAcknowledgment("plan-m1-1", "Q1", { kind: "assumption-confirmed" }, "david"),
+    ).toThrow(/acts after approval/);
+    expect(() =>
+      store.recordConfirmation(
+        "plan-m1-1",
+        { segmentId: "S1", requirementId: "CAM-APP-09", statement: "s" },
+        "david",
+      ),
+    ).toThrow(/acts after approval/);
+    expect(() => store.recordRejection("plan-m1-1", "david")).toThrow(/acts after approval/);
+  });
+
+  it("refuses the approval act while any derivable gate condition is unmet (r2 finding 1)", () => {
+    const store = openStore(":memory:");
+    seedCoherentSession(store);
+    // No acts at all: every unmet condition is named.
+    expect(() => store.recordApproval("plan-m1-1", "david")).toThrow(
+      /unacknowledged.*unconfirmed|unconfirmed.*unacknowledged/s,
+    );
+  });
+
+  it("binds confirmations to their checklist row's statement (r2 finding 2)", () => {
+    const store = openStore(":memory:");
+    seedCoherentSession(store);
+    expect(() =>
+      store.recordConfirmation(
+        "plan-m1-1",
+        { segmentId: "S1", requirementId: "CAM-APP-01", statement: "forged unrelated statement" },
+        "david",
+      ),
+    ).toThrow(/does not match the checklist row/);
+    expect(() =>
+      store.recordAcknowledgment(
+        "plan-m1-1",
+        "Q1",
+        {} as unknown as { kind: "assumption-confirmed" },
+        "david",
+      ),
+    ).toThrow(/response refused/);
   });
 });
 
@@ -316,14 +424,25 @@ describe("appendStream store-level guards (r1 finding 1)", () => {
       reviewClass: "full-falsification",
       reviewer: "codex-cli",
     });
-    // …but nothing lands once the session is closed by an approval act.
-    store.recordApproval("plan-m1-1", "david");
+    // …but nothing lands once the session is closed by a rejection act.
+    store.recordRejection("plan-m1-1", "david");
     expect(() =>
       store.appendStream("plan-m1-1", "review-attached", {
         reviewClass: "full-falsification",
         reviewer: "codex-cli",
       }),
     ).toThrow(/closed to stream appends/);
+  });
+
+  it("binds the review artifact's class to the session template (r2 finding 2)", () => {
+    const store = openStore(":memory:");
+    seedSession(store); // feature template
+    expect(() =>
+      store.appendStream("plan-m1-1", "review-attached", {
+        reviewClass: "mini-falsification",
+        reviewer: "codex-cli",
+      }),
+    ).toThrow(/does not match the feature template/);
   });
 
   it("adoption refuses a stream with duplicates or post-completion records (raw-writer class)", () => {

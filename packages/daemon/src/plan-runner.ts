@@ -17,11 +17,20 @@
  * recorded in the run record and never crashes the daemon. The planner
  * holds no repository credentials and never touches the stores — the
  * service seam is the only write path, and it validates everything.
+ *
+ * Stream-integrity boundary, stated plainly: the tail keeps a hash of the
+ * consumed prefix, so append-only violations — truncation, shrink, or a
+ * same-length in-place rewrite — are refused by name, never silently
+ * re-read or dropped (r2 finding 11). What no tail can defend is the
+ * workspace itself: a worker with filesystem authority over its own
+ * directory can rename or destroy it wholesale, which surfaces as a run
+ * with no stream and constructionComplete false. Filesystem containment
+ * of workers is the WP-107 container's job, not this protocol's.
  */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PLAN_STREAM_FILENAME } from "@camino/shared";
+import { PLAN_STREAM_FILENAME, sha256Hex } from "@camino/shared";
 import type { AdapterSpec, DispatchOutcome } from "@camino/shared";
 import { dispatch } from "./dispatch/lifecycle.js";
 import type { DispatchOptions } from "./dispatch/lifecycle.js";
@@ -144,6 +153,8 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
    * below the consumed offset is a protocol violation (the worker rewrote
    * history): refused by name once, then ignored — never silently re-read.
    */
+  let consumedHash = sha256Hex("");
+
   const drain = (final: boolean): void => {
     if (shrunk) return;
     try {
@@ -164,17 +175,32 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
       });
       return;
     }
+    // The consumed PREFIX must be byte-identical to what was ingested — a
+    // same-length in-place rewrite would otherwise slip valid records
+    // before the retained offset and lose them silently (r2 finding 11).
+    if (sha256Hex(text.slice(0, offset)) !== consumedHash) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          "stream file was rewritten in place (consumed prefix changed) — " +
+          "the worker rewrote history; further records refused",
+      });
+      return;
+    }
     const unseen = text.slice(offset);
     const lastNewline = unseen.lastIndexOf("\n");
     const complete = lastNewline === -1 ? "" : unseen.slice(0, lastNewline);
     if (lastNewline !== -1) {
       offset += lastNewline + 1;
+      consumedHash = sha256Hex(text.slice(0, offset));
       for (const line of complete.split("\n")) ingestLine(line);
     }
     if (final) {
       const tail = text.slice(offset);
       if (tail.trim().length > 0) {
         offset = text.length;
+        consumedHash = sha256Hex(text);
         ingestLine(tail);
       }
     }
