@@ -12,11 +12,13 @@
 //   3. workspace destroyed           (never before 1 and 2 both succeeded)
 //
 // Every failure is FAIL-CLOSED toward retention: an over-quota workspace, an
-// over-cap archive, a failed ledger write, or a failed destroy each throw a
-// staged ArchivalError and LEAVE THE WORKSPACE IN PLACE (the A.2
-// cleanup-failure row: recorded → `blocked` with cleanup-failed cause →
-// janitor + escalation). Audit material is never silently lost to make
-// cleanup succeed.
+// over-cap archive, or a failed ledger write throws a staged ArchivalError and
+// LEAVES THE WORKSPACE FULLY IN PLACE. A failure DURING the destroy step is the one
+// exception to "fully in place": a recursive delete is not transactional, so a
+// partial destroy is marked `workspaceRetained: false` (round-18 finding 3) — but
+// it is STILL fail-closed, routed to the same A.2 cleanup-failure row (recorded →
+// `blocked` with cleanup-failed cause → janitor + escalation), never silently
+// completed. Audit material is never silently lost to make cleanup succeed.
 //
 // The returned record carries the exact payload of the core machine's
 // `archival-completed` event (A.3#8), with timestamps guaranteed strictly
@@ -47,7 +49,7 @@ import type { FileHandle } from "node:fs/promises";
 import {
   lstat as lstatAsync,
   open as openAsync,
-  readdir as readdirAsync,
+  opendir as opendirAsync,
   rm as rmAsync,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -72,7 +74,12 @@ export type ArchivalStage =
 
 export class ArchivalError extends Error {
   readonly stage: ArchivalStage;
-  /** True when the workspace was left in place (every stage except a completed destroy). */
+  /**
+   * True when the workspace is known to be fully in place. Every PRE-destroy stage
+   * sets it true; a failure DURING the destroy sets it false (round-18 finding 3),
+   * since a partial recursive delete is not transactional — the tree may be
+   * incomplete, so it is NOT claimed retained (still fail-closed → cleanup-failed).
+   */
   readonly workspaceRetained: boolean;
   constructor(stage: ArchivalStage, message: string, workspaceRetained = true) {
     super(message);
@@ -161,22 +168,26 @@ const MAX_WORKSPACE_ENTRIES = 1_000_000;
  * Async twin of workspaceSizeBytes used on the archival path (round-13 finding 1):
  * walks with async fs and YIELDS every YIELD_EVERY entries, so sizing a workspace
  * with a huge file count does not monopolize the daemon loop and defeat another
- * attempt's budget. Same accounting (lstat, symlinks not followed). Also enforces
- * MAX_WORKSPACE_ENTRIES (round-17 finding 1), SHORT-CIRCUITING the walk so a
- * pathological file count cannot drive unbounded work even to reach the refusal.
+ * attempt's budget. Same accounting (lstat, symlinks not followed). Enforces
+ * MAX_WORKSPACE_ENTRIES (round-17 finding 1) via a STREAMING enumeration
+ * (`opendir`, round-18 finding 1): `readdir` MATERIALIZES a whole directory before
+ * the count check, so a SINGLE directory with millions of entries would blow memory
+ * (OOM) before the walk could short-circuit. `opendir` yields entries incrementally,
+ * so the count is checked and the refusal thrown BEFORE a pathological single dir is
+ * fully read. (`for await` closes the Dir handle on normal end AND on throw.)
  */
 async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise<number> {
   const YIELD_EVERY = 2_000;
   let total = 0;
   let seen = 0;
   const walk = async (abs: string): Promise<void> => {
-    let names: string[];
+    let handle;
     try {
-      names = await readdirAsync(abs);
+      handle = await opendirAsync(abs);
     } catch {
       return;
     }
-    for (const name of names) {
+    for await (const dirent of handle) {
       if (++seen % YIELD_EVERY === 0) await Promise.resolve(); // yield to the loop
       if (seen > maxEntries) {
         throw new ArchivalError(
@@ -184,10 +195,10 @@ async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise
           `workspace exceeds ${maxEntries} entries — refusing archival (a defensive cardinality bound: empty files evade the byte quota but impose unbounded post-worker traversal/tar/hash the container/WP-114 timeout cannot cover); workspace retained for escalation`,
         );
       }
-      const child = join(abs, name);
+      const child = join(abs, dirent.name);
       let stat;
       try {
-        stat = await lstatAsync(child);
+        stat = await lstatAsync(child); // lstat (not the dirent type) so symlinks are not followed and DT_UNKNOWN is resolved
       } catch {
         continue;
       }

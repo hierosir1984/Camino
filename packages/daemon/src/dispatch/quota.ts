@@ -100,9 +100,14 @@ const USAGE_TOKEN_FIELDS = [
 /**
  * Sum a vendor usage object's token counts (WP-107, CAM-EXEC-03 "tokens where
  * reportable"). Total over hostile/absent shapes: any non-record usage yields
- * undefined ("not reportable"); a non-finite/negative field is skipped, never a
- * throw and never a partial figure treated as authoritative. Returns undefined
- * only when NO recognized token field is present.
+ * undefined ("not reportable"). A PRESENT NUMERIC field that is non-finite or
+ * negative FAILS CLOSED — the whole figure caps at MAX_SAFE_INTEGER so it trips any
+ * finite budget (never silently dropped, never a throw). A NON-NUMERIC field (a
+ * string, null, object) is treated as ABSENT — so a provider that reported a count
+ * as a STRING would UNDER-count that one field (round-18 finding 4); no current
+ * official provider does this (Claude/Codex report numeric usage), and per "tokens
+ * where reportable" an unparseable field is simply not-reported. Returns undefined
+ * only when NO recognized numeric token field is present.
  */
 export function sumUsageTokens(usage: unknown): number | undefined {
   if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;

@@ -59,6 +59,10 @@ const OUTCOMES: readonly DispatchOutcome[] = [
   "quota-blocked",
   "cancelled",
   "killed",
+  // WP-107's per-attempt budget breach (CAM-EXEC-03). A DispatchOutcome the tracker
+  // MUST accept, or a real killed-budget record is rejected downstream (round-18
+  // finding 2). Kept in lockstep with the SQL CHECK below and DispatchOutcome.
+  "killed-budget",
 ];
 
 // The BEFORE INSERT guards refuse EVERY rewrite route (REPLACE deletes a
@@ -81,7 +85,7 @@ CREATE TABLE IF NOT EXISTS window_observations (
   family       TEXT    NOT NULL CHECK (family IN ('anthropic', 'openai', 'xai')),
   observed_at  TEXT    NOT NULL,
   duration_ms  INTEGER NOT NULL CHECK (duration_ms >= 0),
-  outcome      TEXT    NOT NULL CHECK (outcome IN ('succeeded', 'requirement-failed', 'quota-blocked', 'cancelled', 'killed')),
+  outcome      TEXT    NOT NULL CHECK (outcome IN ('succeeded', 'requirement-failed', 'quota-blocked', 'cancelled', 'killed', 'killed-budget')),
   quota_signal INTEGER NOT NULL CHECK (quota_signal IN (0, 1))
 );
 

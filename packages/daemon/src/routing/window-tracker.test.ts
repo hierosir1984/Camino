@@ -70,6 +70,30 @@ describe("observation log", () => {
     }
   });
 
+  it("accepts the WP-107 `killed-budget` outcome — runtime allowlist AND SQL CHECK (round-18 finding 2)", () => {
+    // killed-budget is a valid DispatchOutcome (CAM-EXEC-03). Without it in both the
+    // runtime allowlist and the SQL CHECK, a real budget-breach record is rejected
+    // downstream ("Unknown dispatch outcome" / CHECK constraint).
+    const path = tempPath();
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
+    tracker.recordDispatch("anthropic", {
+      dispatchId: "kb1",
+      outcome: "killed-budget",
+      durationMs: 1_234,
+      quotaSignalSeen: false,
+      at: at(0),
+    });
+    tracker.close();
+    const reopened = new QuotaWindowTracker(path, { writerLock: null });
+    try {
+      const obs = reopened.observations("anthropic");
+      expect(obs).toHaveLength(1);
+      expect(obs[0]?.outcome).toBe("killed-budget");
+    } finally {
+      reopened.close();
+    }
+  });
+
   it("is append-only at the database layer", () => {
     const path = tempPath();
     const tracker = new QuotaWindowTracker(path, { writerLock: null });
