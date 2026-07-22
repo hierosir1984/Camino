@@ -84,17 +84,21 @@ export interface DispatchOptions {
   timeoutMs?: number;
   /**
    * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock budget is REQUIRED and
-   * enforced within the event loop's scheduling latency. BOUNDARY, stated (round-14
-   * findings 1/2): the in-process timer is best-effort to within the daemon loop's
-   * worst-case stall — a worker that overruns by LESS than that stall may be
-   * classified `succeeded`. Camino's own concurrent work is bounded NOT to induce a
-   * stall past STALL_GRACE_MS (archival tars via spawn and hashes/deletes/walks in
-   * yielding chunks — archive.ts; clone attestation reads candidate files capped and
-   * bounded — clone.ts; the pre-parser caps per-line CPU — below), so a worker
-   * cannot manufacture a stall THROUGH those paths. A GROSS stall from outside
-   * Camino's control (OS scheduling, a stop-the-world GC, swap) is the residual; the
-   * authoritative wall-clock bound against it is the OUT-OF-PROCESS container/WP-114
-   * supervisor, not this timer. Tokens enforced
+   * enforced within the event loop's scheduling latency. BOUNDARY, stated honestly
+   * (round-14 findings 1/2, round-15 findings 2/3): the in-process timer is
+   * BEST-EFFORT to within the daemon loop's worst-case stall — a worker that
+   * overruns by LESS than that stall may be classified `succeeded`. This IS
+   * worker-influenceable: a single Node event loop that both runs the timer AND does
+   * a worker's own archival/attestation work can be delayed by that work — N
+   * concurrent archival hashes, a 200k-entry credential scan, or a large fsync each
+   * push the max gap into the tens-to-hundreds of ms. We shrink Camino's own
+   * contribution where cheap (tar/hash/delete/walk via spawn + yielding chunks and
+   * off-loop fsync — archive.ts; capped candidate reads — clone.ts; a per-line CPU
+   * cap — below), but we do NOT claim to bound it: making the in-process timer
+   * immune to concurrent same-process CPU is not achievable without moving that work
+   * off the loop entirely. The AUTHORITATIVE wall-clock bound is therefore the
+   * OUT-OF-PROCESS container timeout / WP-114 supervisor, not this timer; this timer
+   * is a fast-path best-effort kill, not the guarantee. Tokens enforced
    * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach runs
    * kill-confirm and classifies `killed-budget` — distinct from `cancelled` (user
    * decision) and `killed` (harness runaway cap) so the state machine's
@@ -822,6 +826,24 @@ export async function dispatch(
             handleLine(channel, partial + s.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
           partial = "";
           skipping = true; // discard until the next terminator
+          // TOKEN-BUDGET INTEGRITY (round-15 finding 1): truncating an over-cap line
+          // bounds RSS but DISCARDS any usage the adapter reports in that SAME JSON
+          // object (Claude bundles terminal text + usage), so a giant line could hide
+          // token usage and slip past the token budget. Under an ACTIVE token budget,
+          // an over-cap STDOUT line (where usage lives) is a usage report we cannot
+          // verify → fail CLOSED: declare a token breach and kill-and-escalate rather
+          // than silently accept it as under-budget. stdout only (stderr carries no
+          // usage); only when a token budget is set (wall-clock is unaffected).
+          if (channel === "stdout" && budgetTokens !== undefined && !budgetBreach) {
+            budgetBreach = {
+              kind: "tokens",
+              limit: budgetTokens,
+              observed: budgetTokens,
+              reason:
+                "usage-unverifiable: a stdout line exceeded the reader cap, so its reported token usage could not be parsed (fail-closed)",
+            };
+            requestKill("budget");
+          }
         }
       };
       const emitLine = () => {

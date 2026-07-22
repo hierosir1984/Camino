@@ -131,14 +131,18 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
     // error) must FAIL CLOSED (round-13 finding 4): swallowing it would make a
     // large malicious worktree config INVISIBLE here while git still obeys it.
     // Recognize ONLY the genuine "extensions.worktreeConfig is not enabled"
-    // message (round-14 finding 8 tightened round-13's predicate): git names the
-    // `worktreeConfig` extension explicitly, or says the worktree extension is "not
-    // enabled". A generic message that merely contains "worktree" and "extension"
-    // (e.g. "worktree transient extension I/O failure") is NOT this case and must
-    // FAIL CLOSED, not be swallowed as "no worktree config".
+    // message (round-13 finding 4 → round-14 finding 8 → round-15 finding 10): git's
+    // real message names the `worktreeConfig` extension AND says it is (not) enabled
+    // — "unless the config extension worktreeConfig is enabled". Merely containing
+    // "worktreeconfig" is NOT enough: a hostile/injected git on the daemon PATH
+    // emitting e.g. "worktreeConfig backend I/O failure" (round-15 finding 10) or
+    // "worktree transient extension I/O failure" must FAIL CLOSED, not be swallowed
+    // as "no worktree config". So require the extension name TOGETHER with an
+    // enabled/disabled verdict, or the explicit "not enabled".
     const msg = describeCloneError(err, 400).toLowerCase();
     const notEnabled =
-      msg.includes("worktreeconfig") || (msg.includes("worktree") && msg.includes("not enabled"));
+      (msg.includes("worktreeconfig") && (msg.includes("enabled") || msg.includes("disabled"))) ||
+      (msg.includes("worktree") && msg.includes("not enabled"));
     if (!notEnabled) {
       throw new WorkerCloneError(
         `workspace clone worktree config could not be enumerated for attestation — refused (fail-closed): ${describeCloneError(err)}`,
@@ -516,6 +520,14 @@ function readFileCapped(path: string): string {
  * that the worker CONTAINER mounts no host HOME (egress.ts), so a vendor CLI
  * cannot reach the host's real credentials regardless of workspace content, and
  * a repo committing its OWN token has leaked its own secret, not Camino's.
+ *
+ * BOUNDARY, stated (round-15 finding 2): this walk is SYNCHRONOUS and bounded only
+ * by SCAN_MAX_DEPTH/SCAN_MAX_ENTRIES, so a worker whose repository content is a very
+ * wide/deep tree can make it run for tens-to-hundreds of ms on the shared daemon
+ * loop — enough to delay a CONCURRENT attempt's in-process wall-clock timer. Per
+ * the budget boundary in lifecycle.ts, that in-process timer is best-effort; the
+ * AUTHORITATIVE bound against any such daemon-side stall (this scan included) is the
+ * OUT-OF-PROCESS container timeout / WP-114 supervisor, not the in-process timer.
  */
 export function scanForGithubCredentialMaterial(dir: string): string[] {
   const findings: string[] = [];

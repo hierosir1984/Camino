@@ -125,17 +125,28 @@ run_probe github-cred-content sh -c '
   fi
   if [ -z "$found" ]; then
     # Pass 2: a GitHub HOST stanza (subdomains + optional trailing dot allowed,
-    # bounded, case-insensitive) that also carries the gh `oauth_token` key — the gh
-    # hosts.yml shape, catching a legacy 40-hex token no prefix rule would. Requires
-    # oauth_token SPECIFICALLY, not a generic `token:` line (round-14 finding 7): a
-    # non-GitHub provider-auth file that merely mentions github.com in a doc comment
-    # AND has its own `token:` line is NOT a GitHub credential and must not false-hit.
+    # bounded, case-insensitive) that also carries a GitHub credential KEY with a
+    # REAL value — the gh hosts.yml `oauth_token` shape OR an npm `_authToken` for a
+    # github registry (`//npm.pkg.github.com/:_authToken=…`, round-15 finding 5),
+    # catching a legacy 40-hex/npm token no prefix rule would. Requires a credential
+    # KEY (not a generic `token:` line — round-14 finding 7) AND a value of >=16 token
+    # chars, so a PLACEHOLDER like `oauth_token: example` is NOT a false hit (round-15
+    # finding 9).
     found=$(grep -rIliE "(^|[^a-z0-9-])([a-z0-9-]+\.)*github\.com\.?($|[:/?#@])" $roots 2>/dev/null \
       | while IFS= read -r f; do
           [ -z "$f" ] && continue
           [ "$f" = "$self" ] && continue
-          grep -Iiq -E "oauth_token" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
+          grep -Iiq -E "(oauth_token|_authtoken)[[:space:]]*[:=][[:space:]\"]*[A-Za-z0-9_]{16,}" "$f" 2>/dev/null && { printf "%s" "$f"; break; }
         done)
+  fi
+  if [ -z "$found" ]; then
+    # FAIL CLOSED on an UNENUMERABLE credential root (round-15 finding 5): a provider
+    # -auth dir mode 0711 lets the worker TRAVERSE to a known filename but blocks
+    # LISTING, so the passes above (which enumerate) silently miss its contents while
+    # the worker still reads them by exact path. If find hits a permission error under
+    # /auth, the content scan is INCOMPLETE — we cannot assert clean.
+    denied=$(find /auth -type f 2>&1 >/dev/null | grep -i "permission denied" | head -1)
+    [ -n "$denied" ] && found="unenumerable-credential-root"
   fi
   [ -z "$found" ] && echo clean || echo "$found"
 '

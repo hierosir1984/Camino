@@ -30,13 +30,11 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  closeSync,
   createReadStream,
+  createWriteStream,
   existsSync,
-  fsyncSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -45,7 +43,13 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { lstat as lstatAsync, readdir as readdirAsync, rm as rmAsync } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import {
+  lstat as lstatAsync,
+  open as openAsync,
+  readdir as readdirAsync,
+  rm as rmAsync,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
 import type { AttemptEvent } from "@camino/core";
@@ -333,18 +337,25 @@ function safeRemove(p: string): void {
   }
 }
 
-/** fsync a single path (file OR directory); NEVER throws (platform quirks are swallowed). */
-function fsyncPathBestEffort(p: string): void {
-  let fd: number | undefined;
+/**
+ * fsync a single path (file OR directory); NEVER throws (platform quirks are
+ * swallowed). ASYNC (round-15 finding 3): `fsyncSync` on a worker-sized archive
+ * blocks the shared daemon loop for tens of ms (~92 ms observed on a 268 MB
+ * archive) right before recordLedgerRow, defeating a concurrent attempt's budget.
+ * The promisified `fh.sync()` runs the blocking fsync on the libuv threadpool, so
+ * it is off the event loop.
+ */
+async function fsyncPathBestEffort(p: string): Promise<void> {
+  let fh: FileHandle | undefined;
   try {
-    fd = openSync(p, "r");
-    fsyncSync(fd);
+    fh = await openAsync(p, "r");
+    await fh.sync();
   } catch {
     /* best-effort: durability hardening must never break an otherwise-good archival */
   } finally {
-    if (fd !== undefined) {
+    if (fh !== undefined) {
       try {
-        closeSync(fd);
+        await fh.close();
       } catch {
         /* ignore */
       }
@@ -365,9 +376,9 @@ function fsyncPathBestEffort(p: string): void {
  * the authoritative durable record; this only reduces the local-evidence loss
  * window, it does not make the archive crash-proof.
  */
-function syncFileAndParentDir(filePath: string): void {
-  fsyncPathBestEffort(filePath);
-  fsyncPathBestEffort(join(filePath, ".."));
+async function syncFileAndParentDir(filePath: string): Promise<void> {
+  await fsyncPathBestEffort(filePath);
+  await fsyncPathBestEffort(join(filePath, ".."));
 }
 
 /**
@@ -431,11 +442,16 @@ function realWorkspaceIdentity(dir: string): string | null {
  * pathname commonly REUSES the freed inode number, so a rm+recreated directory
  * presents the SAME (dev, ino) and defeats the check (the two archive-identity
  * tests failed on Linux CI for exactly this reason). `birthtimeNs` — the inode's
- * BIRTH (creation) time — closes it: `mkdir` stamps a FRESH birth time on the new
- * inode even when the inode NUMBER is reused, so a rm+recreate changes birthtimeNs
- * even when (dev, ino) is unchanged. Crucially birthtime is IMMUTABLE after
- * creation, so a benign `chmod`/`chown`/content change on the SAME directory does
- * NOT change it (ctime would, giving a false "replaced" on a genuine resume).
+ * BIRTH (creation) time — closes it in practice: `mkdir` stamps the new inode's
+ * birth time at creation, so a rm+recreate gives a DIFFERENT birthtimeNs — PROVIDED
+ * the recreate is more than the filesystem's birth-time granularity after the
+ * original (round-15 finding 7: on Linux overlay/ext4 that granularity is ~1 ms, so
+ * a recreate WITHIN the same 1 ms tick can collide on the whole tuple). In the real
+ * archival flow the only replacement window is between the up-front baseline capture
+ * and the destroy, separated by tar + streaming hash + the ledger callback (>> 1 ms),
+ * so a colliding recreate is not worker-reachable. Crucially birthtime is IMMUTABLE
+ * after creation, so a benign `chmod`/`chown`/content change on the SAME directory
+ * does NOT change it (ctime would, giving a false "replaced" on a genuine resume).
  * Any of the three differing means the directory was replaced.
  *
  * RESIDUAL, stated: a filesystem without birth-time (btime) support reports 0 for
@@ -484,38 +500,86 @@ function readFsIdentity(dir: string): FsIdentity | null {
 }
 
 /**
- * tar the workspace to `tmpPath`, OFF the daemon loop. Uses `spawn` (not
- * execFile) so tar's STDERR VOLUME can never turn a SUCCESSFUL archive into a
- * refusal (round-14 finding 5): a worker can fill its workspace with entries tar
- * only WARNS about — e.g. UNIX sockets, one "socket ignored" line each — emitting
- * megabytes of stderr while tar still exits 0 with a valid archive. execFile's
- * `maxBuffer` would abort tar on that stderr and reject a good archive. Here
- * success is decided by the EXIT CODE alone; stderr is drained (never buffered
- * unbounded) into a bounded TAIL used only to describe a genuine non-zero failure.
+ * tar the workspace, streaming tar's STDOUT to `tmpPath`, OFF the daemon loop and
+ * BOUNDED to `maxBytes` compressed. Streaming (not `tar -f`) lets us both ignore
+ * stderr volume AND cap the write:
+ *  - stderr VOLUME can never turn a SUCCESSFUL archive into a refusal (round-14
+ *    finding 5): a worker filling its workspace with tar-WARNS-only entries (UNIX
+ *    sockets — one "ignored" line each) emits megabytes of stderr while tar still
+ *    exits 0 with a valid archive; execFile's `maxBuffer` would have aborted it.
+ *    Success is the EXIT CODE alone.
+ *  - the compressed size is bounded DURING the write (round-15 finding 6): the old
+ *    post-tar size check let a worker balloon the on-disk archive toward the 2 GB
+ *    workspace ceiling before refusing. Here the byte count is enforced as it
+ *    streams — once it passes `maxBytes`, tar is killed and the partial abandoned,
+ *    so at most one chunk is ever written past the cap.
+ * Backpressure is respected (pause on a full write buffer, resume on drain), so
+ * RSS stays ~one chunk regardless of archive size. stderr is drained into a
+ * bounded TAIL — the LAST bytes, where a genuine failure's cause sits (round-15
+ * finding 8) — used only to describe a non-zero exit.
  */
-function runTarToFile(tmpPath: string, workspaceReal: string): Promise<void> {
+function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const STDERR_TAIL_CAP = 8 * 1024;
     let stderrTail = "";
-    const child = spawn("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
-      stdio: ["ignore", "ignore", "pipe"],
+    let written = 0;
+    let settled = false;
+    const out = createWriteStream(tmpPath);
+    const child = spawn("tar", ["-cz", "-C", workspaceReal, "."], {
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      // Keep only a bounded tail; the rest is consumed (flowing mode) and
-      // discarded, so a multi-MB warning stream cannot grow daemon RSS.
-      if (stderrTail.length < STDERR_TAIL_CAP) {
-        stderrTail += chunk.toString("utf8", 0, STDERR_TAIL_CAP - stderrTail.length);
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    const fail = (err: Error): void => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
       }
+      out.destroy();
+      settle(() => reject(err));
+    };
+    child.stderr?.on("data", (chunk: Buffer) => {
+      // Bounded TAIL (last bytes): append then keep only the last cap. A stderr
+      // chunk is itself pipe-buffer-bounded (~64 KiB), so the transient is small.
+      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_CAP);
     });
-    child.once("error", reject); // spawn failure (e.g. tar not on PATH)
-    child.once("close", (code) => {
-      if (code === 0) resolve();
-      else
-        reject(
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      written += chunk.length;
+      if (written > maxBytes) {
+        fail(
+          new ArchivalError(
+            "archive-quota",
+            `archive exceeded the ${maxBytes}-byte compressed cap during write (registry item 11) — tar aborted, workspace retained for escalation`,
+          ),
+        );
+        return;
+      }
+      if (!out.write(chunk)) child.stdout.pause();
+    });
+    out.on("drain", () => {
+      if (!settled) child.stdout.resume();
+    });
+    child.stdout.on("end", () => out.end());
+    child.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    out.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
+    child.on("close", (code) => {
+      if (settled) return;
+      if (code === 0) {
+        // Resolve only once the file stream has flushed everything to disk.
+        if (out.writableFinished) settle(() => resolve());
+        else out.once("finish", () => settle(() => resolve()));
+      } else {
+        fail(
           new Error(
             `tar exited ${code ?? "null"}${stderrTail ? `: ${stderrTail.trim().slice(0, 300)}` : ""}`,
           ),
         );
+      }
     });
   });
 }
@@ -730,7 +794,17 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // throws a raw RangeError past the max valid Date. A clock at/near the ceiling
   // (an injected/corrupt clock) would let `nextStamp` throw AFTER the workspace was
   // destroyed. Refuse up-front so the failure is staged and the workspace retained.
-  const nowMs = now().getTime();
+  // A clock that THROWS (an injected `now: () => { throw }`) is staged too (round-15
+  // finding 10), so EVERY archival failure — including the clock read — is staged.
+  let nowMs: number;
+  try {
+    nowMs = now().getTime();
+  } catch (err) {
+    throw new ArchivalError(
+      "id-validation",
+      `clock threw (${describeError(err, 120)}) — refusing before any destructive step (fail-closed)`,
+    );
+  }
   if (!Number.isFinite(nowMs) || nowMs > MAX_TIMESTAMP_MS - 100_000) {
     throw new ArchivalError(
       "id-validation",
@@ -970,11 +1044,15 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   try {
     // ASYNC tar (round-13 finding 1): execFileSync would BLOCK the daemon loop for
     // the whole tar of a pathological workspace; await lets other attempts' timers
-    // run. spawn + exit-code success (round-14 finding 5): tar stderr volume never
-    // converts a successful archive into a refusal.
-    await runTarToFile(tmpPath, workspaceReal);
+    // run. spawn + exit-code success (round-14 finding 5) + write-time cap (round-15
+    // finding 6): tar stderr volume never converts a successful archive into a
+    // refusal, and the compressed size is bounded as it streams.
+    await runTarToFile(tmpPath, workspaceReal, quotas.archiveMaxCompressedBytes);
   } catch (err) {
     safeRemove(tmpPath);
+    // An over-cap-during-write refusal is already a staged ArchivalError
+    // (archive-quota) — preserve its stage; only a tar/spawn failure is wrapped.
+    if (err instanceof ArchivalError) throw err;
     throw new ArchivalError(
       "archive-write",
       `tar failed: ${describeError(err, 300)} — workspace retained`,
@@ -1020,7 +1098,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `archive install failed: ${describeError(err, 300)} — workspace retained`,
     );
   }
-  syncFileAndParentDir(finalPath); // flush the archive to stable storage (round-9 finding 9)
+  await syncFileAndParentDir(finalPath); // flush the archive to stable storage (round-9 finding 9)
   const archiveWrittenAt = nextStamp(nowMs, null);
 
   // Step 2 — ledger row referencing the archive, BEFORE the sidecar (A.4#5
@@ -1073,7 +1151,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `sidecar write failed after the ledger row: ${describeError(err, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
     );
   }
-  syncFileAndParentDir(sidecarPath); // flush the sidecar to stable storage (round-9 finding 9)
+  await syncFileAndParentDir(sidecarPath); // flush the sidecar to stable storage (round-9 finding 9)
 
   // IMMEDIATELY before the destroy, re-validate BOTH the archive and the
   // workspace identity from the filesystem (round-10 findings 2/3/5). The

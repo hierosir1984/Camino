@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -818,6 +819,30 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     } finally {
       for (const s of servers) s.close();
     }
+  });
+
+  it("refuses an over-cap archive DURING the write, not after, and cleans the partial (round-15 finding 6)", async () => {
+    const ws = makeWorkspace();
+    // Incompressible content larger than a tiny cap: tar's gzip output crosses the
+    // cap mid-stream, so it must be aborted then — not written whole and refused
+    // after (which let a worker balloon the on-disk archive toward the 2 GB ceiling).
+    writeFileSync(join(ws, "big.bin"), incompressible(2 * 1024 * 1024));
+    const root = tempDir();
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      quotas: { workspaceMaxBytes: 1_000_000_000, archiveMaxCompressedBytes: 64 * 1024 }, // 64 KiB
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("archive-quota");
+    expect((err as Error).message).toMatch(/during write/i);
+    expect(existsSync(ws)).toBe(true); // workspace retained for escalation
+    // No orphan .partial left behind.
+    const leftover = readdirSync(join(root, "i")).filter((f) => f.includes("partial"));
+    expect(leftover).toEqual([]);
   });
 
   it("a resume REFUSES a workspace RECREATED at the same pathname (different inode) — round-11 finding 3", async () => {

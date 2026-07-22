@@ -101,6 +101,34 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     expect(issueStep).toEqual({ ok: true, to: "escalated", ref: "A.2#10" });
   }, 30_000);
 
+  it("fails CLOSED when an over-cap stdout line hides usage under a token budget (round-15 finding 1)", async () => {
+    // A worker emits ONE >64 KiB stdout line (no newline until the end), so the
+    // bounded line reader truncates it and any token usage it carried is lost. Under
+    // a token budget that UNVERIFIABLE line must classify killed-budget, never a
+    // silent success. The big line is built at runtime (`.repeat`) so the spawn arg
+    // stays tiny — no E2BIG on Linux CI.
+    const bigLineAdapter: AdapterSpec = {
+      name: "bigline",
+      enabled: true,
+      plan: () => ({
+        file: process.execPath,
+        args: ["-e", `process.stdout.write("{" + "x".repeat(70000) + "}\\n")`],
+        env: {},
+      }),
+      parseLine: () => null,
+    };
+    const { record, escalation } = await dispatchWithBudget(
+      bigLineAdapter,
+      { workdir: workdir(), prompt: "hide usage in a giant line" },
+      { wallClockMs: 10_000, tokens: 100 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 100 });
+    expect(record.budgetBreach?.reason).toMatch(/unverifiable/i);
+    expect(escalation).toBeDefined(); // kill-and-escalate, never a silent success
+  }, 30_000);
+
   it("wall-clock covers the GROUP: a leader that EXITS 0 while an in-group descendant outlives the budget is killed-budget, not succeeded (round-8 finding 1)", async () => {
     // The leader emits its success result and exits 0 well before the budget; a
     // same-group descendant ignores SIGTERM and runs past it. The old

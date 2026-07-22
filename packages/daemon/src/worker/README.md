@@ -9,13 +9,13 @@ validation-egress spike (egress profile) and the WP-105 dispatch lifecycle
 
 The pieces, by requirement:
 
-| File                                                            | Requirement    | What it guarantees                                                                                                                                                                                                                        |
-| --------------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`clone.ts`](clone.ts)                                          | CAM-EXEC-02    | A **full isolated clone** (`--no-local`, object store stands alone), hooks disabled by config at clone time, **zero GitHub credentials** — attested from disk (env + filesystem), not merely requested.                                   |
-| [`egress.ts`](egress.ts) + [`worker-profile/`](worker-profile/) | CAM-EXEC-02/03 | The hardened `docker run` composer (cap-drop ALL + minimal bootstrap caps, `no-new-privileges`, pids-limit, PID namespace) and the profile image: **default-deny egress with a per-repo allowlist**, provider auth mounted **read-only**. |
-| [`repo-config.ts`](repo-config.ts)                              | CAM-EXEC-03    | The `.camino/config.yml` egress allowlist, parsed **fail-closed** (absent = deny-all; malformed = refusal, never a silent deny).                                                                                                          |
-| [`budget.ts`](budget.ts) + the lifecycle `budget` seam          | CAM-EXEC-03    | Per-attempt budgets (**wall-clock always**, **tokens where reportable**) → `killed-budget` → **kill-and-escalate, never an automatic retry** (Appendix A.3#5 / A.2#10).                                                                   |
-| [`archive.ts`](archive.ts)                                      | CAM-EXEC-05    | The **single archival step** (A.4#5): archive under quota → ledger row referencing it → workspace destroyed, strictly ordered and fail-closed; registry-item-11 retention (90 days **or** last 10, whichever more).                       |
+| File                                                            | Requirement    | What it guarantees                                                                                                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`clone.ts`](clone.ts)                                          | CAM-EXEC-02    | A **full isolated clone** (`--no-local`, object store stands alone), hooks disabled by config at clone time, and **no GitHub credentials composed into the container** (clean env — no credential-shaped keys; provider auth is the _subscription_ provider's token, mounted read-only) — see the credential-guarantee boundary below. |
+| [`egress.ts`](egress.ts) + [`worker-profile/`](worker-profile/) | CAM-EXEC-02/03 | The hardened `docker run` composer (cap-drop ALL + minimal bootstrap caps, `no-new-privileges`, pids-limit, PID namespace) and the profile image: **default-deny egress with a per-repo allowlist**, provider auth mounted **read-only**.                                                                                              |
+| [`repo-config.ts`](repo-config.ts)                              | CAM-EXEC-03    | The `.camino/config.yml` egress allowlist, parsed **fail-closed** (absent = deny-all; malformed = refusal, never a silent deny).                                                                                                                                                                                                       |
+| [`budget.ts`](budget.ts) + the lifecycle `budget` seam          | CAM-EXEC-03    | Per-attempt budgets (**wall-clock always**, **tokens where reportable**) → `killed-budget` → **kill-and-escalate, never an automatic retry** (Appendix A.3#5 / A.2#10).                                                                                                                                                                |
+| [`archive.ts`](archive.ts)                                      | CAM-EXEC-05    | The **single archival step** (A.4#5): archive under quota → ledger row referencing it → workspace destroyed, strictly ordered and fail-closed; registry-item-11 retention (90 days **or** last 10, whichever more).                                                                                                                    |
 
 Registry item 11's quota values live once in
 [`@camino/shared` `REGISTRY_ITEM_11_QUOTAS`](../../../shared/src/worker-quotas.ts)
@@ -57,6 +57,30 @@ established-egress bypass).
   event-store wiring is the caller's (WP-109 store). The archival step
   guarantees the _order_ and the _retention_, and fails closed (workspace
   retained) if the row is not recorded.
+- **The GitHub-credential-free guarantee is COMPOSITIONAL, not a runtime
+  scanner** (round-15 findings 4/5). WP-107 guarantees it by CONSTRUCTION: the
+  clone carries no credentials, the composed container env has no
+  credential-shaped keys (env.ts strips them), and the only auth mount is the
+  _subscription_ provider's token, mounted read-only. It does NOT scan the
+  content of that operator-supplied mount at runtime — a GitHub token an operator
+  deliberately places into their own subscription-auth mount is their own secret
+  in their own mount, outside this threat model (the worker is _code_ Camino did
+  not write; the mount is config Camino did not compose). The env+filesystem
+  content scan in [`worker-probes.sh`](worker-profile/worker-probes.sh) is **test
+  instrumentation** that asserts the isolation _fixtures_ carry no GitHub material
+  (so a regression that leaks one is caught) — it is not, and does not claim to
+  be, a production runtime credential scanner.
+- **The in-process wall-clock budget is BEST-EFFORT; the authoritative bound is
+  out-of-process** (round-15 findings 2/3). The `budget` timer runs on the same
+  Node event loop that also does a worker's own archival/attestation work, so
+  that work — N concurrent archival hashes, a wide credential scan, a large fsync
+  — can delay the timer by tens-to-hundreds of ms and let a worker overrun by
+  that much. Camino's own contribution is shrunk where cheap (spawned/yielding
+  tar+hash+delete+walk and off-loop fsync; capped candidate reads; a per-line CPU
+  cap), but making an in-process timer immune to concurrent same-process CPU is
+  not achievable here. The **authoritative** wall-clock kill is the OUT-OF-PROCESS
+  container timeout / **WP-114** supervisor; this timer is a fast-path best-effort
+  kill, not the guarantee.
 - **Container parameters are Camino-composed, not worker-supplied.** The
   composer refuses the reachable bootstrap-subversion shapes: a reserved network
   **name** (`host`/`none`/`bridge`/…) and a malformed one; a mount **outside**
