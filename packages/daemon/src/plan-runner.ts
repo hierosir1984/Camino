@@ -1,0 +1,358 @@
+/**
+ * Planner runner (WP-110): drives a WP-105 worker adapter to compile a
+ * PRD into a plan, streaming construction records into the planning
+ * service AS THE WORKER EMITS THEM (CAM-PLAN-01 "streaming to the board
+ * as constructed").
+ *
+ * Protocol — harness-agnostic by design: the worker appends one JSON
+ * construction record per line to `plan-stream.jsonl` in its workspace,
+ * and the runner tails that file while the dispatch runs. Coupling to a
+ * file the worker writes (not to each vendor CLI's own event stream)
+ * means every adapter — Claude Code, Codex CLI, Grok Build, mock — uses
+ * one protocol, and the ingest path is byte-identical to the scripted
+ * fixture path the CI suite exercises.
+ *
+ * Worker output is DATA (CAM-EXEC-09): every line passes the shared total
+ * validator plus the service's cross-record checks; a refused line is
+ * recorded in the run record and never crashes the daemon. The planner
+ * holds no repository credentials and never touches the stores — the
+ * service seam is the only write path, and it validates everything.
+ *
+ * Stream-integrity boundary, stated plainly: the tail keeps a hash of the
+ * consumed prefix, so append-only violations — truncation, shrink, or a
+ * same-length in-place rewrite — are refused by name, never silently
+ * re-read or dropped (r2 finding 11). COST, stated rather than hidden
+ * (r4 finding 9): verifying the consumed prefix means re-reading the file
+ * each poll, so cumulative work is quadratic in stream size. Plans are
+ * human-approved artifacts of bounded size and the poll interval is
+ * configurable; if a future workload outgrows that, prompt rewrite
+ * detection is the property to preserve, not the polling implementation. What no tail can defend is the
+ * workspace itself: a worker with filesystem authority over its own
+ * directory can rename or destroy it wholesale, which surfaces as a run
+ * with no stream and constructionComplete false. Filesystem containment
+ * of workers is the WP-107 container's job, not this protocol's.
+ */
+import {
+  closeSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PLAN_STREAM_FILENAME, sha256Hex } from "@camino/shared";
+import type { AdapterSpec, DispatchOutcome } from "@camino/shared";
+import { dispatch } from "./dispatch/lifecycle.js";
+import type { DispatchOptions } from "./dispatch/lifecycle.js";
+import { PlanningError, PlanningService } from "./planning.js";
+
+/**
+ * Hard cap on the stream file in BYTES, enforced by a bounded read loop
+ * of at most cap+1 total bytes — never a stat-then-read pair a concurrent
+ * append could race (r6 finding 1; r7 verification), and never a
+ * post-decode code-unit check (multi-byte UTF-8 crossed that threefold).
+ * With per-record bounds of 4000 chars this is thousands of records — far
+ * beyond any human-approvable plan — and it makes the quadratic tail's
+ * operand bounded in code rather than in prose (r5 finding 7).
+ */
+export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+
+/** One refused stream line: the line number and the named reason. */
+export interface RefusedLine {
+  readonly line: number;
+  readonly problem: string;
+}
+
+export interface PlannerRunRecord {
+  readonly outcome: DispatchOutcome;
+  /** Records accepted into the plan store, in arrival order. */
+  readonly ingested: number;
+  /** Lines the validators or cross-record checks refused (named reasons). */
+  readonly refused: readonly RefusedLine[];
+  /** True when the session's construction-complete record landed. */
+  readonly constructionComplete: boolean;
+}
+
+export interface PlannerRunOptions {
+  readonly adapter: AdapterSpec;
+  readonly service: PlanningService;
+  readonly sessionId: string;
+  /** Parent directory for the planner workspace (a temp dir by default). */
+  readonly workdirRoot?: string;
+  /** Tail poll interval, ms. */
+  readonly pollMs?: number;
+  /** Hard wall-clock cap for the dispatch. */
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+  /** Sink for raw transcript lines (the dispatch's onLine). */
+  readonly onLine?: DispatchOptions["onLine"];
+  /** Keep the workspace for inspection instead of removing it. */
+  readonly keepWorkspace?: boolean;
+}
+
+/** The planner worker's instructions: inputs on disk, the stream protocol, the mandate. */
+export function plannerPrompt(input: { missionTitle: string; template: string }): string {
+  return [
+    `You are the Camino planner. Compile the PRD for mission "${input.missionTitle}"`,
+    `(template: ${input.template}) into an executable plan.`,
+    "",
+    "Inputs in your working directory:",
+    "  - plan-input/prd.md — the PRD text, verbatim.",
+    "  - plan-input/segments.json — the PRD split into segments, each with a",
+    "    segmentId; every checklist row and clarification references these ids.",
+    "",
+    `Output protocol: append one JSON object per line to ./${PLAN_STREAM_FILENAME}`,
+    "as you work — each record the moment you have it, not batched at the end.",
+    "Record shapes:",
+    '  {"kind":"issue","issue":{"planIssueId":"I1","title":…,"goal":…,"acceptanceCriteria":[…],"dependsOn":["I…"],"interfaces":[{"name":…,"kind":"api|cli|module|schema|event|file-format|other","description":…}]}}',
+    '  {"kind":"clarification","clarification":{"clarificationId":"Q1","question":…,"whyItMatters":…,"assumptionIfUnanswered":…,"relatedSegmentIds":["S…"],"relatedPlanIssueIds":["I…"]}}',
+    '  {"kind":"checklist-row","row":{"segmentId":"S…","disposition":"mapped","proposedStatement":…,"proposedArea":"AREA","mappedPlanIssueIds":["I…"]}}',
+    '  {"kind":"checklist-row","row":{"segmentId":"S…","disposition":"unmapped","reason":"context|non-requirement|out-of-scope|duplicate"}}',
+    '  {"kind":"construction-complete"}',
+    "",
+    "Mandate:",
+    "  - Every segment gets exactly one checklist row; segments that state no",
+    "    requirement of this mission are unmapped with the honest reason.",
+    "  - Acceptance criteria are observable pass/fail checks, not restatements.",
+    "  - Wherever the PRD underdetermines a decision you need, emit a",
+    "    clarification carrying the exact assumption you would otherwise bake",
+    "    in. Do not silently guess: an assumption without a clarification is a",
+    "    planning defect.",
+    "  - Dependencies between issues use dependsOn; keep the graph acyclic.",
+    "  - Declare the interfaces each issue exposes to its dependents.",
+    `  - Finish with the construction-complete record, then exit.`,
+  ].join("\n");
+}
+
+/**
+ * Run one planner compile over the session. Resolves when the dispatch
+ * settles and the stream file is fully drained. The workspace is removed
+ * afterwards unless keepWorkspace is set.
+ */
+export async function runPlannerCompile(options: PlannerRunOptions): Promise<PlannerRunRecord> {
+  const { adapter, service, sessionId } = options;
+  const pollMs = options.pollMs ?? 150;
+  const brief = service.sessionBrief(sessionId);
+  const workdir = mkdtempSync(join(options.workdirRoot ?? tmpdir(), "camino-plan-"));
+  const refused: RefusedLine[] = [];
+  let ingested = 0;
+  let offset = 0;
+  let lineNumber = 0;
+  const streamPath = join(workdir, PLAN_STREAM_FILENAME);
+
+  let shrunk = false;
+
+  const ingestLine = (line: string): void => {
+    lineNumber += 1;
+    const trimmed = line.trim();
+    if (trimmed.length === 0) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      refused.push({ line: lineNumber, problem: "not valid JSON" });
+      return;
+    }
+    try {
+      service.ingest(sessionId, parsed);
+      ingested += 1;
+    } catch (error) {
+      if (error instanceof PlanningError) {
+        refused.push({ line: lineNumber, problem: error.message });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  /**
+   * Drain the unseen suffix. Mid-run only COMPLETE (newline-terminated)
+   * lines are consumed; on the FINAL drain — after the worker exited, so
+   * the file can no longer grow — an unterminated last line is a finished
+   * record and is ingested too (r1 finding 10: an EOF record without a
+   * trailing newline must not be silently dropped). A file that SHRINKS
+   * below the consumed offset is a protocol violation (the worker rewrote
+   * history): refused by name once, then ignored — never silently re-read.
+   */
+  let consumedHash = sha256Hex("");
+
+  // One reusable read buffer, one byte over the cap: the byte bound is
+  // enforced BY CONSTRUCTION of a single bounded read — there is no
+  // stat-then-read pair for a concurrent append to race (the r7
+  // verification's counterexample), and the runner can never allocate or
+  // decode more than cap+1 bytes regardless of how fast the file grows.
+  const readBuffer = Buffer.allocUnsafe(MAX_STREAM_BYTES + 1);
+
+  const drain = (final: boolean): void => {
+    if (shrunk) return;
+    // Errors are DISCRIMINATED, never blanket-swallowed (r9 verification:
+    // an EINTR on the sole final drain fell into a catch-all "not created
+    // yet" and silently lost the stream — libuv does not auto-retry reads).
+    // ENOENT = not created yet (the one silent case); EINTR retries with a
+    // bound; anything else is transient mid-run (the next poll retries) and
+    // a NAMED refusal on the final drain — unread records are refused,
+    // never silently lost.
+    let bytesRead = 0;
+    try {
+      let fd: number;
+      try {
+        fd = openSync(streamPath, "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // not created yet
+        throw error;
+      }
+      try {
+        // Loop to EOF or cap+1: readSync may legally return FEWER bytes
+        // than requested (fs.read semantics — network filesystems and
+        // other conditions), and a single call treated a short read as the
+        // whole file, silently losing the unread suffix (r8 verification).
+        // With the loop, "read whole or refuse" is total: an in-cap file
+        // is always read to EOF, so no multi-byte character can be split
+        // anywhere but the over-cap refusal path.
+        let interrupts = 0;
+        while (bytesRead < MAX_STREAM_BYTES + 1) {
+          let chunk: number;
+          try {
+            chunk = readSync(
+              fd,
+              readBuffer,
+              bytesRead,
+              MAX_STREAM_BYTES + 1 - bytesRead,
+              bytesRead,
+            );
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EINTR" && interrupts < 100) {
+              interrupts += 1;
+              continue;
+            }
+            throw error;
+          }
+          if (chunk === 0) break; // EOF
+          bytesRead += chunk;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch (error) {
+      if (final) {
+        shrunk = true;
+        refused.push({
+          line: lineNumber + 1,
+          problem:
+            `final stream read failed (${(error as NodeJS.ErrnoException).code ?? "unknown"}) — ` +
+            "unread records refused rather than silently lost",
+        });
+      }
+      return; // mid-run: transient; the next poll retries
+    }
+    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7; r6
+    // finding 1). Offsets below are string (code-unit) indices; the byte
+    // count is never compared against them. A multi-byte character split
+    // at the read boundary can only sit in the unterminated tail, which
+    // mid-run drains never consume — and a file within the cap is always
+    // read whole, so the final drain never sees a split.
+    if (bytesRead > MAX_STREAM_BYTES) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          `stream file exceeds the ${MAX_STREAM_BYTES}-byte bound — ` +
+          "runaway worker output; further records refused",
+      });
+      return;
+    }
+    const text = readBuffer.toString("utf8", 0, bytesRead);
+    if (text.length < offset) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          `stream file shrank from consumed offset ${offset} to ${text.length} — ` +
+          "the worker rewrote history; further records refused",
+      });
+      return;
+    }
+    // The consumed PREFIX must be byte-identical to what was ingested — a
+    // same-length in-place rewrite would otherwise slip valid records
+    // before the retained offset and lose them silently (r2 finding 11).
+    if (sha256Hex(text.slice(0, offset)) !== consumedHash) {
+      shrunk = true;
+      refused.push({
+        line: lineNumber + 1,
+        problem:
+          "stream file was rewritten in place (consumed prefix changed) — " +
+          "the worker rewrote history; further records refused",
+      });
+      return;
+    }
+    const unseen = text.slice(offset);
+    const lastNewline = unseen.lastIndexOf("\n");
+    const complete = lastNewline === -1 ? "" : unseen.slice(0, lastNewline);
+    if (lastNewline !== -1) {
+      offset += lastNewline + 1;
+      consumedHash = sha256Hex(text.slice(0, offset));
+      for (const line of complete.split("\n")) ingestLine(line);
+    }
+    if (final) {
+      const tail = text.slice(offset);
+      if (tail.trim().length > 0) {
+        offset = text.length;
+        consumedHash = sha256Hex(text);
+        ingestLine(tail);
+      }
+    }
+  };
+
+  try {
+    mkdirSync(join(workdir, "plan-input"));
+    writeFileSync(join(workdir, "plan-input", "prd.md"), brief.content);
+    writeFileSync(
+      join(workdir, "plan-input", "segments.json"),
+      JSON.stringify(brief.segments, null, 2) + "\n",
+    );
+
+    const dispatchPromise = dispatch(
+      adapter,
+      {
+        workdir,
+        prompt: plannerPrompt({ missionTitle: brief.missionTitle, template: brief.template }),
+      },
+      {
+        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(options.onLine !== undefined ? { onLine: options.onLine } : {}),
+      },
+    );
+
+    let settled = false;
+    const settle = dispatchPromise.then(
+      (record) => {
+        settled = true;
+        return record;
+      },
+      (error: unknown) => {
+        settled = true;
+        throw error;
+      },
+    );
+    while (!settled) {
+      drain(false);
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    const record = await settle;
+    drain(true); // final drain after exit — including an unterminated last record
+    return {
+      outcome: record.outcome,
+      ingested,
+      refused,
+      constructionComplete: service.planView(sessionId).status !== "constructing",
+    };
+  } finally {
+    if (options.keepWorkspace !== true) {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  }
+}
