@@ -95,3 +95,28 @@ export type {
 } from "./canon-ledger.js";
 export { CanonFactsStore } from "./canon-facts.js";
 export type { CanonFactsStoreOptions } from "./canon-facts.js";
+
+// WP-110: planning — the plan store, the planning service, and the contract
+// freeze (CAM-PLAN-01/-02/-04/-07/-11).
+export { PlanStore, PLAN_STREAM_KINDS, reviewArtifactProblems } from "./plan-store.js";
+export type {
+  ConfirmationRow,
+  PlanSessionRow,
+  PlanStoreOptions,
+  PlanStreamKind,
+  PlanStreamRecord,
+  UserActRow,
+} from "./plan-store.js";
+export { PlanningService, PlanningError, PLANNER_ACTOR } from "./planning.js";
+export type {
+  ApprovePlanOutcome,
+  ChecklistRowView,
+  ClarificationView,
+  DependencyInterfaceView,
+  PlanningServiceOptions,
+  PlanView,
+  ResumeReport,
+  ServiceApprovalRefusal,
+} from "./planning.js";
+export { runPlannerCompile, plannerPrompt } from "./plan-runner.js";
+export type { PlannerRunOptions, PlannerRunRecord, RefusedLine } from "./plan-runner.js";

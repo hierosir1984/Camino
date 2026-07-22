@@ -176,6 +176,8 @@ export default tseslint.config(
       "packages/gui/build.mjs",
       // The dispatch layer's fake CLI (zero-quota conformance stand-in).
       "packages/daemon/src/dispatch/adapters/mock-cli.mjs",
+      // The planner runner's fake worker (WP-110, same zero-quota pattern).
+      "packages/daemon/src/plan-mock-planner-cli.mjs",
     ],
     languageOptions: {
       globals: {

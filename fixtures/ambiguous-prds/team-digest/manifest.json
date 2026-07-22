@@ -1,0 +1,61 @@
+{
+  "fixture": "team-digest",
+  "area": "DIG",
+  "missionTitle": "Team digest",
+  "plantedAmbiguities": [
+    {
+      "id": "A1",
+      "segmentText": "Members get a digest of workspace activity.",
+      "summary": "The delivery channel is never stated (email, in-app, chat).",
+      "exampleQuestion": "Which channel delivers the digest?",
+      "exampleAssumption": "Email to the member's account address.",
+      "answerKeyTerms": ["channel", "email"]
+    },
+    {
+      "id": "A2",
+      "segmentText": "The digest arrives daily.",
+      "summary": "Daily at what time, and in whose timezone?",
+      "exampleQuestion": "What send time and timezone does daily mean?",
+      "exampleAssumption": "08:00 in each member's profile timezone.",
+      "answerKeyTerms": ["timezone", "send time"]
+    },
+    {
+      "id": "A3",
+      "segmentText": "Members can opt out.",
+      "summary": "Opt-out scope is unstated: per workspace or account-wide.",
+      "exampleQuestion": "Does opting out apply per workspace or to the whole account?",
+      "exampleAssumption": "Per workspace.",
+      "answerKeyTerms": ["opt out", "opting out", "opt-out"]
+    },
+    {
+      "id": "A4",
+      "segmentText": "Old digests are cleaned up eventually.",
+      "summary": "\"Eventually\" names no retention period.",
+      "exampleQuestion": "How long are past digests retained?",
+      "exampleAssumption": "90 days.",
+      "answerKeyTerms": ["retained", "retention", "90 days"]
+    }
+  ],
+  "requirementSegments": [
+    {
+      "segmentText": "Members get a digest of workspace activity.",
+      "statement": "Each member receives a digest of workspace activity."
+    },
+    {
+      "segmentText": "The digest arrives daily.",
+      "statement": "The digest is delivered once per day."
+    },
+    {
+      "segmentText": "Members can opt out.",
+      "statement": "A member can opt out of the digest."
+    },
+    {
+      "segmentText": "The digest lists new documents and comments.",
+      "statement": "The digest lists new documents and comments since the prior digest."
+    },
+    {
+      "segmentText": "Old digests are cleaned up eventually.",
+      "statement": "Digests older than the retention period are removed."
+    }
+  ]
+}
