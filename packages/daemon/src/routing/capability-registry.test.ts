@@ -190,6 +190,20 @@ describe("buildCapabilityRegistry — live composition", () => {
     expect(view.providers.xai.enablement.reason).toContain("sanctioned-path");
   });
 
+  it("refuses enablement from an enabled-looking spec without registry provenance", () => {
+    // Round-5 review finding 3: enablement is believed only from specs the
+    // dispatch gate ENABLED (the same provenance dispatch() requires).
+    const forged = {
+      name: "grok-build",
+      enabled: true,
+      plan: () => ({ file: "/forged/grok", args: [] }),
+      parseLine: () => null,
+    };
+    const view = buildCapabilityRegistry({ adapters: [forged] });
+    expect(view.providers.xai.enablement.enabled).toBe(false);
+    expect(view.providers.xai.enablement.reason).toContain("provenance");
+  });
+
   it("reports an absent adapter as disabled rather than guessing", () => {
     const view = buildCapabilityRegistry({ adapters: [] });
     for (const family of PROVIDER_FAMILIES) {
@@ -204,6 +218,7 @@ describe("buildCapabilityRegistry — live composition", () => {
     });
     try {
       tracker.recordDispatch("anthropic", {
+        dispatchId: "d1",
         outcome: "quota-blocked",
         durationMs: 60_000,
         quotaSignalSeen: true,

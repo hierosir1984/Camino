@@ -69,6 +69,7 @@ const OUTCOMES: readonly DispatchOutcome[] = [
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS window_observations (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq > 0),
+  dispatch_id  TEXT    NOT NULL UNIQUE CHECK (length(dispatch_id) > 0),
   family       TEXT    NOT NULL CHECK (family IN ('anthropic', 'openai', 'xai')),
   observed_at  TEXT    NOT NULL,
   duration_ms  INTEGER NOT NULL CHECK (duration_ms >= 0),
@@ -117,6 +118,7 @@ function expectedSchemaObjects(): Map<string, string> {
 
 interface ObservationRow {
   seq: number;
+  dispatch_id: string;
   family: string;
   observed_at: string;
   duration_ms: number;
@@ -127,6 +129,8 @@ interface ObservationRow {
 /** One dispatch observation as recorded (and as read back). */
 export interface WindowObservation {
   readonly seq: number;
+  /** The recording key: one row per dispatch/attempt, replay-idempotent. */
+  readonly dispatchId: string;
   readonly family: ProviderFamily;
   /** ISO-8601 UTC instant the dispatch ENDED (signals classify at the end). */
   readonly observedAt: string;
@@ -138,6 +142,15 @@ export interface WindowObservation {
 
 /** What the caller supplies per finished dispatch (a DispatchRecord slice). */
 export interface DispatchObservationInput {
+  /**
+   * Durable identity of the dispatch/attempt this observation describes
+   * (the WP-114 attempt id). Recording is IDEMPOTENT on it: replaying the
+   * same id with identical content returns the existing row (the WP-104
+   * §4.4 recovery posture — a crash between dispatch and downstream
+   * processing must not double-count usage; round-5 review finding 1);
+   * the same id with DIFFERENT content is refused as conflicting evidence.
+   */
+  readonly dispatchId: string;
   readonly outcome: DispatchOutcome;
   readonly durationMs: number;
   readonly quotaSignalSeen: boolean;
@@ -287,8 +300,8 @@ export class QuotaWindowTracker {
         );
       }
       this.#insert = this.#db.prepare(
-        `INSERT INTO window_observations (family, observed_at, duration_ms, outcome, quota_signal)
-         VALUES (@family, @observedAt, @durationMs, @outcome, @quotaSignal)`,
+        `INSERT INTO window_observations (dispatch_id, family, observed_at, duration_ms, outcome, quota_signal)
+         VALUES (@dispatchId, @family, @observedAt, @durationMs, @outcome, @quotaSignal)`,
       );
     } catch (error) {
       this.#db.close();
@@ -307,6 +320,13 @@ export class QuotaWindowTracker {
    */
   recordDispatch(family: ProviderFamily, input: DispatchObservationInput): WindowObservation {
     const checkedFamily = validFamily(family);
+    const dispatchId = input.dispatchId;
+    if (typeof dispatchId !== "string" || dispatchId.length === 0 || dispatchId.length > 200) {
+      throw new TypeError("dispatchId must be a non-empty string of at most 200 UTF-16 units");
+    }
+    if (!dispatchId.isWellFormed() || dispatchId.includes("\0")) {
+      throw new TypeError("dispatchId must be well-formed text without NUL");
+    }
     if (!OUTCOMES.includes(input.outcome)) {
       throw new TypeError(`Unknown dispatch outcome: ${JSON.stringify(input.outcome)}`);
     }
@@ -315,21 +335,57 @@ export class QuotaWindowTracker {
     }
     const observedAt = validInstant("observation instant", input.at ?? this.#now());
     const quotaSignalSeen = input.quotaSignalSeen === true || input.outcome === "quota-blocked";
-    const result = this.#insert.run({
-      family: checkedFamily,
-      observedAt,
-      durationMs: Math.ceil(input.durationMs),
-      outcome: input.outcome,
-      quotaSignal: quotaSignalSeen ? 1 : 0,
-    });
-    return {
-      seq: Number(result.lastInsertRowid),
-      family: checkedFamily,
-      observedAt,
-      durationMs: Math.ceil(input.durationMs),
-      outcome: input.outcome,
-      quotaSignalSeen,
-    };
+    const durationMs = Math.ceil(input.durationMs);
+    try {
+      const result = this.#insert.run({
+        dispatchId,
+        family: checkedFamily,
+        observedAt,
+        durationMs,
+        outcome: input.outcome,
+        quotaSignal: quotaSignalSeen ? 1 : 0,
+      });
+      return {
+        seq: Number(result.lastInsertRowid),
+        dispatchId,
+        family: checkedFamily,
+        observedAt,
+        durationMs,
+        outcome: input.outcome,
+        quotaSignalSeen,
+      };
+    } catch (error) {
+      if (!/UNIQUE constraint failed: window_observations\.dispatch_id/.test(String(error))) {
+        throw error;
+      }
+      // Idempotent replay: the same dispatch id with identical content
+      // returns the EXISTING row (its original observedAt — a replay must
+      // not move history); different content is conflicting evidence and
+      // is refused (round-5 review finding 1; WP-104 §4.4 posture).
+      const row = this.#db
+        .prepare("SELECT * FROM window_observations WHERE dispatch_id = ?")
+        .get(dispatchId) as ObservationRow;
+      const matches =
+        row.family === checkedFamily &&
+        row.observed_at === observedAt &&
+        row.duration_ms === durationMs &&
+        row.outcome === input.outcome &&
+        row.quota_signal === (quotaSignalSeen ? 1 : 0);
+      if (!matches) {
+        throw new Error(
+          `dispatch ${dispatchId} is already recorded with different content — refusing conflicting evidence`,
+        );
+      }
+      return {
+        seq: row.seq,
+        dispatchId: row.dispatch_id,
+        family: row.family as ProviderFamily,
+        observedAt: row.observed_at,
+        durationMs: row.duration_ms,
+        outcome: row.outcome as DispatchOutcome,
+        quotaSignalSeen: row.quota_signal === 1,
+      };
+    }
   }
 
   /** All observations for a family, in insertion order (seq). */
@@ -339,6 +395,7 @@ export class QuotaWindowTracker {
       .all(validFamily(family)) as ObservationRow[];
     return rows.map((row) => ({
       seq: row.seq,
+      dispatchId: row.dispatch_id,
       family: row.family as ProviderFamily,
       observedAt: row.observed_at,
       durationMs: row.duration_ms,
@@ -358,8 +415,14 @@ export class QuotaWindowTracker {
    * the ledger evidence registry item 13 names for refining window shapes
    * — most useful for a provider with no recorded shape yet (Grok Build).
    */
-  recoveryGapsMs(family: ProviderFamily): number[] {
-    const ordered = this.observations(family).sort(byInstantThenSeq);
+  recoveryGapsMs(family: ProviderFamily, options: { asOf?: Date } = {}): number[] {
+    const asOfMs = options.asOf?.getTime() ?? Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(asOfMs) && options.asOf !== undefined) {
+      throw new TypeError("asOf must be a valid Date");
+    }
+    const ordered = this.observations(family)
+      .filter((o) => Date.parse(o.observedAt) <= asOfMs)
+      .sort(byInstantThenSeq);
     const gaps: number[] = [];
     for (let i = 0; i < ordered.length; i++) {
       if (ordered[i]!.outcome !== "quota-blocked") continue;
@@ -421,7 +484,11 @@ export class QuotaWindowTracker {
     if (!Number.isFinite(nowMs)) {
       throw new TypeError("windowState clock must yield a valid Date");
     }
-    const all = this.observations(checkedFamily);
+    // AS-OF semantics (round-5 review finding 2): the state at `now` is
+    // computed from observations whose instant is at or before `now` — a
+    // future-dated row (skewed clock, backfill tooling) is recorded but
+    // invisible until its instant arrives; it must not un-pin the present.
+    const all = this.observations(checkedFamily).filter((o) => Date.parse(o.observedAt) <= nowMs);
     // Latest by TIMESTAMP, not by insertion order: a backfilled older row
     // must not displace a newer exhaustion (round-1 review finding 1).
     const latestOf = (candidates: WindowObservation[]): WindowObservation | undefined =>
@@ -441,7 +508,9 @@ export class QuotaWindowTracker {
     let shapes = this.#shapes(checkedFamily);
     let synthesized = false;
     if (shapes.length === 0) {
-      const gaps = this.recoveryGapsMs(checkedFamily).filter((gap) => gap > 0);
+      const gaps = this.recoveryGapsMs(checkedFamily, { asOf: new Date(nowMs) }).filter(
+        (gap) => gap > 0,
+      );
       if (gaps.length > 0) {
         shapes = [
           { id: "observed-recovery", kind: "unknown-reset", durationMs: Math.max(...gaps) },

@@ -18,7 +18,7 @@
  */
 import type { AdapterSpec, ProviderCapabilityRecord, ProviderFamily } from "@camino/shared";
 import { HARNESS_FAMILY, PROVIDER_FAMILIES } from "@camino/shared";
-import { buildRegistry } from "../dispatch/registry.js";
+import { buildRegistry, hasRegistryProvenance } from "../dispatch/registry.js";
 import { CAPABILITY_SEED } from "./capability-seed.js";
 import type { ProviderWindowState, QuotaWindowTracker } from "./window-tracker.js";
 
@@ -75,6 +75,16 @@ function enablementOf(family: ProviderFamily, adapters: readonly AdapterSpec[]):
     enabled = spec.enabled === true;
   } catch {
     enabled = false;
+  }
+  // Enablement is believed only from a spec the dispatch registry's gate
+  // ENABLED (the same WeakSet provenance dispatch() itself requires): an
+  // enabled-looking spec that never passed the sanctioned-path + CLI gate
+  // must not present as enabled here first (round-5 review finding 3).
+  if (enabled && !hasRegistryProvenance(spec)) {
+    return {
+      enabled: false,
+      reason: `${harness} spec lacks registry provenance — obtain adapters from buildRegistry() (CAM-EXEC-01 gate)`,
+    };
   }
   if (enabled) return { enabled: true };
   let reason: string;
