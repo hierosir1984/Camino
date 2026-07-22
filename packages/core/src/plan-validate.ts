@@ -61,7 +61,9 @@ export function segmentPrd(text: string): PrdSegment[] {
   const lines = text.split(/\r\n|\r|\n/);
   const blocks: string[] = [];
   let current: string[] = [];
-  let inFence = false;
+  // Markdown closes a fence only with the SAME delimiter family — a ~~~
+  // line inside a ``` fence is fence CONTENT, not a closer (r3 finding 7).
+  let openFence: "```" | "~~~" | null = null;
 
   const flush = (): void => {
     if (current.length > 0) {
@@ -70,20 +72,26 @@ export function segmentPrd(text: string): PrdSegment[] {
     }
   };
 
+  const fenceFamily = (line: string): "```" | "~~~" | null => {
+    if (/^ {0,3}```/.test(line)) return "```";
+    if (/^ {0,3}~~~/.test(line)) return "~~~";
+    return null;
+  };
+
   for (const line of lines) {
-    const fenceDelimiter = /^ {0,3}(```|~~~)/.test(line);
-    if (inFence) {
+    const family = fenceFamily(line);
+    if (openFence !== null) {
       current.push(line);
-      if (fenceDelimiter) {
-        inFence = false;
+      if (family === openFence) {
+        openFence = null;
         flush();
       }
       continue;
     }
-    if (fenceDelimiter) {
+    if (family !== null) {
       flush();
       current.push(line);
-      inFence = true;
+      openFence = family;
       continue;
     }
     if (line.trim().length === 0) {
@@ -129,7 +137,7 @@ export function segmentPrd(text: string): PrdSegment[] {
  * Unicode (\s), so a no-break space no longer buries a sentence.
  */
 const SENTENCE_TERMINATORS = new Set([".", "!", "?", ";", "。", "！", "？", "；"]);
-const CLOSER_RE = /["')\]”’»›」』]/;
+const CLOSER_RE = /["')\]”’»›」』】〉》）］｣]/;
 const WHITESPACE_RE = /\s/;
 
 function splitSentences(block: string): string[] {
@@ -519,9 +527,31 @@ export function plantedAmbiguityCoverage(
   }> = [];
   const uncovered: Array<{ plantedId: string; segmentId: string }> = [];
   const unlocatable: string[] = [];
-  const canon = (text: string): string => text.normalize("NFC").toLowerCase();
+  // TOKEN matching, not substring matching (r3 finding 6): "support" must
+  // not cover the anchor "port". Both sides NFC-normalize, lowercase, and
+  // tokenize on non-letter/digit runs; a term matches when its token
+  // sequence appears consecutively in the clarification's tokens.
+  const tokens = (text: string): string[] =>
+    text
+      .normalize("NFC")
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter((t) => t.length > 0);
+  const containsTokenSequence = (
+    haystack: readonly string[],
+    needle: readonly string[],
+  ): boolean => {
+    if (needle.length === 0) return false;
+    outer: for (let i = 0; i + needle.length <= haystack.length; i += 1) {
+      for (let j = 0; j < needle.length; j += 1) {
+        if (haystack[i + j] !== needle[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  };
   for (const ambiguity of planted) {
-    const terms = ambiguity.answerKeyTerms.map(canon).filter((t) => t.trim().length > 0);
+    const terms = ambiguity.answerKeyTerms.map(tokens).filter((t) => t.length > 0);
     if (terms.length === 0) {
       // An empty or blank answer key would make coverage vacuously
       // gameable ("" is a substring of everything) — manifest drift,
@@ -540,10 +570,10 @@ export function plantedAmbiguityCoverage(
         if (!c.relatedSegmentIds.includes(segmentId)) return false;
         // Match only the DECISION-carrying fields — the question asked and
         // the assumption recorded. A stray term in the free-text rationale
-        // must not cover (r2 finding 6); both sides NFC-normalize so
-        // canonically equivalent Unicode cannot false-negative.
-        const text = canon(`${c.question} ${c.assumptionIfUnanswered}`);
-        return terms.some((term) => text.includes(term));
+        // must not cover (r2 finding 6), and token matching means a term
+        // inside a longer word never counts (r3 finding 6).
+        const text = tokens(`${c.question} ${c.assumptionIfUnanswered}`);
+        return terms.some((term) => containsTokenSequence(text, term));
       })
       .map((c) => c.clarificationId);
     if (touching.length > 0) {

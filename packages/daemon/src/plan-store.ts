@@ -36,11 +36,14 @@
 import Database from "better-sqlite3";
 import {
   DAVID_ACTOR,
+  checklistProblems,
+  clarificationReferenceProblems,
   dependencyGraphProblems,
   findDependencyCycle,
   formatCycle,
   templateProblems,
 } from "@camino/core";
+import type { PrdSegment } from "@camino/core";
 import {
   CanonicalJsonError,
   canonicalJson,
@@ -61,7 +64,12 @@ import type {
 import { MISSION_TEMPLATES, MISSION_TEMPLATE_NAMES } from "@camino/shared";
 import type { HeldWriterLock } from "./writer-lock.js";
 
-const SCHEMA_VERSION = 1;
+// Version 2: plan_sessions gained the persisted `segments` column (the
+// store-derivable gate needs them, r3 finding 1) and contracts.session_id
+// became FK-bound (r2 finding 10). No migration path exists: WP-110 has
+// never merged, so no version-1 store exists outside dev/test scratch —
+// a version mismatch refuses with that stated reason (r3 finding 9).
+const SCHEMA_VERSION = 2;
 const MAX_SAFE_SEQ = 9007199254740991;
 
 const TEMPLATE_LIST_SQL = MISSION_TEMPLATE_NAMES.map((name) => `'${name}'`).join(", ");
@@ -81,12 +89,36 @@ const STREAM_KIND_LIST_SQL = PLAN_STREAM_KINDS.map((kind) => `'${kind}'`).join("
 const NUL_FREE = (column: string): string =>
   `typeof(${column}) = 'text' AND length(${column}) > 0 AND instr(CAST(${column} AS BLOB), x'00') = 0`;
 
+/** Shape check for a persisted segmentation: S1..Sn in order, non-blank text. */
+function segmentListProblems(value: unknown): string[] {
+  if (!Array.isArray(value)) return ["segments must be an array"];
+  const problems: string[] = [];
+  value.forEach((entry, i) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      problems.push(`segments[${i}] must be an object`);
+      return;
+    }
+    const segment = entry as Record<string, unknown>;
+    if (segment["segmentId"] !== `S${i + 1}`) {
+      problems.push(`segments[${i}] must carry segmentId S${i + 1} (document order)`);
+    }
+    if (typeof segment["text"] !== "string" || segment["text"].trim().length === 0) {
+      problems.push(`segments[${i}].text must be non-blank`);
+    }
+    const extra = Object.keys(segment).filter((k) => k !== "segmentId" && k !== "text");
+    for (const key of extra)
+      problems.push(`segments[${i}] has unknown field ${JSON.stringify(key)}`);
+  });
+  return problems;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS plan_sessions (
   session_id  TEXT PRIMARY KEY CHECK (${NUL_FREE("session_id")}),
   mission_id  TEXT NOT NULL CHECK (${NUL_FREE("mission_id")}),
   template    TEXT NOT NULL CHECK (template IN (${TEMPLATE_LIST_SQL})),
   prd_sha256  TEXT NOT NULL CHECK (typeof(prd_sha256) = 'text' AND length(prd_sha256) = 64),
+  segments    TEXT NOT NULL CHECK (typeof(segments) = 'text'),
   created_at  TEXT NOT NULL CHECK (${NUL_FREE("created_at")})
 );
 
@@ -222,6 +254,15 @@ export interface PlanStreamRecord {
   readonly recordedAt: string;
 }
 
+/** The stream-derived shape the store's act guards check against. */
+interface StreamState {
+  issues: PlannedIssueDraft[];
+  clarifications: ClarifyingItemDraft[];
+  checklist: ChecklistRowDraft[];
+  constructionComplete: boolean;
+  reviewArtifacts: Array<Record<string, unknown>>;
+}
+
 interface ContractRowShape {
   issue_id: string;
   version: number;
@@ -312,7 +353,8 @@ export class PlanStore {
         this.#db.pragma(`user_version = ${SCHEMA_VERSION}`);
       } else if (version !== SCHEMA_VERSION) {
         throw new Error(
-          `plan store ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
+          `plan store ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION} ` +
+            "(pre-release schemas carry no migration path — WP-110 never shipped version 1)",
         );
       }
       // Tamper-evident open by schema DEFINITIONS, not names (the canon-ledger
@@ -432,17 +474,89 @@ export class PlanStore {
         );
       }
     }
-    // Confirmation and flag-acknowledgment rows validate at adoption too
-    // (r2 finding 10): malformed ids or non-array flag payloads written by
-    // a raw writer are refused, not adopted.
+    // Session integrity at adoption: every session's persisted segments
+    // validate, and every row in every dependent table names a session
+    // that EXISTS — FK enforcement is per-connection, so rows written by
+    // a prior FK-disabled writer are hunted here (r3 finding 4).
+    const sessionIds = new Set(
+      (
+        this.#db.prepare("SELECT session_id, segments FROM plan_sessions").all() as Array<{
+          session_id: string;
+          segments: string;
+        }>
+      ).map((row) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(row.segments);
+        } catch {
+          parsed = null;
+        }
+        const segmentProblems = segmentListProblems(parsed);
+        if (segmentProblems.length > 0) {
+          throw new Error(
+            `plan store ${path} session ${row.session_id} segments fail validation — ` +
+              `refusing to adopt: ${segmentProblems.join("; ")}`,
+          );
+        }
+        return row.session_id;
+      }),
+    );
+    for (const table of [
+      "plan_stream",
+      "plan_acknowledgments",
+      "plan_confirmations",
+      "plan_flag_acknowledgments",
+      "plan_rejections",
+      "plan_approvals",
+      "plan_approval_completions",
+    ]) {
+      const orphans = this.#db.prepare(`SELECT DISTINCT session_id FROM ${table}`).all() as Array<{
+        session_id: string;
+      }>;
+      for (const orphan of orphans) {
+        if (!sessionIds.has(orphan.session_id)) {
+          throw new Error(
+            `plan store ${path} table ${table} references session ${orphan.session_id}, ` +
+              "which does not exist — refusing to adopt orphan rows",
+          );
+        }
+      }
+    }
+    // Confirmation rows validate at adoption too (r2/r3 finding 10/4):
+    // malformed ids AND statements unbound from their checklist rows are
+    // refused, not adopted.
     const confirmationRows = this.#db
-      .prepare("SELECT session_id, segment_id, requirement_id FROM plan_confirmations")
-      .all() as Array<{ session_id: string; segment_id: string; requirement_id: string }>;
+      .prepare("SELECT session_id, segment_id, requirement_id, statement FROM plan_confirmations")
+      .all() as Array<{
+      session_id: string;
+      segment_id: string;
+      requirement_id: string;
+      statement: string;
+    }>;
     for (const row of confirmationRows) {
       if (!isRequirementId(row.requirement_id)) {
         throw new Error(
           `plan store ${path} confirmation ${row.session_id}/${row.segment_id} holds a ` +
             `malformed requirement id — refusing to adopt`,
+        );
+      }
+      const checklistRow = this.#db
+        .prepare(`SELECT payload FROM plan_stream WHERE session_id = ? AND kind = 'checklist-row'`)
+        .all(row.session_id) as Array<{ payload: string }>;
+      const bound = checklistRow.some((streamRow) => {
+        const parsed = JSON.parse(streamRow.payload) as {
+          row?: { segmentId?: string; disposition?: string; proposedStatement?: string };
+        };
+        return (
+          parsed.row?.segmentId === row.segment_id &&
+          parsed.row.disposition === "mapped" &&
+          parsed.row.proposedStatement === row.statement
+        );
+      });
+      if (!bound) {
+        throw new Error(
+          `plan store ${path} confirmation ${row.session_id}/${row.segment_id} statement is ` +
+            "not bound to a mapped checklist row — refusing to adopt",
         );
       }
     }
@@ -542,16 +656,54 @@ export class PlanStore {
     missionId: string;
     template: MissionTemplateName;
     prdSha256: string;
+    /** The PRD's segmentation, persisted so the store's gate can check totality (r3 finding 1). */
+    segments: readonly PrdSegment[];
   }): PlanSessionRow {
     this.#assertWritable("plan store createSession");
+    const problems = segmentListProblems(input.segments);
+    if (problems.length > 0) {
+      throw new Error(`session segments refused: ${problems.join("; ")}`);
+    }
     const createdAt = this.#now().toISOString();
+    const segments = input.segments.map((s) => ({ segmentId: s.segmentId, text: s.text }));
     this.#db
       .prepare(
-        `INSERT INTO plan_sessions (session_id, mission_id, template, prd_sha256, created_at)
-         VALUES (@sessionId, @missionId, @template, @prdSha256, @createdAt)`,
+        `INSERT INTO plan_sessions (session_id, mission_id, template, prd_sha256, segments, created_at)
+         VALUES (@sessionId, @missionId, @template, @prdSha256, @segments, @createdAt)`,
       )
-      .run({ ...input, createdAt });
-    return { ...input, createdAt };
+      .run({
+        sessionId: input.sessionId,
+        missionId: input.missionId,
+        template: input.template,
+        prdSha256: input.prdSha256,
+        segments: JSON.stringify(segments),
+        createdAt,
+      });
+    return {
+      sessionId: input.sessionId,
+      missionId: input.missionId,
+      template: input.template,
+      prdSha256: input.prdSha256,
+      createdAt,
+    };
+  }
+
+  /** The session's persisted segmentation, shape-verified on read. */
+  sessionSegments(sessionId: string): PrdSegment[] {
+    const row = this.#db
+      .prepare("SELECT segments FROM plan_sessions WHERE session_id = ?")
+      .get(sessionId) as { segments: string } | undefined;
+    if (row === undefined) {
+      throw new Error(`plan session ${sessionId} does not exist`);
+    }
+    const parsed = JSON.parse(row.segments) as PrdSegment[];
+    const problems = segmentListProblems(parsed);
+    if (problems.length > 0) {
+      throw new Error(
+        `stored segments for ${sessionId} fail validation on read: ${problems.join("; ")}`,
+      );
+    }
+    return parsed;
   }
 
   session(sessionId: string): PlanSessionRow | undefined {
@@ -614,12 +766,11 @@ export class PlanStore {
     payload: PlanConstructionRecord | Record<string, unknown>,
   ): PlanStreamRecord {
     this.#assertWritable("plan store appendStream");
-    if (this.session(sessionId) === undefined) {
-      throw new Error(`plan session ${sessionId} does not exist`);
-    }
-    if (this.rejection(sessionId) !== undefined || this.approval(sessionId) !== undefined) {
-      throw new Error(`plan session ${sessionId} is closed to stream appends`);
-    }
+    // SNAPSHOT FIRST (r3 finding 3): canonicalization is the only step that
+    // evaluates caller-controlled property reads. Taking it before any
+    // guard means a re-entrant caller (a getter recording an act mid-read)
+    // changes state BEFORE the guards run — the guards then see the final
+    // state and refuse correctly. After this line no caller code runs.
     let serialized: string;
     try {
       serialized = canonicalJson(payload);
@@ -629,7 +780,13 @@ export class PlanStore {
       }
       throw error;
     }
-    // Single observation: validate the parsed snapshot, persist its bytes.
+    if (this.session(sessionId) === undefined) {
+      throw new Error(`plan session ${sessionId} does not exist`);
+    }
+    if (this.rejection(sessionId) !== undefined || this.approval(sessionId) !== undefined) {
+      throw new Error(`plan session ${sessionId} is closed to stream appends`);
+    }
+    // Validate the parsed snapshot, persist its bytes.
     const snapshot = JSON.parse(serialized) as Record<string, unknown>;
     if (kind === "review-attached") {
       const problems = reviewArtifactProblems(snapshot);
@@ -736,14 +893,28 @@ export class PlanStore {
   // service cannot persist rows the service would refuse.
   // -------------------------------------------------------------------------
 
+  /**
+   * Memoized per (session, last seq): the act guards would otherwise
+   * re-parse the whole stream per act — quadratic in plan size
+   * (r3 finding 10). One cheap MAX(seq) query decides cache validity.
+   */
+  readonly #streamStateCache = new Map<string, { lastSeq: number; state: StreamState }>();
+
   /** The stream-derived plan shape the act guards check against. */
-  #streamStateFor(sessionId: string): {
-    issues: PlannedIssueDraft[];
-    clarifications: ClarifyingItemDraft[];
-    checklist: ChecklistRowDraft[];
-    constructionComplete: boolean;
-    reviewArtifacts: Array<Record<string, unknown>>;
-  } {
+  #streamStateFor(sessionId: string): StreamState {
+    const lastSeq = (
+      this.#db
+        .prepare("SELECT COALESCE(MAX(seq), 0) AS last FROM plan_stream WHERE session_id = ?")
+        .get(sessionId) as { last: number }
+    ).last;
+    const cached = this.#streamStateCache.get(sessionId);
+    if (cached !== undefined && cached.lastSeq === lastSeq) return cached.state;
+    const state = this.#streamStateUncached(sessionId);
+    this.#streamStateCache.set(sessionId, { lastSeq, state });
+    return state;
+  }
+
+  #streamStateUncached(sessionId: string): StreamState {
     const issues: PlannedIssueDraft[] = [];
     const clarifications: ClarifyingItemDraft[] = [];
     const checklist: ChecklistRowDraft[] = [];
@@ -796,8 +967,20 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordAcknowledgment");
+    // Snapshot before guards (r3 finding 3): serializing `response` is the
+    // only caller-controlled read in this method.
+    let serialized: string;
+    try {
+      serialized = canonicalJson(response);
+    } catch (error) {
+      if (error instanceof CanonicalJsonError) {
+        throw new Error(`acknowledgment response has no canonical JSON form: ${error.message}`);
+      }
+      throw error;
+    }
+    const snapshot = JSON.parse(serialized) as ClarificationResponse;
     this.#assertActsOpen(sessionId, "acknowledgment");
-    const problems = clarificationResponseProblems(response);
+    const problems = clarificationResponseProblems(snapshot);
     if (problems.length > 0) {
       throw new Error(`acknowledgment response refused: ${problems.join("; ")}`);
     }
@@ -813,7 +996,7 @@ export class PlanStore {
       .run({
         sessionId,
         clarificationId,
-        response: JSON.stringify(response),
+        response: serialized,
         actor,
         recordedAt: this.#now().toISOString(),
       });
@@ -844,6 +1027,13 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordConfirmation");
+    // Snapshot the caller's fields ONCE before any guard (r3 finding 3).
+    const snapshot = {
+      segmentId: String(confirmation.segmentId),
+      requirementId: String(confirmation.requirementId),
+      statement: String(confirmation.statement),
+    };
+    confirmation = snapshot;
     this.#assertActsOpen(sessionId, "confirmation");
     if (!isRequirementId(confirmation.requirementId)) {
       throw new Error(
@@ -928,6 +1118,8 @@ export class PlanStore {
     actor: string,
   ): void {
     this.#assertWritable("plan store recordFlagAcknowledgment");
+    // Snapshot the caller's array ONCE before any guard (r3 finding 3).
+    flaggedSegmentIds = Array.from(flaggedSegmentIds, (s) => String(s));
     this.#assertActsOpen(sessionId, "flag acknowledgment");
     const state = this.#streamStateFor(sessionId);
     const flagged = state.checklist
@@ -1017,6 +1209,11 @@ export class PlanStore {
       }
     }
     problems.push(...templateProblems(template, state.issues));
+    // With the segmentation persisted, the store derives the FULL gate —
+    // totality and reference consistency included (r3 finding 1).
+    const segments = this.sessionSegments(sessionId);
+    problems.push(...checklistProblems(segments, state.checklist, state.issues));
+    problems.push(...clarificationReferenceProblems(state.clarifications, segments, state.issues));
     problems.push(...dependencyGraphProblems(state.issues));
     const cycle = findDependencyCycle(state.issues);
     if (cycle !== null) problems.push(`dependency cycle ${formatCycle(cycle)}`);
@@ -1145,6 +1342,18 @@ export class PlanStore {
     if (problems.length > 0) {
       throw new Error(`refusing to store an invalid contract: ${problems.join("; ")}`);
     }
+    // Live custody (r3 finding 4): the naming session must exist and belong
+    // to the contract's mission — not only at adoption, at every write.
+    const custody = this.session(sessionId);
+    if (custody === undefined) {
+      throw new Error(`contract insert refused: session ${sessionId} does not exist`);
+    }
+    if (custody.missionId !== snapshot.missionId) {
+      throw new Error(
+        `contract insert refused: session ${sessionId} belongs to mission ${custody.missionId}, ` +
+          `not the contract's ${snapshot.missionId}`,
+      );
+    }
     const existing = this.contract(snapshot.issueId, snapshot.version);
     if (existing !== undefined) {
       if (existing.contractHash === snapshot.contractHash) return existing;
@@ -1197,6 +1406,14 @@ export class PlanStore {
       )
       .get(contractHash) as ContractRowShape | undefined;
     return row === undefined ? undefined : this.#toContract(row);
+  }
+
+  /** Which session froze this contract version (custody, r3 finding 2). */
+  contractSession(issueId: string, version: number): string | undefined {
+    const row = this.#db
+      .prepare("SELECT session_id FROM contracts WHERE issue_id = ? AND version = ?")
+      .get(issueId, version) as { session_id: string } | undefined;
+    return row?.session_id;
   }
 
   contractsForMission(missionId: string): IssueContract[] {

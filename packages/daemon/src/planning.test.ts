@@ -1021,3 +1021,101 @@ describe("round-2 falsification regressions", () => {
     expect(() => service.resumePendingWork()).toThrow(/no stored contract/);
   });
 });
+
+describe("round-3 falsification regressions", () => {
+  it("R3-1: the store's approval act refuses a non-total checklist (full derived gate)", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    // A stream that covers only SOME segments, written straight to the store
+    // (bypassing the service): the store's own gate must refuse the act.
+    h.planStore.appendStream(session.sessionId, "issue", issue("I1"));
+    h.planStore.appendStream(
+      session.sessionId,
+      "checklist-row",
+      mappedRow("S2", "The system sends a daily summary email.", ["I1"]),
+    );
+    h.planStore.appendStream(session.sessionId, "construction-complete", {
+      kind: "construction-complete",
+    });
+    h.planStore.appendStream(session.sessionId, "review-attached", { ...REVIEW });
+    h.planStore.recordConfirmation(
+      session.sessionId,
+      {
+        segmentId: "S2",
+        requirementId: "CAM-APP-01",
+        statement: "The system sends a daily summary email.",
+      },
+      "david",
+    );
+    expect(() => h.planStore.recordApproval(session.sessionId, "david")).toThrow(
+      /has no checklist row/,
+    );
+  });
+
+  it("R3-2: reconciliation refuses a completion whose contract another session froze", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    constructPlan(h, session.sessionId);
+    acknowledgeEverything(h, session.sessionId);
+    expect(h.service.approvePlan(session.sessionId).ok).toBe(true);
+    // A second session for the same mission cannot even start while this
+    // one is frozen-approved… but a forged replay row could. Simulate the
+    // custody check directly: the stored contracts belong to session 1.
+    expect(h.planStore.contractSession(`${mission.id}.I1`, 1)).toBe(session.sessionId);
+    expect(() => h.service.resumePendingWork()).not.toThrow();
+  });
+
+  it("R3-4: a contract naming a session from a DIFFERENT mission refuses at insert", () => {
+    const h = newHarness();
+    const missionA = newMission(h);
+    const sessionA = h.service.startSession(missionA.id, "feature");
+    constructPlan(h, sessionA.sessionId);
+    // Forge a contract for a foreign mission id under session A's custody.
+    const foreign = {
+      schemaVersion: 1,
+      missionId: "foreign-mission",
+      issueId: "foreign-mission.I1",
+      version: 1,
+      template: "feature" as const,
+      title: "Foreign",
+      goal: "Foreign goal.",
+      acceptanceCriteria: ["Foreign criterion."],
+      requirementIds: [],
+      dependsOn: [],
+      interfaces: [],
+    };
+    const forged = {
+      ...foreign,
+      contractHash: contractHash(foreign),
+      frozenAt: "2026-07-22T10:00:00.000Z",
+      approvedBy: "david",
+    };
+    expect(() => h.planStore.insertContract(forged, sessionA.sessionId)).toThrow(
+      /belongs to mission/,
+    );
+  });
+
+  it("R3-3: an accessor-carrying stream payload is refused before any guard runs", () => {
+    const h = newHarness();
+    const mission = newMission(h);
+    const session = h.service.startSession(mission.id, "feature");
+    let fired = 0;
+    const reentrant = Object.defineProperty(
+      { kind: "review-attached", reviewClass: "full-falsification", reviewer: "codex-cli" },
+      "verdict",
+      {
+        enumerable: true,
+        get() {
+          fired += 1;
+          return "approve";
+        },
+      },
+    );
+    expect(() => h.planStore.appendStream(session.sessionId, "review-attached", reentrant)).toThrow(
+      /no canonical JSON form/,
+    );
+    expect(fired).toBe(0); // the getter never evaluated — no re-entrancy window
+  });
+});

@@ -62,6 +62,7 @@ function seedSession(store: PlanStore, sessionId = "plan-m1-1"): void {
     missionId: "m1",
     template: "feature",
     prdSha256: "a".repeat(64),
+    segments: [{ segmentId: "S1", text: "The exporter works." }],
   });
 }
 
@@ -511,15 +512,12 @@ describe("contract index binding (r1 finding 8)", () => {
         return reads === 1 ? base.title : "Different on second read";
       },
     }) as typeof base;
-    // ONE observation: the getter is read exactly once (by the canonical
-    // snapshot), so what validated is byte-for-byte what persisted — the
-    // shifting second value never exists anywhere. The stored record is
-    // self-consistent and re-validates on read.
-    const inserted = store.insertContract(shifty, "plan-m1-1");
-    expect(inserted.title).toBe(base.title);
-    expect(reads).toBe(1);
-    const served = store.contract("m1.I1", 1);
-    expect(served?.title).toBe(base.title);
-    expect(served?.contractHash).toBe(base.contractHash);
+    // Accessor properties have no stable value, so the canonical snapshot
+    // REFUSES them outright (r3 finding 5) — the getter is never trusted,
+    // nothing persists, and the shifting value can never split validation
+    // from storage.
+    expect(() => store.insertContract(shifty, "plan-m1-1")).toThrow(/no canonical form/);
+    expect(reads).toBe(0);
+    expect(store.contractsForMission("m1")).toEqual([]);
   });
 });

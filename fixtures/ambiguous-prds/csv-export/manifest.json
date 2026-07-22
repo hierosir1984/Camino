@@ -25,7 +25,7 @@
       "summary": "\"Large\" names no size bound or behavior at the bound.",
       "exampleQuestion": "What is the row bound, and what happens above it?",
       "exampleAssumption": "Cap at 100000 rows with a stated truncation notice.",
-      "answerKeyTerms": ["row bound", "truncat", "cap at"]
+      "answerKeyTerms": ["row bound", "truncation", "cap"]
     }
   ],
   "requirementSegments": [

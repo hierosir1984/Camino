@@ -186,8 +186,8 @@ describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {
     expect(CONTRACT_REFERENCE_OBLIGATIONS).toEqual([
       "issue-created event payload carries { contractVersion, contractHash } (WP-110, at freeze)",
       "attempt records carry a ContractRef for the contract they execute (WP-114 dispatch)",
-      "issue PRs embed their ContractRef in the PR body (WP-117)",
-      "mission PRs embed the ContractRef set of their issues (WP-117)",
+      "issue PRs embed their ContractRef in the PR body (WP-120 PR lifecycle; enforced at push by WP-119)",
+      "mission PRs embed the ContractRef set of their issues (WP-120 PR lifecycle; enforced at push by WP-119)",
       "evidence packets carry the ContractRef their evidence binds to (WP-116)",
       "context packs cite the ContractRef they were assembled against (WP-113)",
     ]);

@@ -240,6 +240,10 @@ export class PlanningService {
       missionId,
       template,
       prdSha256: mission.contentSha256,
+      // Persisted so the store's own gate can check checklist totality and
+      // segment references (r3 finding 1); #planState verifies the stored
+      // copy still equals the recomputation on every read.
+      segments: segmentPrd(mission.content),
     });
   }
 
@@ -842,6 +846,17 @@ export class PlanningService {
             `state (${contract.contractHash}) — refusing to adopt`,
         );
       }
+      // Session custody (r3 finding 2): the stored contract must have been
+      // frozen BY THIS SESSION — a replayed session cannot claim another
+      // session's contract as its own completion substance.
+      const custodySession = this.#store.contractSession(contract.issueId, contract.version);
+      if (custodySession !== sessionId) {
+        throw new PlanningError(
+          `completed approval ${sessionId} but contract ${contract.issueId} v${contract.version} ` +
+            `was frozen by session ${custodySession ?? "unknown"} — refusing to adopt a ` +
+            "replayed completion",
+        );
+      }
       const missionState = this.#recorder.currentState("mission", state.mission.id);
       if (missionState === "draft" || missionState === "planned" || missionState === undefined) {
         throw new PlanningError(
@@ -849,10 +864,25 @@ export class PlanningService {
             `${missionState ?? "unrecorded"} — refusing to adopt`,
         );
       }
-      if (this.#recorder.currentState("issue", contract.issueId) === undefined) {
+      // The issue's creation record must reference THIS contract — not
+      // merely exist (r3 finding 2's forged-payload variant).
+      const created = this.#events
+        .read({ entityKind: "issue", entityId: contract.issueId })
+        .find((r) => r.event === "issue-created" && r.outcome === "applied");
+      if (created === undefined) {
         throw new PlanningError(
           `completed approval ${sessionId} but issue ${contract.issueId} was never created — ` +
             "refusing to adopt",
+        );
+      }
+      if (
+        created.payload["contractVersion"] !== contract.version ||
+        created.payload["contractHash"] !== contract.contractHash
+      ) {
+        throw new PlanningError(
+          `completed approval ${sessionId} but issue ${contract.issueId}'s creation record ` +
+            `references ${JSON.stringify(created.payload["contractHash"])} — refusing to adopt ` +
+            "a mismatched contract reference",
         );
       }
     }
@@ -1037,6 +1067,14 @@ export class PlanningService {
           `session's pinned ${session.prdSha256} — refusing to plan over changed content`,
       );
     }
+    const segments = segmentPrd(mission.content);
+    const stored = this.#store.sessionSegments(sessionId);
+    if (JSON.stringify(stored) !== JSON.stringify(segments)) {
+      throw new PlanningError(
+        `plan session ${sessionId} stored segments disagree with the recomputation from the ` +
+          "mission's retained content — refusing a drifted or tampered session",
+      );
+    }
     const issues: PlannedIssueDraft[] = [];
     const clarifications: ClarifyingItemDraft[] = [];
     const checklist: ChecklistRowDraft[] = [];
@@ -1066,7 +1104,7 @@ export class PlanningService {
     return {
       session,
       mission,
-      segments: segmentPrd(mission.content),
+      segments,
       issues,
       clarifications,
       checklist,

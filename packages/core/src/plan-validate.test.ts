@@ -559,3 +559,49 @@ describe("plantedAmbiguityCoverage", () => {
     expect(coverage.unlocatable).toEqual(["A1"]);
   });
 });
+
+describe("round-3 falsification regressions (core)", () => {
+  it("R3-6: a term inside a longer word does not cover (token matching)", () => {
+    const segs: PrdSegment[] = [{ segmentId: "S1", text: "The API port is configurable." }];
+    const coverage = plantedAmbiguityCoverage(
+      [
+        {
+          id: "A1",
+          segmentText: "The API port is configurable.",
+          summary: "default port unstated",
+          answerKeyTerms: ["port"],
+        },
+      ],
+      segs,
+      [
+        {
+          clarificationId: "Q1",
+          question: "What support hours apply?", // "support" contains "port"
+          whyItMatters: "Unrelated.",
+          assumptionIfUnanswered: "Business hours support.",
+          relatedSegmentIds: ["S1"],
+          relatedPlanIssueIds: [],
+        },
+      ],
+    );
+    expect(coverage.covered).toEqual([]);
+    expect(coverage.uncovered).toEqual([{ plantedId: "A1", segmentId: "S1" }]);
+  });
+
+  it("R3-7: full-width closers ride their sentence and split", () => {
+    const segments = segmentPrd("Data is encrypted。】 Users can delete accounts。");
+    expect(segments.map((s) => s.text)).toEqual([
+      "Data is encrypted。】",
+      "Users can delete accounts。",
+    ]);
+  });
+
+  it("R3-7: a ~~~ line does not close a ``` fence (delimiter families are distinct)", () => {
+    const text =
+      "```text\nData is encrypted. Users can delete accounts.\n~~~\nStill fenced.\n```\n\nOutside.";
+    const segments = segmentPrd(text);
+    expect(segments).toHaveLength(2);
+    expect((segments[0] as PrdSegment).text).toContain("Still fenced.");
+    expect((segments[1] as PrdSegment).text).toBe("Outside.");
+  });
+});

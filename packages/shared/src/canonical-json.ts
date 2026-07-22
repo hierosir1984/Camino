@@ -12,13 +12,21 @@
  * finite (JSON.stringify renders -0 as "0", so 0 and -0 share one canonical
  * form — the same normalization the intent journal's canonical-read applies).
  *
- * Everything else REFUSES loudly: undefined, functions, symbols, bigints,
- * non-finite numbers, and non-plain objects (Date, Map, Set, RegExp, class
- * instances). JSON.stringify's habit of silently dropping or coercing such
+ * The DOMAIN is deliberately narrow — exactly the values JSON.parse can
+ * produce: plain data. Everything else REFUSES loudly with its path:
+ * undefined, functions, symbols and symbol-keyed properties, bigints,
+ * non-finite numbers, non-plain objects (Date/Map/Set/RegExp/class
+ * instances), Proxy exotic objects, sparse-array holes and array expando
+ * properties, non-enumerable own properties, ACCESSOR properties (a getter
+ * has no stable value — evaluating it can throw, observe, or return a
+ * different value per read, r3 finding 5), and nesting beyond a named
+ * bound. JSON.stringify's habit of silently dropping or coercing such
  * values is exactly what a content hash cannot tolerate — two different
- * inputs must never quietly serialize to the same bytes.
+ * inputs must never quietly serialize to the same bytes, and serializing
+ * the same input twice must never differ.
  */
 import { createHash } from "node:crypto";
+import { types } from "node:util";
 
 /** Thrown when a value has no canonical JSON form. Never swallowed into a hash. */
 export class CanonicalJsonError extends Error {
@@ -43,6 +51,25 @@ function isPlainObject(value: object): boolean {
  */
 const MAX_DEPTH = 256;
 
+/**
+ * A property participates only as an own, enumerable DATA property — the
+ * only shape JSON.parse produces. Hidden (non-enumerable) own state would
+ * silently vanish ({} and a secret-carrying object would hash alike), and
+ * an accessor's value is not stable across reads (r3 finding 5).
+ */
+function assertDataProperty(owner: object, key: string | number, path: string): void {
+  const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+  if (descriptor === undefined) {
+    throw new CanonicalJsonError(path, "property vanished mid-serialization");
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    throw new CanonicalJsonError(path, "accessor properties have no stable JSON form");
+  }
+  if (descriptor.enumerable !== true) {
+    throw new CanonicalJsonError(path, "non-enumerable own properties have no JSON form");
+  }
+}
+
 function serialize(value: unknown, path: string, seen: Set<object>, depth: number): string {
   if (depth > MAX_DEPTH) {
     throw new CanonicalJsonError(path, `nesting exceeds ${MAX_DEPTH} levels`);
@@ -65,6 +92,11 @@ function serialize(value: unknown, path: string, seen: Set<object>, depth: numbe
   }
   if (value === null) return "null";
   const obj = value as object;
+  if (types.isProxy(obj)) {
+    // A Proxy can lie to every introspection below, per call — no stable
+    // canonical form exists for it (r3 finding 5's exotica class).
+    throw new CanonicalJsonError(path, "Proxy exotic objects have no stable JSON form");
+  }
   if (seen.has(obj)) {
     throw new CanonicalJsonError(path, "circular reference");
   }
@@ -86,11 +118,14 @@ function serialize(value: unknown, path: string, seen: Set<object>, depth: numbe
         if (!Object.hasOwn(obj, i)) {
           throw new CanonicalJsonError(`${path}[${i}]`, "sparse-array hole");
         }
+        assertDataProperty(obj, i, `${path}[${i}]`);
         parts.push(serialize(obj[i], `${path}[${i}]`, seen, depth + 1));
       }
-      // Non-index own properties on an array (arr.note = "x") would be
-      // silently discarded by JSON — refuse them instead.
-      for (const key of Object.keys(obj)) {
+      // Own properties beyond the indices — expandos (arr.note = "x"),
+      // enumerable or hidden — would be silently discarded by JSON:
+      // refuse them instead ("length" is the array's own bookkeeping).
+      for (const key of Object.getOwnPropertyNames(obj)) {
+        if (key === "length") continue;
         const index = Number(key);
         if (!Number.isInteger(index) || index < 0 || index >= obj.length) {
           throw new CanonicalJsonError(
@@ -107,9 +142,12 @@ function serialize(value: unknown, path: string, seen: Set<object>, depth: numbe
         "only plain objects and arrays are canonicalizable (Date/Map/Set/RegExp/class instances are not)",
       );
     }
-    const keys = Object.keys(obj).sort();
+    // Walk ALL own string-named properties (not just enumerable ones) so a
+    // hidden property is a refusal, never a silent omission (r3 finding 5).
+    const keys = Object.getOwnPropertyNames(obj).sort();
     const parts: string[] = [];
     for (const key of keys) {
+      assertDataProperty(obj, key, `${path}.${key}`);
       const element: unknown = (obj as Record<string, unknown>)[key];
       parts.push(`${JSON.stringify(key)}:${serialize(element, `${path}.${key}`, seen, depth + 1)}`);
     }
@@ -122,7 +160,9 @@ function serialize(value: unknown, path: string, seen: Set<object>, depth: numbe
 /**
  * The canonical serialization of `value`, or a CanonicalJsonError naming the
  * exact path that has no canonical form. Total over its declared domain:
- * equal values (after key ordering) always produce identical bytes.
+ * equal values (after key ordering) always produce identical bytes, and
+ * because only data properties are read, serializing the same value twice
+ * always produces the same bytes.
  */
 export function canonicalJson(value: unknown): string {
   return serialize(value, "$", new Set(), 0);

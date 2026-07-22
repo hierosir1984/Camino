@@ -33,7 +33,7 @@
       "summary": "\"Eventually\" names no retention period.",
       "exampleQuestion": "How long are past digests retained?",
       "exampleAssumption": "90 days.",
-      "answerKeyTerms": ["retain", "retention", "90 days"]
+      "answerKeyTerms": ["retained", "retention", "90 days"]
     }
   ],
   "requirementSegments": [

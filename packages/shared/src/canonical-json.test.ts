@@ -115,3 +115,37 @@ describe("sparse arrays (r1 finding 7)", () => {
     expect(canonicalJson([null, 1])).toBe("[null,1]");
   });
 });
+
+describe("data-property domain (r3 finding 5)", () => {
+  it("refuses accessor properties instead of evaluating them", () => {
+    let evaluated = 0;
+    const shifty = Object.defineProperty({}, "value", {
+      enumerable: true,
+      get() {
+        evaluated += 1;
+        return evaluated;
+      },
+    });
+    expect(() => canonicalJson(shifty)).toThrow(/accessor properties/);
+    expect(evaluated).toBe(0); // the getter never ran — no throw/observe/shift vector
+  });
+
+  it("refuses hidden (non-enumerable) own properties instead of omitting them", () => {
+    const hidden = Object.defineProperty({}, "secret", { enumerable: false, value: "s" });
+    expect(() => canonicalJson(hidden)).toThrow(/non-enumerable/);
+    const hiddenExpando: unknown[] = ["x"];
+    Object.defineProperty(hiddenExpando, "note", { enumerable: false, value: "n" });
+    expect(() => canonicalJson(hiddenExpando)).toThrow(/non-index own properties/);
+  });
+
+  it("refuses Proxy exotic objects", () => {
+    expect(() => canonicalJson(new Proxy({}, {}))).toThrow(/Proxy/);
+  });
+
+  it("refuses depth beyond the named bound with a CanonicalJsonError, not RangeError", () => {
+    let deep: unknown = 1;
+    for (let i = 0; i < 400; i += 1) deep = { d: deep };
+    expect(() => canonicalJson(deep)).toThrow(CanonicalJsonError);
+    expect(() => canonicalJson(deep)).toThrow(/nesting exceeds/);
+  });
+});
