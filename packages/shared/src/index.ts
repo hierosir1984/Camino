@@ -134,6 +134,104 @@ export type {
   StatusTuple,
 } from "./canon.js";
 
+// WP-106: routing foundation — capability-registry schema + per-project
+// policy table (CAM-ROUTE-01/02). Every value export is deep-frozen at
+// module load; DEFAULT_POLICY_TABLE is built by a constructor that throws
+// on any cross-family constraint failure (defaults cannot load broken).
+export {
+  PROVIDER_FAMILIES,
+  HARNESS_FAMILY,
+  harnessFamily,
+  ROUTING_ROLES,
+  REASONING_TIERS,
+  TASK_TEMPLATES,
+  RISK_TIERS,
+  QUOTA_PAUSE_THRESHOLD,
+  CROSS_FAMILY_CONSTRAINTS,
+  CAPABILITY_CONFIDENCE,
+  DEFAULT_POLICY_TABLE,
+  makeCrossFamilyDefaults,
+  validatePolicyTable,
+  crossFamilyViolations,
+  resolveAssignment,
+  deepFreeze,
+} from "./routing.js";
+export type {
+  ProviderFamily,
+  RoutingRole,
+  ReasoningTier,
+  TaskTemplate,
+  RiskTier,
+  TaskFeatures,
+  PolicyAssignment,
+  PolicyCells,
+  PolicyTable,
+  PolicyViolation,
+  CrossFamilyViolation,
+  RoleRotation,
+  CapabilityConfidence,
+  CapabilityAttribute,
+  ModelInfo,
+  WindowShape,
+  BillingPool,
+  SanctionedPathRecord,
+  ProviderCapabilityRecord,
+} from "./routing.js";
+
+// WP-110: canonical JSON + content hashing (the contract-hash definition).
+export { CanonicalJsonError, canonicalJson, sha256Hex } from "./canonical-json.js";
+
+// WP-110: plan construction vocabulary + mission templates
+// (CAM-PLAN-01/-02/-07/-11). Id grammars are predicates + pattern sources;
+// live RegExps never cross the barrel.
+export {
+  MISSION_TEMPLATE_NAMES,
+  MISSION_TEMPLATES,
+  PLAN_ISSUE_ID_PATTERN_SOURCE,
+  CLARIFICATION_ID_PATTERN_SOURCE,
+  SEGMENT_ID_PATTERN_SOURCE,
+  REQUIREMENT_AREA_PATTERN_SOURCE,
+  isPlanIssueId,
+  isClarificationId,
+  isSegmentId,
+  isRequirementArea,
+  INTERFACE_KINDS,
+  UNMAPPED_REASONS,
+  PLAN_CONSTRUCTION_RECORD_KINDS,
+  PLAN_STREAM_FILENAME,
+  PLAN_MAX_TEXT_LENGTH,
+  PLAN_MAX_LIST_LENGTH,
+  planConstructionRecordProblems,
+  clarificationResponseProblems,
+} from "./plan.js";
+export type {
+  MissionTemplateName,
+  MissionTemplate,
+  PlanReviewClass,
+  InterfaceKind,
+  DeclaredInterface,
+  PlannedIssueDraft,
+  ClarifyingItemDraft,
+  UnmappedReason,
+  ChecklistRowDraft,
+  PlanConstructionRecord,
+  ClarificationResponse,
+} from "./plan.js";
+
+// WP-110: issue contracts — hash-referenced frozen acceptance criteria
+// (CAM-PLAN-04/-11); the schema WP-108/111/112/113/114 build against.
+export {
+  CONTRACT_SCHEMA_VERSION,
+  SHA256_HEX_PATTERN_SOURCE,
+  isSha256Hex,
+  contractTermsOf,
+  contractHash,
+  contractProblems,
+  contractRefProblems,
+  CONTRACT_REFERENCE_OBLIGATIONS,
+} from "./contract.js";
+export type { ContractTerms, IssueContract, ContractRef } from "./contract.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,
