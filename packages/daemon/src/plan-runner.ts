@@ -42,12 +42,15 @@ import type { DispatchOptions } from "./dispatch/lifecycle.js";
 import { PlanningError, PlanningService } from "./planning.js";
 
 /**
- * Hard cap on the stream file (code units): with per-record bounds of 4000
- * chars this is thousands of records — far beyond any human-approvable
- * plan — and it makes the quadratic tail's operand bounded in code rather
- * than in prose (r5 finding 7).
+ * Hard cap on the stream file in BYTES, checked against the file's stat
+ * size BEFORE the read/decode (r6 finding 1: a code-unit check after a
+ * full read is not a pre-allocation bound — multi-byte UTF-8 crossed it
+ * threefold). With per-record bounds of 4000 chars this is thousands of
+ * records — far beyond any human-approvable plan — and it makes the
+ * quadratic tail's operand bounded in code rather than in prose
+ * (r5 finding 7).
  */
-export const MAX_STREAM_CHARS = 4 * 1024 * 1024;
+export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
 /** One refused stream line: the line number and the named reason. */
 export interface RefusedLine {
@@ -170,26 +173,28 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
 
   const drain = (final: boolean): void => {
     if (shrunk) return;
+    let byteSize: number;
     try {
-      statSync(streamPath);
+      byteSize = statSync(streamPath).size;
     } catch {
       return; // not created yet
     }
-    // Offsets are string (code-unit) indices throughout — the byte size from
-    // stat is only an existence probe, never compared against them.
-    const text = readFileSync(streamPath, "utf8");
-    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7): a
-    // stream past the cap is a protocol violation, refused by name.
-    if (text.length > MAX_STREAM_CHARS) {
+    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7), and
+    // enforced in BYTES against the stat size BEFORE the read/decode
+    // (r6 finding 1) — a runaway worker cannot make the runner allocate
+    // past the cap. Offsets below are string (code-unit) indices; the byte
+    // size is never compared against them.
+    if (byteSize > MAX_STREAM_BYTES) {
       shrunk = true;
       refused.push({
         line: lineNumber + 1,
         problem:
-          `stream file exceeds the ${MAX_STREAM_CHARS}-character bound — ` +
+          `stream file is ${byteSize} bytes, over the ${MAX_STREAM_BYTES}-byte bound — ` +
           "runaway worker output; further records refused",
       });
       return;
     }
+    const text = readFileSync(streamPath, "utf8");
     if (text.length < offset) {
       shrunk = true;
       refused.push({

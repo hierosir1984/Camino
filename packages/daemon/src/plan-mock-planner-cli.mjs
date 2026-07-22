@@ -21,6 +21,18 @@ const STREAM = "plan-stream.jsonl";
 const emit = (record) => appendFileSync(STREAM, JSON.stringify(record) + "\n");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+if (process.env.MOCK_PLANNER_MODE === "oversize") {
+  // Flood the stream past the byte cap (r6 finding 1) — generated in-script
+  // by a loop, never as one giant spawn argument (the E2BIG lesson). The
+  // multi-byte character makes bytes exceed code units, pinning that the
+  // cap is a BYTE bound.
+  const flood = "é".repeat(64 * 1024); // 64k chars, 128k UTF-8 bytes
+  for (let i = 0; i < 40; i += 1) {
+    appendFileSync(STREAM, JSON.stringify({ kind: "flood", data: flood }) + "\n");
+  }
+  process.exit(0);
+}
+
 const segments = JSON.parse(readFileSync("plan-input/segments.json", "utf8"));
 if (!Array.isArray(segments) || segments.length === 0) {
   console.error("segments.json missing or empty");

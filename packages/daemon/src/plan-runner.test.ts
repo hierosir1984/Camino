@@ -235,3 +235,22 @@ describe("in-place rewrite detection (r2 finding 11)", () => {
     expect(h.service.planView(h.sessionId).issues.map((i) => i.planIssueId)).toEqual(["I1"]);
   });
 });
+
+describe("stream byte cap (r6 finding 1)", () => {
+  it("refuses a stream past the byte bound before decoding it", async () => {
+    const h = newHarness();
+    const record = await runPlannerCompile({
+      adapter: mockPlannerAdapter("oversize"),
+      service: h.service,
+      sessionId: h.sessionId,
+      workdirRoot: h.workdirRoot,
+      pollMs: 25,
+      timeoutMs: 60_000,
+    });
+    // ~5 MiB of UTF-8 (multi-byte, so bytes > code units): refused by the
+    // BYTE bound, by name, and nothing past the first ingested prefix
+    // reaches the store.
+    expect(record.refused.some((r) => r.problem.includes("-byte bound"))).toBe(true);
+    expect(record.constructionComplete).toBe(false);
+  });
+});

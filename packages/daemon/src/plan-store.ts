@@ -1358,7 +1358,7 @@ export class PlanStore {
       .run(sessionId, this.#now().toISOString());
   }
 
-  /** The contract terms this session's durable rows produce (version filled by caller). */
+  /** The contract terms this session's durable rows produce — always the freeze's version 1. */
   #expectedContractTerms(
     sessionId: string,
     session: PlanSessionRow,
