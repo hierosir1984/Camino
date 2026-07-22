@@ -140,3 +140,26 @@ export type {
   RenderCanonOptions,
   StandaloneFoldDecision,
 } from "./canon-render.js";
+
+// WP-110: pure planning decisions — segmentation, dependency cycles named,
+// checklist totality, the approval gate (CAM-PLAN-01/-02/-11).
+export {
+  segmentPrd,
+  dependencyGraphProblems,
+  findDependencyCycle,
+  formatCycle,
+  checklistProblems,
+  clarificationReferenceProblems,
+  templateProblems,
+  decidePlanApproval,
+  plantedAmbiguityCoverage,
+} from "./plan-validate.js";
+export type {
+  PrdSegment,
+  PlanGateInput,
+  ApprovalRefusal,
+  GateAttestedFacts,
+  ApprovalDecision,
+  PlantedAmbiguity,
+  AmbiguityCoverage,
+} from "./plan-validate.js";
