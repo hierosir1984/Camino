@@ -25,7 +25,15 @@ export const REGISTRY_ITEM_11_QUOTAS = Object.freeze({
     maxObjects: 5_000,
     maxBytes: 500_000_000,
   }),
-  /** Worker workspace size cap (CAM-EXEC-02/03; enforced by WP-107). */
+  /**
+   * Worker workspace size (CAM-EXEC-02/03). SCOPE, stated (round-13 finding 5):
+   * WP-107 enforces this as an ARCHIVAL REFUSAL THRESHOLD — archiveAttempt refuses
+   * (and RETAINS for escalation) a workspace over this size. It is NOT a runtime
+   * disk ceiling: the workspace is rw-mounted, so a worker CAN grow it past this
+   * during the run; a runtime ceiling (a bounded volume / `--storage-opt` on a
+   * pquota-capable driver / a filesystem quota) is a container/deployment concern
+   * wired by WP-114, not a guarantee this constant makes on its own.
+   */
   workspace: Object.freeze({
     maxBytes: 2_000_000_000,
   }),

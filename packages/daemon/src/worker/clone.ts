@@ -124,10 +124,20 @@ function effectiveGitConfig(dir: string): { key: string; value: string }[] {
   let worktreeRaw = "";
   try {
     worktreeRaw = gitRaw(dir, ["config", "--worktree", "--includes", "--list", "-z"]);
-  } catch {
-    // `--worktree` errors when extensions.worktreeConfig is not enabled — then
-    // there IS no worktree-scoped config, so an empty result is correct. (Any
-    // other git error here would also mean no readable worktree config.)
+  } catch (err) {
+    // `--worktree` errors ONLY when extensions.worktreeConfig is not enabled —
+    // then there is genuinely no worktree-scoped config and empty is correct. Any
+    // OTHER failure (ENOBUFS on an oversized/hostile .git/config.worktree, a git
+    // error) must FAIL CLOSED (round-13 finding 4): swallowing it would make a
+    // large malicious worktree config INVISIBLE here while git still obeys it.
+    const msg = describeCloneError(err, 400).toLowerCase();
+    const notEnabled =
+      msg.includes("worktree") && (msg.includes("not enabled") || msg.includes("extension"));
+    if (!notEnabled) {
+      throw new WorkerCloneError(
+        `workspace clone worktree config could not be enumerated for attestation — refused (fail-closed): ${describeCloneError(err)}`,
+      );
+    }
     worktreeRaw = "";
   }
   const out: { key: string; value: string }[] = [];

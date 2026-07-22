@@ -27,17 +27,17 @@
 // last 10 attempts per issue (whichever more)" — the UNION of the windows.
 // pruneArchives deletes an archive only when it is BOTH older than 90 days
 // AND outside the issue's newest 10.
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
+  createReadStream,
   existsSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
-  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -45,8 +45,17 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { lstat as lstatAsync, readdir as readdirAsync, rm as rmAsync } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
+
+// Archival runs on the daemon's SHARED event loop, concurrently with other
+// attempts' dispatch/budget timers. Its heavy I/O (tar, hashing, recursive
+// delete, the size walk) MUST be async and yield — a synchronous archival of a
+// pathological workspace (a worker can create many files) would monopolize the
+// loop and defeat ANOTHER attempt's wall-clock budget (round-13 finding 1).
+const execFileP = promisify(execFile);
 import type { AttemptEvent } from "@camino/core";
 
 /** Which sub-step failed — drives the cleanup-failed record (A.2 row). */
@@ -130,6 +139,40 @@ export function workspaceSizeBytes(dir: string): number {
     }
   };
   walk(dir);
+  return total;
+}
+
+/**
+ * Async twin of workspaceSizeBytes used on the archival path (round-13 finding 1):
+ * walks with async fs and YIELDS every YIELD_EVERY entries, so sizing a workspace
+ * with a huge file count does not monopolize the daemon loop and defeat another
+ * attempt's budget. Same accounting (lstat, symlinks not followed).
+ */
+async function workspaceSizeBytesAsync(dir: string): Promise<number> {
+  const YIELD_EVERY = 2_000;
+  let total = 0;
+  let seen = 0;
+  const walk = async (abs: string): Promise<void> => {
+    let names: string[];
+    try {
+      names = await readdirAsync(abs);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (++seen % YIELD_EVERY === 0) await Promise.resolve(); // yield to the loop
+      const child = join(abs, name);
+      let stat;
+      try {
+        stat = await lstatAsync(child);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) await walk(child);
+      else total += stat.size;
+    }
+  };
+  await walk(dir);
   return total;
 }
 
@@ -381,20 +424,19 @@ interface FsIdentity {
   ino: number;
 }
 
-/** sha256 of a file, read in bounded chunks — NEVER buffers the whole file (round-10 finding 5). */
-function sha256File(path: string): string {
-  const hash = createHash("sha256");
-  const fd = openSync(path, "r");
-  try {
-    const buf = Buffer.allocUnsafe(1 << 16);
-    let bytes: number;
-    while ((bytes = readSync(fd, buf, 0, buf.length, null)) > 0) {
-      hash.update(buf.subarray(0, bytes));
-    }
-  } finally {
-    closeSync(fd);
-  }
-  return hash.digest("hex");
+/**
+ * sha256 of a file, STREAMED asynchronously — never buffers the whole file
+ * (round-10 finding 5) and YIELDS to the event loop between chunks so hashing a
+ * large archive does not stall other attempts' budgets (round-13 finding 1).
+ */
+function sha256File(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path, { highWaterMark: 1 << 16 });
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(hash.digest("hex")));
+  });
 }
 
 /**
@@ -418,12 +460,12 @@ function sha256File(path: string): string {
  * hardlinked archive; a rm+recreated workspace); they are not, and do not claim
  * to be, a defense against a concurrent daemon-side mutator.
  */
-function verifyArchiveIntact(
+async function verifyArchiveIntact(
   finalPath: string,
   attemptId: string,
   expectedSha256: string,
   archiveMaxCompressedBytes: number,
-): number {
+): Promise<number> {
   let st;
   try {
     st = lstatSync(finalPath);
@@ -456,7 +498,7 @@ function verifyArchiveIntact(
   }
   let actual: string;
   try {
-    actual = sha256File(finalPath);
+    actual = await sha256File(finalPath);
   } catch (err) {
     throw new ArchivalError(
       "archive-write",
@@ -507,10 +549,14 @@ function assertWorkspaceUnchanged(
   }
 }
 
-/** Destroy the workspace, strictly last (A.4#5). Throws a staged, non-retained error on failure. */
-function destroyWorkspaceOrThrow(workspaceDir: string): void {
+/**
+ * Destroy the workspace, strictly last (A.4#5). ASYNC so a recursive delete of a
+ * large tree yields to the loop (round-13 finding 1). Throws a staged,
+ * non-retained error on failure.
+ */
+async function destroyWorkspaceOrThrow(workspaceDir: string): Promise<void> {
   try {
-    rmSync(workspaceDir, { recursive: true, force: true });
+    await rmAsync(workspaceDir, { recursive: true, force: true });
   } catch (err) {
     throw new ArchivalError(
       "workspace-destroy",
@@ -674,7 +720,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // over-quota workspace is an abnormal condition: refusing here routes it to
   // the cleanup-failed/escalation path with the workspace intact. Checked
   // FIRST — before creating the issue dir — so a refusal writes nothing at all.
-  const workspaceBytes = workspaceSizeBytes(workspaceReal);
+  const workspaceBytes = await workspaceSizeBytesAsync(workspaceReal);
   if (workspaceBytes > quotas.workspaceMaxBytes) {
     throw new ArchivalError(
       "workspace-quota",
@@ -778,7 +824,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       // verifiably present, a regular file, within cap, and hash-matching —
       // re-derived from the FILE, never sidecar byte-fields (round-9 finding 3,
       // hardened round-10 findings 2/3/5).
-      const verifiedBytes = verifyArchiveIntact(
+      const verifiedBytes = await verifyArchiveIntact(
         finalPath,
         opts.attemptId,
         prior.sha256,
@@ -806,7 +852,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
       const archiveWrittenAt = prior.archiveWrittenAt;
       const ledgerRowAt = nextStamp(nowMs, archiveWrittenAt);
-      destroyWorkspaceOrThrow(prior.workspacePath);
+      await destroyWorkspaceOrThrow(prior.workspacePath);
       const workspaceDestroyedAt = nextStamp(nowMs, ledgerRowAt);
       return buildArchivalRecord({
         archivePath: finalPath,
@@ -824,8 +870,10 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
   try {
-    execFileSync("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
-      stdio: ["ignore", "pipe", "pipe"],
+    // ASYNC tar (round-13 finding 1): execFileSync would BLOCK the daemon loop for
+    // the whole tar of a pathological workspace; await lets other attempts' timers run.
+    await execFileP("tar", ["-czf", tmpPath, "-C", workspaceReal, "."], {
+      maxBuffer: 1 << 20, // tar writes to the file; stdout/stderr are small (bounded)
     });
   } catch (err) {
     safeRemove(tmpPath);
@@ -842,7 +890,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `archive is ${compressedBytes} bytes compressed, over the ${quotas.archiveMaxCompressedBytes}-byte cap (registry item 11) — workspace retained for escalation`,
     );
   }
-  const sha256 = sha256File(tmpPath); // streaming — never buffer up to 500 MB (round-10 finding 5)
+  const sha256 = await sha256File(tmpPath); // streaming, async — never buffer/block on up to 500 MB
   try {
     renameSync(tmpPath, finalPath);
   } catch (err) {
@@ -914,7 +962,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // re-derives everything from the FILE (regular file, size ≤ cap, streaming
   // sha256), and assertWorkspaceUnchanged confirms the same (dev, ino) captured
   // up-front. Either failing retains the workspace → reconciliation.
-  verifyArchiveIntact(finalPath, opts.attemptId, sha256, quotas.archiveMaxCompressedBytes);
+  await verifyArchiveIntact(finalPath, opts.attemptId, sha256, quotas.archiveMaxCompressedBytes);
   assertWorkspaceUnchanged(workspaceReal, workspaceIdentity, opts.attemptId);
 
   // Step 3 — destroy the workspace, strictly last (a failure is a cleanup-failed
@@ -922,7 +970,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // :false because recursive deletion is not transactional — round-1 finding 4).
   // If this fails, a re-invocation RESUMES the destroy (valid sidecar +
   // workspace present — round-6 finding 1).
-  destroyWorkspaceOrThrow(workspaceReal);
+  await destroyWorkspaceOrThrow(workspaceReal);
   const workspaceDestroyedAt = nextStamp(nowMs, ledgerRowAt);
 
   return buildArchivalRecord({
@@ -1035,7 +1083,14 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
     opts.retainLastAttemptsPerIssue,
     REGISTRY_ITEM_11_QUOTAS.archive.retainLastAttemptsPerIssue,
   );
-  const cutoffMs = now().getTime() - retainDays * 24 * 60 * 60 * 1000;
+  // A non-finite clock (round-13 finding 6) would make every age comparison false
+  // and delete FRESH archives (a NaN cutoff → `writtenMs >= NaN` is false). Fail
+  // SAFE: an invalid clock cannot date anything, so nothing is old enough to prune
+  // — cutoff of -Infinity keeps every archive within the age window.
+  const nowMs = now().getTime();
+  const cutoffMs = Number.isFinite(nowMs)
+    ? nowMs - retainDays * 24 * 60 * 60 * 1000
+    : Number.NEGATIVE_INFINITY;
   const report: PruneReport = { kept: [], deleted: [], undatable: [] };
 
   // Resolve to an ABSOLUTE root (round-9 finding 8) so the reported/deleted

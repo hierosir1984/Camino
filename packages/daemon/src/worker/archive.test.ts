@@ -123,6 +123,33 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(step).toEqual({ ok: true, to: "archived", ref: "A.3#8" });
   });
 
+  it("archival YIELDS to the event loop, so a slow archival cannot starve a concurrent timer (round-13 finding 1)", async () => {
+    const ws = makeWorkspace();
+    // Many entries make the walk/tar/hash/rm take real time; a SYNCHRONOUS
+    // archival would monopolize the loop and a concurrent timer would not fire.
+    for (let i = 0; i < 6_000; i++) writeFileSync(join(ws, `f${i}.txt`), "x");
+    const root = tempDir();
+    let ticks = 0;
+    const timer = setInterval(() => {
+      ticks += 1;
+    }, 10);
+    try {
+      await archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      });
+    } finally {
+      clearInterval(timer);
+    }
+    // Async archival yields between chunks/entries, so the 10ms timer fired
+    // repeatedly DURING it. A fully synchronous archival would leave ticks at 0.
+    expect(ticks).toBeGreaterThan(3);
+    expect(existsSync(ws)).toBe(false); // still archived + destroyed correctly
+  }, 30_000);
+
   it("the archive is a faithful audit object: history survives extraction", async () => {
     const ws = makeWorkspace();
     const root = tempDir();

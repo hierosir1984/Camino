@@ -616,8 +616,15 @@ export async function dispatch(
         // does not truncate (e.g. String()-expands a large JSON value) must not
         // let a worker grow daemon RSS through retained events. Bounded here
         // regardless of the adapter; assembleFinalText/parsers use ≤400 anyway.
-        if (typeof t === "string")
-          text = t.length > MAX_EVENT_TEXT_CHARS ? t.slice(0, MAX_EVENT_TEXT_CHARS) : t;
+        if (typeof t === "string") {
+          const capped = t.length > MAX_EVENT_TEXT_CHARS ? t.slice(0, MAX_EVENT_TEXT_CHARS) : t;
+          // DETACH from any V8 sliced-string backing (round-13 finding 2): an
+          // adapter's `String(big).slice(0,400)` keeps the LARGE backing alive
+          // behind a small visible slice, so a bounded visible length can still
+          // hold megabytes. Copy the ≤8 KiB through a Buffer into a fresh FLAT
+          // string, so retained memory is the visible length, not the backing.
+          text = Buffer.from(capped, "utf8").toString("utf8");
+        }
       } catch {
         text = "";
       }
