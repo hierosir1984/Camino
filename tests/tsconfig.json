@@ -3,7 +3,8 @@
   "compilerOptions": {
     "rootDir": ".",
     "outDir": "dist",
-    "types": ["node"]
+    "types": ["node"],
+    "lib": ["ES2024", "DOM", "DOM.Iterable"]
   },
   "include": ["**/*.ts"],
   "references": [
@@ -12,6 +13,9 @@
     },
     {
       "path": "../packages/shared"
+    },
+    {
+      "path": "../packages/daemon"
     }
   ]
 }

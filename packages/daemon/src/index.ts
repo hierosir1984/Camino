@@ -95,3 +95,20 @@ export type {
 } from "./canon-ledger.js";
 export { CanonFactsStore } from "./canon-facts.js";
 export type { CanonFactsStoreOptions } from "./canon-facts.js";
+
+// WP-122: gap register — disposition log, service, HTTP surface
+// (CAM-CANON-05, CAM-CORE-09/10).
+export { GapDispositionsStore } from "./gap-dispositions.js";
+export type { GapDispositionsStoreOptions, GapDispositionWriteInput } from "./gap-dispositions.js";
+export { REGISTER_ACTIONS, RegisterActionError, RegisterService } from "./register-service.js";
+export type {
+  RegisterAction,
+  RegisterActionInput,
+  RegisterActionResult,
+  RegisterAsOf,
+  RegisterContextSource,
+  RegisterDescopeResult,
+  RegisterErrorCode,
+  RegisterServiceDeps,
+  RegisterSnapshot,
+} from "./register-service.js";

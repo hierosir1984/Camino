@@ -77,6 +77,9 @@ import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { BIND_HOST } from "./config.js";
+import { RegisterActionError } from "./register-service.js";
+import type { RegisterActionInput as RegisterActionInputShape } from "./register-service.js";
+import type { RegisterAsOf, RegisterService } from "./register-service.js";
 import { generateToken } from "./token.js";
 
 export interface BuildServerOptions {
@@ -84,6 +87,14 @@ export interface BuildServerOptions {
   token: string;
   /** Directory served as the GUI build; missing directory → 503 hint page. */
   guiRoot?: string;
+  /**
+   * The gap-register surface (WP-122). Optional so the bare shell keeps
+   * working; when absent, /api/register answers 503 register-not-wired —
+   * an explicit refusal, not a 404 that could be mistaken for a routing
+   * bug. All register routes sit behind the same global policy hook as
+   * every other route (token + CSRF, by construction).
+   */
+  register?: RegisterService;
   logger?: boolean;
 }
 
@@ -426,6 +437,88 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     }
     return { stopping: true };
   });
+
+  // ——— Gap register (WP-122, CAM-CANON-05 / CAM-CORE-09 / CAM-CORE-10) ———
+  // The GUI's ONLY canon/requirement read path: everything below returns
+  // ledger projections computed by the register service; no repo canon
+  // text is reachable from these handlers (see register-service.ts for
+  // the full CAM-CORE-10 construction argument).
+  const register = options.register;
+  const registerErrorStatus: Record<RegisterActionError["code"], number> = {
+    unavailable: 503,
+    malformed: 400,
+    "register-advanced": 409,
+    "unknown-row": 404,
+    refused: 409,
+  };
+  const sendRegisterError = (reply: FastifyReply, error: unknown): FastifyReply => {
+    if (error instanceof RegisterActionError) {
+      return reply
+        .code(registerErrorStatus[error.code])
+        .send({ error: error.code, problem: error.message });
+    }
+    throw error; // genuine daemon bug → the generic error handler
+  };
+  /** Body must be a plain JSON object (Fastify parsed it; refuse arrays/null). */
+  const plainBody = (body: unknown): Record<string, unknown> | null =>
+    body !== null && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : null;
+
+  app.get("/api/register", async (request, reply) => {
+    if (register === undefined) {
+      return reply.code(503).send({ error: "register-not-wired" });
+    }
+    return register.snapshot();
+  });
+
+  app.post<{ Params: { requirementId: string } }>(
+    "/api/register/:requirementId/disposition",
+    async (request, reply) => {
+      if (register === undefined) {
+        return reply.code(503).send({ error: "register-not-wired" });
+      }
+      const body = plainBody(request.body);
+      if (body === null) {
+        return reply.code(400).send({ error: "malformed", problem: "body must be a JSON object" });
+      }
+      try {
+        // The service validates every field at runtime (action membership,
+        // reason hygiene, asOf shape); the casts only name the wire shape.
+        return register.recordDisposition(request.params.requirementId, {
+          action: body["action"] as RegisterActionInputShape["action"],
+          reason: body["reason"] as string,
+          asOf: body["asOf"] as RegisterAsOf,
+          ...(body["waivedThroughSeq"] === undefined
+            ? {}
+            : { waivedThroughSeq: body["waivedThroughSeq"] as number }),
+        });
+      } catch (error) {
+        return sendRegisterError(reply, error);
+      }
+    },
+  );
+
+  app.post<{ Params: { requirementId: string } }>(
+    "/api/register/:requirementId/descope",
+    async (request, reply) => {
+      if (register === undefined) {
+        return reply.code(503).send({ error: "register-not-wired" });
+      }
+      const body = plainBody(request.body);
+      if (body === null) {
+        return reply.code(400).send({ error: "malformed", problem: "body must be a JSON object" });
+      }
+      try {
+        return register.descope(request.params.requirementId, {
+          reason: body["reason"] as string,
+          asOf: body["asOf"] as RegisterAsOf,
+        });
+      } catch (error) {
+        return sendRegisterError(reply, error);
+      }
+    },
+  );
 
   if (guiValid) {
     // Serve from the single resolved real path (round 4, finding 2). Two

@@ -134,6 +134,21 @@ export type {
   StatusTuple,
 } from "./canon.js";
 
+// WP-122: gap register — dispositions on register rows (CAM-CANON-05).
+export {
+  DETECTOR_ACTOR_PREFIX,
+  GAP_DISPOSITIONS,
+  GAP_DISPOSITION_EVENTS,
+  isDetectorActor,
+} from "./gap-register.js";
+export type {
+  GapDisposition,
+  GapDispositionAppendInput,
+  GapDispositionEventName,
+  GapDispositionReadFilter,
+  GapDispositionRecord,
+} from "./gap-register.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,

@@ -22,3 +22,7 @@ spikes/untrusted-content/transcripts/raw-evidence.json
 
 # OS noise
 .DS_Store
+
+# Playwright output (WP-122 GUI suite)
+test-results/
+playwright-report/

@@ -229,6 +229,16 @@ export function safeErrorLabel(error: unknown): string {
   }
 }
 
+/**
+ * The ledger's single-line text hygiene, exported for the intent-adjacent
+ * user-action stores (WP-122's gap-disposition log records the same class
+ * of David-authored single-line text and must refuse the same smuggling
+ * vectors — one rule set, not a drifting copy).
+ */
+export function singleLineTextProblem(field: string, value: unknown): string | null {
+  return stringProblem(field, value);
+}
+
 function stringProblem(field: string, value: unknown, requireNonEmpty = true): string | null {
   if (typeof value !== "string") return `${field} must be a string`;
   if (requireNonEmpty && value.length === 0) return `${field} must be non-empty`;
