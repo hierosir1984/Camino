@@ -7,7 +7,7 @@
  * and crash-resume for every interruptible seam.
  */
 import { describe, expect, it, afterEach } from "vitest";
-import { MISSION_TEMPLATES, contractHash, contractTermsOf } from "@camino/shared";
+import { contractHash, contractTermsOf } from "@camino/shared";
 import type { ClarifyingItemDraft, MissionRecord, PlannedIssueDraft } from "@camino/shared";
 import { CanonLedgerStore } from "./canon-ledger.js";
 import { SqliteDomainStore } from "./domain-store.js";

@@ -9,8 +9,10 @@
 // (CAM-EXEC-06), and credential posture is enforced by the one env composer
 // rather than re-implemented per adapter (CAM-SEC-06).
 //
-// This file is types + pure constants only: packages/shared compiles with no
-// Node types and must stay importable from any package, including pure core.
+// This file is types + pure constants only, importable from any package,
+// including pure core. (Shared as a whole gained Node ambient types in WP-110
+// for content hashing — node:crypto in canonical-json.ts — but this module
+// stays platform-neutral.)
 
 /** A normalized event parsed from an adapter's headless output stream. */
 export interface StreamEvent {

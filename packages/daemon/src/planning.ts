@@ -443,11 +443,7 @@ export class PlanningService {
       if (confirmed.has(segmentId)) {
         throw new PlanningError(`segment ${segmentId} is already confirmed`);
       }
-      const requirementId = this.#requirementIdFor(
-        row.proposedArea,
-        row.proposedStatement,
-        sessionId,
-      );
+      const requirementId = this.#requirementIdFor(row.proposedArea, row.proposedStatement);
       this.#store.recordConfirmation(
         sessionId,
         { segmentId, requirementId, statement: row.proposedStatement },
@@ -768,6 +764,24 @@ export class PlanningService {
     };
   }
 
+  /** What the planner runner writes into the worker's workspace inputs. */
+  sessionBrief(sessionId: string): {
+    missionId: string;
+    missionTitle: string;
+    template: MissionTemplateName;
+    content: string;
+    segments: readonly PrdSegment[];
+  } {
+    const state = this.#planState(sessionId);
+    return {
+      missionId: state.mission.id,
+      missionTitle: state.mission.title,
+      template: state.session.template,
+      content: state.mission.content,
+      segments: state.segments,
+    };
+  }
+
   /**
    * The declared interfaces of an issue's dependencies — what WP-113
    * renders into the dependent's context pack (CAM-PLAN-11 "declared
@@ -901,7 +915,7 @@ export class PlanningService {
    * this store; the two-digit grammar bounds an area at 99 ids, refused
    * with a stated reason rather than overflowed.
    */
-  #requirementIdFor(area: string, statement: string, sessionId: string): string {
+  #requirementIdFor(area: string, statement: string): string {
     if (!isRequirementArea(area)) {
       throw new PlanningError(`proposed area ${JSON.stringify(area)} is not a valid AREA token`);
     }

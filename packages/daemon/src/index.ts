@@ -118,3 +118,5 @@ export type {
   ResumeReport,
   ServiceApprovalRefusal,
 } from "./planning.js";
+export { runPlannerCompile, plannerPrompt } from "./plan-runner.js";
+export type { PlannerRunOptions, PlannerRunRecord, RefusedLine } from "./plan-runner.js";
