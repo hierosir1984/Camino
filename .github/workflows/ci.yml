@@ -19,3 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      # WP-122: the gap-register GUI suite (Playwright is the GUI test
+      # runner; CAM-CORE-09/10 acceptance runs in the real browser).
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:gui

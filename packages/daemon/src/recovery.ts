@@ -45,6 +45,7 @@ import type { ExternalOperationSpec, GitHubQueryTransport } from "@camino/shared
 import { CanonFactsStore } from "./canon-facts.js";
 import { CanonLedgerStore } from "./canon-ledger.js";
 import { SqliteEventStore } from "./event-store.js";
+import { GapDispositionsStore } from "./gap-dispositions.js";
 import { IntentJournal } from "./intent-journal.js";
 import { TransitionRecorder } from "./transition-recorder.js";
 import { WriterLock } from "./writer-lock.js";
@@ -79,6 +80,8 @@ export interface RecoveredState {
   readonly canonLedger: CanonLedgerStore;
   /** WP-109: per-requirement observations the status projection folds (CAM-CANON-03). */
   readonly canonFacts: CanonFactsStore;
+  /** WP-122: David's gap-register disposition events (CAM-CANON-05). */
+  readonly gapDispositions: GapDispositionsStore;
   readonly report: RecoveryReport;
   close(): void;
 }
@@ -110,6 +113,7 @@ export const STATE_FILES = Object.freeze({
   intents: "intents.sqlite",
   canonLedger: "canon-ledger.sqlite",
   canonFacts: "canon-facts.sqlite",
+  gapDispositions: "gap-dispositions.sqlite",
 } as const);
 
 /**
@@ -135,6 +139,7 @@ export function openRecoveredState(
   let journal: IntentJournal | undefined;
   let canonLedger: CanonLedgerStore | undefined;
   let canonFacts: CanonFactsStore | undefined;
+  let gapDispositions: GapDispositionsStore | undefined;
   try {
     eventStore = new SqliteEventStore(join(stateDir, STATE_FILES.events), {
       ...(options.now === undefined ? {} : { now: options.now }),
@@ -159,11 +164,18 @@ export function openRecoveredState(
       ...(options.now === undefined ? {} : { now: options.now }),
       writerLock: lock,
     });
+    // WP-122: the gap-disposition log opens under the same lock, with the
+    // same fail-closed shape verification in its constructor.
+    gapDispositions = new GapDispositionsStore(join(stateDir, STATE_FILES.gapDispositions), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
     const report = reconcileIntents(journal, queries, options);
     const openJournal = journal;
     const openStore = eventStore;
     const openCanonLedger = canonLedger;
     const openCanonFacts = canonFacts;
+    const openGapDispositions = gapDispositions;
     return {
       lock,
       eventStore,
@@ -171,6 +183,7 @@ export function openRecoveredState(
       journal,
       canonLedger,
       canonFacts,
+      gapDispositions,
       report,
       close(): void {
         // Exception-safe teardown (review round 1 finding 14; round 2
@@ -185,6 +198,7 @@ export function openRecoveredState(
         // failure. This is best-effort invocation with deterministic
         // precedence, not a proof that every underlying handle closed.
         const failures = closeAll([
+          () => openGapDispositions.close(),
           () => openCanonFacts.close(),
           () => openCanonLedger.close(),
           () => openJournal.close(),
@@ -199,6 +213,7 @@ export function openRecoveredState(
     // of everything opened so far INCLUDING the lock release, and the
     // ORIGINAL refusal (not a secondary close/release failure) rethrown.
     closeAll([
+      () => gapDispositions?.close(),
       () => canonFacts?.close(),
       () => canonLedger?.close(),
       () => journal?.close(),
@@ -210,7 +225,7 @@ export function openRecoveredState(
 }
 
 /** Run every closer, collecting failures instead of aborting the chain. */
-function closeAll(closers: ReadonlyArray<() => void>): unknown[] {
+export function closeAll(closers: ReadonlyArray<() => void>): unknown[] {
   const failures: unknown[] = [];
   for (const closer of closers) {
     try {
