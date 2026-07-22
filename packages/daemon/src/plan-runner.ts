@@ -50,8 +50,8 @@ import type { DispatchOptions } from "./dispatch/lifecycle.js";
 import { PlanningError, PlanningService } from "./planning.js";
 
 /**
- * Hard cap on the stream file in BYTES, enforced by a single bounded read
- * of at most cap+1 bytes — never a stat-then-read pair a concurrent
+ * Hard cap on the stream file in BYTES, enforced by a bounded read loop
+ * of at most cap+1 total bytes — never a stat-then-read pair a concurrent
  * append could race (r6 finding 1; r7 verification), and never a
  * post-decode code-unit check (multi-byte UTF-8 crossed that threefold).
  * With per-record bounds of 4000 chars this is thousands of records — far
@@ -188,9 +188,22 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
 
   const drain = (final: boolean): void => {
     if (shrunk) return;
+    // Errors are DISCRIMINATED, never blanket-swallowed (r9 verification:
+    // an EINTR on the sole final drain fell into a catch-all "not created
+    // yet" and silently lost the stream — libuv does not auto-retry reads).
+    // ENOENT = not created yet (the one silent case); EINTR retries with a
+    // bound; anything else is transient mid-run (the next poll retries) and
+    // a NAMED refusal on the final drain — unread records are refused,
+    // never silently lost.
     let bytesRead = 0;
     try {
-      const fd = openSync(streamPath, "r");
+      let fd: number;
+      try {
+        fd = openSync(streamPath, "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // not created yet
+        throw error;
+      }
       try {
         // Loop to EOF or cap+1: readSync may legally return FEWER bytes
         // than requested (fs.read semantics — network filesystems and
@@ -199,22 +212,41 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
         // With the loop, "read whole or refuse" is total: an in-cap file
         // is always read to EOF, so no multi-byte character can be split
         // anywhere but the over-cap refusal path.
+        let interrupts = 0;
         while (bytesRead < MAX_STREAM_BYTES + 1) {
-          const chunk = readSync(
-            fd,
-            readBuffer,
-            bytesRead,
-            MAX_STREAM_BYTES + 1 - bytesRead,
-            bytesRead,
-          );
+          let chunk: number;
+          try {
+            chunk = readSync(
+              fd,
+              readBuffer,
+              bytesRead,
+              MAX_STREAM_BYTES + 1 - bytesRead,
+              bytesRead,
+            );
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EINTR" && interrupts < 100) {
+              interrupts += 1;
+              continue;
+            }
+            throw error;
+          }
           if (chunk === 0) break; // EOF
           bytesRead += chunk;
         }
       } finally {
         closeSync(fd);
       }
-    } catch {
-      return; // not created yet
+    } catch (error) {
+      if (final) {
+        shrunk = true;
+        refused.push({
+          line: lineNumber + 1,
+          problem:
+            `final stream read failed (${(error as NodeJS.ErrnoException).code ?? "unknown"}) — ` +
+            "unread records refused rather than silently lost",
+        });
+      }
+      return; // mid-run: transient; the next poll retries
     }
     // The bounded-size claim is ENFORCED, not assumed (r5 finding 7; r6
     // finding 1). Offsets below are string (code-unit) indices; the byte
