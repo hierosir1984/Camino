@@ -117,7 +117,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           },
         ],
         snapshotAt: "2026-07-17",
-        source: `${ATTESTATIONS_RECORD} fundedFallbackAccounts.anthropic (WP-000 gate record)`,
+        source: `pool modes: docs/PRD.md §4.7 CAM-ROUTE-08 (fallback = the same official CLI re-authenticated with an API key); funding attestation: ${ATTESTATIONS_RECORD} fundedFallbackAccounts.anthropic (WP-000 gate record)`,
         confidence: "documented",
         recheckTriggers: [
           "attestations record edit",
@@ -162,7 +162,8 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           "ledger observation contradicting the recorded shape (QuotaWindowTracker)",
         ],
         notes: [
-          "The cited page states a five-hour window and 'additional weekly limits'. Only the PERIODS are asserted here; reset semantics are stated for neither window, so both are recorded kind unknown-reset — a one-period pin after exhaustion and no usage fraction (see WindowShape) — refined from ledger observation (round-2 finding 4, round-3 finding 7).",
+          "The cited page states a five-hour window and that additional weekly limits MAY apply. Only the PERIODS are asserted here; reset semantics are stated for neither window, so both are recorded kind unknown-reset — a one-period pin after exhaustion and no usage fraction (see WindowShape) — refined from ledger observation (round-2 finding 4, round-3 finding 7).",
+          "Weekly-limit APPLICABILITY is plan-dependent per the source ('may apply'): the window is seeded conservatively, its pin is an upper bound, and choosing when to probe/resume among differently-pinned windows is the WP-114 scheduler's recorded policy boundary (round-4 finding 5).",
         ],
       },
       harnessFeatures: {
@@ -202,7 +203,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           },
         ],
         snapshotAt: "2026-07-17",
-        source: `${ATTESTATIONS_RECORD} fundedFallbackAccounts.openai (WP-000 gate record)`,
+        source: `pool modes: docs/PRD.md §4.7 CAM-ROUTE-08 (fallback = the same official CLI re-authenticated with an API key); funding attestation: ${ATTESTATIONS_RECORD} fundedFallbackAccounts.openai (WP-000 gate record)`,
         confidence: "documented",
         recheckTriggers: [
           "attestations record edit",

@@ -633,7 +633,9 @@ export interface ModelInfo {
  * observation (QuotaWindowTracker).
  *
  * `kind` records what the SOURCE states about reset semantics:
- *   rolling       — the limit is documented/observed as a rolling window
+ *   rolling       — the limit is DOCUMENTED as a rolling window (a single
+ *                   observed recovery gap is not such evidence — the
+ *                   tracker synthesizes unknown-reset; round-4 finding 2)
  *   unknown-reset — the limit's PERIOD is stated (durationMs) but its reset
  *                   semantics are not (e.g. a documented "weekly limit"
  *                   that may reset on a calendar boundary)

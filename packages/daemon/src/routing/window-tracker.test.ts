@@ -158,13 +158,14 @@ describe("window consumption estimates", () => {
         estimatedResetAt: at(HOUR).toISOString(),
       });
       // After the conservative reset bound the exhaustion no longer pins
-      // the estimate; the blocked dispatch's own 2 minutes became the
-      // capacity sample, and the freed window reads as empty.
+      // the estimate — and a refused attempt's own wall time is NOT
+      // capacity evidence (round-4 finding 4), so with no other usage
+      // there is no capacity estimate at all.
       const after = tracker.windowState("anthropic", { now: at(HOUR + MINUTE) });
       expect(after.windows[0]).toMatchObject({
-        basis: "usage-fraction",
-        estimatedConsumption: 0,
-        capacityEstimateMs: 2 * MINUTE,
+        basis: "no-capacity-estimate",
+        estimatedConsumption: null,
+        capacityEstimateMs: null,
       });
       expect(after.lastQuotaBlockedAt).toBe(at(0).toISOString());
     } finally {
@@ -233,9 +234,11 @@ describe("window consumption estimates", () => {
       const state = tracker.windowState("openai", { now: at(2 * HOUR + 31 * MINUTE) });
       const window = state.windows[0]!;
       expect(window.basis).toBe("usage-fraction");
-      expect(window.capacityEstimateMs).toBe(31 * MINUTE); // 20 + 10 + 1 before the block
+      // 20 + 10 minutes of SUCCEEDED usage before the block; the refused
+      // attempt's own wall time is not capacity evidence (round-4 finding 4).
+      expect(window.capacityEstimateMs).toBe(30 * MINUTE);
       expect(window.observedUsageMs).toBe(15 * MINUTE);
-      expect(window.estimatedConsumption).toBeCloseTo(15 / 31, 5);
+      expect(window.estimatedConsumption).toBeCloseTo(15 / 30, 5);
       expect(window.estimatedConsumption!).toBeLessThan(QUOTA_PAUSE_THRESHOLD);
 
       // More usage pushes the estimate over the WP-114 pause threshold.
@@ -246,7 +249,7 @@ describe("window consumption estimates", () => {
         at: at(2 * HOUR + 45 * MINUTE),
       });
       const later = tracker.windowState("openai", { now: at(2 * HOUR + 46 * MINUTE) });
-      expect(later.windows[0]?.estimatedConsumption).toBeCloseTo(27 / 31, 5);
+      expect(later.windows[0]?.estimatedConsumption).toBeCloseTo(27 / 30, 5);
       expect(later.windows[0]!.estimatedConsumption!).toBeGreaterThan(QUOTA_PAUSE_THRESHOLD);
     } finally {
       tracker.close();
@@ -327,7 +330,7 @@ describe("window consumption estimates", () => {
       expect(refined.windows).toHaveLength(1);
       expect(refined.windows[0]?.shape).toEqual({
         id: "observed-recovery",
-        kind: "rolling",
+        kind: "unknown-reset", // a recovery gap is a horizon, not rolling evidence (round-4 finding 2)
         durationMs: 90 * MINUTE,
       });
       // A fresh exhaustion now pins the observed window until its
@@ -664,6 +667,86 @@ describe("window consumption estimates", () => {
         basis: "usage-fraction",
         capacityEstimateMs: 20 * MINUTE,
         estimatedConsumption: 0.5, // 10min against the LATEST 20min sample
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("does not release a pin for an equal-timestamp success recorded BEFORE the exhaustion", () => {
+    // Round-4 review finding 1: "after the exhaustion" is recorded order
+    // (timestamp-then-seq), not timestamp alone.
+    const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless
+    try {
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(0),
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: 0,
+        quotaSignalSeen: false,
+        at: at(10 * MINUTE), // genuine gap → synthesized shape exists
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: 0,
+        quotaSignalSeen: false,
+        at: at(30 * MINUTE), // recorded BEFORE the block below, same instant
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(30 * MINUTE),
+      });
+      const state = tracker.windowState("xai", { now: at(5 * HOUR) });
+      expect(state.windows[0]).toMatchObject({
+        estimatedConsumption: 1,
+        basis: "exhaustion-observed",
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("yields no capacity estimate when the LATEST exhaustion carries no measured usage", () => {
+    // Round-4 review finding 3: a zero-sample latest exhaustion must not
+    // resurrect a stale historical sample.
+    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    try {
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 40 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(40 * MINUTE),
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(41 * MINUTE), // sample ≈ 40min at this exhaustion
+      });
+      // Hours later: a bare exhaustion with nothing in its window.
+      tracker.recordDispatch("openai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(10 * HOUR),
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 15 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(12 * HOUR),
+      });
+      const state = tracker.windowState("openai", { now: at(12 * HOUR + MINUTE) });
+      expect(state.windows[0]).toMatchObject({
+        basis: "no-capacity-estimate",
+        estimatedConsumption: null,
+        capacityEstimateMs: null,
       });
     } finally {
       tracker.close();

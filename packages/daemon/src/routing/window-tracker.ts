@@ -385,24 +385,32 @@ export class QuotaWindowTracker {
    * QUOTA_PAUSE_THRESHOLD (CAM-ROUTE-06); quota-blocked outcomes queue
    * work regardless of estimates (CAM-EXEC-06).
    *
-   * Estimation rules, per shape (round-3 review findings 1–2):
+   * Estimation rules, per shape (round-3 findings 1–2, round-4 findings
+   * 1–4):
    *   - SEEDED shape after an exhaustion: pinned at 1.0 for one full
    *     period — sound for ANY reset semantics of a stated period, since
-   *     no reset can take longer than the period itself.
+   *     no reset can take longer than the period itself. A quota signal
+   *     cannot be attributed to a specific window, so EVERY window pins on
+   *     it: each pin is an upper bound, and choosing when to probe/resume
+   *     among differently-pinned windows is the WP-114 scheduler's policy.
    *   - SYNTHESIZED (observed-recovery) shape: its duration is an
    *     observation, not a stated period, so an exhaustion stays pinned
-   *     until a GENUINE recovery is observed after it — the pin never
-   *     expires on a guess, and a backfilled shorter gap cannot un-pin a
-   *     still-exhausted provider (estimatedResetAt remains the estimate).
-   *   - kind "unknown-reset" past its pin: estimatedConsumption is null,
-   *     basis "reset-semantics-unknown". A trailing-period usage fraction
-   *     is UNSOUND there: a capacity sample whose window straddles an
-   *     unseen reset can over-state capacity and so under-state
-   *     consumption. No fraction is claimed that the data cannot support.
+   *     until a GENUINE recovery is observed after it — after in recorded
+   *     order (timestamp-then-seq) AND starting at or past the exhaustion.
+   *     The pin never expires on a guess, and a backfilled shorter gap
+   *     cannot un-pin a still-exhausted provider.
+   *   - kind "unknown-reset" past its pin (including every synthesized
+   *     shape): estimatedConsumption is null, basis
+   *     "reset-semantics-unknown". A trailing-period usage fraction is
+   *     UNSOUND there: a capacity sample straddling an unseen reset can
+   *     over-state capacity and so under-state consumption.
    *   - kind "rolling" past its pin: observed usage over the LATEST
-   *     exhaustion's capacity sample (temporal relevance beats the global
-   *     maximum under capacity drift; every sample is a lower bound, so
-   *     the fraction still over-states). NAMED BOUNDARY: a capacity
+   *     exhaustion's capacity sample — only the latest (a zero-usage
+   *     latest exhaustion yields null, never a stale sample), and with
+   *     quota-blocked attempts' own wall time excluded from the sample.
+   *     Fractions compare wall time to wall time (a stated heuristic
+   *     currency — wall time over-counts provider-side consumption in the
+   *     numerator, the safe direction). NAMED BOUNDARY: a capacity
    *     REDUCTION after the latest observed exhaustion is invisible until
    *     the next signal — estimates lag it, and the live quota-blocked
    *     classification is the backstop that re-pins.
@@ -426,38 +434,45 @@ export class QuotaWindowTracker {
 
     // A provider with no recorded shape gets the ledger-observed one: the
     // largest exhaustion→recovery gap estimates the reset horizon (registry
-    // item 13's "shapes refined from ledger observation").
+    // item 13's "shapes refined from ledger observation"). Its kind is
+    // unknown-reset: one recovery gap establishes a horizon, NOT rolling
+    // semantics, so no usage fraction is ever computed on it (round-4
+    // review finding 2).
     let shapes = this.#shapes(checkedFamily);
     let synthesized = false;
     if (shapes.length === 0) {
       const gaps = this.recoveryGapsMs(checkedFamily).filter((gap) => gap > 0);
       if (gaps.length > 0) {
-        shapes = [{ id: "observed-recovery", kind: "rolling", durationMs: Math.max(...gaps) }];
+        shapes = [
+          { id: "observed-recovery", kind: "unknown-reset", durationMs: Math.max(...gaps) },
+        ];
         synthesized = true;
       }
     }
 
-    // Has a GENUINE recovery (whole interval after the exhaustion) been
-    // observed after the LATEST exhaustion? Governs the synthesized pin.
+    // Has a GENUINE recovery been observed after the LATEST exhaustion?
+    // Governs the synthesized pin. "After" is BOTH the recorded order
+    // (timestamp-then-seq — an equal-timestamp success recorded before the
+    // exhaustion is not after it; round-4 review finding 1) AND the
+    // interval condition (the success started at or past the exhaustion —
+    // an in-flight success proves nothing; round-2 finding 1).
     const recoveryAfterLatestBlock =
       latestBlocked !== undefined &&
       all.some((o) => {
         if (o.outcome !== "succeeded") return false;
+        if (byInstantThenSeq(o, latestBlocked) <= 0) return false;
         const endMs = Date.parse(o.observedAt);
         return endMs - o.durationMs >= Date.parse(latestBlocked.observedAt);
       });
 
     const windows = shapes.map((shape): WindowConsumptionEstimate => {
-      const usageIn = (endMs: number, upTo?: WindowObservation): number =>
-        all
-          .filter((o) => {
-            if (upTo === undefined) return true;
-            // "Pre-exhaustion" is timestamp-then-seq order: a row recorded
-            // after the exhaustion with an equal timestamp is not part of
-            // the capacity sample (round-1 review finding 2).
-            return byInstantThenSeq(o, upTo) <= 0;
-          })
-          .reduce((sum, o) => sum + overlapMs(o, endMs - shape.durationMs, endMs), 0);
+      // Usage NUMERATOR: every recorded row counts (wall time over-counts
+      // provider-side consumption, which can only raise the fraction — the
+      // safe direction). Fractions therefore compare wall time to wall
+      // time; they are pressure heuristics with the live signal as the
+      // backstop, stated in the windowState doc.
+      const usageIn = (endMs: number): number =>
+        all.reduce((sum, o) => sum + overlapMs(o, endMs - shape.durationMs, endMs), 0);
 
       // Pin after an exhaustion. A seeded shape un-pins after one full
       // period (sound for any reset semantics of a stated period); a
@@ -497,17 +512,21 @@ export class QuotaWindowTracker {
       }
 
       // Capacity refinement from the ledger: the LATEST exhaustion's
-      // interval-clipped pre-exhaustion usage (see the windowState doc for
-      // why latest beats the global maximum under capacity drift; every
-      // sample is a lower bound, so the fraction still over-states).
-      const orderedBlocked = blocked.slice().sort(byInstantThenSeq);
+      // interval-clipped pre-exhaustion usage — and ONLY the latest. An
+      // exhaustion whose own window shows no measured usage yields no
+      // estimate rather than resurrecting a stale sample (round-4 review
+      // finding 3). Quota-blocked attempts' own wall time is EXCLUDED from
+      // the sample: a refused attempt's runtime is local waiting and
+      // cleanup, not evidence of provider capacity (round-4 finding 4).
+      // The numerator keeps every row (over-counting usage raises the
+      // fraction — the safe direction); the denominator must not.
       let capacityEstimateMs: number | null = null;
-      for (let i = orderedBlocked.length - 1; i >= 0; i--) {
-        const sample = usageIn(Date.parse(orderedBlocked[i]!.observedAt), orderedBlocked[i]!);
-        if (sample > 0) {
-          capacityEstimateMs = sample;
-          break;
-        }
+      if (latestBlocked !== undefined) {
+        const blockedMs = Date.parse(latestBlocked.observedAt);
+        const sample = all
+          .filter((o) => o.outcome !== "quota-blocked" && byInstantThenSeq(o, latestBlocked) <= 0)
+          .reduce((sum, o) => sum + overlapMs(o, blockedMs - shape.durationMs, blockedMs), 0);
+        if (sample > 0) capacityEstimateMs = sample;
       }
       if (capacityEstimateMs === null) {
         return {
