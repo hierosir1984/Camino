@@ -61,9 +61,12 @@ export function segmentPrd(text: string): PrdSegment[] {
   const lines = text.split(/\r\n|\r|\n/);
   const blocks: string[] = [];
   let current: string[] = [];
-  // Markdown closes a fence only with the SAME delimiter family — a ~~~
-  // line inside a ``` fence is fence CONTENT, not a closer (r3 finding 7).
-  let openFence: "```" | "~~~" | null = null;
+  // CommonMark fence semantics (r3 finding 7; r4 finding 4): a fence
+  // closes only on a line of the SAME delimiter family, at least the
+  // OPENING run's length, followed by nothing but whitespace — an info
+  // string marks an opener, never a closer, so a ```js line inside an
+  // open ```text fence is content.
+  let openFence: { family: "`" | "~"; length: number } | null = null;
 
   const flush = (): void => {
     if (current.length > 0) {
@@ -72,26 +75,34 @@ export function segmentPrd(text: string): PrdSegment[] {
     }
   };
 
-  const fenceFamily = (line: string): "```" | "~~~" | null => {
-    if (/^ {0,3}```/.test(line)) return "```";
-    if (/^ {0,3}~~~/.test(line)) return "~~~";
-    return null;
+  const fenceOpener = (line: string): { family: "`" | "~"; length: number } | null => {
+    const match = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (match === null) return null;
+    const run = match[1] as string;
+    return { family: run[0] as "`" | "~", length: run.length };
+  };
+
+  const closesFence = (line: string, fence: { family: "`" | "~"; length: number }): boolean => {
+    const match = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+    if (match === null) return false;
+    const run = match[1] as string;
+    return run[0] === fence.family && run.length >= fence.length;
   };
 
   for (const line of lines) {
-    const family = fenceFamily(line);
     if (openFence !== null) {
       current.push(line);
-      if (family === openFence) {
+      if (closesFence(line, openFence)) {
         openFence = null;
         flush();
       }
       continue;
     }
-    if (family !== null) {
+    const opener = fenceOpener(line);
+    if (opener !== null) {
       flush();
       current.push(line);
-      openFence = family;
+      openFence = opener;
       continue;
     }
     if (line.trim().length === 0) {
@@ -137,7 +148,7 @@ export function segmentPrd(text: string): PrdSegment[] {
  * Unicode (\s), so a no-break space no longer buries a sentence.
  */
 const SENTENCE_TERMINATORS = new Set([".", "!", "?", ";", "。", "！", "？", "；"]);
-const CLOSER_RE = /["')\]”’»›」』】〉》）］｣]/;
+const CLOSER_RE = /["')\]”’»›」』】〕〗〙〛〉》）］｣]/;
 const WHITESPACE_RE = /\s/;
 
 function splitSentences(block: string): string[] {
@@ -537,6 +548,14 @@ export function plantedAmbiguityCoverage(
       .toLowerCase()
       .split(/[^\p{L}\p{N}]+/u)
       .filter((t) => t.length > 0);
+  // An anchor token matches a text token exactly OR as a PREFIX when the
+  // anchor is at least 4 characters ("header" matches "headers", "retain"
+  // matches "retained") — ordinary inflection must not read as a silent
+  // guess (r4 finding 7), while short anchors stay exact so "cap" cannot
+  // match "capable". Substrings never match ("support" is not prefixed by
+  // "port").
+  const tokenMatches = (textToken: string, anchorToken: string): boolean =>
+    textToken === anchorToken || (anchorToken.length >= 4 && textToken.startsWith(anchorToken));
   const containsTokenSequence = (
     haystack: readonly string[],
     needle: readonly string[],
@@ -544,7 +563,7 @@ export function plantedAmbiguityCoverage(
     if (needle.length === 0) return false;
     outer: for (let i = 0; i + needle.length <= haystack.length; i += 1) {
       for (let j = 0; j < needle.length; j += 1) {
-        if (haystack[i + j] !== needle[j]) continue outer;
+        if (!tokenMatches(haystack[i + j] as string, needle[j] as string)) continue outer;
       }
       return true;
     }

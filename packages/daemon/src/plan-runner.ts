@@ -21,7 +21,12 @@
  * Stream-integrity boundary, stated plainly: the tail keeps a hash of the
  * consumed prefix, so append-only violations — truncation, shrink, or a
  * same-length in-place rewrite — are refused by name, never silently
- * re-read or dropped (r2 finding 11). What no tail can defend is the
+ * re-read or dropped (r2 finding 11). COST, stated rather than hidden
+ * (r4 finding 9): verifying the consumed prefix means re-reading the file
+ * each poll, so cumulative work is quadratic in stream size. Plans are
+ * human-approved artifacts of bounded size and the poll interval is
+ * configurable; if a future workload outgrows that, prompt rewrite
+ * detection is the property to preserve, not the polling implementation. What no tail can defend is the
  * workspace itself: a worker with filesystem authority over its own
  * directory can rename or destroy it wholesale, which surfaces as a run
  * with no stream and constructionComplete false. Filesystem containment

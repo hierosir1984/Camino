@@ -521,3 +521,77 @@ describe("contract index binding (r1 finding 8)", () => {
     expect(store.contractsForMission("m1")).toEqual([]);
   });
 });
+
+describe("round-4 falsification regressions (store)", () => {
+  it("R4-1: a session cannot adopt another session's identical contract, nor complete on it", () => {
+    const store = openStore(":memory:");
+    seedCoherentSession(store, "session-a");
+    seedCoherentSession(store, "session-b");
+    actEverything(store, "session-a");
+    actEverything(store, "session-b");
+    store.recordApproval("session-a", "david");
+    store.insertContract(sampleContract(), "session-a");
+    store.recordApprovalCompletion("session-a");
+    store.recordApproval("session-b", "david");
+    // Identical terms, different session: the idempotent path is refused…
+    expect(() => store.insertContract(sampleContract(), "session-b")).toThrow(
+      /frozen by session session-a/,
+    );
+    // …and completion cannot borrow session A's contract as substance.
+    expect(() => store.recordApprovalCompletion("session-b")).toThrow(
+      /frozen by session session-a/,
+    );
+    expect(store.completedApprovalSessions().map((s) => s.sessionId)).toEqual(["session-a"]);
+  });
+
+  it("R4-2: the approval act requires the template's review class, not just any artifact", () => {
+    const dir = tempDir();
+    const path = join(dir, "plan.sqlite");
+    const store = openStore(path);
+    seedCoherentSession(store); // feature; appends a full-falsification review
+    actEverything(store);
+    store.close();
+    // A raw writer swaps in a wrong-class review row (drop trigger to edit).
+    const raw = new Database(path);
+    raw.exec("DROP TRIGGER plan_stream_append_only_update");
+    raw
+      .prepare("UPDATE plan_stream SET payload = ? WHERE kind = 'review-attached'")
+      .run(JSON.stringify({ reviewClass: "mini-falsification", reviewer: "codex-cli" }));
+    raw.close();
+    // Adoption itself refuses the wrong class (schema comparison would also
+    // trip on the dropped trigger; both paths are fail-closed).
+    expect(() => new PlanStore(path)).toThrow(/tampered or foreign store|does not match/);
+  });
+
+  it("R4-3: holed or accessor-bearing segment lists refuse at session creation", () => {
+    const store = openStore(":memory:");
+    const holed: unknown[] = [];
+    holed[1] = { segmentId: "S2", text: "t" };
+    expect(() =>
+      store.createSession({
+        sessionId: "s-holed",
+        missionId: "m1",
+        template: "feature",
+        prdSha256: "a".repeat(64),
+        segments: holed as never,
+      }),
+    ).toThrow(/no canonical JSON form/);
+    const shifty = [
+      Object.defineProperty({ text: "t" }, "segmentId", {
+        enumerable: true,
+        get() {
+          return "S1";
+        },
+      }),
+    ];
+    expect(() =>
+      store.createSession({
+        sessionId: "s-shifty",
+        missionId: "m1",
+        template: "feature",
+        prdSha256: "a".repeat(64),
+        segments: shifty as never,
+      }),
+    ).toThrow(/no canonical JSON form/);
+  });
+});

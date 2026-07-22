@@ -45,8 +45,10 @@ import {
 } from "@camino/core";
 import type { PrdSegment } from "@camino/core";
 import {
+  CONTRACT_SCHEMA_VERSION,
   CanonicalJsonError,
   canonicalJson,
+  contractHash,
   contractProblems,
   clarificationResponseProblems,
   isRequirementId,
@@ -93,6 +95,9 @@ const NUL_FREE = (column: string): string =>
 function segmentListProblems(value: unknown): string[] {
   if (!Array.isArray(value)) return ["segments must be an array"];
   const problems: string[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    if (!Object.hasOwn(value, i)) problems.push(`segments[${i}] is a sparse-array hole`);
+  }
   value.forEach((entry, i) => {
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       problems.push(`segments[${i}] must be an object`);
@@ -660,12 +665,25 @@ export class PlanStore {
     segments: readonly PrdSegment[];
   }): PlanSessionRow {
     this.#assertWritable("plan store createSession");
-    const problems = segmentListProblems(input.segments);
+    // Canonical snapshot BEFORE validation (r4 finding 3): accessors, holes,
+    // and exotica refuse at the snapshot; what validates is byte-for-byte
+    // what persists — properties are never re-read after the check.
+    let serializedSegments: string;
+    try {
+      serializedSegments = canonicalJson(input.segments);
+    } catch (error) {
+      if (error instanceof CanonicalJsonError) {
+        throw new Error(`session segments have no canonical JSON form: ${error.message}`);
+      }
+      throw error;
+    }
+    const snapshotSegments = JSON.parse(serializedSegments) as PrdSegment[];
+    const problems = segmentListProblems(snapshotSegments);
     if (problems.length > 0) {
       throw new Error(`session segments refused: ${problems.join("; ")}`);
     }
     const createdAt = this.#now().toISOString();
-    const segments = input.segments.map((s) => ({ segmentId: s.segmentId, text: s.text }));
+    const segments = snapshotSegments;
     this.#db
       .prepare(
         `INSERT INTO plan_sessions (session_id, mission_id, template, prd_sha256, segments, created_at)
@@ -1203,9 +1221,19 @@ export class PlanStore {
     const artifact = state.reviewArtifacts.at(-1);
     if (artifact === undefined) {
       problems.push("no review artifact is attached");
-    } else if (session.template === "quick-task") {
-      for (const fact of ["riskTierLow", "neutralConcurred", "observabilityAdjudicated"]) {
-        if (artifact[fact] !== true) problems.push(`quick-task review fact ${fact} is not true`);
+    } else {
+      // Class binding at the act too (r4 finding 2): presence of SOME
+      // artifact is not presence of the template's owed review class.
+      if (artifact["reviewClass"] !== template.reviewClass) {
+        problems.push(
+          `review artifact class ${JSON.stringify(artifact["reviewClass"])} does not match ` +
+            `the ${session.template} template's ${template.reviewClass}`,
+        );
+      }
+      if (session.template === "quick-task") {
+        for (const fact of ["riskTierLow", "neutralConcurred", "observabilityAdjudicated"]) {
+          if (artifact[fact] !== true) problems.push(`quick-task review fact ${fact} is not true`);
+        }
       }
     }
     problems.push(...templateProblems(template, state.issues));
@@ -1270,18 +1298,70 @@ export class PlanStore {
     }
     const session = this.session(sessionId) as PlanSessionRow;
     const state = this.#streamStateFor(sessionId);
-    const missing = state.issues
-      .map((issue) => `${session.missionId}.${issue.planIssueId}`)
-      .filter((issueId) => this.latestContract(issueId) === undefined);
-    if (missing.length > 0) {
-      throw new Error(
-        `plan session ${sessionId} completion refused: no contract stored for ` +
-          `[${missing.join(", ")}]`,
-      );
+    // Completion demands its exact substance (r4 finding 1): for every
+    // streamed issue, a stored contract frozen BY THIS SESSION whose hash
+    // equals the terms rebuilt from this session's durable rows — another
+    // session's identical-terms contract does not satisfy this session's
+    // completion.
+    for (const expected of this.#expectedContractTerms(sessionId, session, state)) {
+      const stored = this.latestContract(expected.issueId);
+      if (stored === undefined) {
+        throw new Error(
+          `plan session ${sessionId} completion refused: no contract stored for ${expected.issueId}`,
+        );
+      }
+      const owner = this.contractSession(stored.issueId, stored.version);
+      if (owner !== sessionId) {
+        throw new Error(
+          `plan session ${sessionId} completion refused: contract ${stored.issueId} ` +
+            `v${stored.version} was frozen by session ${owner ?? "unknown"}`,
+        );
+      }
+      const rebuilt = contractHash({ ...expected, version: stored.version });
+      if (stored.contractHash !== rebuilt) {
+        throw new Error(
+          `plan session ${sessionId} completion refused: contract ${stored.issueId} ` +
+            `v${stored.version} hash does not match the terms rebuilt from this session's rows`,
+        );
+      }
     }
     this.#db
       .prepare("INSERT INTO plan_approval_completions (session_id, recorded_at) VALUES (?, ?)")
       .run(sessionId, this.#now().toISOString());
+  }
+
+  /** The contract terms this session's durable rows produce (version filled by caller). */
+  #expectedContractTerms(
+    sessionId: string,
+    session: PlanSessionRow,
+    state: StreamState,
+  ): Array<Omit<import("@camino/shared").ContractTerms, "version"> & { version: number }> {
+    const confirmations = this.confirmations(sessionId);
+    const confirmedBySegment = new Map(confirmations.map((c) => [c.segmentId, c]));
+    const requirementIdsByIssue = new Map<string, Set<string>>();
+    for (const row of state.checklist) {
+      if (row.disposition !== "mapped") continue;
+      const confirmation = confirmedBySegment.get(row.segmentId);
+      if (confirmation === undefined) continue;
+      for (const planIssueId of row.mappedPlanIssueIds) {
+        const set = requirementIdsByIssue.get(planIssueId) ?? new Set<string>();
+        set.add(confirmation.requirementId);
+        requirementIdsByIssue.set(planIssueId, set);
+      }
+    }
+    return state.issues.map((issue) => ({
+      schemaVersion: CONTRACT_SCHEMA_VERSION,
+      missionId: session.missionId,
+      issueId: `${session.missionId}.${issue.planIssueId}`,
+      version: 1,
+      template: session.template,
+      title: issue.title,
+      goal: issue.goal,
+      acceptanceCriteria: [...issue.acceptanceCriteria],
+      requirementIds: [...(requirementIdsByIssue.get(issue.planIssueId) ?? [])].sort(),
+      dependsOn: issue.dependsOn.map((dep) => `${session.missionId}.${dep}`).sort(),
+      interfaces: issue.interfaces.map((i) => ({ ...i })),
+    }));
   }
 
   approvalCompletion(sessionId: string): { recordedAt: string } | undefined {
@@ -1356,7 +1436,20 @@ export class PlanStore {
     }
     const existing = this.contract(snapshot.issueId, snapshot.version);
     if (existing !== undefined) {
-      if (existing.contractHash === snapshot.contractHash) return existing;
+      if (existing.contractHash === snapshot.contractHash) {
+        // The idempotent resume no-op holds only for the OWNING session: a
+        // different session re-inserting identical terms would otherwise
+        // borrow this contract as its own completion substance
+        // (r4 finding 1).
+        const owner = this.contractSession(snapshot.issueId, snapshot.version);
+        if (owner !== sessionId) {
+          throw new Error(
+            `contract ${snapshot.issueId} v${snapshot.version} was frozen by session ` +
+              `${owner ?? "unknown"}; session ${sessionId} cannot adopt it`,
+          );
+        }
+        return existing;
+      }
       throw new Error(
         `contract ${snapshot.issueId} v${snapshot.version} already exists with hash ` +
           `${existing.contractHash}; refusing to overwrite it with ${snapshot.contractHash} ` +

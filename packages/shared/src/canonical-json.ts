@@ -12,8 +12,11 @@
  * finite (JSON.stringify renders -0 as "0", so 0 and -0 share one canonical
  * form — the same normalization the intent journal's canonical-read applies).
  *
- * The DOMAIN is deliberately narrow — exactly the values JSON.parse can
- * produce: plain data. Everything else REFUSES loudly with its path:
+ * The DOMAIN is deliberately narrow: plain data — a strict SUBSET of what
+ * JSON.parse can produce (nesting is bounded at 256 levels, so a legal but
+ * deeper JSON document refuses; property writability/configurability is
+ * deliberately not part of the test — a frozen data property carries the
+ * same value). Everything else REFUSES loudly with its path:
  * undefined, functions, symbols and symbol-keyed properties, bigints,
  * non-finite numbers, non-plain objects (Date/Map/Set/RegExp/class
  * instances), Proxy exotic objects, sparse-array holes and array expando

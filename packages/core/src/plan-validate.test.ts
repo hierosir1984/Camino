@@ -605,3 +605,93 @@ describe("round-3 falsification regressions (core)", () => {
     expect((segments[1] as PrdSegment).text).toBe("Outside.");
   });
 });
+
+describe("round-4 falsification regressions (core)", () => {
+  it("R4-4: a longer opener is not closed by a shorter run of the same family", () => {
+    const text = "````\ncontent. more.\n```\nstill fenced.\n````\n\nOutside.";
+    const segments = segmentPrd(text);
+    expect(segments).toHaveLength(2);
+    expect((segments[0] as PrdSegment).text).toContain("still fenced.");
+    expect((segments[1] as PrdSegment).text).toBe("Outside.");
+  });
+
+  it("R4-4: an info-string fence line inside an open fence is content, not a closer", () => {
+    const text = [
+      "```text",
+      "first. second.",
+      "```js",
+      "still fenced. also fenced.",
+      "```",
+      "",
+      "Users rotate keys. Admins revoke keys.",
+    ].join("\n");
+    const segments = segmentPrd(text);
+    // One fence block (the ```js line rode inside), then the two sentences.
+    expect(segments).toHaveLength(3);
+    expect((segments[0] as PrdSegment).text).toContain("still fenced. also fenced.");
+    expect(segments.map((s) => s.text).slice(1)).toEqual([
+      "Users rotate keys.",
+      "Admins revoke keys.",
+    ]);
+  });
+
+  it("R4-4: the CJK bracket closer rides its sentence", () => {
+    const segments = segmentPrd("Data is encrypted。〕 Users can delete accounts。");
+    expect(segments.map((s) => s.text)).toEqual([
+      "Data is encrypted。〕",
+      "Users can delete accounts。",
+    ]);
+  });
+
+  it("R4-7: ordinary inflection matches — 'header' covers 'headers' (prefix >= 4 chars)", () => {
+    const segs: PrdSegment[] = [{ segmentId: "S1", text: "Clients are told when limited." }];
+    const coverage = plantedAmbiguityCoverage(
+      [
+        {
+          id: "A1",
+          segmentText: "Clients are told when limited.",
+          summary: "signal unstated",
+          answerKeyTerms: ["header"],
+        },
+      ],
+      segs,
+      [
+        {
+          clarificationId: "Q1",
+          question: "Which response headers tell clients they are rate limited?",
+          whyItMatters: "The PRD names no mechanism.",
+          assumptionIfUnanswered: "Retry-After.",
+          relatedSegmentIds: ["S1"],
+          relatedPlanIssueIds: [],
+        },
+      ],
+    );
+    expect(coverage.covered).toHaveLength(1);
+  });
+
+  it("R4-7: short anchors stay exact — 'cap' does not match 'capable'", () => {
+    const segs: PrdSegment[] = [{ segmentId: "S1", text: "Exports are bounded." }];
+    const coverage = plantedAmbiguityCoverage(
+      [
+        {
+          id: "A1",
+          segmentText: "Exports are bounded.",
+          summary: "bound unstated",
+          answerKeyTerms: ["cap"],
+        },
+      ],
+      segs,
+      [
+        {
+          clarificationId: "Q1",
+          question: "Is the exporter capable of resuming?",
+          whyItMatters: "Unrelated.",
+          assumptionIfUnanswered: "Yes.",
+          relatedSegmentIds: ["S1"],
+          relatedPlanIssueIds: [],
+        },
+      ],
+    );
+    expect(coverage.covered).toEqual([]);
+  });
+});
