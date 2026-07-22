@@ -40,7 +40,11 @@ const open = (): GapDispositionsStore => {
   return store;
 };
 
-const payload = (reason = "queued"): Record<string, unknown> => ({ tuple: TUPLE, reason });
+const payload = (reason = "queued"): Record<string, unknown> => ({
+  tuple: TUPLE,
+  contextKey: "main",
+  reason,
+});
 
 describe("append/read round-trip", () => {
   it("assigns strictly increasing seqs, binds the David actor, and reads back canonical JSON", () => {
@@ -78,7 +82,7 @@ describe("append/read round-trip", () => {
       s.append({
         requirementId: "CAM-DEMO-01",
         event: "gap-fix-queued",
-        payload: { tuple: TUPLE, reason: "two\nlines" },
+        payload: { tuple: TUPLE, contextKey: "main", reason: "two\nlines" },
       }),
     ).toThrow(/single-line/);
     expect(() =>

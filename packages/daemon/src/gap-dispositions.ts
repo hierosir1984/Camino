@@ -5,6 +5,19 @@
  * action, actor-bound to the user, with the same tamper-evident open and
  * append-only construction as the intent ledger (canon-ledger.ts).
  *
+ * TAMPER-EVIDENT, NOT TAMPER-PROOF (round 1, finding 14; the WP-109
+ * canon-ledger boundary, restated): "tamper-evident open" here means the
+ * schema-object DEFINITIONS are pinned (a weakened CHECK or dropped trigger
+ * is caught) and every row is re-run through shape verification at adoption,
+ * and the append-only triggers reject UPDATE/DELETE. It does NOT mean the
+ * row DATA is authenticated: an actor with direct write access to the SQLite
+ * file who drops the triggers, edits a row that still passes shape
+ * verification, and recreates identical triggers leaves no evidence — there
+ * is no row hash-chain. That actor already owns the OS account the state
+ * directory's 0700 permissions rest on (the WP-102 token-dir boundary); the
+ * store defends against the accidental and the schema-level, not against the
+ * account owner tampering with their own file.
+ *
  * DECISION ASYMMETRY, stated (the WP-104 intent-journal rationale): the
  * store validates what the log ALONE can prove — shapes, actor binding,
  * closed vocabularies, monotone seqs — via `verifyGapDispositionLog` at

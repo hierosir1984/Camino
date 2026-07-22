@@ -59,11 +59,39 @@ export type GapDispositionEventName = (typeof GAP_DISPOSITION_EVENTS)[number];
  * suspicion behind it is detector-authored (CAM-CANON-05: waivers exist
  * only for detector false positives). Provenance-derived, not a stored
  * flag: nothing else can mark a row waivable.
+ *
+ * BOUNDARY, stated (round 1, finding 4; the WP-109 in-process-liar
+ * precedent): this predicate reads a canon-fact ACTOR STRING. Like every
+ * actor in Camino (event-log actors, ledger DAVID_ACTOR), it is a
+ * trusted-writer label under the single-OS-user model, NOT an
+ * authenticated identity — a component that can write canon facts can
+ * write one under any actor. What this WP fixes is the SEAM: the prefix
+ * grammar below, so a malformed or empty actor never qualifies, and the
+ * name (`camino:detector:*`) that WP-116 binds to a real detector-run
+ * identity when detectors land. Binding writer→actor is WP-116/routing's
+ * job; this layer defines and hygiene-checks the namespace, and does not
+ * claim to authenticate it. Consequently the waiver control is a
+ * user-convenience gate over honestly-recorded provenance — the durable
+ * append still requires David's actor (CAM-CORE-04), so a spoofed
+ * detector fact lets the USER waive a false gap, it does not let a
+ * non-user act.
  */
 export const DETECTOR_ACTOR_PREFIX = "camino:detector:";
 
+/**
+ * The detector-name suffix grammar: one or more dot/dash/underscore
+ * segments of lowercase-alphanumeric, bounded — the same closed-token
+ * shape the rest of Camino uses for machine identifiers. A bare prefix
+ * (`camino:detector:`) or an exotic suffix does not qualify.
+ */
+const DETECTOR_NAME_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+const DETECTOR_ACTOR_MAX_LENGTH = 128;
+
 export function isDetectorActor(actor: string): boolean {
-  return typeof actor === "string" && actor.startsWith(DETECTOR_ACTOR_PREFIX);
+  if (typeof actor !== "string") return false;
+  if (actor.length > DETECTOR_ACTOR_MAX_LENGTH) return false;
+  if (!actor.startsWith(DETECTOR_ACTOR_PREFIX)) return false;
+  return DETECTOR_NAME_PATTERN.test(actor.slice(DETECTOR_ACTOR_PREFIX.length));
 }
 
 /** What a writer submits; the store assigns `seq` and `recordedAt`. */

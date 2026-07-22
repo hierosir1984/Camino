@@ -114,6 +114,10 @@ class FactLog {
   }
 }
 
+/** Default context for fixtures whose payload omits `contextKey`. */
+const withContext = (payload: Record<string, unknown>): Record<string, unknown> =>
+  "contextKey" in payload ? payload : { ...payload, contextKey: "main" };
+
 class DispositionLog {
   readonly records: GapDispositionRecord[] = [];
   #seq = 0;
@@ -122,6 +126,10 @@ class DispositionLog {
     requirementId: string,
     event: GapDispositionEventName,
     payload: Record<string, unknown>,
+    // Disposition timestamps default AFTER the FactLog's (2026-07-02) so an
+    // honest waiver is recorded no earlier than the finding it waives; a
+    // pre-seed test passes an earlier value explicitly.
+    recordedAt = "2026-07-03T00:00:00.000Z",
   ): GapDispositionRecord {
     this.#seq += 1;
     const record: GapDispositionRecord = {
@@ -129,8 +137,8 @@ class DispositionLog {
       requirementId,
       event,
       actor: DAVID_ACTOR,
-      payload,
-      recordedAt: "2026-07-03T00:00:00.000Z",
+      payload: withContext(payload),
+      recordedAt,
     };
     const divergences = verifyGapDispositionLog([record]);
     // Deliberately-bad fixtures skip the guard by writing records directly.
@@ -297,20 +305,24 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
 
   const input = (
     over: Partial<GapDispositionAppendInput> & { payload?: Record<string, unknown> },
-  ): GapDispositionAppendInput => ({
-    requirementId: R2,
-    event: "gap-fix-queued",
-    actor: DAVID_ACTOR,
-    payload: { tuple: openTuple(), reason: "queueing a fix" },
-    ...over,
-  });
+  ): GapDispositionAppendInput => {
+    const { payload, ...rest } = over;
+    return {
+      requirementId: R2,
+      event: "gap-fix-queued",
+      actor: DAVID_ACTOR,
+      ...rest,
+      payload: withContext(payload ?? { tuple: openTuple(), reason: "queueing a fix" }),
+    };
+  };
 
   it("accepts fix-queued and disputed on any live row", () => {
     const { rows } = rowsWithDetectorFinding();
-    expect(decideGapDisposition(rows, input({}))).toEqual({ ok: true });
+    expect(decideGapDisposition(rows, "main", input({}))).toEqual({ ok: true });
     expect(
       decideGapDisposition(
         rows,
+        "main",
         input({ event: "gap-disputed", payload: { tuple: openTuple(), reason: "not a gap" } }),
       ),
     ).toEqual({ ok: true });
@@ -320,6 +332,7 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
     const { rows } = rowsWithDetectorFinding();
     const decision = decideGapDisposition(
       rows,
+      "main",
       input({
         requirementId: R2, // a real unmet requirement: no detector finding behind it
         event: "gap-false-positive-waived",
@@ -334,6 +347,7 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
     const { rows, findingSeq } = rowsWithDetectorFinding();
     const decision = decideGapDisposition(
       rows,
+      "main",
       input({
         requirementId: R1,
         event: "gap-false-positive-waived",
@@ -351,6 +365,7 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
     const { rows, findingSeq } = rowsWithDetectorFinding();
     const decision = decideGapDisposition(
       rows,
+      "main",
       input({
         requirementId: R1,
         event: "gap-false-positive-waived",
@@ -369,6 +384,7 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
     const { rows } = rowsWithDetectorFinding();
     const decision = decideGapDisposition(
       rows,
+      "main",
       input({
         requirementId: R1, // its tuple is suspected-absent, not the recorded absent
         payload: { tuple: openTuple(), reason: "queueing a fix" },
@@ -380,15 +396,16 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
 
   it("refuses actions on requirements without a live row, reopen of an open row, wrong actors, and unknown events", () => {
     const { rows } = rowsWithDetectorFinding();
-    expect(decideGapDisposition(rows, input({ requirementId: R3 })).ok).toBe(false);
+    expect(decideGapDisposition(rows, "main", input({ requirementId: R3 })).ok).toBe(false);
     expect(
       decideGapDisposition(
         rows,
+        "main",
         input({ event: "gap-reopened", payload: { tuple: openTuple(), reason: "reopen" } }),
       ).ok,
     ).toBe(false); // R2 is already open
-    expect(decideGapDisposition(rows, input({ actor: "camino:scheduler" })).ok).toBe(false);
-    expect(decideGapDisposition(rows, input({ event: "waive" as never })).ok).toBe(false);
+    expect(decideGapDisposition(rows, "main", input({ actor: "camino:scheduler" })).ok).toBe(false);
+    expect(decideGapDisposition(rows, "main", input({ event: "waive" as never })).ok).toBe(false);
   });
 
   it("refuses malformed payloads: extra fields, multi-line reasons, missing tuple, bad waive seq", () => {
@@ -400,11 +417,12 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
       { tuple: { disposition: "accepted" }, reason: "truncated tuple" },
     ];
     for (const payload of cases) {
-      expect(decideGapDisposition(rows, input({ payload })).ok).toBe(false);
+      expect(decideGapDisposition(rows, "main", input({ payload })).ok).toBe(false);
     }
     expect(
       decideGapDisposition(
         rows,
+        "main",
         input({
           requirementId: R1,
           event: "gap-false-positive-waived",
@@ -425,7 +443,7 @@ describe("decideGapDisposition (CAM-CANON-05 enforcement)", () => {
         },
       },
     ) as GapDispositionAppendInput;
-    const decision = decideGapDisposition(rows, hostile);
+    const decision = decideGapDisposition(rows, "main", hostile);
     expect(decision.ok).toBe(false);
   });
 });
@@ -495,6 +513,120 @@ describe("disposition fold (basis binding: dispositions recompute like everythin
   });
 });
 
+describe("round-1 falsification regressions", () => {
+  const branch = (name: string): StatusContext => ({
+    kind: "branch",
+    branch: name,
+    headSha: HEAD,
+    baseSha: BASE,
+  });
+
+  it("F5: a waiver recorded BEFORE the finding it names never springs to life (pre-seed via raw store)", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const dispositions = new DispositionLog();
+    // Pre-seeded against a guessed future finding seq=1, recorded 2026-07-01
+    // — BEFORE any detector fact exists.
+    dispositions.add(
+      R1,
+      "gap-false-positive-waived",
+      { tuple: suspectedTuple(), reason: "pre-seed", waivedThroughSeq: 1 },
+      "2026-07-01T00:00:00.000Z",
+    );
+    // The detector finding arrives later (FactLog records at 2026-07-02) at seq 1.
+    const facts = new FactLog();
+    facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "real hit" });
+    const rows = project(view, facts, dispositions);
+    expect(rows[0]!.tuple).toEqual(suspectedTuple()); // tuple + seq both match…
+    expect(rows[0]!.disposition).toBe("open"); // …but the waiver predates the finding, so it is inert
+  });
+
+  it("F5: an honest waiver recorded after the finding does bind", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const facts = new FactLog();
+    const finding = facts.add(R1, "absence-suspected", DETECTOR, {
+      contextKind: "main",
+      reason: "hit",
+    });
+    const dispositions = new DispositionLog(); // default recordedAt 2026-07-03 > finding's 2026-07-02
+    dispositions.add(R1, "gap-false-positive-waived", {
+      tuple: suspectedTuple(),
+      reason: "intentional",
+      waivedThroughSeq: finding.seq,
+    });
+    expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
+  });
+
+  it("F7: a disposition recorded in one context never governs another (main ↛ branch)", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const dispositions = new DispositionLog();
+    // fix-queued in main, on the (accepted, absent, unverified) tuple.
+    dispositions.add(R1, "gap-fix-queued", {
+      tuple: openTuple(),
+      contextKey: "main",
+      reason: "main-context fix",
+    });
+    const facts = new FactLog();
+    expect(project(view, facts, dispositions, MAIN)[0]!.disposition).toBe("fix-queued");
+    // A branch with the SAME tuple must NOT inherit the main disposition.
+    const branchRows = project(view, facts, dispositions, branch("mission/m1"));
+    expect(branchRows[0]!.tuple).toEqual(openTuple());
+    expect(branchRows[0]!.disposition).toBe("open");
+  });
+
+  it("F7: decideGapDisposition refuses a payload whose contextKey is not the projected context", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const rows = project(view);
+    const decision = decideGapDisposition(rows, "main", {
+      requirementId: R1,
+      event: "gap-fix-queued",
+      actor: DAVID_ACTOR,
+      payload: { tuple: openTuple(), contextKey: "mission/m1", reason: "wrong context" },
+    });
+    expect(decision.ok).toBe(false);
+    if (!decision.ok) expect(decision.problem).toContain("context");
+  });
+
+  it("F15: prototype pollution does not satisfy the closed payload schema", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const rows = project(view);
+    const proto = Object.prototype as Record<string, unknown>;
+    proto["tuple"] = openTuple();
+    proto["contextKey"] = "main";
+    proto["reason"] = "polluted";
+    try {
+      const decision = decideGapDisposition(rows, "main", {
+        requirementId: R1,
+        event: "gap-fix-queued",
+        actor: DAVID_ACTOR,
+        payload: {}, // owns nothing; only the prototype carries the fields
+      });
+      expect(decision.ok).toBe(false);
+    } finally {
+      delete proto["tuple"];
+      delete proto["contextKey"];
+      delete proto["reason"];
+    }
+  });
+
+  it("F4: a malformed or bare detector actor does not make a row waivable", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    for (const actor of ["camino:detector:", "camino:detector:Bad Name", "camino:detector"]) {
+      const facts = new FactLog();
+      facts.add(R1, "absence-suspected", actor, { contextKind: "main", reason: "hit" });
+      const row = project(view, facts)[0]!;
+      expect(row.waivableThroughSeq).toBeNull();
+      expect(row.detectorFindings).toEqual([]);
+    }
+    // A well-formed detector actor DOES qualify (control).
+    const ok = new FactLog();
+    ok.add(R1, "absence-suspected", "camino:detector:todo-scan", {
+      contextKind: "main",
+      reason: "hit",
+    });
+    expect(project(view, ok)[0]!.waivableThroughSeq).not.toBeNull();
+  });
+});
+
 describe("projection hygiene (defined over store-produced records only)", () => {
   it("refuses malformed contexts and non-monotone sequences", () => {
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
@@ -520,7 +652,7 @@ describe("verifyGapDispositionLog (store adoption hygiene)", () => {
     requirementId: R1,
     event: "gap-fix-queued",
     actor: DAVID_ACTOR,
-    payload: { tuple: openTuple(), reason: "queued" },
+    payload: { tuple: openTuple(), contextKey: "main", reason: "queued" },
     recordedAt: "2026-07-03T00:00:00.000Z",
   };
 
@@ -533,9 +665,14 @@ describe("verifyGapDispositionLog (store adoption hygiene)", () => {
       { ...good, seq: 4, requirementId: "not-an-id" },
       { ...good, seq: 5, event: "waive" as never },
       { ...good, seq: 6, actor: "camino:scheduler" },
-      { ...good, seq: 7, payload: { tuple: openTuple(), reason: "x", extra: 1 } },
+      {
+        ...good,
+        seq: 7,
+        payload: { tuple: openTuple(), contextKey: "main", reason: "x", extra: 1 },
+      },
+      { ...good, seq: 8, payload: { tuple: openTuple(), reason: "no context" } },
     ]);
-    expect(divergences.map((d) => d.seq)).toEqual([1, 3, 4, 5, 6, 7]);
+    expect(divergences.map((d) => d.seq)).toEqual([1, 3, 4, 5, 6, 7, 8]);
   });
 });
 
@@ -597,11 +734,16 @@ describe("tuple helpers", () => {
 describe("payload schema", () => {
   it("gapDispositionPayloadProblem enforces the closed per-event schemas", () => {
     expect(
-      gapDispositionPayloadProblem("gap-fix-queued", { tuple: openTuple(), reason: "r" }),
+      gapDispositionPayloadProblem("gap-fix-queued", {
+        tuple: openTuple(),
+        contextKey: "main",
+        reason: "r",
+      }),
     ).toBeNull();
     expect(
       gapDispositionPayloadProblem("gap-fix-queued", {
         tuple: openTuple(),
+        contextKey: "main",
         reason: "r",
         waivedThroughSeq: 3,
       }),
@@ -609,6 +751,7 @@ describe("payload schema", () => {
     expect(
       gapDispositionPayloadProblem("gap-false-positive-waived", {
         tuple: suspectedTuple(),
+        contextKey: "main",
         reason: "r",
         waivedThroughSeq: 3,
       }),
@@ -616,8 +759,19 @@ describe("payload schema", () => {
     expect(
       gapDispositionPayloadProblem("gap-false-positive-waived", {
         tuple: suspectedTuple(),
+        contextKey: "main",
         reason: "r",
       }),
     ).not.toBeNull(); // a waiver must name what it waives
+    expect(
+      gapDispositionPayloadProblem("gap-fix-queued", { tuple: openTuple(), reason: "r" }),
+    ).not.toBeNull(); // contextKey is required (round 1, finding 7)
+    expect(
+      gapDispositionPayloadProblem("gap-fix-queued", {
+        tuple: openTuple(),
+        contextKey: "two\nlines",
+        reason: "r",
+      }),
+    ).not.toBeNull(); // contextKey obeys single-line hygiene
   });
 });

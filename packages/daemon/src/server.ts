@@ -95,6 +95,14 @@ export interface BuildServerOptions {
    * every other route (token + CSRF, by construction).
    */
   register?: RegisterService;
+  /**
+   * Run once when the Fastify instance closes (SIGINT/SIGTERM, /api/shutdown,
+   * or a listen failure that reaches close). Registered as an `onClose` hook
+   * BEFORE `listen()` — the daemon's durable stores hang their teardown here
+   * so it fires on every shutdown path, not just the signal handlers. Must be
+   * best-effort internally: a throw is logged, never left to crash close.
+   */
+  onClose?: () => void | Promise<void>;
   logger?: boolean;
 }
 
@@ -292,6 +300,24 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     forceCloseConnections: "idle",
     bodyLimit: 1024 * 1024,
   });
+
+  // Store teardown rides an onClose hook registered HERE — before the caller
+  // ever gets the instance to listen() on — so it cannot hit Fastify's
+  // "already listening, cannot addHook" refusal (round 1, finding 1: main.ts
+  // registered it after startDaemonServer had already listened, crashing the
+  // daemon on boot). It fires on every close path: signals, /api/shutdown, and
+  // a post-listen failure. Best-effort: a throwing closer is logged, never
+  // propagated into close().
+  if (options.onClose !== undefined) {
+    const onClose = options.onClose;
+    app.addHook("onClose", async () => {
+      try {
+        await onClose();
+      } catch (error) {
+        app.log.error(error, "daemon store teardown failed during close");
+      }
+    });
+  }
 
   const csrfToken = generateToken();
   const guiRoot = options.guiRoot;

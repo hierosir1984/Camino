@@ -90,7 +90,7 @@ describe("snapshot", () => {
         service.recordDisposition(R1, {
           action: "fix-queued",
           reason: "r",
-          asOf: { ledgerSeq: 0, factsSeq: 0, dispositionsSeq: 0 },
+          asOf: { ledgerSeq: 0, factsSeq: 0, dispositionsSeq: 0, context: MAIN },
         }),
       ),
     ).toBe("unavailable");
@@ -111,6 +111,7 @@ describe("snapshot", () => {
       ledgerSeq: canonLedger.lastSeq,
       factsSeq: canonFacts.read().at(-1)?.seq ?? 0,
       dispositionsSeq: gapDispositions.lastSeq,
+      context: MAIN,
     });
   });
 });
@@ -195,6 +196,26 @@ describe("disposition actions", () => {
         }),
       ),
     ).toBe("register-advanced");
+  });
+
+  it("F6: a context head change WITHOUT any store write invalidates a stale action", () => {
+    const stale = currentAsOf();
+    // No ledger/fact/disposition write — only the reader's head advances (a
+    // fresh main SHA the register now projects against). The tuple a user saw
+    // (e.g. verified-live at the old head) may differ at the new head, so the
+    // action must be refused even though all three store sequences are unchanged.
+    context = { kind: "main", headSha: "b".repeat(40) };
+    expect(
+      code(() =>
+        service.recordDisposition(R1, {
+          action: "fix-queued",
+          reason: "acting on a head-stale render",
+          asOf: stale,
+        }),
+      ),
+    ).toBe("register-advanced");
+    // An action taken against the CURRENT context succeeds.
+    context = { kind: "main", headSha: HEAD };
   });
 
   it("refuses unknown rows, malformed reasons, and unknown actions", () => {

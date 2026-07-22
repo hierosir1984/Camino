@@ -165,6 +165,19 @@ function renderRow(row, tbody) {
   tr.dataset.evidence = row.tuple.evidence;
   tr.dataset.intentDisposition = row.tuple.disposition;
   tr.dataset.waivable = row.waivableThroughSeq === null ? "false" : "true";
+  // Exact machine values, so the CAM-CORE-10 agreement test compares the whole
+  // row — not just its presence — against the ledger projection.
+  tr.dataset.waivableThroughSeq =
+    row.waivableThroughSeq === null ? "" : String(row.waivableThroughSeq);
+  if (row.tuple.implementation.kind === "present-on") {
+    tr.dataset.implementationBranch = row.tuple.implementation.branch;
+  }
+  tr.dataset.provenanceSeqs = row.provenance.map((f) => f.seq).join(",");
+  tr.dataset.detectorSeqs = row.detectorFindings.map((f) => f.seq).join(",");
+  if (row.dispositionRecord !== null) {
+    tr.dataset.dispositionRecordSeq = String(row.dispositionRecord.seq);
+    tr.dataset.dispositionRecordEvent = row.dispositionRecord.event;
+  }
 
   const requirement = cell(tr, "col-requirement");
   addLine(requirement, "requirement-id", row.requirementId);

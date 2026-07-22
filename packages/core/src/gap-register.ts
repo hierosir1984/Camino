@@ -25,14 +25,22 @@
  *
  * BASIS BINDING — dispositions recompute like everything else (design
  * §3.1: nothing hand-maintains reverse transitions). Every disposition
- * event records the row's status tuple at action time. At fold time an
- * event applies only while the row's current tuple equals the recorded
- * one: if the gap's character changes (implementation or evidence moves,
- * intent is re-resolved), the user's earlier judgment no longer binds
- * and the row recomputes to `open`. A waiver additionally binds to the
- * exact detector findings it waives (`waivedThroughSeq`): a NEW finding —
- * detector or otherwise — re-opens the row even if the tuple reads the
- * same.
+ * event records the row's status tuple AND the register context it was
+ * taken in. At fold time an event applies only while BOTH still hold:
+ *   - the current tuple equals the recorded one — if the gap's character
+ *     changes (implementation or evidence moves, intent is re-resolved),
+ *     the user's earlier judgment no longer binds and the row recomputes
+ *     to `open`;
+ *   - the current context equals the recorded one (round 1, finding 7) —
+ *     a judgment made in `main` never governs a branch row that happens
+ *     to share the tuple, and vice versa.
+ * A waiver binds two things more: the exact detector findings it covers
+ * (`waivedThroughSeq`), so a NEW finding re-opens the row even at an
+ * identical tuple; and the RECENCY of those findings (round 1, finding 5)
+ * — the waiver must have been recorded no earlier than the finding at that
+ * seq, so a waiver pre-seeded (via the raw store) against a finding that
+ * does not yet exist cannot spring to life when a future finding lands at
+ * the guessed seq.
  *
  * THE CAM-CANON-05 WAIVER RULE, structural: waivability is DERIVED from
  * evidence provenance — a row is waivable exactly when its outstanding
@@ -183,8 +191,19 @@ export function statusTupleEquals(a: StatusTuple, b: StatusTuple): boolean {
 /**
  * Closed payload schemas per gap-disposition event: exactly the listed
  * fields (an unknown field is refused, never dropped — WP-104 precedent).
- * `tuple` is the basis the event binds to; `reason` is David's single-line
- * text; a waiver names the findings it waives.
+ *
+ * - `tuple` — the status tuple the event binds to (basis binding).
+ * - `contextKey` — the register context the event was taken in ("main" or a
+ *   branch name; round 1, finding 7): a disposition governs ONLY its own
+ *   context, so a main-context judgment can never leak onto a branch that
+ *   happens to share the tuple.
+ * - `reason` — David's single-line text.
+ * - `waivedThroughSeq` (waivers only) — the canon-fact seq of the newest
+ *   detector finding the waiver covers.
+ *
+ * Presence is tested with `Object.hasOwn`, not `key in payload` (round 1,
+ * finding 15): a polluted `Object.prototype` carrying `tuple`/`reason` must
+ * not satisfy the schema for an object that owns neither.
  */
 export function gapDispositionPayloadProblem(
   event: GapDispositionEventName,
@@ -192,16 +211,18 @@ export function gapDispositionPayloadProblem(
 ): string | null {
   const allowed =
     event === "gap-false-positive-waived"
-      ? ["tuple", "reason", "waivedThroughSeq"]
-      : ["tuple", "reason"];
+      ? ["tuple", "contextKey", "reason", "waivedThroughSeq"]
+      : ["tuple", "contextKey", "reason"];
   for (const key of Object.keys(payload)) {
     if (!allowed.includes(key)) return `unexpected payload field ${JSON.stringify(key)}`;
   }
   for (const key of allowed) {
-    if (!(key in payload)) return `missing payload field ${JSON.stringify(key)}`;
+    if (!Object.hasOwn(payload, key)) return `missing payload field ${JSON.stringify(key)}`;
   }
   const tupleIssue = statusTupleProblem(payload["tuple"]);
   if (tupleIssue !== null) return tupleIssue;
+  const contextIssue = singleLineTextProblem("contextKey", payload["contextKey"]);
+  if (contextIssue !== null) return contextIssue;
   const reasonIssue = singleLineTextProblem("reason", payload["reason"]);
   if (reasonIssue !== null) return reasonIssue;
   if (event === "gap-false-positive-waived") {
@@ -292,29 +313,49 @@ function delivered(tuple: StatusTuple): boolean {
   return tuple.implementation.kind === "on-main" && tuple.evidence === "verified-live";
 }
 
+/** The row state a disposition fold binds against (round 1, findings 5/7). */
+interface DispositionBasis {
+  readonly tuple: StatusTuple;
+  /** The register context the row is projected for ("main" or a branch name). */
+  readonly contextKey: string;
+  /** The row's current waivable-through seq, or null when not waivable. */
+  readonly waivableThroughSeq: number | null;
+  /** The recordedAt of the fact at `waivableThroughSeq`, for the recency guard. */
+  readonly waivableThroughAt: string | null;
+}
+
 /**
- * Fold one requirement's disposition events against its CURRENT row
- * state. Events are hygiene-trusted (the store verified shapes); each
- * APPLIES only while its recorded basis still holds — see the module
- * header. Later events with a non-matching basis are skipped, so a
- * judgment made in a different gap state neither governs nor erases an
- * earlier judgment whose state returned.
+ * Fold one requirement's disposition events against its CURRENT row state.
+ * Events are hygiene-trusted (the store verified shapes); each APPLIES only
+ * while its recorded basis still holds — see the module header. Later events
+ * with a non-matching basis are skipped, so a judgment made in a different
+ * gap state neither governs nor erases an earlier judgment whose state
+ * returned.
+ *
+ * An event binds to THREE things, not one:
+ *  - the status tuple it recorded (the visible gap state);
+ *  - the CONTEXT it was taken in (round 1, finding 7): a `main` judgment
+ *    never governs a branch row that happens to share the tuple;
+ *  - for a waiver, the exact detector findings it covers AND their recency
+ *    (round 1, finding 5): the waiver must name the row's current
+ *    waivable-through seq, and it must have been recorded no earlier than the
+ *    finding at that seq — so a waiver pre-seeded (via the raw store) against
+ *    a finding that does not yet exist can never spring to life when a future
+ *    finding happens to land at the guessed seq.
  */
 function foldDisposition(
   events: readonly GapDispositionRecord[],
-  tuple: StatusTuple,
-  waivableThroughSeq: number | null,
+  basis: DispositionBasis,
 ): { disposition: GapDisposition; record: GapDispositionRef | null } {
   let disposition: GapDisposition = "open";
   let record: GapDispositionRef | null = null;
   for (const event of events) {
-    const basis = event.payload["tuple"] as StatusTuple;
-    if (!statusTupleEquals(basis, tuple)) continue;
-    if (
-      event.event === "gap-false-positive-waived" &&
-      event.payload["waivedThroughSeq"] !== waivableThroughSeq
-    ) {
-      continue; // a newer finding (or a provenance change) outdates the waiver
+    if (event.payload["contextKey"] !== basis.contextKey) continue;
+    if (!statusTupleEquals(event.payload["tuple"] as StatusTuple, basis.tuple)) continue;
+    if (event.event === "gap-false-positive-waived") {
+      if (event.payload["waivedThroughSeq"] !== basis.waivableThroughSeq) continue;
+      if (basis.waivableThroughAt === null) continue;
+      if (Date.parse(event.recordedAt) < Date.parse(basis.waivableThroughAt)) continue;
     }
     disposition = EVENT_TO_DISPOSITION[event.event];
     record =
@@ -374,16 +415,18 @@ export function projectGapRegister(
       .map(toFactRef);
     const suspicions = outstandingSuspicions(requirementFacts, contextKey);
     const detectorFindings = suspicions.filter((f) => isDetectorActor(f.actor)).map(toFactRef);
-    const waivableThroughSeq =
+    const waivable =
       suspicions.length > 0 && suspicions.every((f) => isDetectorActor(f.actor))
-        ? suspicions[suspicions.length - 1]!.seq
+        ? suspicions[suspicions.length - 1]!
         : null;
+    const waivableThroughSeq = waivable?.seq ?? null;
 
-    const folded = foldDisposition(
-      dispositionsByRequirement.get(requirementId) ?? [],
-      explained.tuple,
+    const folded = foldDisposition(dispositionsByRequirement.get(requirementId) ?? [], {
+      tuple: explained.tuple,
+      contextKey,
       waivableThroughSeq,
-    );
+      waivableThroughAt: waivable?.recordedAt ?? null,
+    });
 
     rows.push({
       requirementId,
@@ -403,18 +446,24 @@ export function projectGapRegister(
 }
 
 /**
- * Decide one gap-disposition append against the CURRENT projected rows.
- * Total: never throws on any input value — every refusal names its
- * reason. Used by the daemon's register service at write time; the store
- * itself re-verifies shape hygiene only (it cannot see the other stores —
- * the intent-journal asymmetry, WP-104).
+ * Decide one gap-disposition append against the CURRENT projected rows for a
+ * given register context. `contextKey` is the context the `rows` were
+ * projected for ("main" or a branch name); the payload's own `contextKey`
+ * must match it, so an action can never be recorded against a context other
+ * than the one the caller actually projected (round 1, finding 7).
+ *
+ * Total: never throws on any input value — every refusal names its reason.
+ * Used by the daemon's register service at write time; the store itself
+ * re-verifies shape hygiene only (it cannot see the other stores — the
+ * intent-journal asymmetry, WP-104).
  */
 export function decideGapDisposition(
   rows: readonly GapRegisterRow[],
+  contextKey: string,
   input: GapDispositionAppendInput,
 ): GapDispositionDecision {
   try {
-    return decideGapDispositionInner(rows, input);
+    return decideGapDispositionInner(rows, contextKey, input);
   } catch (error) {
     return {
       ok: false,
@@ -425,6 +474,7 @@ export function decideGapDisposition(
 
 function decideGapDispositionInner(
   rows: readonly GapRegisterRow[],
+  contextKey: string,
   input: GapDispositionAppendInput,
 ): GapDispositionDecision {
   if (typeof input.requirementId !== "string" || !isRequirementId(input.requirementId)) {
@@ -449,6 +499,14 @@ function decideGapDispositionInner(
   }
   const payloadIssue = gapDispositionPayloadProblem(input.event, input.payload);
   if (payloadIssue !== null) return { ok: false, problem: `${input.event}: ${payloadIssue}` };
+  if (input.payload["contextKey"] !== contextKey) {
+    return {
+      ok: false,
+      problem:
+        `the disposition names context ${JSON.stringify(input.payload["contextKey"])} but the ` +
+        `register was projected for ${JSON.stringify(contextKey)} — a disposition binds to its own context`,
+    };
+  }
 
   const row = rows.find((r) => r.requirementId === input.requirementId);
   if (row === undefined) {

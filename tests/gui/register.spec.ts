@@ -175,6 +175,9 @@ async function expectTableMatchesLedger(page: Page): Promise<void> {
   for (let i = 0; i < rows.length; i += 1) {
     const row = rows[i]!;
     const tr = trs.nth(i);
+    // The full tuple, exactly (round 1, finding 11: previously the
+    // implementation branch, exact waivable seq, provenance contents, and the
+    // disposition record's seq/event were not asserted).
     await expect(tr).toHaveAttribute("data-requirement-id", row.requirementId);
     await expect(tr).toHaveAttribute("data-disposition", row.disposition);
     await expect(tr).toHaveAttribute("data-implementation", row.tuple.implementation.kind);
@@ -184,12 +187,58 @@ async function expectTableMatchesLedger(page: Page): Promise<void> {
       "data-waivable",
       row.waivableThroughSeq === null ? "false" : "true",
     );
+    await expect(tr).toHaveAttribute(
+      "data-waivable-through-seq",
+      row.waivableThroughSeq === null ? "" : String(row.waivableThroughSeq),
+    );
+    if (row.tuple.implementation.kind === "present-on") {
+      await expect(tr).toHaveAttribute(
+        "data-implementation-branch",
+        row.tuple.implementation.branch,
+      );
+      await expect(tr.locator(".tuple-implementation")).toHaveText(
+        `present-on(${row.tuple.implementation.branch})`,
+      );
+    } else {
+      await expect(tr.locator(".tuple-implementation")).toHaveText(row.tuple.implementation.kind);
+    }
     await expect(tr.locator(".requirement-statement")).toHaveText(row.statement);
+    if (row.assumption !== null) {
+      await expect(tr.locator(".requirement-assumption")).toHaveText(
+        `assumption: ${row.assumption}`,
+      );
+    } else {
+      await expect(tr.locator(".requirement-assumption")).toHaveCount(0);
+    }
     await expect(tr.locator(".tuple-intent")).toHaveText(row.tuple.disposition);
     await expect(tr.locator(".tuple-evidence")).toHaveText(row.tuple.evidence);
-    await expect(tr.locator(".provenance-fact")).toHaveCount(row.provenance.length);
+    // Provenance content, not just count: every fact's seq, kind, and actor.
+    await expect(tr).toHaveAttribute(
+      "data-provenance-seqs",
+      row.provenance.map((f) => f.seq).join(","),
+    );
+    await expect(tr).toHaveAttribute(
+      "data-detector-seqs",
+      row.detectorFindings.map((f) => f.seq).join(","),
+    );
+    const factLines = tr.locator(".provenance-fact");
+    await expect(factLines).toHaveCount(row.provenance.length);
+    for (let f = 0; f < row.provenance.length; f += 1) {
+      const fact = row.provenance[f]!;
+      await expect(factLines.nth(f)).toContainText(`seq ${fact.seq}`);
+      await expect(factLines.nth(f)).toContainText(fact.kind);
+      await expect(factLines.nth(f)).toContainText(fact.actor);
+    }
     await expect(tr.locator(".disposition-value")).toHaveText(row.disposition);
     if (row.dispositionRecord !== null) {
+      await expect(tr).toHaveAttribute(
+        "data-disposition-record-seq",
+        String(row.dispositionRecord.seq),
+      );
+      await expect(tr).toHaveAttribute(
+        "data-disposition-record-event",
+        row.dispositionRecord.event,
+      );
       await expect(tr.locator(".disposition-reason")).toHaveText(row.dispositionRecord.reason);
     }
   }
@@ -379,6 +428,63 @@ test.describe("gap register (seeded daemon)", () => {
     await expect(page.locator("#register-controls")).toBeVisible();
     await expect(rowFor(page, "CAM-DEMO-06")).toHaveCount(1);
     await expectTableMatchesLedger(page);
+  });
+});
+
+test.describe("gap register in a branch context (present-on rows)", () => {
+  test("renders a present-on(branch) tuple and agrees with the ledger", async ({ page }) => {
+    const dir = mkdtempSync(join(tmpdir(), "camino-gui-register-branch-"));
+    const bLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"));
+    const bFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"));
+    const bDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"));
+    const BRANCH: StatusContext = {
+      kind: "branch",
+      branch: "mission/m1",
+      headSha: "a".repeat(40),
+      baseSha: "b".repeat(40),
+    };
+    bLedger.proposeRequirement("CAM-BR-01", { statement: "branch feature", sourceMissionId: "m1" });
+    bLedger.acceptRequirement("CAM-BR-01");
+    // Implementation present on the branch, not verified → present-on(branch).
+    bFacts.recordFact({
+      requirementId: "CAM-BR-01",
+      kind: "implementation-recorded",
+      actor: "camino:merge",
+      payload: { branch: "mission/m1", sha: "a".repeat(40) },
+    });
+    const branchDaemon = await startDaemonServer({
+      token: TOKEN,
+      port: 0,
+      guiRoot: GUI_ROOT,
+      register: new RegisterService({
+        canonLedger: bLedger,
+        canonFacts: bFacts,
+        gapDispositions: bDispositions,
+        contextSource: { current: () => BRANCH },
+      }),
+    });
+    try {
+      await page.goto(`${branchDaemon.url}/#token=${TOKEN}`);
+      await expect(page.locator("#register-controls")).toBeVisible();
+      const row = page.locator('#register-rows tr[data-requirement-id="CAM-BR-01"]');
+      await expect(row).toHaveAttribute("data-implementation", "present-on");
+      await expect(row).toHaveAttribute("data-implementation-branch", "mission/m1");
+      await expect(row.locator(".tuple-implementation")).toHaveText("present-on(mission/m1)");
+      // Full-row agreement against the branch-context projection.
+      const rows = projectGapRegister(
+        bLedger.currentView(),
+        bFacts.read(),
+        bDispositions.read(),
+        BRANCH,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.tuple.implementation).toEqual({ kind: "present-on", branch: "mission/m1" });
+    } finally {
+      await branchDaemon.app.close();
+      bDispositions.close();
+      bFacts.close();
+      bLedger.close();
+    }
   });
 });
 

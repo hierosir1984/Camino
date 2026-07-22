@@ -20,7 +20,7 @@ import { CanonFactsStore } from "./canon-facts.js";
 import { CanonLedgerStore } from "./canon-ledger.js";
 import { caminoHome, ConfigError, daemonPort, guiDistPath } from "./config.js";
 import { GapDispositionsStore } from "./gap-dispositions.js";
-import { STATE_FILES } from "./recovery.js";
+import { closeAll, STATE_FILES } from "./recovery.js";
 import { RegisterService } from "./register-service.js";
 import { startDaemonServer } from "./server.js";
 import { loadOrCreateToken, TokenError } from "./token.js";
@@ -58,11 +58,22 @@ export async function main(): Promise<void> {
   let canonLedger: CanonLedgerStore | undefined;
   let canonFacts: CanonFactsStore | undefined;
   let gapDispositions: GapDispositionsStore | undefined;
+  // Best-effort teardown with deterministic precedence, mirroring
+  // openRecoveredState (round 1, finding 13: a sequential close left later
+  // stores and the writer lock open if an earlier close threw). Every closer
+  // runs; the FIRST failure surfaces after cleanup finished. The lock release
+  // is last and always attempted.
+  let closed = false;
   const closeStores = (): void => {
-    gapDispositions?.close();
-    canonFacts?.close();
-    canonLedger?.close();
-    lock.release();
+    if (closed) return; // the onClose hook and a refusal path can both fire
+    closed = true;
+    const failures = closeAll([
+      () => gapDispositions?.close(),
+      () => canonFacts?.close(),
+      () => canonLedger?.close(),
+      () => lock.release(),
+    ]);
+    if (failures.length > 0) throw failures[0];
   };
   try {
     canonLedger = new CanonLedgerStore(join(stateDir, STATE_FILES.canonLedger), {
@@ -73,8 +84,13 @@ export async function main(): Promise<void> {
       writerLock: lock,
     });
   } catch (error) {
-    closeStores();
-    console.error(`Refusing to start: ${(error as Error).message}`);
+    const message = (error as Error).message;
+    try {
+      closeStores();
+    } catch {
+      // A teardown failure must not mask the original store-open refusal.
+    }
+    console.error(`Refusing to start: ${message}`);
     process.exit(1);
   }
   const register = new RegisterService({
@@ -92,10 +108,18 @@ export async function main(): Promise<void> {
       guiRoot,
       port,
       register,
+      // Stores close whenever the instance closes — signals, /api/shutdown, or
+      // a post-listen failure — via a hook registered BEFORE listen (round 1,
+      // finding 1). No post-listen addHook here; that crashed the daemon.
+      onClose: closeStores,
       logger: true,
     });
   } catch (error) {
-    closeStores();
+    try {
+      closeStores();
+    } catch {
+      // A teardown failure must not mask the original listen refusal.
+    }
     if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
       console.error(
         `Refusing to start: port ${port} is already in use ` +
@@ -113,9 +137,6 @@ export async function main(): Promise<void> {
       : `GUI token read from ${tokenLoad.path}`,
   );
 
-  daemon.app.addHook("onClose", async () => {
-    closeStores();
-  });
   const stop = (): void => {
     void daemon.app.close();
   };

@@ -225,7 +225,7 @@ export function openRecoveredState(
 }
 
 /** Run every closer, collecting failures instead of aborting the chain. */
-function closeAll(closers: ReadonlyArray<() => void>): unknown[] {
+export function closeAll(closers: ReadonlyArray<() => void>): unknown[] {
   const failures: unknown[] = [];
   for (const closer of closers) {
     try {

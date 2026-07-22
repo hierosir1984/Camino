@@ -19,12 +19,22 @@
  *     concurrency check (`asOf`) so an action taken against a stale
  *     render is refused instead of silently binding to newer state.
  *
- * What remains is agreement-at-a-sequence: a GET returns the register AT
- * its `asOf` sequence triple; the ledger may advance after the response
- * is written (the GUI re-reads; v1 refresh, WP-123 polling). "Ledger and
- * GUI never disagree" means the GUI never renders anything but a ledger
- * projection, at a named point in the logs — asserted end-to-end by the
- * Playwright agreement suite (register.spec.ts).
+ * WHAT CAM-CORE-10 DELIVERS HERE, STATED PRECISELY (round 1, finding 10):
+ * SNAPSHOT PROVENANCE, not live real-time agreement. The GUI never renders
+ * anything but a faithful ledger projection, taken at a NAMED point in the
+ * logs (`asOf` = the three store sequences plus the reader context) and
+ * labeled with those sequences in the UI. It is NOT a live mirror: after a
+ * GET, an out-of-band ledger write is not reflected until the next read (a
+ * mutation response, a refused action's re-read, or a page reload). Continuous
+ * freshness — polling so a background change appears within one interval — is
+ * WP-123's job (CAM-CORE-03), explicitly out of scope here. So "ledger and GUI
+ * never disagree" holds in the CAM-CORE-10 sense the requirement means: the
+ * GUI never derives requirement state from anything but the ledger (never repo
+ * canon text, never a client re-computation), and every render is a projection
+ * the daemon itself produced at a stated sequence. The Playwright agreement
+ * suite (register.spec.ts) asserts that equality field-by-field after every
+ * mutation; the out-of-band case is asserted after the reload that the v1
+ * refresh model requires.
  *
  * CONTEXT: the register renders the MAIN context (the user's delivery
  * view; branch contexts are worker context-pack territory). The daemon
@@ -39,6 +49,7 @@ import {
   decideGapDisposition,
   projectGapRegister,
   singleLineTextProblem,
+  statusContextProblem,
 } from "@camino/core";
 import type { GapRegisterRow } from "@camino/core";
 import { GAP_DISPOSITION_EVENTS } from "@camino/shared";
@@ -62,11 +73,20 @@ export interface RegisterContextSource {
   current(): StatusContext | null;
 }
 
-/** The store sequence triple a snapshot was computed at (optimistic-concurrency token). */
+/**
+ * The state a snapshot was computed at (optimistic-concurrency token). The
+ * three store sequences catch a ledger/fact/disposition write; `context`
+ * catches a repository-context change that moves the tuples WITHOUT any
+ * store write (round 1, finding 6: an evidence axis flips verified-live →
+ * stale purely because the reader's head advanced, and a stale-tab action
+ * must not bind to the tuple the user never saw). The client echoes this
+ * whole token back; `recordDisposition`/`descope` refuse a mismatch.
+ */
 export interface RegisterAsOf {
   readonly ledgerSeq: number;
   readonly factsSeq: number;
   readonly dispositionsSeq: number;
+  readonly context: StatusContext;
 }
 
 export type RegisterSnapshot =
@@ -139,6 +159,21 @@ function isRegisterAction(value: unknown): value is RegisterAction {
   return typeof value === "string" && (REGISTER_ACTIONS as readonly string[]).includes(value);
 }
 
+/** The context key the projection uses ("main" or the branch name). */
+function contextKeyOf(context: StatusContext): string {
+  return context.kind === "branch" ? context.branch : "main";
+}
+
+/** Structural equality over the closed StatusContext shape (asOf comparison). */
+function contextEquals(a: StatusContext, b: StatusContext): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "main" && b.kind === "main") return a.headSha === b.headSha;
+  if (a.kind === "branch" && b.kind === "branch") {
+    return a.branch === b.branch && a.headSha === b.headSha && a.baseSha === b.baseSha;
+  }
+  return false;
+}
+
 export class RegisterService {
   readonly #deps: RegisterServiceDeps;
 
@@ -161,6 +196,7 @@ export class RegisterService {
         ledgerSeq: this.#deps.canonLedger.lastSeq,
         factsSeq: facts.at(-1)?.seq ?? 0,
         dispositionsSeq: this.#deps.gapDispositions.lastSeq,
+        context,
       },
     };
   }
@@ -195,7 +231,15 @@ export class RegisterService {
       throw new RegisterActionError("unknown-row", `${requirementId} has no live gap-register row`);
     }
     const event = ACTION_TO_EVENT[input.action];
-    const payload: Record<string, unknown> = { tuple: row.tuple, reason: input.reason };
+    const contextKey = contextKeyOf(snapshot.context);
+    const payload: Record<string, unknown> = {
+      tuple: row.tuple,
+      // The context is taken from the service's own projection, not the
+      // client — a disposition binds to the register context it was taken
+      // in (round 1, finding 7), never leaking onto another context.
+      contextKey,
+      reason: input.reason,
+    };
     if (event === "gap-false-positive-waived") {
       // The waiver binds to what the CLIENT saw (waivedThroughSeq), and
       // the decision layer refuses it unless that still names the row's
@@ -203,7 +247,7 @@ export class RegisterService {
       // click can never be silently waived.
       payload["waivedThroughSeq"] = input.waivedThroughSeq;
     }
-    const decision = decideGapDisposition(snapshot.rows, {
+    const decision = decideGapDisposition(snapshot.rows, contextKey, {
       requirementId,
       event,
       actor: DAVID_ACTOR,
@@ -253,14 +297,21 @@ export class RegisterService {
       typeof presented === "object" &&
       Number.isSafeInteger(presented.ledgerSeq) &&
       Number.isSafeInteger(presented.factsSeq) &&
-      Number.isSafeInteger(presented.dispositionsSeq);
+      Number.isSafeInteger(presented.dispositionsSeq) &&
+      presented.context !== null &&
+      typeof presented.context === "object" &&
+      statusContextProblem(presented.context) === null;
     if (!wellFormed) {
-      throw new RegisterActionError("malformed", "asOf must carry the snapshot's sequence triple");
+      throw new RegisterActionError(
+        "malformed",
+        "asOf must carry the snapshot's sequence triple and context",
+      );
     }
     if (
       presented.ledgerSeq !== current.ledgerSeq ||
       presented.factsSeq !== current.factsSeq ||
-      presented.dispositionsSeq !== current.dispositionsSeq
+      presented.dispositionsSeq !== current.dispositionsSeq ||
+      !contextEquals(presented.context, current.context)
     ) {
       throw new RegisterActionError(
         "register-advanced",
