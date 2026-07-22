@@ -323,6 +323,16 @@ describe("replay timestamp semantics (round-6 finding 2)", () => {
 });
 
 describe("writer lock and clock independence (round-7 findings 2, 3)", () => {
+  it("refuses construction without an explicit runtime lock decision (round-9 finding 1)", () => {
+    type LooseCtor = new (path: string, options?: unknown) => unknown;
+    const Loose = QuotaWindowTracker as unknown as LooseCtor;
+    expect(() => new Loose(tempPath())).toThrow(/writerLock decision/);
+    expect(() => new Loose(tempPath(), {})).toThrow(/writerLock decision/);
+    expect(() => new Loose(tempPath(), { writerLock: undefined })).toThrow(/or explicitly null/);
+    expect(() => new Loose(tempPath(), { writerLock: {} })).toThrow(/assertHeld/);
+    expect(() => new Loose(tempPath(), { writerLock: "held" })).toThrow(/assertHeld/);
+  });
+
   it("asserts the daemon writer lock on every append when wired", () => {
     const calls: string[] = [];
     const tracker = new QuotaWindowTracker(tempPath(), {

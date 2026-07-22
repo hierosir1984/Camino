@@ -264,8 +264,23 @@ export class QuotaWindowTracker {
   readonly #insert: Database.Statement;
 
   constructor(path: string, options: QuotaWindowTrackerOptions) {
+    // The lock DECISION is enforced at runtime, not just in the type
+    // (round-9 review finding 1: TypeScript erases, and a JS caller could
+    // omit the property): only a lock-shaped value or an EXPLICIT null —
+    // the named test-context opt-out — counts as a decision.
+    if (options === null || typeof options !== "object" || !("writerLock" in options)) {
+      throw new TypeError(
+        "QuotaWindowTracker requires a writerLock decision: pass the daemon's held writer lock, or explicitly null for a test context",
+      );
+    }
+    const lock = options.writerLock;
+    if (lock !== null && (typeof lock !== "object" || typeof lock.assertHeld !== "function")) {
+      throw new TypeError(
+        "writerLock must be the daemon's held writer lock ({ assertHeld }) or explicitly null",
+      );
+    }
     this.#now = options.now ?? (() => new Date());
-    this.#writerLock = options.writerLock ?? undefined;
+    this.#writerLock = lock ?? undefined;
     this.#shapes = options.windowShapes ?? ((family) => CAPABILITY_SEED[family].quotaWindows.value);
     this.#db = new Database(path);
     // Every refusal path closes the native handle (WP-104 store pattern).

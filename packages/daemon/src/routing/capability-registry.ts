@@ -2,12 +2,16 @@
  * Capability registry assembly (WP-106, CAM-ROUTE-01): compose the static,
  * source-linked seed (capability-seed.ts) with LIVE state —
  *
- *   - enablement, taken from the dispatch registry's gated AdapterSpec
- *     objects (CLI presence + recorded sanctioned-path; WP-105). The
- *     registry never re-derives the gate: the specs from buildRegistry()
- *     ARE the decision, reason included, so a flipped attestation or a
- *     missing CLI shows up here without a second code path to keep in
- *     sync.
+ *   - enablement, composed from the dispatch registry's gated AdapterSpec
+ *     objects (CLI presence + recorded sanctioned-path; WP-105) and ONE
+ *     live xAI attestation evaluation per assembly — the gate's own
+ *     evaluator (xaiSanctioned), reused rather than reimplemented, so
+ *     there is no second parser to keep in sync. The live read and the
+ *     sanctioned-path attribute derive from the same snapshot: a record
+ *     withdrawn after gating supersedes a stale enabled spec, and a
+ *     record accepted after a refusing gate stays disabled (dispatch
+ *     would refuse those spec objects) with the rebuild obligation
+ *     stated on the structured cause (rounds 5–9).
  *   - window consumption estimates, from the QuotaWindowTracker when one
  *     is supplied (adapter rate-limit signals, ledger-refined capacity —
  *     registry item 13).
