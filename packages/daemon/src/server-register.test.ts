@@ -53,15 +53,12 @@ async function api(
 
 beforeEach(async () => {
   const dir = mkdtempSync(join(tmpdir(), "camino-register-http-"));
+  // One shared fixed clock: an honest waiver co-timestamped with its finding
+  // must still bind (round 3, finding 4 — the recency guard is "no earlier than").
   const now = () => new Date("2026-07-03T00:00:00.000Z");
-  // Disposition store clock is strictly later than the fact store's, so a
-  // waiver's recordedAt exceeds its finding's (round 2, finding 3 recency guard).
-  const laterNow = () => new Date("2026-07-04T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });
-  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), {
-    now: laterNow,
-  });
+  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), { now });
   canonLedger.proposeRequirement(R1, { statement: "demo behavior one", sourceMissionId: "m1" });
   canonLedger.acceptRequirement(R1);
   canonLedger.proposeRequirement(R2, { statement: "demo behavior two", sourceMissionId: "m1" });

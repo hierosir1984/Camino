@@ -27,6 +27,23 @@
  * (register-service.ts) decides it with `decideGapDisposition` BEFORE
  * appending, and the projection re-judges applicability on every read
  * (basis binding), so a row whose basis no longer holds governs nothing.
+ *
+ * PROTOTYPE-POLLUTION BOUNDARY, named (round 3, findings 1/3/6). The
+ * envelope and read filter here read OWN properties only, so a caller's
+ * object cannot borrow fields from a polluted `Object.prototype`. But
+ * `Object.prototype.toJSON` pollution (which `JSON.stringify` honors) and
+ * every deeper nested read cannot ALL be closed by own-property checks —
+ * and chasing them is unbounded. This is deliberate: polluting the
+ * daemon's own global `Object.prototype` requires executing code INSIDE
+ * the daemon process. That is not reachable from the remote surface —
+ * `JSON.parse` of a request body does not mutate a prototype (a
+ * `"__proto__"` key becomes an own property, not a prototype change) — so
+ * it is the same single-OS-user in-process boundary the token dir
+ * (WP-102) and the intent ledger's in-process-liar (CAM-CANON-01) rest
+ * on: a party that can pollute the daemon's globals can equally call this
+ * store directly, read the token, or replace the code. The own-property
+ * reads are defense-in-depth against the accidental, not a security
+ * boundary against an in-process attacker who has already won.
  */
 import Database from "better-sqlite3";
 import { GAP_DISPOSITION_EVENTS } from "@camino/shared";
@@ -312,13 +329,18 @@ export class GapDispositionsStore {
   read(filter: GapDispositionReadFilter = {}): GapDispositionRecord[] {
     const clauses: string[] = [];
     const params: Record<string, unknown> = {};
-    if (filter.requirementId !== undefined) {
+    // Own-property reads (round 3, finding 6): a polluted Object.prototype must
+    // not smuggle a `requirementId`/`afterSeq` onto the default `{}` filter and
+    // silently narrow a full-log read (which snapshot() relies on).
+    const requirementId = Object.hasOwn(filter, "requirementId") ? filter.requirementId : undefined;
+    const afterSeq = Object.hasOwn(filter, "afterSeq") ? filter.afterSeq : undefined;
+    if (requirementId !== undefined) {
       clauses.push("requirement_id = @requirementId");
-      params["requirementId"] = filter.requirementId;
+      params["requirementId"] = requirementId;
     }
-    if (filter.afterSeq !== undefined) {
+    if (afterSeq !== undefined) {
       clauses.push("seq > @afterSeq");
-      params["afterSeq"] = filter.afterSeq;
+      params["afterSeq"] = afterSeq;
     }
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.#db

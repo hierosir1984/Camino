@@ -292,15 +292,28 @@ export class RegisterService {
   }
 
   #assertAsOf(presented: RegisterAsOf, current: RegisterAsOf): void {
+    // Own-property reads of the asOf sub-fields (round 3, finding 3): the outer
+    // body field is already own-read at the HTTP layer, but its nested sequence
+    // triple / context must not inherit from a polluted prototype either. A
+    // missing own field reads as undefined and fails `wellFormed`. (Deeper
+    // pollution of the daemon's global prototypes is the named in-process
+    // boundary — see gap-dispositions.ts.)
+    const own = <T>(value: unknown, key: string): T | undefined =>
+      value !== null && typeof value === "object" && Object.hasOwn(value, key)
+        ? ((value as Record<string, unknown>)[key] as T)
+        : undefined;
+    const ledgerSeq = own<number>(presented, "ledgerSeq");
+    const factsSeq = own<number>(presented, "factsSeq");
+    const dispositionsSeq = own<number>(presented, "dispositionsSeq");
+    const context = own<StatusContext>(presented, "context");
     const wellFormed =
-      presented !== null &&
-      typeof presented === "object" &&
-      Number.isSafeInteger(presented.ledgerSeq) &&
-      Number.isSafeInteger(presented.factsSeq) &&
-      Number.isSafeInteger(presented.dispositionsSeq) &&
-      presented.context !== null &&
-      typeof presented.context === "object" &&
-      statusContextProblem(presented.context) === null;
+      Number.isSafeInteger(ledgerSeq) &&
+      Number.isSafeInteger(factsSeq) &&
+      Number.isSafeInteger(dispositionsSeq) &&
+      context !== undefined &&
+      context !== null &&
+      typeof context === "object" &&
+      statusContextProblem(context) === null;
     if (!wellFormed) {
       throw new RegisterActionError(
         "malformed",
@@ -308,10 +321,10 @@ export class RegisterService {
       );
     }
     if (
-      presented.ledgerSeq !== current.ledgerSeq ||
-      presented.factsSeq !== current.factsSeq ||
-      presented.dispositionsSeq !== current.dispositionsSeq ||
-      !contextEquals(presented.context, current.context)
+      ledgerSeq !== current.ledgerSeq ||
+      factsSeq !== current.factsSeq ||
+      dispositionsSeq !== current.dispositionsSeq ||
+      !contextEquals(context, current.context)
     ) {
       throw new RegisterActionError(
         "register-advanced",

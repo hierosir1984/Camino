@@ -176,7 +176,13 @@ a sketch, not a complete design:
    macOS/WebKit discrepancy (round 1, finding 12) is exactly why.
 3. **Token-rotation lifecycle** (see §4.4): rotate only after the writer lock is held; define
    what a still-open browser tab from the prior launch sees (a 401 → re-handoff), and how the
-   printed/opened URL carries the new token.
+   printed/opened URL carries the new token. **Also unspecified (round 3, finding 9): the
+   atomic-replacement / crash-recovery protocol for the token file itself** — a rotation that
+   writes the new token but crashes before persisting (or is interrupted between unlink and
+   rename) must leave a well-formed 0600 token on disk, never a truncated or absent one, or the
+   next launch fails to authenticate its own GUI. Write-to-temp-then-rename within the state
+   dir, with the 0600 mode set before the rename, is the likely shape; it must be specified and
+   tested.
 4. **Legacy-origin eviction remains a named residual** (§5): none of the above evicts a worker
    already planted on a stale origin; it only keeps that worker off the current session.
 
@@ -206,7 +212,8 @@ new-origin exposure). They are the scope of the implementing WP that §6's rulin
 
 ## 6. Placement — David's ruling requested
 
-The design above is complete and self-contained. Where should the implementation land?
+The DIRECTION above is settled; the mechanics are not (see §7 — this is a sketch, not a
+complete design). Where should the implementation, and the remaining design work, land?
 
 - **Option B (recommended): a dedicated micro-WP** immediately after WP-122 merges, before
   WP-123 grows the GUI. Single-concern diff over `config.ts`/`server.ts`/`main.ts` + the

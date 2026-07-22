@@ -332,31 +332,49 @@ interface DispositionBasis {
  * gap state neither governs nor erases an earlier judgment whose state
  * returned.
  *
+ * DECISION PENDING (David) — the "state returned" reapplication above: today a
+ * non-waiver disposition (fix-queued / disputed) re-applies if a gap's tuple
+ * changes and later returns to the IDENTICAL tuple+context, with no fresh user
+ * action (waivers are immune — they bind to a detector-finding seq that only
+ * climbs). This is a deliberate v1 SEMANTICS CHOICE, not a settled invariant:
+ * falsification rounds 2 and 3 flagged that an old judgment can relabel a new
+ * gap episode. The recorded recommendation is to REQUIRE RE-TRIAGE (a
+ * disposition dies the first time its tuple changes and never resurrects — a
+ * merged fact+disposition timeline fold). Pending David's ruling, the current
+ * reapplication behavior is what `gap-register.test.ts` pins; if he chooses
+ * re-triage, that test and this fold change together.
+ *
  * An event binds to THREE things, not one:
  *  - the status tuple it recorded (the visible gap state);
  *  - the CONTEXT it was taken in (round 1, finding 7): a `main` judgment
  *    never governs a branch row that happens to share the tuple;
  *  - for a waiver, the exact detector findings it covers AND their recency
- *    (round 1, finding 5; round 2, finding 3): the waiver must name the row's
- *    current waivable-through seq, and it must have been recorded STRICTLY
- *    AFTER the finding at that seq — a waiver at or before the finding's
- *    recordedAt is rejected, so a waiver pre-seeded (via the raw store) against
- *    a finding that does not yet exist cannot spring to life, even when the
- *    pre-seed and the future finding carry the same millisecond timestamp
- *    (round 2 falsified the earlier `<`-only guard with equal timestamps from
- *    two independent stores' injectable clocks).
+ *    (round 1, finding 5; round 2, finding 3; round 3, finding 4): the waiver
+ *    must name the row's current waivable-through seq, and it must have been
+ *    recorded NO EARLIER THAN the finding at that seq. A waiver recorded before
+ *    that finding is inert, so a waiver pre-seeded (via the raw store) against a
+ *    finding that does not yet exist cannot spring to life when a future finding
+ *    lands at the guessed seq.
  *
- *    BOUNDARY, stated: this makes the HONEST path pre-seed-proof — a waiver is
- *    only ever recorded by the register service, which decides against the LIVE
- *    projection, so it cannot name a finding that does not yet exist; and the
- *    strict-after guard additionally defeats a naive direct-`append()` pre-seed.
- *    What it does NOT defeat is a fully-adversarial in-process writer that
- *    controls the injectable clock to stamp its pre-seed AFTER a finding it also
- *    authored — that is the same single-OS-user in-process-liar boundary the
- *    intent ledger names (CAM-CANON-01), not a property a single log can prove.
- *    Millisecond timestamps across two logs are a recency heuristic, not a
- *    causal-ordering primitive; a shared ordered log would be, and is the
- *    documented path if this boundary ever needs to be closed.
+ *    BOUNDARY, stated precisely (this is where three rounds converged): the
+ *    HONEST path is pre-seed-proof by CONSTRUCTION, independent of timestamps —
+ *    a waiver is only ever recorded by the register service, which decides
+ *    against the LIVE projection, so the finding it names already exists and is
+ *    waivable at record time; the service can never name a finding that does not
+ *    yet exist. The recordedAt guard is the defense for the RAW `append()` path
+ *    (which bypasses the service): it rejects a pre-seed stamped before its
+ *    finding. What no single-log timestamp can decide is a raw-`append()` caller
+ *    that stamps its pre-seed at the SAME millisecond as a finding it also
+ *    authored — two independent stores' clocks can collide, so `recordedAt` is a
+ *    recency heuristic, not a causal-ordering primitive. That residual is the
+ *    same single-OS-user in-process-liar boundary the intent ledger names
+ *    (CAM-CANON-01): a component that can forge canon facts AND drive the raw
+ *    disposition store is already inside the process. Closing it fully needs a
+ *    shared ordered log, the documented path if it ever must be. The guard is
+ *    "no earlier than" (not "strictly after") deliberately: strictly-after would
+ *    reject a LEGITIMATE service waiver co-timestamped with its finding —
+ *    persisting a successful-but-inert waiver (round 3, finding 4) — for no
+ *    security gain, since the service path cannot pre-seed at all.
  */
 function foldDisposition(
   events: readonly GapDispositionRecord[],
@@ -370,8 +388,8 @@ function foldDisposition(
     if (event.event === "gap-false-positive-waived") {
       if (event.payload["waivedThroughSeq"] !== basis.waivableThroughSeq) continue;
       if (basis.waivableThroughAt === null) continue;
-      // Strictly after: reject a waiver recorded at OR before the finding.
-      if (Date.parse(event.recordedAt) <= Date.parse(basis.waivableThroughAt)) continue;
+      // No earlier than: reject a waiver recorded strictly BEFORE the finding.
+      if (Date.parse(event.recordedAt) < Date.parse(basis.waivableThroughAt)) continue;
     }
     disposition = EVENT_TO_DISPOSITION[event.event];
     record =

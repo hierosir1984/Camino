@@ -210,4 +210,19 @@ describe("own-property envelope (round 2, finding 4)", () => {
       delete proto["payload"];
     }
   });
+
+  it("read() ignores an inherited filter (round 3, finding 6)", () => {
+    const s = open();
+    s.append({ requirementId: "CAM-DEMO-01", event: "gap-fix-queued", payload: payload() });
+    s.append({ requirementId: "CAM-DEMO-02", event: "gap-disputed", payload: payload("d") });
+    const proto = Object.prototype as Record<string, unknown>;
+    proto["requirementId"] = "CAM-DEMO-01"; // a polluted default filter would hide row 2
+    try {
+      // read() with the default {} filter must return the FULL log, not a
+      // prototype-narrowed subset.
+      expect(s.read().map((r) => r.requirementId)).toEqual(["CAM-DEMO-01", "CAM-DEMO-02"]);
+    } finally {
+      delete proto["requirementId"];
+    }
+  });
 });

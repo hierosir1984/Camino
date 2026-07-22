@@ -202,8 +202,12 @@ async function expectTableMatchesLedger(
         `present-on(${row.tuple.implementation.branch})`,
       );
     } else {
+      // No stray branch attribute on a non-present-on row (round 3, finding 8).
+      await expect(tr).not.toHaveAttribute("data-implementation-branch", /.*/);
       await expect(tr.locator(".tuple-implementation")).toHaveText(row.tuple.implementation.kind);
     }
+    // The visible requirement id, not just the data attribute (round 3, finding 8).
+    await expect(tr.locator(".requirement-id")).toHaveText(row.requirementId);
     await expect(tr.locator(".requirement-statement")).toHaveText(row.statement);
     if (row.assumption !== null) {
       await expect(tr.locator(".requirement-assumption")).toHaveText(
@@ -225,6 +229,12 @@ async function expectTableMatchesLedger(
     );
     const factLines = tr.locator(".provenance-fact");
     await expect(factLines).toHaveCount(row.provenance.length);
+    if (row.provenance.length === 0) {
+      // The empty-provenance placeholder, exactly (round 3, finding 8).
+      await expect(tr.locator(".provenance-empty")).toHaveText("no recorded facts in this context");
+    } else {
+      await expect(tr.locator(".provenance-empty")).toHaveCount(0);
+    }
     for (let f = 0; f < row.provenance.length; f += 1) {
       // The WHOLE rendered line, exactly (round 2, finding 9: asserting only
       // seq/kind/actor let a corrupted reason/outcome pass). Mirrors app.js's
@@ -282,6 +292,13 @@ test.describe("gap register (seeded daemon)", () => {
     // Provenance is visible: the detector finding is cited on its row.
     await expect(rowFor(page, R_DETECTED).locator(".provenance-fact")).toContainText([/todo-scan/]);
     await expectTableMatchesLedger(page);
+    // The count line reports the visible/total counts AND the exact asOf
+    // sequences (round 3, finding 8): a stale/corrupted sequence must fail here.
+    const total = projected().length;
+    await expect(page.locator("#register-count")).toHaveText(
+      `${total} of ${total} register rows shown (ledger seq ${ledger.lastSeq}, ` +
+        `facts seq ${facts.read().at(-1)?.seq ?? 0}, dispositions seq ${dispositions.lastSeq})`,
+    );
   });
 
   test("filters actually filter (asserted against independent expectations)", async ({ page }) => {

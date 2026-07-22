@@ -147,6 +147,19 @@ async function actOnRow(path, body) {
     renderRegister();
     message("");
   } catch (error) {
+    if (error.status === 403) {
+      // A daemon restart rotates the per-process CSRF token, so a held token is
+      // rejected with 403 (round 3, finding 7). Re-fetch it and reload the
+      // register once, so an open tab recovers without a manual page reload.
+      try {
+        csrfToken = (await api("/api/csrf")).csrfToken;
+        await loadRegister();
+        message("Reconnected to the daemon — re-try the action.");
+        return;
+      } catch {
+        // Fall through to surfacing the original error below.
+      }
+    }
     if (error.status === 409) {
       // The register advanced or the action was refused: re-read so the
       // table shows the current ledger projection, then surface the reason.

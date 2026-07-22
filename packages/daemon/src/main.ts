@@ -67,16 +67,21 @@ export async function main(): Promise<void> {
   // runs; the FIRST failure surfaces after cleanup finished. The lock release
   // is last and always attempted.
   let closed = false;
-  const closeStores = (): void => {
-    if (closed) return; // the onClose hook and a refusal path can both fire
+  let teardownFailures: unknown[] = [];
+  // Returns the failures (does not throw): the caller decides what an unclean
+  // teardown means. The onClose hook records them so a stop signal can exit
+  // NON-ZERO (round 3, finding 5: the hook wrapper swallows a throw, so a
+  // resolved close() must still surface teardown failure through this record).
+  const closeStores = (): unknown[] => {
+    if (closed) return teardownFailures; // the onClose hook and a refusal path can both fire
     closed = true;
-    const failures = closeAll([
+    teardownFailures = closeAll([
       () => gapDispositions?.close(),
       () => canonFacts?.close(),
       () => canonLedger?.close(),
       () => lock.release(),
     ]);
-    if (failures.length > 0) throw failures[0];
+    return teardownFailures;
   };
   try {
     canonLedger = new CanonLedgerStore(join(stateDir, STATE_FILES.canonLedger), {
@@ -88,14 +93,11 @@ export async function main(): Promise<void> {
     });
   } catch (error) {
     const message = (error as Error).message;
-    try {
-      closeStores();
-    } catch {
-      // A teardown failure must not mask the original store-open refusal.
-    }
+    closeStores();
     console.error(`Refusing to start: ${message}`);
     process.exit(1);
   }
+
   const register = new RegisterService({
     canonLedger,
     canonFacts,
@@ -104,50 +106,22 @@ export async function main(): Promise<void> {
     contextSource: { current: () => null },
   });
 
-  let daemon;
-  try {
-    daemon = await startDaemonServer({
-      token: tokenLoad.token,
-      guiRoot,
-      port,
-      register,
-      // Stores close whenever the instance closes — signals, /api/shutdown, or
-      // a post-listen failure — via a hook registered BEFORE listen (round 1,
-      // finding 1). No post-listen addHook here; that crashed the daemon.
-      onClose: closeStores,
-      logger: true,
-    });
-  } catch (error) {
-    try {
-      closeStores();
-    } catch {
-      // A teardown failure must not mask the original listen refusal.
-    }
-    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
-      console.error(
-        `Refusing to start: port ${port} is already in use ` +
-          `(another daemon instance? — set CAMINO_PORT to use a different port).`,
-      );
-      process.exit(1);
-    }
-    throw error;
-  }
-
-  // Install the shutdown handlers BEFORE advertising readiness (round 2,
-  // finding 1): a SIGTERM arriving between the "listening" line and the handler
-  // registration would otherwise hit the default action and kill the daemon
-  // ungracefully. Registered here — after the instance exists, before the user
-  // is told it is up — so every signal from the moment readiness is announced
-  // is handled.
+  // Install the shutdown handlers BEFORE binding the listener (round 3, finding
+  // 2): startDaemonServer awaits listen(), and a SIGTERM arriving after the
+  // socket binds but before the handlers existed would take the default action
+  // and kill the daemon ungracefully. Registered here — before startDaemonServer
+  // — so every signal from process start onward is handled. Until the server is
+  // listening, `daemon` is undefined and a stop just releases the stores + lock
+  // and exits; afterwards it closes the instance (whose onClose hook releases
+  // them).
   //
-  // On a stop signal: close the instance (its onClose hook releases the stores +
-  // writer lock) and exit. Two portability guards, learned on CI: (1) relying on
-  // the event loop draining after close() is not portable — on Linux a lingering
-  // handle kept the process alive until the default signal action killed it — so
-  // we exit explicitly; (2) close() itself can hang waiting on a connection to
-  // drain, so a bounded force-exit timer guarantees a daemon told to stop always
-  // stops. The forced path exits NON-ZERO — an unclean shutdown must not report
-  // itself as clean (round 2, finding 1).
+  // The forced-exit path (a hung close) exits NON-ZERO, and a resolved close
+  // whose store teardown FAILED also exits non-zero (round 3, finding 5) — an
+  // unclean shutdown must not report itself as clean. close() itself can hang
+  // waiting on a connection to drain, so the bounded timer guarantees a daemon
+  // told to stop always stops (relying on the loop draining after close is not
+  // portable — round 2, finding 1).
+  let daemon: Awaited<ReturnType<typeof startDaemonServer>> | undefined;
   let stopping = false;
   const stop = (): void => {
     if (stopping) return;
@@ -162,8 +136,14 @@ export async function main(): Promise<void> {
       clearTimeout(forceExit);
       process.exit(code);
     };
+    if (daemon === undefined) {
+      // Signalled before the listener bound: nothing to close but the stores.
+      const failures = closeStores();
+      done(failures.length > 0 ? 1 : 0);
+      return;
+    }
     daemon.app.close().then(
-      () => done(0),
+      () => done(teardownFailures.length > 0 ? 1 : 0),
       (error) => {
         console.error(`Error during shutdown: ${(error as Error).message}`);
         done(1);
@@ -172,6 +152,30 @@ export async function main(): Promise<void> {
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+
+  try {
+    daemon = await startDaemonServer({
+      token: tokenLoad.token,
+      guiRoot,
+      port,
+      register,
+      // Stores close whenever the instance closes — signals, /api/shutdown, or
+      // a post-listen failure — via a hook registered BEFORE listen (round 1,
+      // finding 1). No post-listen addHook here; that crashed the daemon.
+      onClose: () => void closeStores(),
+      logger: true,
+    });
+  } catch (error) {
+    closeStores();
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      console.error(
+        `Refusing to start: port ${port} is already in use ` +
+          `(another daemon instance? — set CAMINO_PORT to use a different port).`,
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
 
   console.log(`Camino daemon listening at ${daemon.url}/`);
   console.log(

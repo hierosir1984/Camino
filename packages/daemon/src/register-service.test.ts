@@ -35,17 +35,16 @@ let service: RegisterService;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "camino-register-"));
+  // One shared, FIXED clock across every store, deliberately (round 3, finding
+  // 4): the fact store and the disposition store stamp the SAME millisecond, so
+  // an honest service-recorded waiver is co-timestamped with its finding and
+  // MUST still bind (the recency guard is "no earlier than", and the service
+  // decided against the live projection). A strictly-after guard would leave
+  // this waiver persisted-but-inert; this fixture would catch that regression.
   const now = () => new Date("2026-07-03T00:00:00.000Z");
-  // Dispositions are recorded by the user AFTER a finding renders, so their
-  // store's clock is strictly later — a waiver's recordedAt must exceed the
-  // finding's for the recency guard (round 2, finding 3). Real deployments get
-  // this from wall-clock time; the fixtures make it explicit.
-  const laterNow = () => new Date("2026-07-04T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });
-  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), {
-    now: laterNow,
-  });
+  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), { now });
   context = MAIN;
   service = new RegisterService({
     canonLedger,

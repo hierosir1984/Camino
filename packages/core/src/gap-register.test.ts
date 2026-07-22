@@ -459,6 +459,10 @@ describe("disposition fold (basis binding: dispositions recompute like everythin
   });
 
   it("recomputes to open when a new fact changes the tuple, and re-applies when the state returns", () => {
+    // NOTE: the re-application on identical return is a v1 SEMANTICS CHOICE
+    // pending David's ruling (see foldDisposition's "DECISION PENDING" note).
+    // The recommendation is re-triage (no resurrection); if adopted, this
+    // final expectation flips to "open" and the fold changes with it.
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
     const dispositions = new DispositionLog();
     dispositions.add(R1, "gap-fix-queued", { tuple: openTuple(), reason: "queued" });
@@ -556,20 +560,24 @@ describe("round-1 falsification regressions", () => {
     expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
   });
 
-  it("F5 (round 2): a waiver at the SAME instant as the finding is inert (strictly-after)", () => {
+  it("F5 (round 3): an honest waiver at the SAME instant as the finding DOES bind (no-earlier-than)", () => {
+    // A service-recorded waiver is co-timestamped with its finding when both
+    // stores share a clock. The guard is "no earlier than", not "strictly
+    // after": the honest path decided against the live projection, so a
+    // same-instant waiver must bind — a strictly-after guard would persist it
+    // as a successful-but-inert row (round 3, finding 4). The raw-store
+    // BEFORE-the-finding pre-seed stays inert (asserted separately above).
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
     const facts = new FactLog(); // records at 2026-07-02T00:00:00.000Z
     facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "hit" });
     const dispositions = new DispositionLog();
-    // Equal timestamp — two independent logs can produce the same millisecond;
-    // it is not a causal ordering, so the waiver must not bind.
     dispositions.add(
       R1,
       "gap-false-positive-waived",
-      { tuple: suspectedTuple(), reason: "co-timestamped pre-seed", waivedThroughSeq: 1 },
+      { tuple: suspectedTuple(), reason: "co-timestamped honest waiver", waivedThroughSeq: 1 },
       "2026-07-02T00:00:00.000Z",
     );
-    expect(project(view, facts, dispositions)[0]!.disposition).toBe("open");
+    expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
   });
 
   it("F7: a disposition recorded in one context never governs another (main ↛ branch)", () => {
