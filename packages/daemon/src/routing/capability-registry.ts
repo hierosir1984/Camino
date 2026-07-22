@@ -62,7 +62,11 @@ export interface BuildCapabilityRegistryOptions {
   readonly now?: () => Date;
 }
 
-function enablementOf(family: ProviderFamily, adapters: readonly AdapterSpec[]): EnablementView {
+function enablementOf(
+  family: ProviderFamily,
+  adapters: readonly AdapterSpec[],
+  liveXai: { accepted: boolean; reason?: string },
+): EnablementView {
   const harness = CAPABILITY_SEED[family].harness;
   const spec = adapters.find((candidate) => {
     // A hostile/broken spec must not crash registry assembly; unreadable
@@ -93,12 +97,28 @@ function enablementOf(family: ProviderFamily, adapters: readonly AdapterSpec[]):
       reason: `${harness} spec lacks registry provenance — obtain adapters from buildRegistry() (CAM-EXEC-01 gate)`,
     };
   }
+  // ONE evaluation snapshot for xAI (round-7 review finding 1): the same
+  // live attestation read that produces the sanctioned-path attribute also
+  // governs enablement, so the pair can never disagree across a record
+  // edit between adapter gating and assembly. A gated-enabled adapter
+  // whose record has since been withdrawn reports disabled with the live
+  // reason; a gated-disabled adapter whose record now reads accepted stays
+  // disabled (dispatch would refuse those specs) with the lag stated.
+  if (family === "xai" && enabled && !liveXai.accepted) {
+    return {
+      enabled: false,
+      reason: `${liveXai.reason ?? "xAI sanctioned-path not accepted"} (live read at assembly supersedes the gated spec)`,
+    };
+  }
   if (enabled) return { enabled: true };
   let reason: string;
   try {
     reason = typeof spec.disabledReason === "string" ? spec.disabledReason : "disabled";
   } catch {
     reason = "disabled reason unavailable";
+  }
+  if (family === "xai" && liveXai.accepted && /sanctioned-path/.test(reason)) {
+    reason = `${reason} (the attestation record reads accepted at assembly; rebuild the adapter registry to re-gate)`;
   }
   return { enabled: false, reason };
 }
@@ -146,7 +166,7 @@ export function buildCapabilityRegistry(
               },
             }
           : {}),
-        enablement: enablementOf(family, adapters),
+        enablement: enablementOf(family, adapters, liveXai),
         ...(options.tracker
           ? { windowState: options.tracker.windowState(family, { now: assembledInstant }) }
           : {}),

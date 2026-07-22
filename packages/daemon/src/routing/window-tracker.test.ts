@@ -317,6 +317,79 @@ describe("replay timestamp semantics (round-6 finding 2)", () => {
   });
 });
 
+describe("writer lock and clock independence (round-7 findings 2, 3)", () => {
+  it("asserts the daemon writer lock on every append when wired", () => {
+    const calls: string[] = [];
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: {
+        assertHeld: (context) => {
+          calls.push(context);
+        },
+      },
+    });
+    try {
+      tracker.recordDispatch("openai", {
+        dispatchId: "locked-1",
+        outcome: "succeeded",
+        durationMs: 1,
+        quotaSignalSeen: false,
+        at: at(0),
+      });
+      expect(calls).toEqual(["window observation append"]);
+    } finally {
+      tracker.close();
+    }
+    const refused = new QuotaWindowTracker(tempPath(), {
+      writerLock: {
+        assertHeld: () => {
+          throw new Error("writer lock lost");
+        },
+      },
+    });
+    try {
+      expect(() =>
+        refused.recordDispatch("openai", {
+          dispatchId: "locked-2",
+          outcome: "succeeded",
+          durationMs: 1,
+          quotaSignalSeen: false,
+          at: at(0),
+        }),
+      ).toThrow(/writer lock lost/);
+      expect(refused.observations("openai")).toEqual([]);
+    } finally {
+      refused.close();
+    }
+  });
+
+  it("replays an omitted-`at` dispatch without consulting the clock", () => {
+    // Round-7 review finding 3: a replay whose instant is already
+    // store-owned must not require a live clock.
+    let clockCalls = 0;
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      now: () => {
+        clockCalls++;
+        if (clockCalls > 1) throw new Error("clock unavailable");
+        return at(HOUR);
+      },
+    });
+    try {
+      const input = {
+        dispatchId: "clockless-1",
+        outcome: "succeeded" as const,
+        durationMs: 1_000,
+        quotaSignalSeen: false,
+      };
+      const first = tracker.recordDispatch("openai", input); // clock call 1
+      const replay = tracker.recordDispatch("openai", input); // must not call the clock
+      expect(replay).toEqual(first);
+      expect(tracker.observations("openai")).toHaveLength(1);
+    } finally {
+      tracker.close();
+    }
+  });
+});
+
 describe("as-of semantics (round-5 finding 2)", () => {
   it("ignores future-dated observations until their instant arrives", () => {
     const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless

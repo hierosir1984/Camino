@@ -209,6 +209,41 @@ describe("buildCapabilityRegistry — live composition", () => {
     expect(accepted.providers.xai.sanctionedPath.value.status).toBe("recorded-accepted");
   });
 
+  it("keeps xAI enablement and sanctioned-path coherent across a record edit (round-7 finding 1)", () => {
+    // One evaluation snapshot: a record flipped between adapter gating and
+    // assembly must yield a coherent pair, in BOTH directions.
+    const acceptedPath = acceptedAttestations();
+    const withdrawnPath = join(tempDir(), "withdrawn.json");
+    writeFileSync(withdrawnPath, JSON.stringify({ xaiSanctionedPath: { status: "withdrawn" } }));
+
+    // Gated while accepted; withdrawn by assembly time.
+    const gatedAccepted = buildRegistryForTest({ attestationsPath: acceptedPath, ...ALL_PRESENT });
+    const flippedToWithdrawn = buildCapabilityRegistry({
+      adapters: gatedAccepted,
+      attestationsPath: withdrawnPath,
+    });
+    expect(flippedToWithdrawn.providers.xai.enablement.enabled).toBe(false);
+    expect(flippedToWithdrawn.providers.xai.enablement.reason).toContain(
+      "live read at assembly supersedes",
+    );
+    expect(flippedToWithdrawn.providers.xai.sanctionedPath.value.status).toBe("recorded-refused");
+
+    // Gated while withdrawn; accepted by assembly time.
+    const gatedWithdrawn = buildRegistryForTest({
+      attestationsPath: withdrawnPath,
+      ...ALL_PRESENT,
+    });
+    const flippedToAccepted = buildCapabilityRegistry({
+      adapters: gatedWithdrawn,
+      attestationsPath: acceptedPath,
+    });
+    expect(flippedToAccepted.providers.xai.enablement.enabled).toBe(false);
+    expect(flippedToAccepted.providers.xai.enablement.reason).toContain(
+      "rebuild the adapter registry to re-gate",
+    );
+    expect(flippedToAccepted.providers.xai.sanctionedPath.value.status).toBe("recorded-accepted");
+  });
+
   it("computes every window-state read at the single assembly instant (round-6 finding 4)", () => {
     // The tracker's own clock is far in the future; the registry's instant
     // must govern, so a recovery recorded after the assembly instant is

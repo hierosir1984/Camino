@@ -208,6 +208,16 @@ export interface QuotaWindowTrackerOptions {
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date;
   /**
+   * The daemon's durable cross-process writer lock (WP-104). When present,
+   * every recordDispatch asserts it is still held — the same wiring as the
+   * event store: multi-process writers are outside the daemon's
+   * single-writer posture, and the production composition passes the lock
+   * (round-7 review finding 2). Unit tests may open a tracker without it;
+   * the in-database dispatch guard additionally converts any residual
+   * check/insert race into replay semantics rather than a rewrite.
+   */
+  readonly writerLock?: { assertHeld(context: string): void };
+  /**
    * Window shapes per family; defaults to the seeded capability registry
    * (CAPABILITY_SEED quotaWindows). Injectable so tests can exercise
    * shapes independently of the seed.
@@ -247,10 +257,12 @@ export class QuotaWindowTracker {
   readonly #db: Database.Database;
   readonly #now: () => Date;
   readonly #shapes: (family: ProviderFamily) => readonly WindowShape[];
+  readonly #writerLock: { assertHeld(context: string): void } | undefined;
   readonly #insert: Database.Statement;
 
   constructor(path: string, options: QuotaWindowTrackerOptions = {}) {
     this.#now = options.now ?? (() => new Date());
+    this.#writerLock = options.writerLock;
     this.#shapes = options.windowShapes ?? ((family) => CAPABILITY_SEED[family].quotaWindows.value);
     this.#db = new Database(path);
     // Every refusal path closes the native handle (WP-104 store pattern).
@@ -351,28 +363,30 @@ export class QuotaWindowTracker {
     if (!Number.isFinite(input.durationMs) || input.durationMs < 0) {
       throw new TypeError("durationMs must be a finite non-negative number");
     }
-    const observedAt = validInstant("observation instant", input.at ?? this.#now());
+    this.#writerLock?.assertHeld("window observation append");
     const quotaSignalSeen = input.quotaSignalSeen === true || input.outcome === "quota-blocked";
     const durationMs = Math.ceil(input.durationMs);
-    // Idempotent replay, checked BEFORE inserting (round-5 finding 1,
-    // corrected by round-6 finding 2): the same dispatch id with identical
-    // content returns the EXISTING row — and when the caller omitted `at`,
-    // the stored instant is THIS STORE'S derivation, not caller content,
-    // so a replay after the clock advanced still matches and returns the
-    // original row (history does not move). Different CONTENT is
-    // conflicting evidence and is refused (WP-104 §4.4 posture). The
-    // daemon is single-writer (WP-104 lock), and the dispatch-guard
-    // trigger backstops any insert race by aborting rather than rewriting.
-    const existing = this.#db
-      .prepare("SELECT * FROM window_observations WHERE dispatch_id = ?")
-      .get(dispatchId) as ObservationRow | undefined;
-    if (existing !== undefined) {
+    // An EXPLICIT instant is caller content and validates up front; an
+    // omitted one is THIS STORE'S clock derivation, consulted only when a
+    // new row is actually inserted — a replay of an already-recorded
+    // dispatch must not require a live clock (round-7 review finding 3).
+    const explicitAt =
+      input.at === undefined ? undefined : validInstant("observation instant", input.at);
+    // Idempotent replay, checked BEFORE inserting (rounds 5–6): the same
+    // dispatch id with identical content returns the EXISTING row —
+    // clock-derived instants are not compared (round-6 finding 2) —
+    // and different CONTENT is refused (WP-104 §4.4 posture).
+    const readExisting = (): WindowObservation | undefined => {
+      const existing = this.#db
+        .prepare("SELECT * FROM window_observations WHERE dispatch_id = ?")
+        .get(dispatchId) as ObservationRow | undefined;
+      if (existing === undefined) return undefined;
       const matches =
         existing.family === checkedFamily &&
         existing.duration_ms === durationMs &&
         existing.outcome === input.outcome &&
         existing.quota_signal === (quotaSignalSeen ? 1 : 0) &&
-        (input.at === undefined || existing.observed_at === observedAt);
+        (explicitAt === undefined || existing.observed_at === explicitAt);
       if (!matches) {
         throw new Error(
           `dispatch ${dispatchId} is already recorded with different content — refusing conflicting evidence`,
@@ -387,24 +401,44 @@ export class QuotaWindowTracker {
         outcome: existing.outcome as DispatchOutcome,
         quotaSignalSeen: existing.quota_signal === 1,
       };
-    }
-    const result = this.#insert.run({
-      dispatchId,
-      family: checkedFamily,
-      observedAt,
-      durationMs,
-      outcome: input.outcome,
-      quotaSignal: quotaSignalSeen ? 1 : 0,
-    });
-    return {
-      seq: Number(result.lastInsertRowid),
-      dispatchId,
-      family: checkedFamily,
-      observedAt,
-      durationMs,
-      outcome: input.outcome,
-      quotaSignalSeen,
     };
+    const replayed = readExisting();
+    if (replayed !== undefined) return replayed;
+    const observedAt = explicitAt ?? validInstant("observation instant", this.#now());
+    try {
+      const result = this.#insert.run({
+        dispatchId,
+        family: checkedFamily,
+        observedAt,
+        durationMs,
+        outcome: input.outcome,
+        quotaSignal: quotaSignalSeen ? 1 : 0,
+      });
+      return {
+        seq: Number(result.lastInsertRowid),
+        dispatchId,
+        family: checkedFamily,
+        observedAt,
+        durationMs,
+        outcome: input.outcome,
+        quotaSignalSeen,
+      };
+    } catch (error) {
+      // A concurrent writer (outside the single-writer posture, or a
+      // check/insert race) hit the dispatch guard or the UNIQUE key first.
+      // Degrade to replay semantics: re-read and return the winner's row
+      // when content matches; refuse conflicts (round-7 review finding 2).
+      if (
+        !/dispatch replacement rejected|UNIQUE constraint failed: window_observations\.dispatch_id/.test(
+          String(error),
+        )
+      ) {
+        throw error;
+      }
+      const raced = readExisting();
+      if (raced === undefined) throw error;
+      return raced;
+    }
   }
 
   /** All observations for a family, in insertion order (seq). */
