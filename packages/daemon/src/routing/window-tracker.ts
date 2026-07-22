@@ -46,7 +46,12 @@ import { PROVIDER_FAMILIES } from "@camino/shared";
 import type { DispatchOutcome, ProviderFamily, WindowShape } from "@camino/shared";
 import { CAPABILITY_SEED } from "./capability-seed.js";
 
-const SCHEMA_VERSION = 1;
+// Pre-release schema iterations BUMP this version rather than migrating:
+// no store shipped before this work package merges, so a mid-review store
+// at an older version is refused with the precise version message (round-6
+// review finding 5). Migration machinery starts with the first released
+// version.
+const SCHEMA_VERSION = 2;
 
 const OUTCOMES: readonly DispatchOutcome[] = [
   "succeeded",
@@ -56,16 +61,19 @@ const OUTCOMES: readonly DispatchOutcome[] = [
   "killed",
 ];
 
-// The BEFORE INSERT guard refuses EVERY caller-supplied seq: ordinary
-// autoincrement inserts reach the trigger with NEW.seq = -1 (the
-// not-yet-assigned sentinel), and anything >= 0 is an explicit value. That
-// closes, in one rule, the INSERT OR REPLACE rewrite (REPLACE deletes the
-// conflicting row without firing the DELETE trigger — the PR #45 fold,
-// round-1 finding 4), gap-forgery at fresh positions, and the
-// max-rowid poisoning that would make every later autoincrement fail
-// SQLITE_FULL (round-3 finding 4). The CHECK (seq > 0) separately refuses
-// negative forgeries that would collide with the sentinel (round-2 finding
-// 3). All shapes probed directly against better-sqlite3 before coding.
+// The BEFORE INSERT guards refuse EVERY rewrite route (REPLACE deletes a
+// conflicting row WITHOUT firing the DELETE trigger — the PR #45 fold):
+//   - explicit seq (ordinary autoincrement inserts reach the trigger with
+//     the -1 sentinel, so anything >= 0 is caller-supplied) — closes
+//     replacement, fresh-position forgery, and max-rowid poisoning
+//     (rounds 1, 3, 4);
+//   - an INSERT whose dispatch_id already exists — closes the
+//     REPLACE-on-UNIQUE-dispatch_id route (round-6 finding 1); the
+//     app-level replay path never reaches this trigger because it returns
+//     the existing row before inserting.
+// The CHECK (seq > 0) separately refuses negative forgeries that would
+// collide with the sentinel (round-2 finding 3). All shapes probed
+// directly against better-sqlite3 before coding.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS window_observations (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq > 0),
@@ -96,6 +104,13 @@ BEFORE INSERT ON window_observations
 WHEN NEW.seq >= 0
 BEGIN
   SELECT RAISE(ABORT, 'window observations are append-only: explicit seq rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS window_obs_append_only_dispatch
+BEFORE INSERT ON window_observations
+WHEN EXISTS (SELECT 1 FROM window_observations WHERE dispatch_id = NEW.dispatch_id)
+BEGIN
+  SELECT RAISE(ABORT, 'window observations are append-only: dispatch replacement rejected');
 END;
 `;
 
@@ -149,6 +164,9 @@ export interface DispatchObservationInput {
    * §4.4 recovery posture — a crash between dispatch and downstream
    * processing must not double-count usage; round-5 review finding 1);
    * the same id with DIFFERENT content is refused as conflicting evidence.
+   * When `at` is omitted, the recorded instant is this store's clock
+   * derivation, not caller content — a replay after the clock advanced
+   * still matches and returns the original row (round-6 finding 2).
    */
   readonly dispatchId: string;
   readonly outcome: DispatchOutcome;
@@ -336,56 +354,57 @@ export class QuotaWindowTracker {
     const observedAt = validInstant("observation instant", input.at ?? this.#now());
     const quotaSignalSeen = input.quotaSignalSeen === true || input.outcome === "quota-blocked";
     const durationMs = Math.ceil(input.durationMs);
-    try {
-      const result = this.#insert.run({
-        dispatchId,
-        family: checkedFamily,
-        observedAt,
-        durationMs,
-        outcome: input.outcome,
-        quotaSignal: quotaSignalSeen ? 1 : 0,
-      });
-      return {
-        seq: Number(result.lastInsertRowid),
-        dispatchId,
-        family: checkedFamily,
-        observedAt,
-        durationMs,
-        outcome: input.outcome,
-        quotaSignalSeen,
-      };
-    } catch (error) {
-      if (!/UNIQUE constraint failed: window_observations\.dispatch_id/.test(String(error))) {
-        throw error;
-      }
-      // Idempotent replay: the same dispatch id with identical content
-      // returns the EXISTING row (its original observedAt — a replay must
-      // not move history); different content is conflicting evidence and
-      // is refused (round-5 review finding 1; WP-104 §4.4 posture).
-      const row = this.#db
-        .prepare("SELECT * FROM window_observations WHERE dispatch_id = ?")
-        .get(dispatchId) as ObservationRow;
+    // Idempotent replay, checked BEFORE inserting (round-5 finding 1,
+    // corrected by round-6 finding 2): the same dispatch id with identical
+    // content returns the EXISTING row — and when the caller omitted `at`,
+    // the stored instant is THIS STORE'S derivation, not caller content,
+    // so a replay after the clock advanced still matches and returns the
+    // original row (history does not move). Different CONTENT is
+    // conflicting evidence and is refused (WP-104 §4.4 posture). The
+    // daemon is single-writer (WP-104 lock), and the dispatch-guard
+    // trigger backstops any insert race by aborting rather than rewriting.
+    const existing = this.#db
+      .prepare("SELECT * FROM window_observations WHERE dispatch_id = ?")
+      .get(dispatchId) as ObservationRow | undefined;
+    if (existing !== undefined) {
       const matches =
-        row.family === checkedFamily &&
-        row.observed_at === observedAt &&
-        row.duration_ms === durationMs &&
-        row.outcome === input.outcome &&
-        row.quota_signal === (quotaSignalSeen ? 1 : 0);
+        existing.family === checkedFamily &&
+        existing.duration_ms === durationMs &&
+        existing.outcome === input.outcome &&
+        existing.quota_signal === (quotaSignalSeen ? 1 : 0) &&
+        (input.at === undefined || existing.observed_at === observedAt);
       if (!matches) {
         throw new Error(
           `dispatch ${dispatchId} is already recorded with different content — refusing conflicting evidence`,
         );
       }
       return {
-        seq: row.seq,
-        dispatchId: row.dispatch_id,
-        family: row.family as ProviderFamily,
-        observedAt: row.observed_at,
-        durationMs: row.duration_ms,
-        outcome: row.outcome as DispatchOutcome,
-        quotaSignalSeen: row.quota_signal === 1,
+        seq: existing.seq,
+        dispatchId: existing.dispatch_id,
+        family: existing.family as ProviderFamily,
+        observedAt: existing.observed_at,
+        durationMs: existing.duration_ms,
+        outcome: existing.outcome as DispatchOutcome,
+        quotaSignalSeen: existing.quota_signal === 1,
       };
     }
+    const result = this.#insert.run({
+      dispatchId,
+      family: checkedFamily,
+      observedAt,
+      durationMs,
+      outcome: input.outcome,
+      quotaSignal: quotaSignalSeen ? 1 : 0,
+    });
+    return {
+      seq: Number(result.lastInsertRowid),
+      dispatchId,
+      family: checkedFamily,
+      observedAt,
+      durationMs,
+      outcome: input.outcome,
+      quotaSignalSeen,
+    };
   }
 
   /** All observations for a family, in insertion order (seq). */

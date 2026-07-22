@@ -226,6 +226,97 @@ describe("idempotent recording (round-5 finding 1)", () => {
   });
 });
 
+describe("append-only guards for the dispatch key (round-6 findings 1, 5)", () => {
+  it("refuses INSERT OR REPLACE that conflicts on dispatch_id", () => {
+    const path = tempPath();
+    const tracker = new QuotaWindowTracker(path);
+    tracker.recordDispatch("openai", {
+      dispatchId: "victim",
+      outcome: "succeeded",
+      durationMs: 1_000,
+      quotaSignalSeen: false,
+      at: at(0),
+    });
+    tracker.close();
+    const db = new Database(path);
+    try {
+      expect(() =>
+        db
+          .prepare(
+            `INSERT OR REPLACE INTO window_observations (dispatch_id, family, observed_at, duration_ms, outcome, quota_signal)
+             VALUES ('victim', 'openai', ?, 999999, 'quota-blocked', 1)`,
+          )
+          .run(at(0).toISOString()),
+      ).toThrow(/append-only/);
+      const row = db
+        .prepare(
+          "SELECT outcome, duration_ms FROM window_observations WHERE dispatch_id = 'victim'",
+        )
+        .get() as { outcome: string; duration_ms: number };
+      expect(row).toEqual({ outcome: "succeeded", duration_ms: 1000 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("refuses an older-version store with the version message, not a tamper message", () => {
+    const path = tempPath();
+    new QuotaWindowTracker(path).close();
+    const db = new Database(path);
+    db.pragma("user_version = 1");
+    db.close();
+    expect(() => new QuotaWindowTracker(path)).toThrow(/schema version 1; this daemon expects 2/);
+  });
+});
+
+describe("replay timestamp semantics (round-6 finding 2)", () => {
+  it("treats a clock-derived instant as the store's, not caller content — later replays still match", () => {
+    let clock = at(HOUR);
+    const tracker = new QuotaWindowTracker(tempPath(), { now: () => clock });
+    try {
+      const input = {
+        dispatchId: "durable-1",
+        outcome: "succeeded" as const,
+        durationMs: 1_000,
+        quotaSignalSeen: false,
+        // no `at`: the instant comes from the store's clock
+      };
+      const first = tracker.recordDispatch("openai", input);
+      clock = at(2 * HOUR); // crash, restart, replay an hour later
+      const replay = tracker.recordDispatch("openai", input);
+      expect(replay).toEqual(first);
+      expect(replay.observedAt).toBe(at(HOUR).toISOString());
+      expect(tracker.observations("openai")).toHaveLength(1);
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("still refuses a replay whose EXPLICIT instant differs — that is caller content", () => {
+    const tracker = new QuotaWindowTracker(tempPath());
+    try {
+      tracker.recordDispatch("openai", {
+        dispatchId: "explicit-1",
+        outcome: "succeeded",
+        durationMs: 1_000,
+        quotaSignalSeen: false,
+        at: at(0),
+      });
+      expect(() =>
+        tracker.recordDispatch("openai", {
+          dispatchId: "explicit-1",
+          outcome: "succeeded",
+          durationMs: 1_000,
+          quotaSignalSeen: false,
+          at: at(MINUTE),
+        }),
+      ).toThrow(/conflicting evidence/);
+    } finally {
+      tracker.close();
+    }
+  });
+});
+
 describe("as-of semantics (round-5 finding 2)", () => {
   it("ignores future-dated observations until their instant arrives", () => {
     const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless

@@ -105,6 +105,7 @@ describe("capability seed — time-varying, source-linked attributes", () => {
       expect(model.maxOutputTokens).toBeUndefined();
     }
     expect(CAPABILITY_SEED.anthropic.models.value.map((m) => m.id)).toContain("claude-opus-4-8");
+    expect(CAPABILITY_SEED.anthropic.models.value.map((m) => m.id)).toContain("claude-fable-5");
     expect(CAPABILITY_SEED.openai.models.value.map((m) => m.id)).toContain("gpt-5.6-sol");
     expect(CAPABILITY_SEED.xai.models.value.map((m) => m.id)).toContain("grok-4.5");
   });
@@ -181,13 +182,71 @@ describe("buildCapabilityRegistry — live composition", () => {
     expect(view.providers.openai.enablement.reason).toBe("codex CLI not found on PATH");
   });
 
-  it("disables the xAI entry when the recorded disposition is withdrawn (time-varying gate)", () => {
+  it("tracks a withdrawn xAI disposition in BOTH enablement and the sanctioned-path attribute", () => {
+    // Round-6 review finding 3: the capability record must never contradict
+    // its own gate — the attribute varies with the live attestation record.
     const path = join(tempDir(), "attestations.json");
     writeFileSync(path, JSON.stringify({ xaiSanctionedPath: { status: "withdrawn" } }));
     const adapters = buildRegistryForTest({ attestationsPath: path, ...ALL_PRESENT });
-    const view = buildCapabilityRegistry({ adapters });
+    const view = buildCapabilityRegistry({
+      adapters,
+      attestationsPath: path,
+      now: () => new Date("2026-07-22T10:00:00Z"),
+    });
     expect(view.providers.xai.enablement.enabled).toBe(false);
     expect(view.providers.xai.enablement.reason).toContain("sanctioned-path");
+    const sanctioned = view.providers.xai.sanctionedPath;
+    expect(sanctioned.value.status).toBe("recorded-refused");
+    expect(sanctioned.snapshotAt).toBe("2026-07-22");
+    expect(sanctioned.source).toContain("live read at assembly");
+    expect(sanctioned.notes?.some((n) => n.includes("withdrawn"))).toBe(true);
+    // While the record reads accepted, the seed's dated disposition IS the
+    // live truth and passes through unchanged.
+    const accepted = buildCapabilityRegistry({
+      adapters: buildRegistryForTest({ attestationsPath: acceptedAttestations(), ...ALL_PRESENT }),
+      attestationsPath: acceptedAttestations(),
+    });
+    expect(accepted.providers.xai.sanctionedPath.value.status).toBe("recorded-accepted");
+  });
+
+  it("computes every window-state read at the single assembly instant (round-6 finding 4)", () => {
+    // The tracker's own clock is far in the future; the registry's instant
+    // must govern, so a recovery recorded after the assembly instant is
+    // invisible in the assembled snapshot.
+    const tracker = new QuotaWindowTracker(join(tempDir(), "windows.sqlite"), {
+      now: () => new Date("2026-07-22T20:00:00Z"),
+    });
+    try {
+      tracker.recordDispatch("xai", {
+        dispatchId: "asm-1",
+        outcome: "quota-blocked",
+        durationMs: 60_000,
+        quotaSignalSeen: true,
+        at: new Date("2026-07-22T09:00:00Z"),
+      });
+      tracker.recordDispatch("xai", {
+        dispatchId: "asm-2",
+        outcome: "succeeded",
+        durationMs: 60_000,
+        quotaSignalSeen: false,
+        at: new Date("2026-07-22T15:00:00Z"),
+      });
+      const view = buildCapabilityRegistry({
+        adapters: buildRegistryForTest({
+          attestationsPath: acceptedAttestations(),
+          ...ALL_PRESENT,
+        }),
+        attestationsPath: acceptedAttestations(),
+        tracker,
+        now: () => new Date("2026-07-22T10:00:00Z"),
+      });
+      expect(view.assembledAt).toBe("2026-07-22T10:00:00.000Z");
+      const state = view.providers.xai.windowState;
+      expect(state?.windows).toEqual([]); // the 15:00 recovery is after the snapshot instant
+      expect(state?.lastQuotaBlockedAt).toBe("2026-07-22T09:00:00.000Z");
+    } finally {
+      tracker.close();
+    }
   });
 
   it("refuses enablement from an enabled-looking spec without registry provenance", () => {

@@ -18,7 +18,12 @@
  */
 import type { AdapterSpec, ProviderCapabilityRecord, ProviderFamily } from "@camino/shared";
 import { HARNESS_FAMILY, PROVIDER_FAMILIES } from "@camino/shared";
-import { buildRegistry, hasRegistryProvenance } from "../dispatch/registry.js";
+import {
+  DEFAULT_ATTESTATIONS_PATH,
+  buildRegistry,
+  hasRegistryProvenance,
+  xaiSanctioned,
+} from "../dispatch/registry.js";
 import { CAPABILITY_SEED } from "./capability-seed.js";
 import type { ProviderWindowState, QuotaWindowTracker } from "./window-tracker.js";
 
@@ -51,6 +56,8 @@ export interface BuildCapabilityRegistryOptions {
   readonly adapters?: readonly AdapterSpec[];
   /** Supply the tracker to include live window consumption estimates. */
   readonly tracker?: QuotaWindowTracker;
+  /** Attestations record the live xAI sanctioned-path read uses (tests). */
+  readonly attestationsPath?: string;
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date;
 }
@@ -108,13 +115,41 @@ export function buildCapabilityRegistry(
 ): CapabilityRegistryView {
   const adapters = options.adapters ?? buildRegistry();
   const now = options.now ?? (() => new Date());
+  // ONE assembly instant: assembledAt and every window-state read use the
+  // same clock reading, so the snapshot is as-of a single instant even
+  // when the tracker was built with a different clock (round-6 finding 4).
+  const assembledInstant = now();
+  // The xAI sanctioned-path attribute is TIME-VARYING through the same
+  // live record the dispatch gate consumes (round-6 finding 3): while the
+  // recorded disposition stands, the seed's dated snapshot IS the live
+  // truth; when the record no longer reads accepted, the assembled view
+  // says so — the capability record can never contradict its own gate.
+  const attestationsPath = options.attestationsPath ?? DEFAULT_ATTESTATIONS_PATH;
+  const liveXai = xaiSanctioned(attestationsPath);
   const providers = Object.fromEntries(
     PROVIDER_FAMILIES.map((family) => {
       const seed = CAPABILITY_SEED[family];
       const view: ProviderCapabilityView = {
         ...seed,
+        ...(family === "xai" && !liveXai.accepted
+          ? {
+              sanctionedPath: {
+                value: { status: "recorded-refused" as const },
+                snapshotAt: assembledInstant.toISOString().slice(0, 10),
+                source: `${attestationsPath} (live read at assembly; the recorded disposition in the seed no longer reads accepted)`,
+                confidence: "observed" as const,
+                recheckTriggers: seed.sanctionedPath.recheckTriggers,
+                notes: [
+                  `gate reason: ${liveXai.reason ?? "not accepted"}`,
+                  ...(seed.sanctionedPath.notes ?? []),
+                ],
+              },
+            }
+          : {}),
         enablement: enablementOf(family, adapters),
-        ...(options.tracker ? { windowState: options.tracker.windowState(family) } : {}),
+        ...(options.tracker
+          ? { windowState: options.tracker.windowState(family, { now: assembledInstant }) }
+          : {}),
       };
       return [family, view];
     }),
@@ -130,5 +165,5 @@ export function buildCapabilityRegistry(
     }
   }
 
-  return { assembledAt: now().toISOString(), providers };
+  return { assembledAt: assembledInstant.toISOString(), providers };
 }

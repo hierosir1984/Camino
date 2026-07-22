@@ -38,13 +38,14 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       harness: "claude-code",
       models: {
         value: [
+          { id: "claude-fable-5", contextWindowTokens: 1_000_000, maxOutputTokens: 128_000 },
           { id: "claude-opus-4-8", contextWindowTokens: 1_000_000, maxOutputTokens: 128_000 },
           { id: "claude-sonnet-5", contextWindowTokens: 1_000_000, maxOutputTokens: 128_000 },
           { id: "claude-haiku-4-5", contextWindowTokens: 200_000, maxOutputTokens: 64_000 },
         ],
-        snapshotAt: "2026-06-24",
+        snapshotAt: "2026-07-22",
         source:
-          "Anthropic model catalog, platform.claude.com/docs/en/about-claude/models/overview (catalog copy cached 2026-06-24)",
+          "Anthropic model catalog, platform.claude.com/docs/en/about-claude/models/overview (retrieved 2026-07-22; context windows and max output stated per model)",
         confidence: "documented",
         recheckTriggers: [
           "provider model-catalog change",
@@ -222,7 +223,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
         ],
         snapshotAt: "2026-07-22",
         source:
-          "xAI model catalog, docs.x.ai/docs/models (retrieved 2026-07-22; context windows stated per model); grok-4.5 is named as the model powering Grok Build at docs.x.ai/build/overview",
+          "xAI model catalog, docs.x.ai/docs/models and per-model pages docs.x.ai/developers/models/{grok-4.5,grok-build-0.1} (retrieved 2026-07-22; context windows stated per model); grok-4.5 is named as the model powering Grok Build at docs.x.ai/build/overview",
         confidence: "documented",
         recheckTriggers: [
           "provider model-catalog documentation change (docs.x.ai)",
