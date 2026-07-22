@@ -37,6 +37,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -72,6 +73,10 @@ export class ArchivalError extends Error {
 // Conservative id shape: path-safe, no traversal, no hidden files. Kept
 // module-private; ids come from Camino's own stores, this is a fence.
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+// The maximum time value a JS Date can represent (±8.64e15 ms); beyond it
+// `new Date(...).toISOString()` throws RangeError.
+const MAX_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 function assertSafeId(kind: "issueId" | "attemptId", value: string): void {
   if (!ID_RE.test(value) || value.includes("..")) {
@@ -148,12 +153,16 @@ export const DEFAULT_ARCHIVE_QUOTAS: ArchiveQuotas = Object.freeze({
  * `quotasEnforced: true`.
  */
 export function effectiveArchiveQuotas(override: ArchiveQuotas): ArchiveQuotas {
+  // A NON-FINITE override (NaN, ±Infinity) must NOT weaken the registry: NaN
+  // defeats `Math.min` (min(NaN, x) === NaN) and every later `size > NaN` test is
+  // false — silently disabling the cap (round-10 finding 13). Non-finite → the
+  // registry value (never weaker); a finite value clamps to the registry (a
+  // negative one clamps to itself and fails closed, refusing everything).
+  const clamp = (o: number, registry: number): number =>
+    Number.isFinite(o) ? Math.min(o, registry) : registry;
   return {
-    workspaceMaxBytes: Math.min(
-      override.workspaceMaxBytes,
-      DEFAULT_ARCHIVE_QUOTAS.workspaceMaxBytes,
-    ),
-    archiveMaxCompressedBytes: Math.min(
+    workspaceMaxBytes: clamp(override.workspaceMaxBytes, DEFAULT_ARCHIVE_QUOTAS.workspaceMaxBytes),
+    archiveMaxCompressedBytes: clamp(
       override.archiveMaxCompressedBytes,
       DEFAULT_ARCHIVE_QUOTAS.archiveMaxCompressedBytes,
     ),
@@ -285,12 +294,17 @@ function fsyncPathBestEffort(p: string): void {
 }
 
 /**
- * Flush a just-written file's DATA and its parent directory ENTRY to stable
- * storage (round-9 finding 9): `writeFileSync`/`renameSync` return once the data
- * reaches the page cache, so a host/power crash could still lose an archive or
- * sidecar. Fsyncing the file and its containing directory makes the durability
- * claim true for a crash, not merely a process kill. Best-effort and total: the
- * WP-109 ledger row remains the authoritative durable record regardless.
+ * Best-effort flush of a just-written file's data and its parent directory entry
+ * (round-9 finding 9, scoped round-10 finding 14). `writeFileSync`/`renameSync`
+ * return once the data reaches the page cache, so a crash could still lose it;
+ * `fsync` pushes it toward stable storage. SCOPE, stated honestly: `fsync(2)`
+ * guarantees the data left the OS cache, which survives a DAEMON-PROCESS crash;
+ * it does NOT guarantee power-loss durability on macOS (that needs `F_FULLFSYNC`,
+ * which Node's fs does not expose) or on drives that lie about flushing. Failures
+ * are intentionally SWALLOWED (a platform that rejects a directory fsync must not
+ * fail an otherwise-good archival). The WP-109 ledger row — not this file — is
+ * the authoritative durable record; this only reduces the local-evidence loss
+ * window, it does not make the archive crash-proof.
  */
 function syncFileAndParentDir(filePath: string): void {
   fsyncPathBestEffort(filePath);
@@ -318,13 +332,19 @@ function readValidSidecar(
   }
   try {
     const s = JSON.parse(raw) as Partial<ArchiveSidecar>;
+    const writtenMs = typeof s.archiveWrittenAt === "string" ? Date.parse(s.archiveWrittenAt) : NaN;
     if (
       s.issueId === issueId &&
       s.attemptId === attemptId &&
       typeof s.workspacePath === "string" &&
       Number.isSafeInteger(s.seq) &&
       typeof s.archiveWrittenAt === "string" &&
-      Number.isFinite(Date.parse(s.archiveWrittenAt)) &&
+      Number.isFinite(writtenMs) &&
+      // Bound the timestamp below the max valid JS Date (round-10 finding 15):
+      // nextStamp() adds ~1ms per resume sub-step, and `new Date(8.64e15 + n)`
+      // .toISOString() throws a raw RangeError. A sidecar at/near the max date is
+      // corrupt → treat as no-valid-sidecar (reconciliation), never a crash.
+      writtenMs < MAX_TIMESTAMP_MS - 1000 &&
       typeof s.sha256 === "string" &&
       Number.isFinite(s.compressedBytes) &&
       Number.isFinite(s.workspaceBytes)
@@ -346,38 +366,115 @@ function realWorkspaceIdentity(dir: string): string | null {
   }
 }
 
+/** A filesystem object's (dev, ino) — its stable identity, immune to pathname reuse. */
+interface FsIdentity {
+  dev: number;
+  ino: number;
+}
+
+/** sha256 of a file, read in bounded chunks — NEVER buffers the whole file (round-10 finding 5). */
+function sha256File(path: string): string {
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.allocUnsafe(1 << 16);
+    let bytes: number;
+    while ((bytes = readSync(fd, buf, 0, buf.length, null)) > 0) {
+      hash.update(buf.subarray(0, bytes));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
 /**
- * Before a resume-destroy trades the workspace (its LAST copy) for the archive,
- * verify that archive is actually present AND intact (round-9 finding 3): a lone
- * valid sidecar whose `.tar.gz` has since gone (e.g. a prune interrupted between
- * deleting the archive and its sidecar, or any partial loss) must NOT cause the
- * workspace to be destroyed on top of it. Missing file, unreadable, or a
- * sha256 mismatch each REFUSE (staged, workspace retained) → reconciliation.
+ * Re-validate the archive IMMEDIATELY before a destroy, from the FILE itself —
+ * never from sidecar byte-fields a caller/corruption could forge (round-10
+ * findings 2/3/5). The recordLedgerRow callback ran between the archive write and
+ * this point and is treated as capable of mutating the tree, so nothing about the
+ * archive is trusted from before it. Requires: a present REGULAR file (no
+ * symlink/dir/fifo), an ACTUAL size within the compressed cap (not the sidecar's
+ * claimed size — a 1-byte claim over a 500 MB file must not pass), and a STREAMING
+ * sha256 that matches. Returns the verified real size. Any doubt → staged refusal,
+ * workspace retained → reconciliation.
  */
-function assertArchiveIntactForResume(
+function verifyArchiveIntact(
   finalPath: string,
   attemptId: string,
-  prior: ArchiveSidecar,
-): void {
-  if (!existsSync(finalPath)) {
+  expectedSha256: string,
+  archiveMaxCompressedBytes: number,
+): number {
+  let st;
+  try {
+    st = lstatSync(finalPath);
+  } catch {
     throw new ArchivalError(
       "archive-write",
-      `resume for attempt ${attemptId}: the archive ${finalPath} the sidecar references is missing — refusing to destroy the workspace (its last copy); janitor/escalation reconciles (fail-closed)`,
+      `attempt ${attemptId}: the archive ${finalPath} is missing before the workspace destroy — refusing to destroy the workspace (its last copy); janitor/escalation reconciles (fail-closed)`,
+    );
+  }
+  if (!st.isFile()) {
+    throw new ArchivalError(
+      "archive-write",
+      `attempt ${attemptId}: the archive ${finalPath} is not a regular file (${describeFileType(st)}) — refusing to destroy the workspace (fail-closed)`,
+    );
+  }
+  if (st.size > archiveMaxCompressedBytes) {
+    throw new ArchivalError(
+      "archive-quota",
+      `attempt ${attemptId}: the archive ${finalPath} is ${st.size} bytes, over the ${archiveMaxCompressedBytes}-byte cap (registry item 11) — refusing to destroy the workspace (fail-closed)`,
     );
   }
   let actual: string;
   try {
-    actual = createHash("sha256").update(readFileSync(finalPath)).digest("hex");
+    actual = sha256File(finalPath);
   } catch (err) {
     throw new ArchivalError(
       "archive-write",
-      `resume for attempt ${attemptId}: could not read the archive ${finalPath} to verify it: ${describeError(err, 200)} — refusing to destroy the workspace (fail-closed)`,
+      `attempt ${attemptId}: could not read the archive ${finalPath} to verify it: ${describeError(err, 200)} — refusing to destroy the workspace (fail-closed)`,
     );
   }
-  if (actual !== prior.sha256) {
+  if (actual !== expectedSha256) {
     throw new ArchivalError(
       "archive-write",
-      `resume for attempt ${attemptId}: the archive ${finalPath} does not match the recorded sha256 (recorded ${prior.sha256}, actual ${actual}) — refusing to destroy the workspace; janitor/escalation reconciles (fail-closed)`,
+      `attempt ${attemptId}: the archive ${finalPath} does not match the recorded sha256 (recorded ${expectedSha256}, actual ${actual}) — refusing to destroy the workspace; janitor/escalation reconciles (fail-closed)`,
+    );
+  }
+  return st.size;
+}
+
+/** A short human label for a non-regular-file stat, for the refusal message. */
+function describeFileType(st: { isDirectory(): boolean; isSymbolicLink(): boolean }): string {
+  if (st.isDirectory()) return "a directory";
+  if (st.isSymbolicLink()) return "a symlink";
+  return "not a regular file";
+}
+
+/**
+ * Confirm the workspace to be destroyed is STILL the exact directory we archived,
+ * by (dev, ino) — a pathname comparison is TOCTOU (round-10 finding 3): a
+ * recordLedgerRow callback that `rm`s and recreates the path leaves an unrelated
+ * victim at the same spelling. Refuses (workspace retained) on any change.
+ */
+function assertWorkspaceUnchanged(
+  workspaceReal: string,
+  baseline: FsIdentity,
+  attemptId: string,
+): void {
+  let st;
+  try {
+    st = statSync(workspaceReal);
+  } catch {
+    throw new ArchivalError(
+      "archive-write",
+      `attempt ${attemptId}: the workspace ${workspaceReal} vanished before the destroy — refusing (janitor/escalation reconciles)`,
+    );
+  }
+  if (st.dev !== baseline.dev || st.ino !== baseline.ino) {
+    throw new ArchivalError(
+      "archive-write",
+      `attempt ${attemptId}: the directory at ${workspaceReal} was REPLACED (inode changed) since archival — refusing to destroy it; it is no longer the workspace we archived (janitor/escalation reconciles)`,
     );
   }
 }
@@ -488,11 +585,38 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // when the workspace does not exist yet, where the size/tar step below raises
   // the real, clearer error.
   const workspaceDir = resolve(opts.workspaceDir);
+  // Reject a workspace whose own final component is a symlink (round-10 finding
+  // 3): the workspace is a real directory Camino created; a symlink would let the
+  // destroy delete its target and leave a dangling link. (A symlinked PARENT —
+  // e.g. macOS /var → /private/var — is fine; realpath resolves it.)
+  try {
+    if (lstatSync(workspaceDir).isSymbolicLink()) {
+      throw new ArchivalError(
+        "id-validation",
+        `workspaceDir ${JSON.stringify(workspaceDir)} is a symlink — the workspace must be a real directory (fail-closed)`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof ArchivalError) throw err;
+    // not-exist / unreadable: the size/tar step below raises the clearer error
+  }
   const workspaceReal = ((): string => {
     try {
       return realpathSync(workspaceDir);
     } catch {
       return workspaceDir;
+    }
+  })();
+  // Capture the workspace's STABLE identity (dev, ino) up-front, BEFORE the
+  // recordLedgerRow callback can run — the destroy re-confirms against this so a
+  // callback that rm+recreates the pathname cannot redirect it (round-10 finding
+  // 3). A sentinel when absent; the size/tar step raises the real error.
+  const workspaceIdentity: FsIdentity = ((): FsIdentity => {
+    try {
+      const s = statSync(workspaceReal);
+      return { dev: s.dev, ino: s.ino };
+    } catch {
+      return { dev: -1, ino: -1 };
     }
   })();
 
@@ -601,8 +725,15 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
         );
       }
       // Never trade the workspace (its last copy) for an archive that is not
-      // verifiably present and intact (round-9 finding 3).
-      assertArchiveIntactForResume(finalPath, opts.attemptId, prior);
+      // verifiably present, a regular file, within cap, and hash-matching —
+      // re-derived from the FILE, never sidecar byte-fields (round-9 finding 3,
+      // hardened round-10 findings 2/3/5).
+      const verifiedBytes = verifyArchiveIntact(
+        finalPath,
+        opts.attemptId,
+        prior.sha256,
+        quotas.archiveMaxCompressedBytes,
+      );
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
       const archiveWrittenAt = prior.archiveWrittenAt;
       const ledgerRowAt = nextStamp(now, archiveWrittenAt);
@@ -611,7 +742,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       return buildArchivalRecord({
         archivePath: finalPath,
         sha256: prior.sha256,
-        compressedBytes: prior.compressedBytes,
+        compressedBytes: verifiedBytes, // the REAL size, not the sidecar's claim
         workspaceBytes: prior.workspaceBytes,
         archiveWrittenAt,
         ledgerRowAt,
@@ -642,7 +773,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
       `archive is ${compressedBytes} bytes compressed, over the ${quotas.archiveMaxCompressedBytes}-byte cap (registry item 11) — workspace retained for escalation`,
     );
   }
-  const sha256 = createHash("sha256").update(readFileSync(tmpPath)).digest("hex");
+  const sha256 = sha256File(tmpPath); // streaming — never buffer up to 500 MB (round-10 finding 5)
   try {
     renameSync(tmpPath, finalPath);
   } catch (err) {
@@ -703,6 +834,17 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     );
   }
   syncFileAndParentDir(sidecarPath); // flush the sidecar to stable storage (round-9 finding 9)
+
+  // IMMEDIATELY before the destroy, re-validate BOTH the archive and the
+  // workspace identity from the filesystem (round-10 findings 2/3/5). The
+  // recordLedgerRow callback ran above and is treated as capable of mutating the
+  // tree — so a callback that deleted/replaced the archive, or rm+recreated the
+  // workspace pathname, must NOT let the destroy proceed. verifyArchiveIntact
+  // re-derives everything from the FILE (regular file, size ≤ cap, streaming
+  // sha256), and assertWorkspaceUnchanged confirms the same (dev, ino) captured
+  // up-front. Either failing retains the workspace → reconciliation.
+  verifyArchiveIntact(finalPath, opts.attemptId, sha256, quotas.archiveMaxCompressedBytes);
+  assertWorkspaceUnchanged(workspaceReal, workspaceIdentity, opts.attemptId);
 
   // Step 3 — destroy the workspace, strictly last (a failure is a cleanup-failed
   // teardown, A.2 "cleanup failure during teardown → blocked"; workspaceRetained
@@ -850,8 +992,19 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
       // the archive falls through to `undatable` and is never deleted.
       const sidecar = readValidSidecar(sidecarPath, issueId, attemptId);
       if (sidecar) {
-        const t = Date.parse(sidecar.archiveWrittenAt);
-        if (Number.isFinite(t)) writtenMs = t;
+        const claimed = Date.parse(sidecar.archiveWrittenAt); // finite (readValidSidecar checked)
+        // AGE uses the MORE RECENT of the sidecar's claim and the archive FILE's
+        // actual mtime (round-10 finding 11): a sidecar with a spoofed OLD
+        // timestamp (and a low seq) must NOT make a FRESH archive look old enough
+        // to prune — its real mtime keeps it inside the age window (retention is
+        // the UNION, so within-age alone retains it).
+        let fileMtime = Number.NaN;
+        try {
+          fileMtime = statSync(archivePath).mtimeMs;
+        } catch {
+          /* unreadable mtime → fall back to the (validated) sidecar claim */
+        }
+        writtenMs = Number.isFinite(fileMtime) ? Math.max(claimed, fileMtime) : claimed;
         // readValidSidecar already required a SAFE-INTEGER seq; a corrupt/
         // overflowed seq made it null → undatable (fail-closed, round-2 finding 6).
         seq = sidecar.seq;

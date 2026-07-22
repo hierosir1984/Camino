@@ -15,7 +15,7 @@
 // cannot land changes to it, so this file is user-authored configuration.
 // It is still parsed defensively (schema refusal on unknown keys, entry
 // caps, safe host/port shapes) because a config error must fail loudly.
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { type EgressAllowlistEntry, isValidAllowlistHost, isValidAllowlistPort } from "./egress.js";
@@ -115,6 +115,25 @@ export function parseRepoEgressConfig(text: string | null): WorkerEgressConfig {
 
 /** Load and parse the per-repo egress config from a checked-out repo dir. */
 export function loadRepoEgressConfig(repoDir: string): WorkerEgressConfig {
+  // The config must be a REAL file reached through REAL directories (round-10
+  // finding 8). Quarantine (CAM-EXEC-04) protects the pathname `.camino/config.yml`;
+  // a SYMLINK there (or a symlinked `.camino`) would let the read resolve to a
+  // DIFFERENT, unprotected path the worker CAN edit — controlling effective egress
+  // policy while the protected pathname appears unchanged. Refuse any symlink on
+  // the path; an absent path stays the deny-all baseline.
+  for (const rel of [".camino", REPO_CONFIG_PATH]) {
+    let st: ReturnType<typeof lstatSync> | null;
+    try {
+      st = lstatSync(join(repoDir, rel));
+    } catch {
+      st = null; // absent — the readFileSync below yields the deny-all baseline
+    }
+    if (st?.isSymbolicLink()) {
+      throw new RepoConfigError(
+        `${rel} is a symlink — the per-repo config must be a real file reached through real directories (fail-closed): a symlink could redirect egress policy to a path outside quarantine's protection`,
+      );
+    }
+  }
   let text: string | null;
   try {
     text = readFileSync(join(repoDir, REPO_CONFIG_PATH), "utf8");

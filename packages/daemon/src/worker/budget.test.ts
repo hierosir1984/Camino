@@ -15,16 +15,15 @@ import { mockAdapter } from "../dispatch/adapters/mock.js";
 import { BudgetConfigError, dispatchWithBudget, validateAttemptBudget } from "./budget.js";
 
 /**
- * The `budget-starve-descendant` mock wrapped in an adapter whose parseLine
- * busy-waits synchronously on the STARVE marker line — starving the daemon's
- * event loop long past the budget deadline AND the descendant's self-exit, so
- * the in-process budget TIMER can never fire in time (round-9 finding 4).
+ * A mock wrapped in an adapter whose parseLine busy-waits synchronously on the
+ * STARVE marker line — starving the daemon's event loop past the budget deadline,
+ * so the in-process budget TIMER can never fire in time (round-10 finding 9).
  */
-function starvingAdapter(): AdapterSpec {
-  const base = mockAdapter("budget-starve-descendant");
+function starvingAdapter(mode: string): AdapterSpec {
+  const base = mockAdapter(mode);
   return {
     ...base,
-    name: "mock:budget-starve-descendant",
+    name: `mock:${mode}`,
     parseLine(line: string, channel: "stdout" | "stderr") {
       const ev = base.parseLine(line, channel);
       const text = (ev as { text?: unknown } | null)?.text;
@@ -139,25 +138,46 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     });
   }, 30_000);
 
-  it("wall-clock BACKSTOP: an over-budget worker is killed-budget even when a synchronous callback starves the event loop so the timer misses the deadline (round-9 finding 4)", async () => {
-    // The worker's leader exits fast; a same-group descendant lives ~400ms past
-    // the 200ms budget then self-exits; the adapter's parseLine busy-waits 800ms
-    // on the STARVE line, so the in-process budget timer cannot fire until the
-    // group is already gone. Only the elapsed-since-start backstop remains —
-    // and it must still classify killed-budget (never silently `succeeded`).
+  it("wall-clock POSITIVE-EVIDENCE backstop: an over-budget group STILL ALIVE when a starved loop frees is killed-budget, not succeeded (round-10 finding 9)", async () => {
+    // The leader exits fast; an immortal in-group descendant runs past the budget;
+    // the adapter busy-waits 1.5s on STARVE so the in-process timer cannot fire in
+    // time. When the loop frees, the leader is REAPED (exited) and the descendant
+    // is STILL ALIVE, so the exit-handling groupAlive() — trustworthy post-reap —
+    // observes a real member alive past the deadline → killed-budget; the sweep
+    // then SIGKILLs it. The 1s budget is comfortably below the 1.5s stall so the
+    // stall reliably outlasts the deadline even under heavy CI load.
     const { record, escalation } = await dispatchWithBudget(
-      starvingAdapter(),
-      { workdir: workdir(), prompt: "starve the loop" },
-      { wallClockMs: 200 },
+      starvingAdapter("budget-starve-descendant"),
+      { workdir: workdir(), prompt: "starve the loop, group still alive" },
+      { wallClockMs: 1_000 },
       { killConfirm: { graceMs: 500, sigkillWaitMs: 1_000 } },
     );
     expect(record.outcome).toBe("killed-budget");
-    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 200 });
-    expect(record.budgetBreach!.observed).toBeGreaterThan(200);
-    // The descendant self-exited, so the group is confirmed gone by the probe →
-    // the clean A.3#5 / A.2#10 escalation applies (not the cleanup-failed path).
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 1_000 });
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(900); // ~budget or the stall length
     expect(escalation).toBeDefined();
     expect(escalation!.attemptEvent.killConfirmed).toBe(true);
+  }, 30_000);
+
+  it("wall-clock backstop does NOT false-positive: an in-time group whose end is merely observed late (loop stall) is succeeded, not killed-budget (round-10 finding 9)", async () => {
+    // The leader and its whole group finish FAST, well under the 1s budget; the
+    // adapter then busy-waits 1.5s on STARVE, stalling the loop past the budget.
+    // The stall (started well before the deadline) blocks the on-time timer, so
+    // the decision falls to the RELIABLE exit-handling check where the leader is
+    // reaped and the group is empty → no breach. The group was never observed
+    // alive past the deadline (it died in time; the delay is pure observation lag),
+    // so the run must be `succeeded`. The old observation-time backstop, and a
+    // late timer trusting a zombie, both wrongly reported killed-budget.
+    const { record, escalation } = await dispatchWithBudget(
+      starvingAdapter("budget-inreach-stall"),
+      { workdir: workdir(), prompt: "finish in time, then stall the loop" },
+      { wallClockMs: 1_000 },
+      { killConfirm: { graceMs: 500, sigkillWaitMs: 1_000 } },
+    );
+    expect(record.outcome).toBe("succeeded");
+    expect(record.budgetBreach).toBeUndefined();
+    expect(record.finalText).toContain("in-time-then-stall");
+    expect(escalation).toBeUndefined();
   }, 30_000);
 
   it("token breach mid-stream: cumulative usage reports kill the dispatch in flight", async () => {

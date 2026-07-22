@@ -220,8 +220,9 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
   const noHardlinkedObjects = !hasHardlinkedObject(join(gitPath, "objects"));
   if (!noHardlinkedObjects) {
     throw new WorkerCloneError(
-      "workspace has a hardlinked object file (nlink>1, loose or packed) — a --local hardlink " +
-        "clone shares its object store and is never a worker workspace (CAM-EXEC-02)",
+      "workspace object store is not self-contained — a hardlinked object file (nlink>1, loose " +
+        "or packed), or a symlinked object directory pointing at an external store (round-10 " +
+        "finding 6) — a --local/shared clone is never a worker workspace (CAM-EXEC-02)",
     );
   }
 
@@ -333,7 +334,20 @@ function hasHardlinkedObject(objectsDir: string): boolean {
   // A SHARED store shows up as either a hardlink (nlink>1 — a --local clone) OR
   // a SYMLINK pointing back at the source (round-3 finding 9: a symlinked
   // .pack has nlink 1 but is not standalone; delete the source and fsck fails).
+  // A whole object DIRECTORY can also be a symlink to an external store (round-10
+  // finding 6): its files have nlink 1 and aren't symlinks, so the per-file scan
+  // passes, yet the clone is NOT self-contained — move the store and fsck fails.
+  // So a symlinked objects dir, fan-out dir, or pack dir is itself "shared".
+  const isSymlink = (p: string): boolean => {
+    try {
+      return lstatSync(p).isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  if (isSymlink(objectsDir)) return true;
   const anySharedIn = (subDir: string): boolean => {
+    if (isSymlink(subDir)) return true; // a symlinked fan-out/pack dir → external store
     let names: string[];
     try {
       names = readdirSync(subDir);

@@ -66,6 +66,12 @@ export interface EgressAllowlistEntry {
 const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const NETWORK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+// A Docker network ID (short 12 or full 64 hex). `docker run --network` resolves
+// a value by NAME *or* ID, so a bare ID for the `host`/`none`/`bridge` network
+// slips past the reserved-NAME check (round-10 finding 1). Requiring a name makes
+// that check authoritative; the network's DRIVER/ownership is attested where the
+// network is CREATED (WP-005/WP-114), which this composer does not run.
+const DOCKER_NETWORK_ID_RE = /^[0-9a-f]{12}([0-9a-f]{52})?$/i;
 
 /** Is `host` a safe allowlist host token (DNS name / IPv4 literal)? */
 export function isValidAllowlistHost(host: string): boolean {
@@ -83,39 +89,23 @@ export function isValidAllowlistPort(port: number): boolean {
 // is accepted (fail-closed, from WP-005).
 const RESERVED_NETWORKS = new Set(["host", "none", "bridge", "default", "host-gateway"]);
 const RESERVED_ENV_PREFIX = "CAMINO_EGRESS_";
-// BOUNDARY (round-3 finding 1, widened round-9 finding 2): the set of container
-// paths from which the ROOT bootstrap phase EXECUTES or LOADS code/config before
-// isolation is installed. A mount over any of them — or any ancestor
-// (assertSafeMountPaths rejects both directions) — could hand the root phase
-// attacker-controlled code. It is the UNION of three load channels, and nothing
-// the root phase reads code/config from may be left off it:
-//   - executable search (every PATH dir the entrypoint searches);
-//   - config (`/etc`, incl. the dynamic linker's `/etc/ld.so.*`);
-//   - code LOADING — the shared-library and plugin search paths `iptables`,
-//     `getent`, `su-exec` dlopen/link as root. A `:ro` mount blocks WRITES, not
-//     dlopen: a bind at `/usr/lib/xtables` shadows `libxt_conntrack.so` and its
-//     constructor runs as root the moment the bootstrap invokes `iptables`
-//     (round-9 finding 2). `/lib` alone did NOT cover `/usr/lib*` / `/lib64`.
-// The profile bakes its tools+libs into the image precisely so the root phase
-// never depends on a mountable path; this list is the run-time enforcement of
-// that. Keep the PATH entries in lockstep with the entrypoint's `PATH=…`.
-const PROTECTED_MOUNT_TARGETS = [
-  "/",
-  "/usr/local/sbin",
-  "/usr/local/bin",
-  "/usr/sbin",
-  "/usr/bin",
-  "/sbin",
-  "/bin",
-  "/etc",
-  "/lib",
-  "/lib64",
-  "/usr/lib",
-  "/usr/lib64",
-];
-
-/** Where the workspace clone is mounted (rw) inside the worker container. */
+// Where the workspace clone is mounted (rw) inside the worker container.
 export const WORKER_WORKSPACE_MOUNT = "/workspace";
+
+// The single subtree under which provider-auth is mounted (read-only). A
+// Camino-invented location, disjoint from every system path.
+export const WORKER_AUTH_MOUNT_ROOT = "/auth";
+
+// BOUNDARY, structural (rounds 3/9 chased a DENYLIST of root-loaded paths and it
+// kept regenerating — /usr/local/sbin, then /usr/lib/xtables, then /usr/local/lib
+// under musl's loader path…). Round 10 replaces it with an ALLOWLIST, which is
+// closed by construction: a mount target must sit at or under one of Camino's
+// OWN mount roots (the workspace and the auth subtree). EVERYTHING else — every
+// PATH dir, every dynamic-linker/plugin search path (musl OR glibc), /etc, and
+// any future one — is refused without having to be enumerated, so no root-phase
+// code/config path can be shadowed by a mount. The profile bakes its tools+libs
+// into the image; nothing the root phase loads lives under an allowed root.
+const SAFE_MOUNT_ROOTS = [WORKER_WORKSPACE_MOUNT, WORKER_AUTH_MOUNT_ROOT];
 
 /**
  * The isolation entrypoint, PINNED at run time (`--entrypoint`) rather than
@@ -180,6 +170,13 @@ export interface WorkerContainerRun {
 
 function assertSafeNetwork(network: string): void {
   if (!network) throw new WorkerContainerConfigError("worker run requires a user-defined network");
+  if (DOCKER_NETWORK_ID_RE.test(network)) {
+    throw new WorkerContainerConfigError(
+      `worker network ${JSON.stringify(network)} looks like a Docker network ID — a network must be ` +
+        "referenced by its owned NAME, never an ID (an ID can resolve to host/none/bridge, bypassing " +
+        "the reserved-name check; round-10 finding 1)",
+    );
+  }
   if (network.includes(":") || !NETWORK_NAME_RE.test(network) || RESERVED_NETWORKS.has(network)) {
     throw new WorkerContainerConfigError(
       `worker network ${JSON.stringify(network)} rejected — requires an owned, isolated ` +
@@ -251,16 +248,20 @@ function assertSafeMountPaths(hostPath: string, containerPath: string): string {
       `worker mount target ${JSON.stringify(containerPath)} is the container root — rejected (fail-closed)`,
     );
   }
-  // Reject a target that is inside a bootstrap path (norm under p) OR an
-  // ANCESTOR of one (p under norm) — mounting `/usr` or `/usr/local` shadows
-  // the pinned entrypoint and its tools just as surely as mounting the exact
-  // path (round-2 finding 1: the ancestor case was previously accepted).
-  const conflicts = (p: string): boolean =>
-    p === "/" ? false : norm === p || norm.startsWith(`${p}/`) || p.startsWith(`${norm}/`);
-  if (PROTECTED_MOUNT_TARGETS.some(conflicts)) {
+  // ALLOWLIST (round-10 findings 2/4): the canonical target must sit at or under
+  // one of Camino's OWN mount roots. Canonicalization already collapsed any `..`,
+  // so `/tmp/../usr/local/lib` cannot masquerade as an allowed root. Anything
+  // outside — a system binary/library/plugin/config path, whether or not it is in
+  // any hand-kept denylist — is refused. This is closed by construction; there is
+  // no path left to enumerate.
+  const underAllowedRoot = SAFE_MOUNT_ROOTS.some(
+    (root) => norm === root || norm.startsWith(`${root}/`),
+  );
+  if (!underAllowedRoot) {
     throw new WorkerContainerConfigError(
-      `worker mount target ${JSON.stringify(containerPath)} (canonically ${norm}) would cover or ` +
-        "shadow a bootstrap path — rejected (fail-closed)",
+      `worker mount target ${JSON.stringify(containerPath)} (canonically ${norm}) is outside ` +
+        `Camino's mount roots ${JSON.stringify(SAFE_MOUNT_ROOTS)} — refused (fail-closed): a mount ` +
+        "may only target the workspace or the auth subtree, never a system path the root bootstrap loads",
     );
   }
   return norm;

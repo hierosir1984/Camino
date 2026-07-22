@@ -137,6 +137,13 @@ const EVENT_TAIL_CAP = 200;
 const MAX_LINE_CHARS = 1_000_000;
 const LINE_TRUNCATED_MARK = "…[camino:line-truncated]";
 
+// A budget timer that fires more than this far past its deadline was delayed by a
+// daemon event-loop STALL (far above normal timer jitter/scheduling, ~tens of
+// ms). Past it, the wall-clock breach is re-confirmed on the next tick to reject a
+// not-yet-reaped zombie leader (round-10 finding 9); within it, the breach fires
+// synchronously so it keeps precedence over a same-boundary timeout.
+const STALL_GRACE_MS = 250;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -868,19 +875,25 @@ export async function dispatch(
       const limit = budgetWallClockMs;
       const remaining = Math.max(0, limit - (Date.now() - started));
       budgetTimer = setTimeout(() => {
-        if (killReason) return;
-        // The budget covers the worker's whole process GROUP, not just the
-        // leader (round-8 finding 1): a leader can exit fast while an in-group
-        // descendant runs past the budget. Breach whenever ANY group member is
-        // still alive at the deadline — not merely "leader still running". If
-        // the group is already gone, the worker finished in time: no breach.
+        if (killReason || budgetBreach) return;
         const pid = child?.pid;
-        const groupStillAlive = pid != null && groupAlive(pid);
-        if (!groupStillAlive) return;
-        budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
-        // requestKill is a no-op once the leader exited; the post-exit group
-        // sweep reaps the descendant, and budgetBreach classifies killed-budget.
-        requestKill("budget");
+        if (pid == null || !groupAlive(pid)) return;
+        // ON-TIME path only. When the loop is healthy the timer fires at the
+        // deadline while the group is genuinely alive (the leader is still running,
+        // or a real descendant is) — no exit/reap can be pending, so groupAlive()
+        // is trustworthy. Breach SYNCHRONOUSLY so the budget takes precedence over a
+        // same-boundary timeout (round-1 finding 7), which fires right after this.
+        //
+        // If the timer fired LATE (a daemon event-loop STALL delayed it past
+        // limit+STALL_GRACE_MS), we do NOTHING here: a leader that exited IN TIME
+        // but is not yet reaped is a ZOMBIE that still answers kill(-pgid,0), so a
+        // late groupAlive() cannot be trusted (round-10 finding 9). The stall case
+        // is decided reliably at exit-handling below, where `exited` is already
+        // true (the leader is reaped) so groupAlive() reflects only real members.
+        if (Date.now() - started <= limit + STALL_GRACE_MS) {
+          budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
+          requestKill("budget");
+        }
       }, remaining);
     }
     if (timeoutMs != null) {
@@ -908,14 +921,33 @@ export async function dispatch(
     // boundary at the top of this file.)
     let postExitCleanup: KillConfirmRecord | undefined;
     const pid = child.pid;
+    // Wall-clock BACKSTOP, reliable path (round-10 finding 9). We are here only
+    // AFTER the leader's 'exit' event, so `exited` is true and the leader is REAPED
+    // — a groupAlive() now cannot be fooled by a not-yet-reaped zombie leader; a
+    // true reading means a REAL in-group descendant survives. If such a descendant
+    // is alive AND we are already past the wall-clock deadline (the daemon loop was
+    // stalled so the on-time timer above did not fire), that descendant demonstrably
+    // outran the budget → breach. This uses only post-reap facts, so it does not
+    // false-positive on an in-time worker whose end was merely observed late.
+    if (
+      !budgetBreach &&
+      killReason == null &&
+      budgetWallClockMs !== undefined &&
+      pid != null &&
+      groupAlive(pid) &&
+      Date.now() - started > budgetWallClockMs
+    ) {
+      budgetBreach = {
+        kind: "wall-clock",
+        limit: budgetWallClockMs,
+        observed: Date.now() - started,
+      };
+      // The sweep just below reaps the over-budget descendant; budgetBreach set
+      // here classifies killed-budget (kill-and-escalate).
+    }
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child, timings); // never throws; fail-closed
     }
-    // Time the tracked group is confirmed GONE — captured HERE, before the
-    // (bounded, possibly slow) stream drain, so a group-escaped descendant
-    // holding a pipe (the named WP-107 boundary) cannot inflate it. Basis for
-    // the wall-clock backstop below.
-    const groupGoneAt = Date.now();
 
     // Drain stdout/stderr to EOF so a line still buffered when 'exit' fired is
     // parsed and classified (round-8 finding 3) — but BOUNDED: a group-escaped
@@ -982,32 +1014,9 @@ export async function dispatch(
     // cancel-requested and exited as separate events and reconciles them rather
     // than forcing a synchronous label; WP-105 keeps the conservative
     // synchronous label at the seam.
-    // Wall-clock BACKSTOP (round-9 finding 4): the in-process budget TIMER can be
-    // delayed past its deadline by event-loop starvation (e.g. a synchronous
-    // transcript/parse callback), so when it finally runs it may observe the
-    // group already gone and record NO breach — letting an over-budget worker
-    // classify `succeeded`. This check does not depend on the timer firing on
-    // time: if the tracked group's lifetime (start → group-gone) exceeded the
-    // wall-clock budget and we did not already kill it for another reason, that
-    // is a wall-clock breach. `groupGoneAt` is the group's actual end (captured
-    // before the drain), so a legitimately in-time worker is never mislabeled.
-    // BOUNDARY, stated: `groupGoneAt` is the daemon's OBSERVATION of group-gone;
-    // under pathological daemon-side loop starvation it can over-attribute — the
-    // fail-safe direction (escalate for review, never silently accept an
-    // overrun; CAM-EXEC-03). A fully out-of-process watchdog is the container's
-    // job (WP-114), the same group-vs-tree boundary this file states throughout.
-    if (
-      !budgetBreach &&
-      killReason == null &&
-      budgetWallClockMs !== undefined &&
-      groupGoneAt - started > budgetWallClockMs
-    ) {
-      budgetBreach = {
-        kind: "wall-clock",
-        limit: budgetWallClockMs,
-        observed: groupGoneAt - started,
-      };
-    }
+    // (The wall-clock backstop is applied above at exit-handling time, by POSITIVE
+    // EVIDENCE — a kill(pid,0) that saw the group alive at/after the deadline —
+    // rather than an observation-time estimate that a daemon stall could inflate.)
 
     let outcome: DispatchOutcome;
     if (budgetBreach) {

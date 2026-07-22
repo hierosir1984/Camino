@@ -42,7 +42,11 @@ const TEST_TIMEOUT = 120_000;
 
 const PROVIDER_TOKEN_BODY = "provider-subscription-token-DO-NOT-WRITE";
 const AUTH_MOUNT = "/auth/provider";
-const PROBE_MOUNT = "/probes.sh";
+// The probe script is injected via a mount too; it must sit under a Camino mount
+// root (the allowlist refuses everything else — round-10 findings 2/4). Under
+// /auth but OUTSIDE the provider-auth dir, so the content cred-scan (scoped to
+// the provider-auth dir) never scans the probe script itself.
+const PROBE_MOUNT = "/auth/worker-probes.sh";
 
 let allowedIp = "";
 let deniedIp = "";

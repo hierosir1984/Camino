@@ -5,6 +5,7 @@
 // and the union retention rule ("90 days or last 10, whichever MORE").
 // Large fixtures are generated in-script (the E2BIG CI lesson).
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -13,6 +14,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -443,6 +445,162 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     }
   });
 
+  it("a recordLedgerRow that DELETES the archive does NOT let the initial destroy proceed (round-10 finding 2)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: (row) => {
+        // A hostile/buggy callback deletes the archive it was handed and returns.
+        rmSync(row.archivePath, { force: true });
+      },
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    // The re-validate-before-destroy guard catches the missing archive.
+    expect((err as Error).message).toMatch(/missing|not a regular file/i);
+    expect(existsSync(ws)).toBe(true); // the workspace — the last copy — is retained
+  });
+
+  it("a recordLedgerRow that REPLACES the workspace dir at the same pathname does not destroy the victim (round-10 finding 3)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    let victimContent = "";
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {
+        // rm the archived workspace and recreate an UNRELATED dir at the same path.
+        rmSync(ws, { recursive: true, force: true });
+        mkdirSync(ws, { recursive: true });
+        writeFileSync(join(ws, "victim.txt"), "must-not-be-deleted\n");
+        victimContent = readFileSync(join(ws, "victim.txt"), "utf8");
+      },
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as Error).message).toMatch(/replaced|inode changed/i);
+    // The victim (different inode at the same pathname) is untouched.
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true);
+    expect(victimContent).toBe("must-not-be-deleted\n");
+  });
+
+  it("a resume with an OVER-CAP archive (sidecar under-reports its size) refuses — size is re-derived from the file (round-10 finding 5)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    // Full archival then a modelled destroy-failure (workspace present again).
+    await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "recovered.txt"), "still here\n");
+    // Replace the archive with an over-cap blob AND rewrite the sidecar to claim a
+    // matching hash + a tiny size — a resume that trusted sidecar bytes would pass.
+    const overCap = incompressible(1024);
+    const bigPath = join(root, "i", "a.tar.gz");
+    writeFileSync(bigPath, overCap);
+    const sha = createHash("sha256").update(overCap).digest("hex");
+    const sidecarPath = join(root, "i", "a.json");
+    const sc = JSON.parse(readFileSync(sidecarPath, "utf8")) as ArchiveSidecar;
+    sc.sha256 = sha;
+    sc.compressedBytes = 1; // lie: tiny
+    writeFileSync(sidecarPath, JSON.stringify(sc));
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      quotas: { workspaceMaxBytes: 1_000_000, archiveMaxCompressedBytes: 512 }, // cap < 1024
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as ArchivalError).stage).toBe("archive-quota");
+    expect(existsSync(ws)).toBe(true); // workspace retained
+  });
+
+  it("effectiveArchiveQuotas does NOT let a NaN override disable the cap (round-10 finding 13)", () => {
+    const q = effectiveArchiveQuotas({
+      workspaceMaxBytes: Number.NaN,
+      archiveMaxCompressedBytes: Number.NaN,
+    });
+    // NaN falls back to the registry ceiling, never a disabled (NaN) cap.
+    expect(q.workspaceMaxBytes).toBe(REGISTRY_ITEM_11_QUOTAS.workspace.maxBytes);
+    expect(q.archiveMaxCompressedBytes).toBe(REGISTRY_ITEM_11_QUOTAS.archive.maxCompressedBytes);
+    expect(Number.isFinite(q.workspaceMaxBytes)).toBe(true);
+    expect(Number.isFinite(q.archiveMaxCompressedBytes)).toBe(true);
+  });
+
+  it("a sidecar with a max-date timestamp is treated as invalid, never crashing nextStamp with a RangeError (round-10 finding 15)", async () => {
+    const ws = makeWorkspace();
+    const root = tempDir();
+    const issueDir = join(root, "i");
+    mkdirSync(issueDir, { recursive: true });
+    writeFileSync(join(issueDir, "a.tar.gz"), "archive-bytes");
+    // A shape-valid sidecar whose archiveWrittenAt is the maximum finite JS date.
+    writeFileSync(
+      join(issueDir, "a.json"),
+      JSON.stringify({
+        issueId: "i",
+        attemptId: "a",
+        workspacePath: ws,
+        archiveWrittenAt: new Date(8_640_000_000_000_000).toISOString(),
+        seq: 0,
+        sha256: "x",
+        compressedBytes: 1,
+        workspaceBytes: 1,
+      }),
+    );
+    // The extreme timestamp makes the sidecar INVALID → indeterminate → staged
+    // reconciliation refusal, never a raw RangeError from nextStamp/toISOString.
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as Error).name).toBe("ArchivalError"); // not a raw RangeError
+  });
+
+  it("retention keeps a FRESH archive whose sidecar spoofs an old timestamp — age is floored by the file mtime (round-10 finding 11)", () => {
+    const root = tempDir();
+    const issueDir = join(root, "issueY");
+    mkdirSync(issueDir, { recursive: true });
+    // A FRESH archive (recent mtime) whose VALID-identity sidecar lies: old
+    // timestamp + low seq, so a metadata-trusting pruner would drop it.
+    writeFileSync(join(issueDir, "fresh.tar.gz"), "fresh-audit-material"); // mtime = now
+    writeFileSync(
+      join(issueDir, "fresh.json"),
+      JSON.stringify({
+        issueId: "issueY",
+        attemptId: "fresh",
+        workspacePath: "/gone",
+        archiveWrittenAt: new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString(),
+        seq: 0,
+        sha256: "x",
+        compressedBytes: 1,
+        workspaceBytes: 1,
+      }),
+    );
+    const report = pruneArchives({
+      archiveRoot: root,
+      retainLastAttemptsPerIssue: 0,
+      retainDays: 90,
+    });
+    const fresh = join(issueDir, "fresh.tar.gz");
+    expect(report.deleted).not.toContain(fresh);
+    expect(report.kept).toContain(fresh);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
   it("an INDETERMINATE prior archive (no valid sidecar) is NEVER deleted — routes to reconciliation (round-6 finding 1)", async () => {
     const root = tempDir();
     const issueDir = join(root, "i");
@@ -870,11 +1028,17 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
     mkdirSync(issueDir, { recursive: true });
     const archivePath = join(issueDir, `${attemptId}.tar.gz`);
     writeFileSync(archivePath, `fake-archive-${attemptId}`);
+    const agedAt = new Date(NOW - ageDays * DAY);
+    // A REAL old archive has an old FILE mtime, not just an old sidecar claim.
+    // The pruner floors age with the file mtime (round-10 finding 11), so the
+    // fixture must set it too — else a "200-day-old" archive written just now
+    // would read as fresh and never prune.
+    utimesSync(archivePath, agedAt, agedAt);
     const sidecar: ArchiveSidecar = {
       issueId,
       attemptId,
       workspacePath: `/tmp/seeded-ws/${attemptId}`,
-      archiveWrittenAt: new Date(NOW - ageDays * DAY).toISOString(),
+      archiveWrittenAt: agedAt.toISOString(),
       // Default seq correlates with recency (younger age → higher seq), so
       // the age-based cases below order the same by seq. The tie-break test
       // passes an explicit seq to decouple order from timestamp.

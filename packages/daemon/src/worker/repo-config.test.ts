@@ -1,7 +1,7 @@
 // WP-107 · per-repo egress config parsing (CAM-EXEC-03): absent config is
 // the deny-all baseline; malformed config REFUSES with a reason (never a
 // silent deny); entry shapes are validated fail-closed.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -105,5 +105,31 @@ describe("loadRepoEgressConfig", () => {
     expect(loadRepoEgressConfig(repo)).toEqual({
       allow: [{ host: "registry.invalid", port: 443 }],
     });
+  });
+
+  it("REFUSES a symlinked .camino/config.yml — a redirected read could set egress from an unprotected path (round-10 finding 8)", () => {
+    const repo = tempDir();
+    mkdirSync(join(repo, ".camino"), { recursive: true });
+    // A worker points the protected config pathname at an UNPROTECTED file it can
+    // edit (outside quarantine), controlling effective egress.
+    writeFileSync(
+      join(repo, "egress.yml"),
+      "egress:\n  allow:\n    - host: worker-added.invalid\n      port: 4444\n",
+    );
+    symlinkSync(join(repo, "egress.yml"), join(repo, REPO_CONFIG_PATH));
+    expect(() => loadRepoEgressConfig(repo)).toThrow(RepoConfigError);
+    expect(() => loadRepoEgressConfig(repo)).toThrow(/symlink/i);
+  });
+
+  it("REFUSES a symlinked .camino directory (round-10 finding 8)", () => {
+    const repo = tempDir();
+    const elsewhere = tempDir();
+    mkdirSync(join(elsewhere, "real-camino"), { recursive: true });
+    writeFileSync(
+      join(elsewhere, "real-camino", "config.yml"),
+      "egress:\n  allow:\n    - host: worker-added.invalid\n      port: 4444\n",
+    );
+    symlinkSync(join(elsewhere, "real-camino"), join(repo, ".camino"));
+    expect(() => loadRepoEgressConfig(repo)).toThrow(/symlink/i);
   });
 });

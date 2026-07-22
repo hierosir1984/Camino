@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -178,6 +179,23 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     git(dest, "config", "--local", "core.hooksPath", "/dev/null");
     git(dest, "config", "--local", "credential.helper", "");
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink/);
+  });
+
+  it("rejects a clone whose objects dir is a SYMLINK to an external store — not self-contained (round-10 finding 6)", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Move .git/objects to an external location and replace it with a symlink:
+    // the per-object-file checks pass (the target's files have nlink 1 and aren't
+    // symlinks) but the clone depends on an EXTERNAL store — move it away and git
+    // fsck fails. The attestation must reject a symlinked object DIRECTORY.
+    const objects = join(dest, ".git", "objects");
+    const external = join(tempDir(), "external-objects");
+    renameSync(objects, external);
+    symlinkSync(external, objects);
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(
+      /hardlink|shared|standalone|self-contained/i,
+    );
   });
 
   it("rejects a PUSH url userinfo hidden behind an option-shaped remote name — round-2 finding 4", () => {

@@ -123,7 +123,7 @@ describe("renderWorkerRunArgs", () => {
         },
         ["/bin/true"],
       ),
-    ).toThrow(/shadow a bootstrap path|bootstrap path/);
+    ).toThrow(/outside Camino.s mount roots|refused/);
   });
 
   it("rejects ANCESTOR mounts that would shadow the entrypoint (round-2 finding 1)", () => {
@@ -135,7 +135,7 @@ describe("renderWorkerRunArgs", () => {
           { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
           ["/bin/true"],
         ),
-      ).toThrow(/shadow a bootstrap path|bootstrap path/);
+      ).toThrow(/outside Camino.s mount roots|refused/);
     }
   });
 
@@ -156,28 +156,62 @@ describe("renderWorkerRunArgs", () => {
           { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
           ["/bin/true"],
         ),
-      ).toThrow(/bootstrap path/);
+      ).toThrow(/outside Camino.s mount roots|refused/);
     }
   });
 
-  it("rejects mounts over the root-loaded LIBRARY/PLUGIN paths, incl. /usr/lib/xtables (round-9 finding 2)", () => {
-    // A `:ro` bind blocks writes, not dlopen: a mount at /usr/lib/xtables shadows
-    // libxt_conntrack.so, whose constructor runs as ROOT the moment the bootstrap
-    // invokes iptables — before isolation is installed. /lib alone missed the
-    // /usr/lib* / /lib64 search paths the root phase loads code from.
+  it("rejects mounts over the root-loaded LIBRARY/PLUGIN paths incl. /usr/lib/xtables AND /usr/local/lib (round-9 finding 2, round-10 finding 4)", () => {
+    // A `:ro` bind blocks writes, not dlopen: a mount at a root-loaded library
+    // dir shadows a .so whose constructor runs as ROOT the moment the bootstrap
+    // invokes iptables — before isolation is installed. A DENYLIST kept missing
+    // one (/usr/lib/xtables, then /usr/local/lib on musl's loader path); the
+    // ALLOWLIST refuses all of them by construction, no enumeration.
     for (const containerPath of [
-      "/usr/lib", // ancestor of the iptables plugin dir + the linker search path
+      "/usr/lib", // ancestor of the iptables plugin dir + a linker search path
       "/usr/lib/xtables", // the concrete iptables match-module dir
       "/usr/lib64",
       "/lib64",
+      "/usr/local/lib", // musl's default loader path — the round-10 finding-4 miss
+      "/etc/ld.so.preload", // linker preload config
     ]) {
       expect(() =>
         renderWorkerRunArgs(
           { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
           ["/bin/true"],
         ),
-      ).toThrow(/bootstrap path|shadow/);
+      ).toThrow(/outside Camino.s mount roots|refused/);
     }
+  });
+
+  it("ACCEPTS mounts only under Camino's own roots — the workspace and the /auth subtree (round-10 findings 2/4 allowlist)", () => {
+    // The structural counterpart: legitimate targets are permitted, so the
+    // allowlist is not vacuously rejecting everything.
+    for (const containerPath of ["/auth", "/auth/claude", "/auth/provider/nested"]) {
+      expect(() =>
+        renderWorkerRunArgs(
+          { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
+          ["/bin/true"],
+        ),
+      ).not.toThrow();
+    }
+    // The workspace mount (the fixed /workspace) is accepted too.
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, workspaceHostPath: "/tmp/ws" }, ["/bin/true"]),
+    ).not.toThrow();
+  });
+
+  it("rejects a network referenced by ID, not name — an ID can resolve to host/none (round-10 finding 1)", () => {
+    // `docker run --network <id>` resolves by ID, so a bare hex ID for the host
+    // network slips past the reserved-NAME check. Short (12) and full (64) IDs.
+    for (const network of ["a1b2c3d4e5f6", "0123456789abcdef".repeat(4)]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, network }, ["/bin/true"])).toThrow(
+        /network ID|referenced by its owned NAME/,
+      );
+    }
+    // A normal owned name that merely contains hex is still fine.
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, network: "camino-worker-a1b2c3" }, ["/bin/true"]),
+    ).not.toThrow();
   });
 
   it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {

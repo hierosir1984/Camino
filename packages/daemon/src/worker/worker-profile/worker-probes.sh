@@ -77,6 +77,31 @@ run_probe github-cred-fs sh -c '
       2>/dev/null | head -1)
   [ -z "$found" ] && echo clean || echo "$found"
 '
+# Names are not enough (round-10 finding 7): a mounted gh hosts file holds a
+# GitHub token under a host stanza, and a git-credentials-style URL embeds one — a
+# read-only mount blocks WRITES, not disclosure. Scan the CONTENT of the mounted
+# credential-bearing roots (the workspace, the provider-auth dir, HOME) for
+# GitHub-SPECIFIC material, so the legitimately-mounted (non-GitHub) provider auth
+# is not a false hit: the gh token prefixes anywhere, OR a host stanza naming the
+# GitHub host that also carries a token line. Binary files are skipped (grep -I).
+run_probe github-cred-content sh -c '
+  roots=""
+  for d in "${CAMINO_WORKSPACE_DIR:-}" "${CAMINO_PROVIDER_AUTH_DIR:-}" "${HOME:-}"; do
+    [ -n "$d" ] && [ -d "$d" ] && roots="$roots $d"
+  done
+  [ -z "$roots" ] && { echo clean; exit 0; }
+  ghhost=$(printf "%s\043com" "github.")   # the GitHub host, built so this script never self-matches
+  found=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}" $roots 2>/dev/null | head -1)
+  if [ -z "$found" ]; then
+    for f in $(grep -rIlF "$ghhost" $roots 2>/dev/null); do
+      if grep -qiE "oauth_token|(^|[^a-z])token[[:space:]]*[:=]" "$f" 2>/dev/null; then
+        found=$f
+        break
+      fi
+    done
+  fi
+  [ -z "$found" ] && echo clean || echo "$found"
+'
 
 # --- workspace writable, provider auth NOT (CAM-EXEC-02) ---------------------
 # Control: a write to the workspace SUCCEEDS (so a provider-auth write failure
