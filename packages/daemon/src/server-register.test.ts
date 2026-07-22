@@ -213,3 +213,35 @@ describe("without a wired register service", () => {
     }
   });
 });
+
+describe("onClose teardown wiring (round 1, finding 1 — deterministic guard)", () => {
+  it("runs the onClose hook on close BECAUSE it is registered before listen", async () => {
+    // The mechanism main.ts relies on to release its stores. Registered inside
+    // buildServer before listen(), so it never hits Fastify's post-listen
+    // addHook refusal — the defect that crashed the daemon on boot. This is the
+    // fast, signal-free companion to main.test.ts's child-process smoke test.
+    let closed = 0;
+    const daemon = await startDaemonServer({
+      token: TOKEN,
+      port: 0,
+      onClose: () => {
+        closed += 1;
+      },
+    });
+    expect(closed).toBe(0); // not yet — only on close
+    await daemon.app.close();
+    expect(closed).toBe(1); // fired exactly once, on the real close path
+  });
+
+  it("a throwing onClose is logged, not propagated into close()", async () => {
+    const daemon = await startDaemonServer({
+      token: TOKEN,
+      port: 0,
+      onClose: () => {
+        throw new Error("teardown blew up");
+      },
+    });
+    // close() must resolve even though the hook threw (best-effort teardown).
+    await expect(daemon.app.close()).resolves.toBeUndefined();
+  });
+});
