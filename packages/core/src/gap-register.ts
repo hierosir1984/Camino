@@ -337,11 +337,26 @@ interface DispositionBasis {
  *  - the CONTEXT it was taken in (round 1, finding 7): a `main` judgment
  *    never governs a branch row that happens to share the tuple;
  *  - for a waiver, the exact detector findings it covers AND their recency
- *    (round 1, finding 5): the waiver must name the row's current
- *    waivable-through seq, and it must have been recorded no earlier than the
- *    finding at that seq — so a waiver pre-seeded (via the raw store) against
- *    a finding that does not yet exist can never spring to life when a future
- *    finding happens to land at the guessed seq.
+ *    (round 1, finding 5; round 2, finding 3): the waiver must name the row's
+ *    current waivable-through seq, and it must have been recorded STRICTLY
+ *    AFTER the finding at that seq — a waiver at or before the finding's
+ *    recordedAt is rejected, so a waiver pre-seeded (via the raw store) against
+ *    a finding that does not yet exist cannot spring to life, even when the
+ *    pre-seed and the future finding carry the same millisecond timestamp
+ *    (round 2 falsified the earlier `<`-only guard with equal timestamps from
+ *    two independent stores' injectable clocks).
+ *
+ *    BOUNDARY, stated: this makes the HONEST path pre-seed-proof — a waiver is
+ *    only ever recorded by the register service, which decides against the LIVE
+ *    projection, so it cannot name a finding that does not yet exist; and the
+ *    strict-after guard additionally defeats a naive direct-`append()` pre-seed.
+ *    What it does NOT defeat is a fully-adversarial in-process writer that
+ *    controls the injectable clock to stamp its pre-seed AFTER a finding it also
+ *    authored — that is the same single-OS-user in-process-liar boundary the
+ *    intent ledger names (CAM-CANON-01), not a property a single log can prove.
+ *    Millisecond timestamps across two logs are a recency heuristic, not a
+ *    causal-ordering primitive; a shared ordered log would be, and is the
+ *    documented path if this boundary ever needs to be closed.
  */
 function foldDisposition(
   events: readonly GapDispositionRecord[],
@@ -355,7 +370,8 @@ function foldDisposition(
     if (event.event === "gap-false-positive-waived") {
       if (event.payload["waivedThroughSeq"] !== basis.waivableThroughSeq) continue;
       if (basis.waivableThroughAt === null) continue;
-      if (Date.parse(event.recordedAt) < Date.parse(basis.waivableThroughAt)) continue;
+      // Strictly after: reject a waiver recorded at OR before the finding.
+      if (Date.parse(event.recordedAt) <= Date.parse(basis.waivableThroughAt)) continue;
     }
     disposition = EVENT_TO_DISPOSITION[event.event];
     record =

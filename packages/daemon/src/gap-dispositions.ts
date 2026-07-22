@@ -239,10 +239,19 @@ export class GapDispositionsStore {
           "undo the row while callers already treated it as durable",
       );
     }
+    // OWN-property reads only (round 2, finding 4): the envelope's fields must
+    // be the caller's own, never inherited from a polluted Object.prototype —
+    // an input that owns nothing must not borrow a requirementId/event/payload.
+    if (input === null || typeof input !== "object") {
+      throw new TypeError("gap-disposition input must be an object");
+    }
+    const requirementId = Object.hasOwn(input, "requirementId") ? input.requirementId : undefined;
+    const event = Object.hasOwn(input, "event") ? input.event : undefined;
+    const rawPayload = Object.hasOwn(input, "payload") ? input.payload : undefined;
     let payloadJson: string;
     let canonicalPayload: Record<string, unknown>;
     try {
-      payloadJson = JSON.stringify(input.payload);
+      payloadJson = JSON.stringify(rawPayload);
       const parsed: unknown = JSON.parse(payloadJson);
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new TypeError("payload must serialize to a plain JSON object");
@@ -265,8 +274,8 @@ export class GapDispositionsStore {
     // record exactly as the adoption pass would.
     const candidate: GapDispositionRecord = {
       seq: expectedLastSeq + 1,
-      requirementId: input.requirementId,
-      event: input.event,
+      requirementId: requirementId as string,
+      event: event as GapDispositionEventName,
       actor: DAVID_ACTOR,
       payload: canonicalPayload,
       recordedAt,
@@ -286,8 +295,8 @@ export class GapDispositionsStore {
         );
       }
       const result = this.#insert.run({
-        requirementId: input.requirementId,
-        event: input.event,
+        requirementId: candidate.requirementId,
+        event: candidate.event,
         actor: DAVID_ACTOR,
         payload: payloadJson,
         recordedAt,

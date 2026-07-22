@@ -1,9 +1,14 @@
 # 18 · GUI origin isolation: the per-launch ephemeral origin
 
-**Status:** design complete, corrected after falsification round 1 (dual-stack exclusive
-binding, per-launch token rotation, `*.localhost` resolution probe, and the honest
-stale-origin service-worker residual are now REQUIRED parts of the design, not assumptions) —
-implementation placement awaits David's ruling (see §6).
+**Status: DESIGN SKETCH — direction settled, mechanics NOT yet complete.** Two falsification
+rounds hardened the threat model but also proved the *implementation mechanics* need a
+dedicated design pass (see §7, Open problems): a single Fastify instance cannot own both
+loopback families by calling `listen()` twice; a fixed `*.localhost` override reuses an origin
+and defeats the invariant; token rotation must be ordered against the writer lock; and the
+`*.localhost` resolution probe is under-specified. The DIRECTION — a per-launch nonce origin a
+local squatter cannot pre-seed — is sound and is the deliverable this WP owes; the remaining
+mechanics belong to the WP that implements it (§6 placement ruling). This document is
+deliberately not marked "complete." Do not build from §3 as-is; build from §3 **plus** §7.
 **Origin of the obligation:** WP-102 review round 5, finding 1 (PR #46); David's 2026-07-19
 decision deferred the complete fix "to the real GUI/launch work (WP-122+)" with the
 `worker-src 'none'` partial mitigation left in place. WP-122 (this document) discharges the
@@ -108,29 +113,75 @@ http://<n>.localhost:<port>/#token=<per-launch token>
 
 ## 4. Contract changes when implemented
 
-1. `config.ts`: mint the nonce label at startup; `CAMINO_GUI_HOST` override for the
-   documented fallback (refusal on anything but `127.0.0.1` or a `*.localhost` label).
-2. `server.ts` / `startDaemonServer`: **bind both loopback families exclusively** —
-   `127.0.0.1:<port>` AND `[::1]:<port>` — and fail closed (EADDRINUSE) if either is taken
-   (round 1, finding 2). `selfHosts()` returns the nonce authority only; the not-found/hint
-   paths answer legacy authorities with the launch-hint page; everything else — token, CSRF,
-   single-value headers, origin-pair binding — is untouched.
+1. `config.ts`: mint the nonce label at startup. The `CAMINO_GUI_HOST` override is **only
+   `127.0.0.1`** — the explicit opt-OUT of isolation (round 2, finding 6). It must NOT accept a
+   fixed `*.localhost` value: a fixed nonce-looking host is *reused* every launch, so a worker
+   planted there persists and captures the rotated token, defeating the whole invariant. The
+   nonce is always daemon-minted and never user-supplied.
+2. `server.ts` / `startDaemonServer`: own both loopback families exclusively on the port. This
+   is NOT achievable by calling one Fastify instance's `listen()` twice (round 2, finding 5:
+   `FST_ERR_REOPENED_SERVER`); see §7 for the open mechanics. Whatever the mechanism, one
+   coherent server must answer both families with the SAME CSRF token and shut both down
+   together, and startup must fail closed if either family's port is taken. `selfHosts()`
+   returns the nonce authority only; the not-found/hint paths answer legacy authorities with
+   the launch-hint page; token, CSRF, single-value headers, and origin-pair binding are
+   otherwise untouched.
 3. `main.ts` / future launcher: print (and eventually auto-open) the nonce URL; probe
-   `*.localhost` reachability and fall back to `CAMINO_GUI_HOST=127.0.0.1` when it fails.
-4. **`token.ts`: rotate the GUI token per launch** (round 1, finding 9). Today
-   `loadOrCreateToken` reuses the on-disk token; this design's stale-origin analysis assumes a
-   captured token is already dead, which is only true if each launch mints (and 0600-persists)
-   a fresh token, invalidating outstanding copies. This is a REQUIRED companion change, not
-   optional — without it the origin nonce narrows the attack surface but a phished token from a
-   prior session still authenticates.
+   `*.localhost` reachability and fall back to `CAMINO_GUI_HOST=127.0.0.1` when it fails (probe
+   specification is open — §7).
+4. **`token.ts`: rotate the GUI token per launch, AFTER acquiring the single-writer lock**
+   (round 1, finding 9; round 2, finding 7). Today `loadOrCreateToken` reuses the on-disk
+   token; the stale-origin analysis assumes a captured token is already dead, which holds only
+   if each launch mints (and 0600-persists) a fresh token. The ORDERING matters: rotating
+   before the writer lock is acquired lets a second, losing launch overwrite the token on disk
+   and then fail the lock, leaving the running daemon's in-memory token out of sync with disk.
+   Rotation must happen only once the launch owns the writer lock, so exactly the daemon that
+   will run is the one that rotates.
 5. Tests: the WP-102 policy suites re-pinned to the nonce authority; a fixture asserting a
    request bearing a *previous* launch's authority is refused; a dual-stack fixture asserting
-   startup refuses when `[::1]:<port>` is pre-bound; and a token-rotation fixture asserting a
-   prior launch's token no longer authenticates.
+   startup refuses when either loopback family's port is pre-bound; a token-rotation fixture
+   asserting a prior launch's token no longer authenticates AND that a losing concurrent launch
+   does not corrupt the winner's token; and a resolution-fallback fixture.
 
-The diff is deliberately narrow, but it rewrites the Host-allowlist heart of the WP-102
-policy stack — the module that went through seven falsification rounds — and touches token
-custody. That is the review surface consideration behind §6.
+The diff is deliberately narrow in intent, but it rewrites the Host-allowlist heart of the
+WP-102 policy stack — the module that went through seven falsification rounds — touches token
+custody, and (per §7) changes how the daemon binds its listener. That is the review surface
+consideration behind §6.
+
+## 7. Open problems (surfaced by falsification round 2 — must be closed by the implementing WP)
+
+The direction in §3 is sound; these mechanics are NOT yet solved and are why this document is
+a sketch, not a complete design:
+
+1. **Dual-stack ownership with one coherent server.** One Fastify instance cannot `listen()`
+   on two addresses. Candidate approaches, each with an open question:
+   - *One socket bound to `::` with IPv4-mapped addresses.* Simple, but `::`/`0.0.0.0` are not
+     loopback-scoped — the listener would accept non-loopback traffic unless the OS/dual-stack
+     settings restrict it, contradicting CAM-CORE-01's loopback-only invariant. Needs proof
+     that binding is loopback-restricted.
+   - *Two listeners feeding one Fastify app* (e.g. a second `net.Server` handing sockets to the
+     same request pipeline), so CSRF/token state and shutdown are shared. Needs a concrete
+     wiring that keeps the single-instance policy guarantees.
+   - Node's `exclusive: true` is NOT proof of OS-wide port ownership (a raw probe bound
+     `127.0.0.1`, `::1`, `0.0.0.0`, and `::` on one port simultaneously); the design must state
+     what "exclusive" actually guarantees on each target OS.
+   - `127.0.0.1` is not the whole loopback: RFC 1122 reserves all of `127/8`. The design must
+     state which resolved addresses `*.localhost` can produce on the target platforms and that
+     the daemon owns exactly those (browsers resolve `*.localhost` to `127.0.0.1`/`::1` in
+     practice, but this must be verified, not assumed).
+2. **`*.localhost` resolution probe.** Unspecified: who probes (launcher vs. browser), which
+   resolved addresses count as success, what response authenticates the daemon (not just a
+   TCP connect — a squatter answers too), and the timeout/fallback transition. An OS DNS
+   lookup is not equivalent to successful, daemon-authenticated browser navigation — the
+   macOS/WebKit discrepancy (round 1, finding 12) is exactly why.
+3. **Token-rotation lifecycle** (see §4.4): rotate only after the writer lock is held; define
+   what a still-open browser tab from the prior launch sees (a 401 → re-handoff), and how the
+   printed/opened URL carries the new token.
+4. **Legacy-origin eviction remains a named residual** (§5): none of the above evicts a worker
+   already planted on a stale origin; it only keeps that worker off the current session.
+
+None of these block WP-122 (which ships `worker-src 'none'` and introduces no worker/caching/
+new-origin exposure). They are the scope of the implementing WP that §6's ruling places.
 
 ## 5. What this does not cover (named residuals)
 

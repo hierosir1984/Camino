@@ -556,6 +556,22 @@ describe("round-1 falsification regressions", () => {
     expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
   });
 
+  it("F5 (round 2): a waiver at the SAME instant as the finding is inert (strictly-after)", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const facts = new FactLog(); // records at 2026-07-02T00:00:00.000Z
+    facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "hit" });
+    const dispositions = new DispositionLog();
+    // Equal timestamp — two independent logs can produce the same millisecond;
+    // it is not a causal ordering, so the waiver must not bind.
+    dispositions.add(
+      R1,
+      "gap-false-positive-waived",
+      { tuple: suspectedTuple(), reason: "co-timestamped pre-seed", waivedThroughSeq: 1 },
+      "2026-07-02T00:00:00.000Z",
+    );
+    expect(project(view, facts, dispositions)[0]!.disposition).toBe("open");
+  });
+
   it("F7: a disposition recorded in one context never governs another (main ↛ branch)", () => {
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
     const dispositions = new DispositionLog();

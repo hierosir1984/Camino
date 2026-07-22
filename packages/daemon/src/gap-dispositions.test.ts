@@ -192,3 +192,22 @@ describe("writer-lock binding", () => {
     ).toThrow(/lock/i);
   });
 });
+
+describe("own-property envelope (round 2, finding 4)", () => {
+  it("refuses an input that owns nothing, even under Object.prototype pollution", () => {
+    const s = open();
+    const proto = Object.prototype as Record<string, unknown>;
+    proto["requirementId"] = "CAM-DEMO-01";
+    proto["event"] = "gap-fix-queued";
+    proto["payload"] = payload();
+    try {
+      // The envelope owns none of the fields; they exist only on the prototype.
+      expect(() => s.append(Object.create(proto) as never)).toThrow();
+      expect(s.read()).toHaveLength(0); // nothing was recorded
+    } finally {
+      delete proto["requirementId"];
+      delete proto["event"];
+      delete proto["payload"];
+    }
+  });
+});

@@ -168,8 +168,10 @@ function rowFor(page: Page, requirementId: string): Locator {
  * projection recomputed independently from the stores — every row, every
  * register-relevant field, in order.
  */
-async function expectTableMatchesLedger(page: Page): Promise<void> {
-  const rows = projected();
+async function expectTableMatchesLedger(
+  page: Page,
+  rows: readonly GapRegisterRow[] = projected(),
+): Promise<void> {
   const trs = tableRows(page);
   await expect(trs).toHaveCount(rows.length);
   for (let i = 0; i < rows.length; i += 1) {
@@ -224,10 +226,10 @@ async function expectTableMatchesLedger(page: Page): Promise<void> {
     const factLines = tr.locator(".provenance-fact");
     await expect(factLines).toHaveCount(row.provenance.length);
     for (let f = 0; f < row.provenance.length; f += 1) {
-      const fact = row.provenance[f]!;
-      await expect(factLines.nth(f)).toContainText(`seq ${fact.seq}`);
-      await expect(factLines.nth(f)).toContainText(fact.kind);
-      await expect(factLines.nth(f)).toContainText(fact.actor);
+      // The WHOLE rendered line, exactly (round 2, finding 9: asserting only
+      // seq/kind/actor let a corrupted reason/outcome pass). Mirrors app.js's
+      // provenanceLine — the reason/outcome detail is part of the agreement.
+      await expect(factLines.nth(f)).toHaveText(provenanceLineText(row.provenance[f]!));
     }
     await expect(tr.locator(".disposition-value")).toHaveText(row.disposition);
     if (row.dispositionRecord !== null) {
@@ -240,8 +242,25 @@ async function expectTableMatchesLedger(page: Page): Promise<void> {
         row.dispositionRecord.event,
       );
       await expect(tr.locator(".disposition-reason")).toHaveText(row.dispositionRecord.reason);
+    } else {
+      // No stray record attributes/lines when the row is open (round 2).
+      await expect(tr).not.toHaveAttribute("data-disposition-record-seq", /.*/);
+      await expect(tr).not.toHaveAttribute("data-disposition-record-event", /.*/);
+      await expect(tr.locator(".disposition-reason")).toHaveCount(0);
     }
   }
+}
+
+/** The exact provenance line app.js renders, recomputed for agreement. */
+function provenanceLineText(fact: GapRegisterRow["provenance"][number]): string {
+  const payload = fact.payload as { reason?: unknown; outcome?: unknown };
+  const detail =
+    typeof payload.reason === "string"
+      ? ` — ${payload.reason}`
+      : typeof payload.outcome === "string"
+        ? ` — ${payload.outcome}`
+        : "";
+  return `seq ${fact.seq} · ${fact.kind} · ${fact.actor}${detail}`;
 }
 
 async function act(page: Page, requirementId: string, button: string, reason: string) {
@@ -470,7 +489,9 @@ test.describe("gap register in a branch context (present-on rows)", () => {
       await expect(row).toHaveAttribute("data-implementation", "present-on");
       await expect(row).toHaveAttribute("data-implementation-branch", "mission/m1");
       await expect(row.locator(".tuple-implementation")).toHaveText("present-on(mission/m1)");
-      // Full-row agreement against the branch-context projection.
+      // Genuine full-row DOM agreement against the branch-context projection
+      // (round 2, finding 9: the branch fixture previously checked only the
+      // implementation tuple).
       const rows = projectGapRegister(
         bLedger.currentView(),
         bFacts.read(),
@@ -479,6 +500,7 @@ test.describe("gap register in a branch context (present-on rows)", () => {
       );
       expect(rows).toHaveLength(1);
       expect(rows[0]!.tuple.implementation).toEqual({ kind: "present-on", branch: "mission/m1" });
+      await expectTableMatchesLedger(page, rows);
     } finally {
       await branchDaemon.app.close();
       bDispositions.close();

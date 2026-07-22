@@ -36,9 +36,16 @@ let service: RegisterService;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "camino-register-"));
   const now = () => new Date("2026-07-03T00:00:00.000Z");
+  // Dispositions are recorded by the user AFTER a finding renders, so their
+  // store's clock is strictly later — a waiver's recordedAt must exceed the
+  // finding's for the recency guard (round 2, finding 3). Real deployments get
+  // this from wall-clock time; the fixtures make it explicit.
+  const laterNow = () => new Date("2026-07-04T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });
-  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), { now });
+  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), {
+    now: laterNow,
+  });
   context = MAIN;
   service = new RegisterService({
     canonLedger,

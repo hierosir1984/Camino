@@ -54,9 +54,14 @@ async function api(
 beforeEach(async () => {
   const dir = mkdtempSync(join(tmpdir(), "camino-register-http-"));
   const now = () => new Date("2026-07-03T00:00:00.000Z");
+  // Disposition store clock is strictly later than the fact store's, so a
+  // waiver's recordedAt exceeds its finding's (round 2, finding 3 recency guard).
+  const laterNow = () => new Date("2026-07-04T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });
-  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), { now });
+  gapDispositions = new GapDispositionsStore(join(dir, "gap-dispositions.sqlite"), {
+    now: laterNow,
+  });
   canonLedger.proposeRequirement(R1, { statement: "demo behavior one", sourceMissionId: "m1" });
   canonLedger.acceptRequirement(R1);
   canonLedger.proposeRequirement(R2, { statement: "demo behavior two", sourceMissionId: "m1" });
@@ -210,6 +215,32 @@ describe("without a wired register service", () => {
       );
     } finally {
       await bare.app.close();
+    }
+  });
+});
+
+describe("own-property body reads (round 2, finding 4)", () => {
+  it("an empty {} body is refused even with a polluted Object.prototype", async () => {
+    const asOfBody = (await api("/api/register")).body["asOf"];
+    const proto = Object.prototype as Record<string, unknown>;
+    proto["action"] = "fix-queued";
+    proto["reason"] = "inherited";
+    proto["asOf"] = asOfBody;
+    try {
+      const before = gapDispositions.read().length;
+      // A body that owns nothing must not borrow action/reason/asOf from the
+      // prototype chain and become a real recorded action.
+      const response = await api(`/api/register/${R1}/disposition`, {
+        method: "POST",
+        csrf,
+        body: {},
+      });
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(gapDispositions.read()).toHaveLength(before); // nothing recorded
+    } finally {
+      delete proto["action"];
+      delete proto["reason"];
+      delete proto["asOf"];
     }
   });
 });

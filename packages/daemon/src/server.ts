@@ -490,6 +490,14 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     body !== null && typeof body === "object" && !Array.isArray(body)
       ? (body as Record<string, unknown>)
       : null;
+  /**
+   * Read a body field by OWN property only (round 2, finding 4): never inherit
+   * from a polluted Object.prototype. A missing field reads as undefined, which
+   * the register service then validates and refuses — an empty `{}` body can
+   * never borrow an `action`/`asOf` from the prototype chain.
+   */
+  const field = (body: Record<string, unknown>, key: string): unknown =>
+    Object.hasOwn(body, key) ? body[key] : undefined;
 
   app.get("/api/register", async (request, reply) => {
     if (register === undefined) {
@@ -509,15 +517,15 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
         return reply.code(400).send({ error: "malformed", problem: "body must be a JSON object" });
       }
       try {
-        // The service validates every field at runtime (action membership,
-        // reason hygiene, asOf shape); the casts only name the wire shape.
+        // Own-property reads only (round 2, finding 4); the service validates
+        // every field at runtime (action membership, reason hygiene, asOf
+        // shape) — the casts only name the wire shape.
+        const waived = field(body, "waivedThroughSeq");
         return register.recordDisposition(request.params.requirementId, {
-          action: body["action"] as RegisterActionInputShape["action"],
-          reason: body["reason"] as string,
-          asOf: body["asOf"] as RegisterAsOf,
-          ...(body["waivedThroughSeq"] === undefined
-            ? {}
-            : { waivedThroughSeq: body["waivedThroughSeq"] as number }),
+          action: field(body, "action") as RegisterActionInputShape["action"],
+          reason: field(body, "reason") as string,
+          asOf: field(body, "asOf") as RegisterAsOf,
+          ...(waived === undefined ? {} : { waivedThroughSeq: waived as number }),
         });
       } catch (error) {
         return sendRegisterError(reply, error);
@@ -537,8 +545,8 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
       }
       try {
         return register.descope(request.params.requirementId, {
-          reason: body["reason"] as string,
-          asOf: body["asOf"] as RegisterAsOf,
+          reason: field(body, "reason") as string,
+          asOf: field(body, "asOf") as RegisterAsOf,
         });
       } catch (error) {
         return sendRegisterError(reply, error);
