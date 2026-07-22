@@ -1,0 +1,53 @@
+{
+  "fixture": "rate-limits",
+  "area": "LIM",
+  "missionTitle": "API rate limits",
+  "plantedAmbiguities": [
+    {
+      "id": "A1",
+      "segmentText": "API calls are rate limited.",
+      "summary": "The limit's scope is unstated: per user, per key, or per IP.",
+      "exampleQuestion": "Is the limit scoped per user, per API key, or per IP?",
+      "exampleAssumption": "Per API key."
+    },
+    {
+      "id": "A2",
+      "segmentText": "Limits reset over time.",
+      "summary": "Window semantics are unstated: sliding or fixed.",
+      "exampleQuestion": "Is the window sliding or fixed, and how long is it?",
+      "exampleAssumption": "A fixed one-minute window."
+    },
+    {
+      "id": "A3",
+      "segmentText": "Clients are told when they are limited.",
+      "summary": "The signal is unstated: status code, headers, body shape.",
+      "exampleQuestion": "How is the limit communicated to clients?",
+      "exampleAssumption": "HTTP 429 with a Retry-After header."
+    },
+    {
+      "id": "A4",
+      "segmentText": "Some clients are exempt.",
+      "summary": "Which clients are exempt, and how exemption is designated.",
+      "exampleQuestion": "Which clients are exempt and where is that recorded?",
+      "exampleAssumption": "Internal service keys flagged in the key registry."
+    }
+  ],
+  "requirementSegments": [
+    {
+      "segmentText": "API calls are rate limited.",
+      "statement": "API calls above the configured rate are limited."
+    },
+    {
+      "segmentText": "Limits reset over time.",
+      "statement": "A limited client regains capacity when its window resets."
+    },
+    {
+      "segmentText": "Clients are told when they are limited.",
+      "statement": "A limited client receives an explicit limit signal."
+    },
+    {
+      "segmentText": "Some clients are exempt.",
+      "statement": "Designated clients are exempt from rate limiting."
+    }
+  ]
+}

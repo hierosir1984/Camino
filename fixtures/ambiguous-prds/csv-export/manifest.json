@@ -1,0 +1,42 @@
+{
+  "fixture": "csv-export",
+  "area": "EXP",
+  "missionTitle": "Record export",
+  "plantedAmbiguities": [
+    {
+      "id": "A1",
+      "segmentText": "Users can export their records.",
+      "summary": "The exported column set is never specified.",
+      "exampleQuestion": "Which record fields does the export include?",
+      "exampleAssumption": "All visible list columns, in list order."
+    },
+    {
+      "id": "A2",
+      "segmentText": "Exports open correctly in common spreadsheet software.",
+      "summary": "Encoding and locale behavior is unstated (Excel needs a BOM).",
+      "exampleQuestion": "What encoding and delimiter should the file use?",
+      "exampleAssumption": "UTF-8 with BOM, comma-delimited."
+    },
+    {
+      "id": "A3",
+      "segmentText": "Large exports should not break the app.",
+      "summary": "\"Large\" names no size bound or behavior at the bound.",
+      "exampleQuestion": "What is the row bound, and what happens above it?",
+      "exampleAssumption": "Cap at 100000 rows with a stated truncation notice."
+    }
+  ],
+  "requirementSegments": [
+    {
+      "segmentText": "Users can export their records.",
+      "statement": "A user can export their records as a CSV file."
+    },
+    {
+      "segmentText": "Exports open correctly in common spreadsheet software.",
+      "statement": "Exported files open correctly in common spreadsheet software."
+    },
+    {
+      "segmentText": "Large exports should not break the app.",
+      "statement": "Export of a large record set completes without degrading the app."
+    }
+  ]
+}
