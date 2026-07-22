@@ -54,14 +54,14 @@ At startup the daemon mints a 128-bit random label `n` and serves the GUI at
 http://<n>.localhost:<port>/#token=<per-launch token>
 ```
 
-- Browsers resolve any `*.localhost` name to the loopback interface and treat it as a
-  secure/trustworthy context — the RFC 6761 special-use name. **Resolution is NOT universal
-  and must not be assumed** (round 1, finding 12): RFC 6761 §6.3 permits (does not require)
-  resolvers to map `.localhost` to loopback, and on Apple platforms it is the OS resolver, not
-  the browser, that decides — WebKit bug 160504 records `*.localhost` failing on macOS 15.7
-  and succeeding on macOS 26, so a given Safari version does not imply the behavior. The
-  implementation therefore **probes resolution at launch and falls back** (below), rather than
-  asserting cross-browser support.
+- **Where it works**, a browser resolves a `*.localhost` name to the loopback interface and
+  treats it as a secure/trustworthy context — the RFC 6761 special-use name. But **resolution
+  is NOT universal and must not be assumed** (round 1, finding 12; round 4, finding 7): RFC
+  6761 §6.3 *permits* (does not require) resolvers to map `.localhost` to loopback, and on
+  Apple platforms it is the OS resolver, not the browser, that decides — WebKit bug 160504
+  records `*.localhost` failing on macOS 15.7 and succeeding on macOS 26, so a given Safari
+  version does not imply the behavior. The implementation therefore **probes resolution at
+  launch and falls back** (below), rather than asserting cross-browser support.
 - **The listener must be dual-stack EXCLUSIVE** (round 1, finding 2, FALSIFIED the original
   IPv4-only plan): RFC 6761 §6.3 lets `.localhost` resolve to *either* `127.0.0.1` *or*
   `[::1]`, and Chromium prefers `[::1]` when both are offered. An IPv4-only listener leaves

@@ -103,6 +103,13 @@ export interface BuildServerOptions {
    * best-effort internally: a throw is logged, never left to crash close.
    */
   onClose?: () => void | Promise<void>;
+  /**
+   * Invoked when a client POSTs /api/shutdown. The process owner (main.ts)
+   * passes its `stop` here so the HTTP shutdown path shares the single
+   * teardown-aware, force-guarded exit route as SIGTERM/SIGINT (round 4,
+   * finding 2). When absent, the endpoint closes the instance directly.
+   */
+  onShutdownRequest?: () => void;
   logger?: boolean;
 }
 
@@ -453,12 +460,20 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
 
   // Graceful stop, so the GUI can shut the daemon down — and so the shell
   // ships with a real state-changing endpoint under the full policy stack.
+  // When the process owner supplies `onShutdownRequest` (main.ts), route
+  // through it so shutdown shares the ONE stop path — the same teardown-aware,
+  // force-guarded exit as a signal (round 4, finding 2: closing the app here
+  // directly left the HTTP shutdown path unable to report a teardown failure or
+  // guarantee process exit). Absent it (the bare WP-102 shell / tests), fall
+  // back to closing the instance directly.
+  const onShutdownRequest = options.onShutdownRequest;
   let stopping = false;
   app.post("/api/shutdown", async () => {
     if (!stopping) {
       stopping = true;
       setImmediate(() => {
-        void app.close();
+        if (onShutdownRequest !== undefined) onShutdownRequest();
+        else void app.close();
       });
     }
     return { stopping: true };

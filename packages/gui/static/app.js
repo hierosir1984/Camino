@@ -136,6 +136,23 @@ function actionButton(parent, label, className, handler) {
   return button;
 }
 
+// A daemon restart rotates the per-process CSRF token, so a held token is
+// rejected with 403 on every state-changing call (round 3 finding 7; round 4
+// finding 3 — this applies to EVERY such control, not just the register
+// actions). Re-fetch the token and reload the register once, so an open tab
+// recovers without a manual page reload. Returns true if recovery ran.
+async function recoverCsrfIfRotated(error) {
+  if (error.status !== 403) return false;
+  try {
+    csrfToken = (await api("/api/csrf")).csrfToken;
+    await loadRegister();
+    message("Reconnected to the daemon — re-try the action.");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function actOnRow(path, body) {
   try {
     const result = await api(path, {
@@ -147,19 +164,7 @@ async function actOnRow(path, body) {
     renderRegister();
     message("");
   } catch (error) {
-    if (error.status === 403) {
-      // A daemon restart rotates the per-process CSRF token, so a held token is
-      // rejected with 403 (round 3, finding 7). Re-fetch it and reload the
-      // register once, so an open tab recovers without a manual page reload.
-      try {
-        csrfToken = (await api("/api/csrf")).csrfToken;
-        await loadRegister();
-        message("Reconnected to the daemon — re-try the action.");
-        return;
-      } catch {
-        // Fall through to surfacing the original error below.
-      }
-    }
+    if (await recoverCsrfIfRotated(error)) return;
     if (error.status === 409) {
       // The register advanced or the action was refused: re-read so the
       // table shows the current ledger projection, then surface the reason.
@@ -340,6 +345,7 @@ el("shutdown").addEventListener("click", async () => {
     await api("/api/shutdown", { method: "POST", headers: { "x-camino-csrf": csrfToken } });
     message("Daemon is stopping.");
   } catch (error) {
+    if (await recoverCsrfIfRotated(error)) return;
     message(String(error.message ?? error));
   }
 });

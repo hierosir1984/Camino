@@ -59,12 +59,14 @@ const TOKEN = generateToken();
 //   CAM-DEMO-03  accepted, landed, no verdict  → on-main/unverified (evidence gap)
 //   CAM-DEMO-04  accepted, landed + live pass  → delivered, NOT in the register
 //   CAM-VERIF-01 accepted, landed + old pass   → on-main/stale (evidence gap)
+//   CAM-ZONE-01  assumed (documented assumption) → absent/unverified, carries an assumption line
 //   CAM-DEMO-05  proposed only                 → not accepted intent, NOT in the register
 const R_REAL = "CAM-DEMO-01";
 const R_DETECTED = "CAM-DEMO-02";
 const R_UNVERIFIED = "CAM-DEMO-03";
 const R_DELIVERED = "CAM-DEMO-04";
 const R_STALE = "CAM-VERIF-01";
+const R_ASSUMED = "CAM-ZONE-01";
 const R_PROPOSED = "CAM-DEMO-05";
 
 let daemon: RunningDaemon;
@@ -87,6 +89,19 @@ test.beforeAll(async () => {
   accept(R_UNVERIFIED, "sessions expire after inactivity");
   accept(R_DELIVERED, "login rejects malformed identifiers");
   accept(R_STALE, "reports render the fiscal-year summary");
+  // An accepted-family requirement carrying a documented assumption, so the
+  // register row renders an assumption line (round 4, finding 4).
+  ledger.proposeRequirement(R_ASSUMED, {
+    statement: "timestamps display in the viewer's local timezone",
+    sourceMissionId: "m1",
+  });
+  ledger.disputeRequirement(R_ASSUMED, {
+    reason: "the source repo has no timezone handling to confirm this against",
+    conflictWith: null,
+  });
+  ledger.resolveDisputeAssumed(R_ASSUMED, {
+    assumption: "assume UTC until a locale requirement is confirmed",
+  });
   ledger.proposeRequirement(R_PROPOSED, {
     statement: "still awaiting intake confirmation",
     sourceMissionId: "m1",
@@ -285,10 +300,14 @@ test.describe("gap register (seeded daemon)", () => {
   }) => {
     await openRegister(page);
     // Membership: accepted-family gaps only — delivered and merely-proposed
-    // requirements are absent.
-    await expect(tableRows(page)).toHaveCount(4);
+    // requirements are absent; the assumed requirement IS present.
+    await expect(tableRows(page)).toHaveCount(5);
     await expect(rowFor(page, R_DELIVERED)).toHaveCount(0);
     await expect(rowFor(page, R_PROPOSED)).toHaveCount(0);
+    // The assumed row shows its documented assumption (round 4, finding 4).
+    await expect(rowFor(page, R_ASSUMED).locator(".requirement-assumption")).toHaveText(
+      "assumption: assume UTC until a locale requirement is confirmed",
+    );
     // Provenance is visible: the detector finding is cited on its row.
     await expect(rowFor(page, R_DETECTED).locator(".provenance-fact")).toContainText([/todo-scan/]);
     await expectTableMatchesLedger(page);

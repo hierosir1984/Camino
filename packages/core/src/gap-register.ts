@@ -34,13 +34,13 @@
  *   - the current context equals the recorded one (round 1, finding 7) —
  *     a judgment made in `main` never governs a branch row that happens
  *     to share the tuple, and vice versa.
- * A waiver binds two things more: the exact detector findings it covers
+ * A waiver binds one thing more: the exact detector findings it covers
  * (`waivedThroughSeq`), so a NEW finding re-opens the row even at an
- * identical tuple; and the RECENCY of those findings (round 1, finding 5)
- * — the waiver must have been recorded no earlier than the finding at that
- * seq, so a waiver pre-seeded (via the raw store) against a finding that
- * does not yet exist cannot spring to life when a future finding lands at
- * the guessed seq.
+ * identical tuple. Pre-seeding a waiver against a finding that does not yet
+ * exist is impossible on the honest path (the service decides against the
+ * live projection) and is otherwise the raw-store in-process boundary — see
+ * `foldDisposition` for why the earlier cross-log recency heuristic was
+ * removed (rounds 3/4).
  *
  * THE CAM-CANON-05 WAIVER RULE, structural: waivability is DERIVED from
  * evidence provenance — a row is waivable exactly when its outstanding
@@ -320,8 +320,6 @@ interface DispositionBasis {
   readonly contextKey: string;
   /** The row's current waivable-through seq, or null when not waivable. */
   readonly waivableThroughSeq: number | null;
-  /** The recordedAt of the fact at `waivableThroughSeq`, for the recency guard. */
-  readonly waivableThroughAt: string | null;
 }
 
 /**
@@ -348,33 +346,32 @@ interface DispositionBasis {
  *  - the status tuple it recorded (the visible gap state);
  *  - the CONTEXT it was taken in (round 1, finding 7): a `main` judgment
  *    never governs a branch row that happens to share the tuple;
- *  - for a waiver, the exact detector findings it covers AND their recency
- *    (round 1, finding 5; round 2, finding 3; round 3, finding 4): the waiver
- *    must name the row's current waivable-through seq, and it must have been
- *    recorded NO EARLIER THAN the finding at that seq. A waiver recorded before
- *    that finding is inert, so a waiver pre-seeded (via the raw store) against a
- *    finding that does not yet exist cannot spring to life when a future finding
- *    lands at the guessed seq.
+ *  - for a waiver, the EXACT detector findings it covers, by the row's current
+ *    `waivableThroughSeq` (round 1, finding 5). A new finding raises that seq, so
+ *    the waiver's recorded seq no longer matches and the row re-opens — a waiver
+ *    only ever covers the findings that were outstanding when it was made.
  *
- *    BOUNDARY, stated precisely (this is where three rounds converged): the
- *    HONEST path is pre-seed-proof by CONSTRUCTION, independent of timestamps —
- *    a waiver is only ever recorded by the register service, which decides
- *    against the LIVE projection, so the finding it names already exists and is
- *    waivable at record time; the service can never name a finding that does not
- *    yet exist. The recordedAt guard is the defense for the RAW `append()` path
- *    (which bypasses the service): it rejects a pre-seed stamped before its
- *    finding. What no single-log timestamp can decide is a raw-`append()` caller
- *    that stamps its pre-seed at the SAME millisecond as a finding it also
- *    authored — two independent stores' clocks can collide, so `recordedAt` is a
- *    recency heuristic, not a causal-ordering primitive. That residual is the
- *    same single-OS-user in-process-liar boundary the intent ledger names
- *    (CAM-CANON-01): a component that can forge canon facts AND drive the raw
- *    disposition store is already inside the process. Closing it fully needs a
- *    shared ordered log, the documented path if it ever must be. The guard is
- *    "no earlier than" (not "strictly after") deliberately: strictly-after would
- *    reject a LEGITIMATE service waiver co-timestamped with its finding —
- *    persisting a successful-but-inert waiver (round 3, finding 4) — for no
- *    security gain, since the service path cannot pre-seed at all.
+ *    WAIVER PRE-SEED BOUNDARY, stated precisely (this is where four rounds
+ *    converged, ending a recency-heuristic that kept breaking). A waiver is
+ *    pre-seed-proof on the HONEST path BY CONSTRUCTION, with no timestamp
+ *    reasoning: the register service is the only legitimate writer, and it
+ *    records a waiver only after `decideGapDisposition` confirms — against the
+ *    LIVE projection — that the finding exists and the row is waivable NOW. The
+ *    service can never name a finding that does not yet exist. The ONLY way to
+ *    pre-seed a waiver against a future finding is to call the store's raw
+ *    `append()` directly, bypassing the service — which is the same
+ *    single-OS-user in-process-liar boundary the intent ledger names
+ *    (CAM-CANON-01) and the gap-disposition store's decision-asymmetry header
+ *    states: a component that can drive the raw store AND forge the matching
+ *    canon fact is already inside the process. An earlier `recordedAt`-recency
+ *    guard tried to defend that raw path with cross-log timestamps, but two
+ *    independent stores' clocks are not a causal-ordering primitive — it
+ *    false-rejected legitimate honest waivers under equal-millisecond writes
+ *    (round 3, finding 4) and wall-clock rollback (round 4, finding 1) while
+ *    only weakly deterring an in-process attacker who controls the clock anyway.
+ *    It is removed: the honest path is correct without it, and closing the raw
+ *    in-process pre-seed for real needs a shared ordered log, the documented
+ *    path if this boundary ever must be closed.
  */
 function foldDisposition(
   events: readonly GapDispositionRecord[],
@@ -387,9 +384,6 @@ function foldDisposition(
     if (!statusTupleEquals(event.payload["tuple"] as StatusTuple, basis.tuple)) continue;
     if (event.event === "gap-false-positive-waived") {
       if (event.payload["waivedThroughSeq"] !== basis.waivableThroughSeq) continue;
-      if (basis.waivableThroughAt === null) continue;
-      // No earlier than: reject a waiver recorded strictly BEFORE the finding.
-      if (Date.parse(event.recordedAt) < Date.parse(basis.waivableThroughAt)) continue;
     }
     disposition = EVENT_TO_DISPOSITION[event.event];
     record =
@@ -449,17 +443,15 @@ export function projectGapRegister(
       .map(toFactRef);
     const suspicions = outstandingSuspicions(requirementFacts, contextKey);
     const detectorFindings = suspicions.filter((f) => isDetectorActor(f.actor)).map(toFactRef);
-    const waivable =
+    const waivableThroughSeq =
       suspicions.length > 0 && suspicions.every((f) => isDetectorActor(f.actor))
-        ? suspicions[suspicions.length - 1]!
+        ? suspicions[suspicions.length - 1]!.seq
         : null;
-    const waivableThroughSeq = waivable?.seq ?? null;
 
     const folded = foldDisposition(dispositionsByRequirement.get(requirementId) ?? [], {
       tuple: explained.tuple,
       contextKey,
       waivableThroughSeq,
-      waivableThroughAt: waivable?.recordedAt ?? null,
     });
 
     rows.push({

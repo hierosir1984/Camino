@@ -110,10 +110,14 @@ export async function main(): Promise<void> {
   // 2): startDaemonServer awaits listen(), and a SIGTERM arriving after the
   // socket binds but before the handlers existed would take the default action
   // and kill the daemon ungracefully. Registered here — before startDaemonServer
-  // — so every signal from process start onward is handled. Until the server is
-  // listening, `daemon` is undefined and a stop just releases the stores + lock
-  // and exits; afterwards it closes the instance (whose onClose hook releases
-  // them).
+  // — so every signal from THIS POINT (which precedes the listener) is handled.
+  // A brief earlier window remains (during token / lock / store setup above): a
+  // signal there still takes the default action, but nothing is listening yet
+  // and the kernel releases the writer lock on process exit, so a re-launch
+  // starts cleanly (round 4, finding 6 — this is a documented residual, not the
+  // listener race, which is closed). Until the server is listening, `daemon` is
+  // undefined and a stop just releases the stores + lock and exits; afterwards it
+  // closes the instance (whose onClose hook releases them).
   //
   // The forced-exit path (a hung close) exits NON-ZERO, and a resolved close
   // whose store teardown FAILED also exits non-zero (round 3, finding 5) — an
@@ -163,6 +167,9 @@ export async function main(): Promise<void> {
       // a post-listen failure — via a hook registered BEFORE listen (round 1,
       // finding 1). No post-listen addHook here; that crashed the daemon.
       onClose: () => void closeStores(),
+      // /api/shutdown shares the ONE stop path (round 4, finding 2): the same
+      // teardown-aware, force-guarded exit as a signal.
+      onShutdownRequest: stop,
       logger: true,
     });
   } catch (error) {

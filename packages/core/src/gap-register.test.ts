@@ -525,59 +525,49 @@ describe("round-1 falsification regressions", () => {
     baseSha: BASE,
   });
 
-  it("F5: a waiver recorded BEFORE the finding it names never springs to life (pre-seed via raw store)", () => {
+  it("F5: an honest waiver binds by (tuple, context, waivedThroughSeq) regardless of clock", () => {
+    // The pre-seed defense is the SERVICE's live decision, not a timestamp:
+    // rounds 3 and 4 showed a cross-log recency heuristic false-rejects honest
+    // waivers under equal-millisecond and clock-rollback writes, so it was
+    // removed. A waiver applies whenever its tuple/context/seq match the row —
+    // the service can only ever record such a waiver against a finding that
+    // already exists (register-service.test proves the service cannot pre-seed).
     const view = ledgerView([{ id: R1, disposition: "accepted" }]);
-    const dispositions = new DispositionLog();
-    // Pre-seeded against a guessed future finding seq=1, recorded 2026-07-01
-    // — BEFORE any detector fact exists.
-    dispositions.add(
-      R1,
-      "gap-false-positive-waived",
-      { tuple: suspectedTuple(), reason: "pre-seed", waivedThroughSeq: 1 },
-      "2026-07-01T00:00:00.000Z",
-    );
-    // The detector finding arrives later (FactLog records at 2026-07-02) at seq 1.
-    const facts = new FactLog();
-    facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "real hit" });
-    const rows = project(view, facts, dispositions);
-    expect(rows[0]!.tuple).toEqual(suspectedTuple()); // tuple + seq both match…
-    expect(rows[0]!.disposition).toBe("open"); // …but the waiver predates the finding, so it is inert
-  });
-
-  it("F5: an honest waiver recorded after the finding does bind", () => {
-    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
-    const facts = new FactLog();
+    const facts = new FactLog(); // records at 2026-07-02
     const finding = facts.add(R1, "absence-suspected", DETECTOR, {
       contextKind: "main",
       reason: "hit",
     });
-    const dispositions = new DispositionLog(); // default recordedAt 2026-07-03 > finding's 2026-07-02
-    dispositions.add(R1, "gap-false-positive-waived", {
-      tuple: suspectedTuple(),
-      reason: "intentional",
-      waivedThroughSeq: finding.seq,
-    });
-    expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
-  });
-
-  it("F5 (round 3): an honest waiver at the SAME instant as the finding DOES bind (no-earlier-than)", () => {
-    // A service-recorded waiver is co-timestamped with its finding when both
-    // stores share a clock. The guard is "no earlier than", not "strictly
-    // after": the honest path decided against the live projection, so a
-    // same-instant waiver must bind — a strictly-after guard would persist it
-    // as a successful-but-inert row (round 3, finding 4). The raw-store
-    // BEFORE-the-finding pre-seed stays inert (asserted separately above).
-    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
-    const facts = new FactLog(); // records at 2026-07-02T00:00:00.000Z
-    facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "hit" });
+    // Even a waiver stamped EARLIER than the finding binds (clock rollback must
+    // not make an honest waiver inert — round 4, finding 1).
     const dispositions = new DispositionLog();
     dispositions.add(
       R1,
       "gap-false-positive-waived",
-      { tuple: suspectedTuple(), reason: "co-timestamped honest waiver", waivedThroughSeq: 1 },
-      "2026-07-02T00:00:00.000Z",
+      { tuple: suspectedTuple(), reason: "intentional", waivedThroughSeq: finding.seq },
+      "2026-07-01T00:00:00.000Z",
     );
     expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
+  });
+
+  it("F5: a NEW detector finding still re-opens a waived row (the seq binding holds)", () => {
+    const view = ledgerView([{ id: R1, disposition: "accepted" }]);
+    const facts = new FactLog();
+    const first = facts.add(R1, "absence-suspected", DETECTOR, {
+      contextKind: "main",
+      reason: "first",
+    });
+    const dispositions = new DispositionLog();
+    dispositions.add(R1, "gap-false-positive-waived", {
+      tuple: suspectedTuple(),
+      reason: "waive the first",
+      waivedThroughSeq: first.seq,
+    });
+    expect(project(view, facts, dispositions)[0]!.disposition).toBe("false-positive-waived");
+    // A second finding raises waivableThroughSeq; the waiver's seq no longer
+    // matches → the row re-opens (the waiver only covered the first finding).
+    facts.add(R1, "absence-suspected", DETECTOR, { contextKind: "main", reason: "second" });
+    expect(project(view, facts, dispositions)[0]!.disposition).toBe("open");
   });
 
   it("F7: a disposition recorded in one context never governs another (main ↛ branch)", () => {
