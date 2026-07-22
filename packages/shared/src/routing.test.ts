@@ -217,13 +217,19 @@ describe("validatePolicyTable — structural refusals", () => {
     ]);
   });
 
-  it("is not satisfied by prototype-inherited fields (validates the shape that would persist)", () => {
-    // Round-1 review finding 3: JSON round-trips drop inherited fields, so
-    // validation must not read through the prototype chain.
+  it("refuses non-plain candidates: inherited-field carriers and class instances", () => {
+    // Round-1 finding 3 / round-2 finding 7: only PLAIN objects are valid —
+    // a candidate whose fields live on its prototype, or whose behavior
+    // lives on a class, diverges from the JSON snapshot that persists.
     const carrier = Object.create(editableCopy()) as Record<string, unknown>;
-    const violations = validatePolicyTable(carrier);
-    expect(violations.some((v) => v.path === "cells")).toBe(true);
-    expect(violations.some((v) => v.path === "providerAllowlist")).toBe(true);
+    expect(validatePolicyTable(carrier)).toEqual([
+      { path: "", reason: "policy table must be a plain object" },
+    ]);
+    class PolicyCarrier {}
+    const instance = Object.assign(new PolicyCarrier(), editableCopy());
+    expect(validatePolicyTable(instance)).toEqual([
+      { path: "", reason: "policy table must be a plain object" },
+    ]);
   });
 
   it("refuses model identifiers that are not clean printable strings", () => {
@@ -232,10 +238,13 @@ describe("validatePolicyTable — structural refusals", () => {
     // defects. (Harness ACCEPTANCE of a clean id is the named dispatch-time
     // boundary — see the PolicyAssignment doc.)
     const cases: Array<[unknown, RegExp]> = [
-      ["\u0000", /control characters/],
+      ["\u0000", /control, format, separator/],
       ["\ud800", /unpaired surrogate/],
-      ["  gpt-5.6-sol", /whitespace/],
-      ["gpt\n5", /control characters/],
+      ["  gpt-5.6-sol", /control, format, separator/],
+      ["gpt\n5", /control, format, separator/],
+      ["gpt\u200bmodel", /control, format, separator/], // zero-width space
+      ["\u202egpt", /control, format, separator/], // bidirectional override
+      ["a\u2028b", /control, format, separator/], // line separator
       ["x".repeat(300), /exceeds/],
       [42, /must be null/],
       [undefined, /must be null/],

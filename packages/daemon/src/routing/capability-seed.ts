@@ -59,7 +59,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       quotaWindows: {
         value: [
           { id: "session-5h", kind: "rolling", durationMs: 5 * HOUR_MS },
-          { id: "weekly-7d", kind: "rolling", durationMs: 7 * DAY_MS },
+          { id: "weekly", kind: "unknown-reset", durationMs: 7 * DAY_MS },
         ],
         snapshotAt: "2026-07-17",
         source: `${REGISTRY_ITEM_13} (Claude 5-hour + weekly windows), PRD approved 2026-07-17`,
@@ -70,6 +70,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
         ],
         notes: [
           "Window CAPACITY is deliberately unstated: it varies by plan and is estimated from ledger observation, never assumed.",
+          "The weekly limit's PERIOD is stated by the source; its reset semantics are not — kind unknown-reset receives the conservative rolling bounds (see WindowShape), refined from ledger observation.",
         ],
       },
       harnessFeatures: {
@@ -149,7 +150,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       quotaWindows: {
         value: [
           { id: "session-5h", kind: "rolling", durationMs: 5 * HOUR_MS },
-          { id: "weekly-7d", kind: "rolling", durationMs: 7 * DAY_MS },
+          { id: "weekly", kind: "unknown-reset", durationMs: 7 * DAY_MS },
         ],
         snapshotAt: "2026-07-22",
         source: `ChatGPT Codex pricing documentation, learn.chatgpt.com/docs/pricing (retrieved 2026-07-22): usage limits for local messages and cloud chats share a five-hour window, with additional weekly limits; window set per ${REGISTRY_ITEM_13}`,
@@ -159,7 +160,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           "ledger observation contradicting the recorded shape (QuotaWindowTracker)",
         ],
         notes: [
-          "The cited page states a five-hour window and 'additional weekly limits'; the weekly RESET semantics (rolling vs fixed) are not stated and are refined from ledger observation.",
+          "The cited page states a five-hour window and 'additional weekly limits'. Only the weekly PERIOD is asserted here; reset semantics are not stated by the source, so the window is recorded kind unknown-reset and receives the conservative rolling bounds (see WindowShape), refined from ledger observation (round-2 review finding 4).",
         ],
       },
       harnessFeatures: {

@@ -31,11 +31,13 @@
  *     window has fully freed at most one duration later (conservative
  *     reset bound).
  *   - A provider with NO recorded window shape (Grok Build) is still
- *     schedulable: once an exhaustion→success recovery gap has been
- *     observed, the largest gap is synthesized as an "observed-recovery"
- *     window — the ledger-refined shape registry item 13 names — so the
- *     reset bound and consumption estimates apply to it like any seeded
- *     shape. Before any gap exists, `windows` stays empty and
+ *     schedulable: once a GENUINE recovery has been observed — a succeeded
+ *     dispatch whose whole interval lies after an exhaustion; a success
+ *     that was already in flight when the limit tripped proves nothing —
+ *     the largest exhaustion→recovery gap is synthesized as an
+ *     "observed-recovery" window (the ledger-refined shape registry item
+ *     13 names), so the reset bound and consumption estimates apply to it
+ *     like any seeded shape. Before any gap exists, `windows` stays empty and
  *     `lastQuotaBlockedAt` tells the scheduler "exhausted, reset horizon
  *     unknown" — resuming on evidence (a later successful dispatch) is the
  *     WP-114 scheduler's policy, stated here as its boundary.
@@ -63,12 +65,15 @@ const OUTCOMES: readonly DispatchOutcome[] = [
 // UPDATE/DELETE triggers: REPLACE deletes a conflicting row WITHOUT firing
 // the DELETE trigger unless recursive triggers are on, so an explicit-seq
 // replace would silently rewrite history (the PR #45 append-only fold,
-// reproduced against this store by the round-1 review, finding 4). NEW.seq
-// is NULL for ordinary autoincrement inserts, so the guard never fires on
-// the append path.
+// reproduced against this store by the round-1 review, finding 4).
+// Ordinary autoincrement inserts reach the trigger with NEW.seq = -1 (the
+// not-yet-assigned sentinel), so the guard requires NEW.seq >= 0 — and the
+// CHECK (seq > 0) refuses an explicit negative-seq row that would collide
+// with the sentinel and brick every later append (round-2 review finding 3;
+// both properties probed directly against better-sqlite3).
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS window_observations (
-  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq > 0),
   family       TEXT    NOT NULL CHECK (family IN ('anthropic', 'openai', 'xai')),
   observed_at  TEXT    NOT NULL,
   duration_ms  INTEGER NOT NULL CHECK (duration_ms >= 0),
@@ -92,11 +97,28 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS window_obs_append_only_replace
 BEFORE INSERT ON window_observations
-WHEN EXISTS (SELECT 1 FROM window_observations WHERE seq = NEW.seq)
+WHEN NEW.seq >= 0 AND EXISTS (SELECT 1 FROM window_observations WHERE seq = NEW.seq)
 BEGIN
   SELECT RAISE(ABORT, 'window observations are append-only: seq replacement rejected');
 END;
 `;
+
+/** Expected schema objects from a pristine in-memory creation (canon-store pattern). */
+let expectedTrackerSchema: Map<string, string> | null = null;
+function expectedSchemaObjects(): Map<string, string> {
+  if (expectedTrackerSchema !== null) return expectedTrackerSchema;
+  const mem = new Database(":memory:");
+  try {
+    mem.exec(SCHEMA);
+    const rows = mem
+      .prepare("SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all() as Array<{ name: string; sql: string | null }>;
+    expectedTrackerSchema = new Map(rows.map((r) => [r.name, r.sql ?? ""]));
+    return expectedTrackerSchema;
+  } finally {
+    mem.close();
+  }
+}
 
 interface ObservationRow {
   seq: number;
@@ -222,6 +244,38 @@ export class QuotaWindowTracker {
           `window-observation store ${path} has schema version ${version}; this daemon expects ${SCHEMA_VERSION}`,
         );
       }
+      // Tamper-EVIDENT adoption (round-2 review finding 2, the WP-109
+      // canon-store pattern): the append-only promise rests on the triggers,
+      // so a store whose schema OBJECTS — definitions, not names — differ
+      // from this daemon's is refused instead of silently trusted on its
+      // user_version alone. NAMED BOUNDARY: this is evidence, not proof — a
+      // writer with filesystem access can delete or rebuild the whole file;
+      // that perimeter is the 0700 state directory (CAM-CORE-01 posture),
+      // the same boundary named for every store in this daemon.
+      const expected = expectedSchemaObjects();
+      const actual = new Map(
+        (
+          this.#db
+            .prepare(
+              "SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .all() as Array<{ name: string; sql: string | null }>
+        ).map((r) => [r.name, r.sql ?? ""]),
+      );
+      if (actual.size !== expected.size) {
+        throw new Error(
+          `window-observation store ${path} has ${actual.size} schema objects, expected ${expected.size} — ` +
+            "refusing to open a tampered or foreign store",
+        );
+      }
+      for (const [name, sql] of expected) {
+        if (actual.get(name) !== sql) {
+          throw new Error(
+            `window-observation store ${path} schema object ${name} does not match this daemon's definition — ` +
+              "refusing to open a tampered or foreign store",
+          );
+        }
+      }
       this.#insert = this.#db.prepare(
         `INSERT INTO window_observations (family, observed_at, duration_ms, outcome, quota_signal)
          VALUES (@family, @observedAt, @durationMs, @outcome, @quotaSignal)`,
@@ -285,11 +339,14 @@ export class QuotaWindowTracker {
 
   /**
    * Exhaustion→recovery gaps in milliseconds: for each quota-blocked
-   * observation, the time until the next SUCCEEDED dispatch — in TIMESTAMP
-   * order, so backfilled rows land where they belong and no gap is ever
-   * negative (round-1 review finding 2). This is the ledger evidence
-   * registry item 13 names for refining window shapes — most useful for a
-   * provider with no recorded shape yet (Grok Build).
+   * observation, the time until the end of the next GENUINE recovery — a
+   * succeeded dispatch whose whole interval lies after the exhaustion
+   * (start = end − duration at or past the blocked instant). A success
+   * that merely ENDED after the exhaustion proves nothing about the quota
+   * freeing: it was already in flight when the limit tripped (round-2
+   * review finding 1; timestamp ordering per round-1 finding 2). This is
+   * the ledger evidence registry item 13 names for refining window shapes
+   * — most useful for a provider with no recorded shape yet (Grok Build).
    */
   recoveryGapsMs(family: ProviderFamily): number[] {
     const ordered = this.observations(family).sort(byInstantThenSeq);
@@ -298,8 +355,11 @@ export class QuotaWindowTracker {
       if (ordered[i]!.outcome !== "quota-blocked") continue;
       const blockedAt = Date.parse(ordered[i]!.observedAt);
       for (let j = i + 1; j < ordered.length; j++) {
-        if (ordered[j]!.outcome === "succeeded") {
-          gaps.push(Date.parse(ordered[j]!.observedAt) - blockedAt);
+        const candidate = ordered[j]!;
+        if (candidate.outcome !== "succeeded") continue;
+        const endMs = Date.parse(candidate.observedAt);
+        if (endMs - candidate.durationMs >= blockedAt) {
+          gaps.push(endMs - blockedAt);
           break;
         }
       }

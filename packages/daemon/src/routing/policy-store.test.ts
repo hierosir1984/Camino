@@ -193,6 +193,26 @@ describe("refusals", () => {
     }
   });
 
+  it("persists exactly the validated snapshot — a toJSON that MANUFACTURES a valid table is that table", () => {
+    // Round-2 review finding 6 pinned as semantics: the live object is
+    // never consulted; only its serialized snapshot is validated and
+    // persisted, so a valid manufactured snapshot is accepted exactly as
+    // if passed directly, and later reads agree with it byte-for-byte.
+    const store = new RoutingPolicyStore(tempPath(), CLOCK);
+    try {
+      const manufactured = copyOfDefaults();
+      manufactured.cells["feature"]!["low"]!["implementer"]!.reasoningTier = "xhigh";
+      const weirdLiveObject = { marker: "not a policy table at all", toJSON: () => manufactured };
+      const result = store.setPolicyTable("project-a", weirdLiveObject, "David");
+      expect(result.ok).toBe(true);
+      const readBack = store.getEffectivePolicy("project-a");
+      expect(readBack.source).toBe("project");
+      expect(JSON.parse(JSON.stringify(readBack.table))).toEqual(manufactured);
+    } finally {
+      store.close();
+    }
+  });
+
   it("surfaces the resolved cell's recorded cross-family trade-offs at lookup time", () => {
     // Round-1 review finding 9: the dispatch lookup must not hide what the
     // edit path recorded.

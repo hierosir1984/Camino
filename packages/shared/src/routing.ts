@@ -205,8 +205,15 @@ export interface PolicyViolation {
   readonly reason: string;
 }
 
+/**
+ * A PLAIN object: Object.prototype or null prototype only. Class instances
+ * are refused outright — their behavior (getters, methods) is invisible to
+ * the JSON snapshot that actually persists (round-2 review finding 7).
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -221,7 +228,16 @@ function ownField(obj: Record<string, unknown>, key: string): unknown {
 
 const MODEL_ID_MAX_LENGTH = 200;
 
-/** Shape defects of a pinned model identifier (see the PolicyAssignment boundary note). */
+/**
+ * Shape defects of a pinned model identifier (see the PolicyAssignment
+ * boundary note). Refuses every code point in the Unicode "Other" and
+ * "Separator" categories — controls, FORMAT characters (zero-width,
+ * bidirectional overrides), separators (including ordinary spaces and
+ * U+2028/U+2029), surrogates, private-use, and unassigned — not just
+ * C0/C1 (round-2 review finding 5): a model identifier is a machine
+ * token, and an invisible or reordering code point in one is never
+ * legitimate.
+ */
 function modelIdProblem(model: unknown): string | null {
   if (model === null) return null;
   if (typeof model !== "string" || model.length === 0) {
@@ -233,12 +249,8 @@ function modelIdProblem(model: unknown): string | null {
   if (!model.isWellFormed()) {
     return "model contains unpaired surrogate code units";
   }
-  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
-  if (/[\u0000-\u001F\u007F-\u009F]/.test(model)) {
-    return "model contains control characters";
-  }
-  if (model !== model.trim()) {
-    return "model must not carry leading or trailing whitespace";
+  if (/[\p{C}\p{Z}]/u.test(model)) {
+    return "model contains control, format, separator, or non-character code points";
   }
   return null;
 }
@@ -618,11 +630,22 @@ export interface ModelInfo {
  * A quota-window shape per PRD §5 registry item 13. Windows are tracked
  * from adapter rate-limit signals; shapes are refined from ledger
  * observation (QuotaWindowTracker).
+ *
+ * `kind` records what the SOURCE states about reset semantics:
+ *   rolling       — the limit is documented/observed as a rolling window
+ *   unknown-reset — the limit's PERIOD is stated (durationMs) but its reset
+ *                   semantics are not (e.g. a documented "weekly limit"
+ *                   that may reset on a calendar boundary)
+ * The estimator applies the same CONSERVATIVE bounds to both: consumption
+ * pinned for at most one period after an exhaustion (a calendar reset can
+ * only come sooner), and usage measured over the trailing period (a
+ * superset of usage since any in-period calendar reset) — both over-state,
+ * never under-state, so an unknown reset never weakens the pause rule
+ * (round-2 review finding 4).
  */
 export interface WindowShape {
   readonly id: string;
-  /** v1 models rolling windows only; calendar-reset shapes are an observation away. */
-  readonly kind: "rolling";
+  readonly kind: "rolling" | "unknown-reset";
   readonly durationMs: number;
 }
 

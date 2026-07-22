@@ -189,7 +189,7 @@ describe("window consumption estimates", () => {
         basis: "usage-fraction",
         estimatedConsumption: 0,
       });
-      expect(byId.get("weekly-7d")).toMatchObject({
+      expect(byId.get("weekly")).toMatchObject({
         estimatedConsumption: 1,
         basis: "exhaustion-observed",
       });
@@ -462,6 +462,90 @@ describe("window consumption estimates", () => {
         at: at(3 * HOUR + 30 * MINUTE),
       });
       expect(tracker.recoveryGapsMs("xai")).toEqual([90 * MINUTE]);
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("does not count a success that was already in flight at the exhaustion as recovery", () => {
+    // Round-2 review finding 1: a succeeded dispatch whose interval BEGAN
+    // before the exhaustion proves nothing about the quota freeing — it
+    // must not synthesize a shape or refine one.
+    const tracker = new QuotaWindowTracker(tempPath()); // xai: no seeded shape
+    try {
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(HOUR),
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(HOUR),
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: HOUR, // started at 00:01 — BEFORE the 01:00 exhaustion
+        quotaSignalSeen: false,
+        at: at(HOUR + MINUTE),
+      });
+      expect(tracker.recoveryGapsMs("xai")).toEqual([]);
+      const state = tracker.windowState("xai", { now: at(HOUR + 2 * MINUTE) });
+      expect(state.windows).toEqual([]); // still "exhausted, horizon unknown"
+
+      // A GENUINE recovery — whole interval after the exhaustion — counts.
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(2 * HOUR + 30 * MINUTE),
+      });
+      expect(tracker.recoveryGapsMs("xai")).toEqual([90 * MINUTE]);
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("refuses to adopt a store whose schema objects were tampered with", () => {
+    // Round-2 review finding 2: the append-only promise rests on the
+    // triggers, so adoption verifies schema DEFINITIONS, not user_version.
+    const path = tempPath();
+    new QuotaWindowTracker(path).close();
+    const db = new Database(path);
+    db.exec("DROP TRIGGER window_obs_append_only_replace");
+    db.close();
+    expect(() => new QuotaWindowTracker(path)).toThrow(/tampered or foreign store/);
+  });
+
+  it("refuses a negative-seq row that would collide with the autoincrement sentinel", () => {
+    // Round-2 review finding 3: a schema-valid seq=-1 row would make every
+    // later append look like a replacement. The CHECK refuses it outright,
+    // and ordinary appends keep working afterwards.
+    const path = tempPath();
+    const tracker = new QuotaWindowTracker(path);
+    try {
+      const db = new Database(path);
+      try {
+        expect(() =>
+          db
+            .prepare(
+              `INSERT INTO window_observations (seq, family, observed_at, duration_ms, outcome, quota_signal)
+               VALUES (-1, 'xai', ?, 0, 'succeeded', 0)`,
+            )
+            .run(at(0).toISOString()),
+        ).toThrow(/CHECK/);
+      } finally {
+        db.close();
+      }
+      const appended = tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: 1_000,
+        quotaSignalSeen: false,
+        at: at(MINUTE),
+      });
+      expect(appended.seq).toBeGreaterThan(0);
     } finally {
       tracker.close();
     }

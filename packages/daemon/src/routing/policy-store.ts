@@ -157,13 +157,17 @@ export class RoutingPolicyStore {
    * refuse the write with every violation listed; an accepted write
    * returns the cross-family properties the table trades away, if any.
    *
-   * Ordering matters (round-1 review finding 3): the candidate is
-   * serialized FIRST and every check — structural validation and the
-   * cross-family measurement — runs on the parsed round-trip, i.e. the
-   * exact snapshot future reads will see. A live object whose getters,
-   * toJSON handler, or prototype-inherited fields present one shape to
-   * validation and serialize to another therefore cannot be persisted:
-   * nothing is written until every check has passed on the snapshot.
+   * Ordering matters (round-1 review finding 3, wording tightened by
+   * round-2 finding 6): the candidate is serialized FIRST and every check
+   * — structural validation and the cross-family measurement — runs on the
+   * parsed round-trip, i.e. the exact snapshot future reads will see, and
+   * nothing is written until every check has passed on that snapshot. The
+   * guaranteed property is therefore: WHAT PERSISTS IS ALWAYS THE VALIDATED
+   * SNAPSHOT. The live object's own shape is never consulted — a toJSON
+   * handler that MANUFACTURES a valid table from an otherwise-invalid
+   * object is accepted, exactly as if the caller had passed the
+   * manufactured table directly; divergence between the live object and
+   * its snapshot can never make an invalid shape persist.
    */
   setPolicyTable(projectId: string, candidate: unknown, actor: string): SetPolicyResult {
     try {
