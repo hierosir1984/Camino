@@ -128,6 +128,32 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
     ).rejects.toThrow(BudgetConfigError);
   });
 
+  it("a plan() that overruns the wall-clock budget then THROWS is killed-budget, not requirement-failed (round-2 finding 5)", async () => {
+    // An adapter whose plan() blocks past the deadline then throws never armed
+    // the async timer; the exception path must still charge the elapsed time.
+    const throwingAdapter = {
+      name: "mock:plan-overrun",
+      enabled: true,
+      plan(): never {
+        const until = Date.now() + 120;
+        while (Date.now() < until) {
+          /* block synchronously past the 30ms budget */
+        }
+        throw new Error("plan failed after overrunning the budget");
+      },
+      parseLine: () => null,
+    };
+    const { record, escalation } = await dispatchWithBudget(
+      throwingAdapter,
+      { workdir: workdir(), prompt: "overrun" },
+      { wallClockMs: 30 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 30 });
+    expect(escalation).toBeDefined();
+  }, 30_000);
+
   it("a budget breach at the SAME boundary as a generic timeout classifies killed-budget (round-1 finding 7)", async () => {
     // Equal wall-clock budget and timeout: the budget must win so A.2#10
     // kill-and-escalate fires, never a generic `killed`.

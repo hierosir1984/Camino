@@ -2,7 +2,10 @@
 // container is launched with, and every fail-closed refusal. The packet-level
 // proof that these arguments produce the isolation they claim is
 // egress.worker.test.ts (docker-backed).
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   WORKER_CONTAINER_CAPS,
   WORKER_PIDS_LIMIT,
@@ -14,6 +17,17 @@ import {
   renderAllowlistEnv,
   renderWorkerRunArgs,
 } from "./egress.js";
+
+let tmpDirs: string[] = [];
+function tempDir(): string {
+  const d = mkdtempSync(join(tmpdir(), "camino-wp107-egress-"));
+  tmpDirs.push(d);
+  return d;
+}
+afterEach(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+  tmpDirs = [];
+});
 
 const BASE = {
   image: "camino-worker-profile:test",
@@ -109,7 +123,20 @@ describe("renderWorkerRunArgs", () => {
         },
         ["/bin/true"],
       ),
-    ).toThrow(/bootstrap path/);
+    ).toThrow(/shadow a bootstrap path|bootstrap path/);
+  });
+
+  it("rejects ANCESTOR mounts that would shadow the entrypoint (round-2 finding 1)", () => {
+    // Mounting /usr or /usr/local (parents of /usr/local/bin/…entrypoint)
+    // shadows the pinned entrypoint just as surely as mounting the exact path.
+    for (const containerPath of ["/usr", "/usr/local", "/usr/local/bin"]) {
+      expect(() =>
+        renderWorkerRunArgs(
+          { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
+          ["/bin/true"],
+        ),
+      ).toThrow(/shadow a bootstrap path|bootstrap path/);
+    }
   });
 
   it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {
@@ -126,7 +153,7 @@ describe("renderWorkerRunArgs", () => {
         },
         ["/bin/true"],
       ),
-    ).toThrow(/overlaps the rw workspace/);
+    ).toThrow(/resolves into the rw workspace/);
     // The reverse (workspace inside the auth source) is equally refused.
     expect(() =>
       renderWorkerRunArgs(
@@ -137,7 +164,7 @@ describe("renderWorkerRunArgs", () => {
         },
         ["/bin/true"],
       ),
-    ).toThrow(/overlaps the rw workspace/);
+    ).toThrow(/resolves into the rw workspace/);
     // Disjoint sources are fine.
     expect(() =>
       renderWorkerRunArgs(
@@ -145,6 +172,40 @@ describe("renderWorkerRunArgs", () => {
           ...BASE,
           workspaceHostPath: "/tmp/attempt/workspace",
           providerAuthMounts: [{ hostPath: "/tmp/attempt/auth", containerPath: "/auth/provider" }],
+        },
+        ["/bin/true"],
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects a SYMLINK auth source that resolves into the workspace (round-2 finding 2)", () => {
+    const base = tempDir();
+    const ws = join(base, "workspace");
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(join(ws, "real-auth"), { recursive: true });
+    // The auth host path is a symlink OUTSIDE the workspace tree lexically, but
+    // it resolves to a dir INSIDE the workspace — writable through /workspace.
+    const authLink = join(base, "auth-link");
+    symlinkSync(join(ws, "real-auth"), authLink);
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          workspaceHostPath: ws,
+          providerAuthMounts: [{ hostPath: authLink, containerPath: "/auth/provider" }],
+        },
+        ["/bin/true"],
+      ),
+    ).toThrow(/resolves into the rw workspace/);
+    // A genuinely disjoint real auth dir is accepted.
+    const auth = join(base, "auth");
+    mkdirSync(auth, { recursive: true });
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          workspaceHostPath: ws,
+          providerAuthMounts: [{ hostPath: auth, containerPath: "/auth/provider" }],
         },
         ["/bin/true"],
       ),

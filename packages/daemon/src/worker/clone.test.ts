@@ -7,7 +7,7 @@
 // credential material — and each must TRIP the attestation, so the fence is
 // proven to fire, not merely believed to.
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -80,6 +80,7 @@ describe("provisionWorkerClone (CAM-EXEC-02 positive path)", () => {
       hooksDisabledByConfig: true,
       noCredentialHelper: true,
       remotesCredentialFree: true,
+      noHttpExtraheader: true,
       credentialMaterialPaths: [],
     });
   });
@@ -147,7 +148,7 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/alternates/);
   });
 
-  it("rejects a --local hardlink clone (shared object store, no alternates) — round-1 finding 10", () => {
+  it("rejects a --local hardlink clone (shared LOOSE object store, no alternates) — round-1 finding 10", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();
     // A plain --local clone HARDLINKS its loose objects to the source (no
@@ -156,6 +157,59 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     git(dest, "config", "--local", "core.hooksPath", "/dev/null");
     git(dest, "config", "--local", "credential.helper", "");
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink/);
+  });
+
+  it("rejects a --local hardlink clone of a PACKED source (shared pack) — round-2 finding 7", () => {
+    const source = makeSourceRepo();
+    // Pack the source so its objects live in objects/pack, then --local clone:
+    // the .pack/.idx are hardlinked, which the loose-only check would miss.
+    execFileSync("git", ["-C", source, "gc", "--prune=now"], { env: GIT_ENV });
+    const dest = cloneDest();
+    execFileSync("git", ["clone", "--local", "--", source, dest], { env: GIT_ENV });
+    git(dest, "config", "--local", "core.hooksPath", "/dev/null");
+    git(dest, "config", "--local", "credential.helper", "");
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink/);
+  });
+
+  it("rejects a PUSH url userinfo hidden behind an option-shaped remote name — round-2 finding 4", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // A remote whose NAME looks like an option would have injected into
+    // `git remote get-url <name>`; reading effective config avoids that AND
+    // sees the pushurl.
+    git(
+      dest,
+      "config",
+      "--local",
+      "remote.--upload-pack.pushurl",
+      "https://x:tok@github.invalid/o/r",
+    );
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/userinfo/);
+  });
+
+  it("rejects an http.extraheader reached through a git-config [include] — round-2 finding 4", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Put the Authorization channel in an INCLUDED file; the effective-config
+    // read resolves the include, the raw-file scan of .git/config would not.
+    const incPath = join(dest, ".git", "creds.inc");
+    writeFileSync(
+      incPath,
+      '[http "https://github.invalid/"]\n\textraheader = AUTHORIZATION: basic SECRET\n',
+    );
+    git(dest, "config", "--local", "include.path", "creds.inc");
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/extraheader/);
+  });
+
+  it("rejects a credential-NAMED symlink (.npmrc → secrets.txt) — round-2 finding 4", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    writeFileSync(join(dest, "secrets.txt"), "//npm.pkg.github.com/:_authToken=ghp_SECRET\n");
+    symlinkSync("secrets.txt", join(dest, ".npmrc"));
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/credential material/);
   });
 
   it("rejects a plain clone without the hooks-disabling config", () => {
@@ -253,6 +307,33 @@ describe("scanForGithubCredentialMaterial", () => {
     const clean = tempDir();
     writeFileSync(join(clean, ".npmrc"), "registry=https://registry.npmjs.org/\n");
     expect(scanForGithubCredentialMaterial(clean)).toEqual([]);
+  });
+
+  it("does NOT flag comment-only or example credential lines (round-2 finding 11)", () => {
+    const commented = tempDir();
+    writeFileSync(
+      join(commented, ".npmrc"),
+      "# //registry.npmjs.org/:_authToken=put-your-token-here\nregistry=https://registry.npmjs.org/\n",
+    );
+    expect(scanForGithubCredentialMaterial(commented)).toEqual([]);
+    const example = tempDir();
+    writeFileSync(join(example, "hosts.yml"), "github.com:\n  oauth_token: example\n");
+    expect(scanForGithubCredentialMaterial(example)).toEqual([]);
+    // ...but a real value on a non-comment line IS flagged.
+    const real = tempDir();
+    writeFileSync(
+      join(real, "hosts.yml"),
+      "# example config\ngithub.com:\n  oauth_token: gho_real\n",
+    );
+    expect(scanForGithubCredentialMaterial(real)).toEqual(["hosts.yml"]);
+  });
+
+  it("flags a credential-named symlink without following it", () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "target.txt"), "//npm.pkg.github.com/:_authToken=ghp_SECRET\n");
+    symlinkSync("target.txt", join(dir, ".npmrc"));
+    const findings = scanForGithubCredentialMaterial(dir);
+    expect(findings).toContain(".npmrc (credential-named symlink)");
   });
 
   it("reports an empty result on a clean tree", () => {

@@ -91,6 +91,12 @@ export interface DispatchOptions {
    * (harness runaway cap) so the state machine's kill-and-escalate row
    * (A.2#10/A.3#5) fires on exactly the budget case, never an auto-retry.
    * Classification stays HERE, centralized, per the WP-105 principle.
+   *
+   * By design (round-2 finding 5): a CANCEL already terminates the worker
+   * within the bounded kill-confirm window, so a wall-clock deadline that
+   * passes DURING a cancel's grace does not separately breach — the worker is
+   * not running unbounded, and `cancelled` is the authoritative trigger. The
+   * budget fires when nothing else is stopping the worker.
    */
   budget?: AttemptBudget;
   killConfirm?: KillConfirmTimings;
@@ -448,6 +454,10 @@ export async function dispatch(
   // Set exactly once, by whichever budget check trips first; consulted only
   // when killReason === "budget" (evidence for the escalation record).
   let budgetBreach: BudgetBreachRecord | undefined;
+  // Hoisted so the exception path can enforce the wall-clock budget too
+  // (round-2 finding 5): a plan() that overruns the budget then THROWS still
+  // records the breach and classifies killed-budget, not requirement-failed.
+  let budgetWallClockMs: number | undefined;
   // Abort may fire during the plan()/spawn window, before a child exists
   // (round-1 review finding 3): remember it and apply it the instant we can.
   let pendingCancel = false;
@@ -496,7 +506,6 @@ export async function dispatch(
     // supplied (CAM-EXEC-03). A corrupt tokens value likewise becomes 0
     // (breach on the first usage report) rather than silently absent.
     const rawBudget = opts.budget; // one read
-    let budgetWallClockMs: number | undefined;
     let budgetTokens: number | undefined;
     if (rawBudget !== undefined && rawBudget !== null) {
       budgetWallClockMs = clampMs(rawBudget.wallClockMs, 0);
@@ -907,9 +916,28 @@ export async function dispatch(
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child!, timings);
     }
+    // Wall-clock is enforced even here (round-2 finding 5): a plan()/env getter
+    // that BLOCKS past the deadline then THROWS never armed the async timer
+    // (it fires only after spawn). Charge the elapsed time now — if it exceeds
+    // the wall-clock budget, this is a killed-budget breach, not a plain
+    // requirement-failed, so kill-and-escalate still fires.
+    const elapsedAtCatch = Date.now() - started;
+    if (
+      budgetWallClockMs !== undefined &&
+      elapsedAtCatch >= budgetWallClockMs &&
+      killReason !== "cancel"
+    ) {
+      budgetBreach ??= {
+        kind: "wall-clock",
+        limit: budgetWallClockMs,
+        observed: elapsedAtCatch,
+      };
+    }
     const record: DispatchRecord = {
       adapter: adapterName,
-      outcome: "requirement-failed",
+      // A budget breach outranks requirement-failed (kill-and-escalate,
+      // CAM-EXEC-03); otherwise the exception path makes no stream claims.
+      outcome: budgetBreach ? "killed-budget" : "requirement-failed",
       spawned: child != null,
       streamedEvents: 0,
       finalText: "",
@@ -921,9 +949,6 @@ export async function dispatch(
       durationMs: Date.now() - started,
       events: [],
       quotaSignalSeen: false, // exception path makes no stream claims (events: [])
-      // Evidence only: the exception path keeps requirement-failed as its
-      // outcome (it makes no stream claims), but a breach already recorded
-      // before the throw is preserved for the escalation record.
       ...(budgetBreach ? { budgetBreach } : {}),
       unexpectedError: safeStringify(err),
     };

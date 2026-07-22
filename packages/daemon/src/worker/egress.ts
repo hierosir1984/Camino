@@ -37,6 +37,7 @@
 // David so the deferral is visible, not buried. For a per-repo registry/docs
 // allowlist on a personal tool this L3/L4 posture is the accepted v1, matching
 // the WP-005 spike it productizes.
+import { realpathSync } from "node:fs";
 import { isAbsolute, posix as posixPath } from "node:path";
 import {
   isGithubCredentialShapedKey,
@@ -90,12 +91,20 @@ export const WORKER_WORKSPACE_MOUNT = "/workspace";
 
 /**
  * The isolation entrypoint, PINNED at run time (`--entrypoint`) rather than
- * trusting the image's own ENTRYPOINT (round-1 finding 1). The worker
- * toolchain image (WP-114) layers on top of the profile, but a caller that
- * passes ANY other image — or an image whose ENTRYPOINT was overridden — must
- * still run through the bootstrap. Pinning here makes the guarantee
- * image-content-independent: no image can skip the rule install and run as
- * root with open egress.
+ * trusting the image's own ENTRYPOINT (round-1 finding 1). The worker toolchain
+ * image (WP-114) layers on top of the profile, but an image whose ENTRYPOINT was
+ * overridden must still run through the bootstrap: pinning defeats that.
+ *
+ * BOUNDARY, stated (round-2 finding 1): pinning the PATH does not pin its
+ * CONTENTS. The guarantee holds for a CAMINO-BUILT image (the profile, or a
+ * `FROM camino-worker-profile` toolchain image WP-114 builds) — the entrypoint
+ * binary and its tools are baked in by Camino. Image PROVENANCE (that the run
+ * uses a Camino-built image, not an attacker-supplied one) is WP-114's image-
+ * build boundary, not this composer's: the `image` argument is Camino-composed
+ * like every other run parameter, not untrusted worker input. What this module
+ * additionally guarantees is that no MOUNT can shadow the entrypoint or its
+ * tools at run time (assertSafeMountPaths rejects a mount over a bootstrap path
+ * OR any ancestor of one).
  */
 export const WORKER_PROFILE_ENTRYPOINT = "/usr/local/bin/worker-profile-entrypoint";
 
@@ -157,6 +166,34 @@ function canonicalAbsolute(p: string): string {
   return norm.length > 1 ? norm.replace(/\/+$/u, "") : norm;
 }
 
+/**
+ * Resolve a HOST path to its real location (following symlinks) so overlap
+ * checks compare inodes, not spellings — a symlink auth source into the
+ * workspace shares the workspace inode despite a distinct path (round-2
+ * finding 2). Falls back to lexical canonicalization when the path (or a
+ * prefix) does not yet exist, resolving the longest existing prefix so a
+ * symlinked PARENT is still followed.
+ */
+function realHostPath(p: string): string {
+  const lexical = canonicalAbsolute(p);
+  try {
+    return realpathSync(lexical);
+  } catch {
+    // Resolve the deepest existing ancestor, then re-append the rest.
+    const parts = lexical.split("/").filter((s) => s.length > 0);
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const prefix = "/" + parts.slice(0, i).join("/");
+      try {
+        const realPrefix = realpathSync(prefix);
+        return canonicalAbsolute(realPrefix + "/" + parts.slice(i).join("/"));
+      } catch {
+        /* keep shrinking */
+      }
+    }
+    return lexical;
+  }
+}
+
 /** Does `a` equal, contain, or sit inside `b` (path-segment prefix, either way)? */
 function pathsOverlap(a: string, b: string): boolean {
   if (a === b) return true;
@@ -181,12 +218,21 @@ function assertSafeMountPaths(hostPath: string, containerPath: string): string {
     );
   }
   const norm = canonicalAbsolute(containerPath);
-  const covers = (p: string): boolean =>
-    p === "/" ? norm === "/" : norm === p || norm.startsWith(`${p}/`);
-  if (PROTECTED_MOUNT_TARGETS.some(covers)) {
+  if (norm === "/") {
     throw new WorkerContainerConfigError(
-      `worker mount target ${JSON.stringify(containerPath)} (canonically ${norm}) would cover a ` +
-        "bootstrap path — rejected (fail-closed)",
+      `worker mount target ${JSON.stringify(containerPath)} is the container root — rejected (fail-closed)`,
+    );
+  }
+  // Reject a target that is inside a bootstrap path (norm under p) OR an
+  // ANCESTOR of one (p under norm) — mounting `/usr` or `/usr/local` shadows
+  // the pinned entrypoint and its tools just as surely as mounting the exact
+  // path (round-2 finding 1: the ancestor case was previously accepted).
+  const conflicts = (p: string): boolean =>
+    p === "/" ? false : norm === p || norm.startsWith(`${p}/`) || p.startsWith(`${norm}/`);
+  if (PROTECTED_MOUNT_TARGETS.some(conflicts)) {
+    throw new WorkerContainerConfigError(
+      `worker mount target ${JSON.stringify(containerPath)} (canonically ${norm}) would cover or ` +
+        "shadow a bootstrap path — rejected (fail-closed)",
     );
   }
   return norm;
@@ -271,12 +317,13 @@ export function renderWorkerRunArgs(run: WorkerContainerRun, cmd: string[]): str
     }
     args.push("-e", `${k}=${v}`);
   }
-  // Canonicalize the workspace host path once so overlap checks compare
-  // normalized paths (an auth source under the rw workspace tree would be
-  // writable through the workspace alias despite its own :ro mount — round-1
-  // finding 3).
+  // Resolve the workspace host path to its REAL location once so overlap checks
+  // compare inodes, not spellings — an auth source that is a symlink into the
+  // workspace tree would be writable through the workspace alias despite its
+  // own :ro mount (round-1 finding 3; round-2 finding 2 widened this from
+  // lexical to realpath).
   const workspaceHost =
-    run.workspaceHostPath !== undefined ? canonicalAbsolute(run.workspaceHostPath) : undefined;
+    run.workspaceHostPath !== undefined ? realHostPath(run.workspaceHostPath) : undefined;
   if (run.workspaceHostPath !== undefined) {
     assertSafeMountPaths(run.workspaceHostPath, WORKER_WORKSPACE_MOUNT);
     args.push("-v", `${run.workspaceHostPath}:${WORKER_WORKSPACE_MOUNT}`);
@@ -300,9 +347,9 @@ export function renderWorkerRunArgs(run: WorkerContainerRun, cmd: string[]): str
       );
     }
     seenTargets.add(target);
-    if (workspaceHost !== undefined && pathsOverlap(canonicalAbsolute(m.hostPath), workspaceHost)) {
+    if (workspaceHost !== undefined && pathsOverlap(realHostPath(m.hostPath), workspaceHost)) {
       throw new WorkerContainerConfigError(
-        `provider auth host source ${JSON.stringify(m.hostPath)} overlaps the rw workspace source ` +
+        `provider auth host source ${JSON.stringify(m.hostPath)} resolves into the rw workspace source ` +
           `${JSON.stringify(run.workspaceHostPath)} — the :ro mount would be writable through the ` +
           "workspace alias (fail-closed)",
       );

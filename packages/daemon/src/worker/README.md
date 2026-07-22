@@ -58,13 +58,31 @@ established-egress bypass).
   guarantees the _order_ and the _retention_, and fails closed (workspace
   retained) if the row is not recorded.
 - **Container parameters are Camino-composed, not worker-supplied.** The
-  composer refuses the reachable bootstrap-subversion shapes: a shared network,
-  a bootstrap-path mount (canonicalized, so `/tmp/../usr/local/bin` cannot slip
-  through), a reserved or credential-shaped env key, an overlapping mount
-  source that would alias a `:ro` mount through the rw workspace, and an image
-  whose ENTRYPOINT could skip the profile (the entrypoint is **pinned**). A
-  worker's untrusted input is the _code_ that runs unprivileged after the rules
-  install.
+  composer refuses the reachable bootstrap-subversion shapes: a shared network;
+  a mount that covers **or shadows an ancestor of** a bootstrap path
+  (canonicalized, so `/tmp/../usr/local/bin` and mounting `/usr` are both
+  rejected); a reserved or credential-shaped env key; a mount source that
+  **resolves** (realpath, following symlinks) into the rw workspace and would
+  alias a `:ro` mount; and an image whose ENTRYPOINT could skip the profile
+  (the entrypoint is **pinned**). Image PROVENANCE — that the run uses a
+  Camino-built image (the profile or a `FROM camino-worker-profile` toolchain
+  image) rather than an attacker-supplied one — is **WP-114's image-build
+  boundary**: pinning the entrypoint path defeats an ENTRYPOINT override, not a
+  maliciously-built image. A worker's untrusted input is the _code_ that runs
+  unprivileged after the rules install.
+- **Credential attestation reads EFFECTIVE git config** (`git config
+--includes --list`, which resolves `[include]` directives and never
+  interprets a value as an option) plus a filesystem scan (credential files,
+  credential-named symlinks, comment-aware token content). Literal content
+  scanning cannot catch every ENCODING of a token a repo could commit — that
+  regenerating surface is bounded by the real guarantee: the container **mounts
+  no host HOME**, so a vendor CLI cannot reach the host's credentials whatever
+  the workspace contains.
+- **Archival assumes single-writer-per-issue and a fixed archiveRoot.** The
+  WP-104 lock (WP-114 scheduler) serializes archival per issue; retention/
+  exactly-once are scoped to the one daemon `archiveRoot`. The retention
+  sequence is the attempt's authoritative ordinal (the caller passes it);
+  archiveRoot is realpath-checked to reject a symlink into the workspace.
 - **Egress is an IP:port allowlist (L3/L4), not an L7 host-identity filter.**
   Per-repo hosts are resolved to IPs at container setup and permitted by
   address; there is no HTTP Host / TLS SNI check. So a non-allowlisted virtual

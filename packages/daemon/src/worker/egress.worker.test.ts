@@ -189,7 +189,10 @@ beforeAll(async () => {
   // An IPv6-enabled network so the IPv6 block is proven at the packet level
   // (round-1 finding 12): containers get v6 addresses and reach each other over
   // v6, so the profile's ip6tables DROP is testable without host v6 egress.
-  await dockerOrThrow(["network", "create", "--ipv6", "--subnet", "fd00:107:6::/64", NET]);
+  // The ULA subnet is DERIVED FROM RUN_ID so concurrent suite runs do not
+  // collide on the address pool (round-2 finding 10).
+  const v6Group = RUN_ID.slice(0, 4);
+  await dockerOrThrow(["network", "create", "--ipv6", "--subnet", `fd00:107:${v6Group}::/64`, NET]);
   await startEndpoint(ALLOWED, ALLOWED_BODY, WRONG_PORT);
   await startEndpoint(DENIED, DENIED_BODY);
   const ipOf = async (name: string): Promise<string> => {
@@ -320,27 +323,40 @@ describe("CAM-EXEC-03 — worker egress is allowlist-positive (per-repo config)"
       expect(allowed.out).toContain(ALLOWED_BODY);
       expect(probeOf(probes, "allowed-name-resolution").exit).toBe(0);
 
-      // SELECTIVE DENY: sibling (by IP), wrong port, external, DNS all fail.
+      // SELECTIVE DENY: sibling (by IP), wrong port, external all fail.
       expect(probeOf(probes, "non-allowlisted-sibling-tcp").exit).not.toBe(0);
       expect(probeOf(probes, "allowed-host-wrong-port-tcp").exit).not.toBe(0);
-      expect(probeOf(probes, "non-allowlisted-name-resolution").exit).not.toBe(0);
       expect(probeOf(probes, "non-allowlisted-external-tcp").exit).not.toBe(0);
 
-      // The embedded resolver is closed: nslookup (which queries 127.0.0.11)
-      // fails under the profile. The by-ADDRESS reject rule (all ports, ahead
-      // of the loopback accept) is asserted present by assertRuleOrder above;
-      // the unrestricted-resolver control test proves nslookup WOULD work
-      // absent the profile, so this failure is the profile's.
-      expect(probeOf(probes, "dns-lookup").exit).not.toBe(0);
+      // RESOLVER CLOSED — the ATTRIBUTABLE proof (round-2 finding 8): a
+      // non-allowlisted NAME does not resolve under the profile
+      // (`getent hosts`, which queries 127.0.0.11). This is attributable
+      // because the "both endpoints are alive" control proves the SAME
+      // resolver resolves names by-name (wget-by-name) absent the profile —
+      // so this failure is the by-address 127.0.0.11 reject, asserted present
+      // and correctly ordered by assertRuleOrder above. `dns-lookup`
+      // (busybox nslookup) is supplementary, NOT the sole proof (a broken
+      // nslookup could pass it vacuously, so it is not load-bearing).
+      expect(probeOf(probes, "non-allowlisted-name-resolution").exit).not.toBe(0);
+      expect(probeOf(probes, "dns-lookup").exit).not.toBe(0); // supplementary
 
-      // IPv6 closed at the packet level (round-1 finding 12). Runs only when
-      // the v6 substrate is PROVEN (beforeAll reached the endpoint over v6 from
-      // an unrestricted container), so the block is attributably the profile's.
-      // Attribution is also self-contained: the SAME endpoint's v4 leg
-      // succeeded just above (allowed-endpoint-tcp, by IP), so it is alive and
-      // on the shared subnet — the only reason its v6 leg fails is ip6tables.
+      // IPv6 (round-1 finding 12, round-2 finding 8). Two levels of proof:
+      //   - RULE PRESENCE whenever the container has a v6 stack (allowedV6): the
+      //     entrypoint installed and printed the ip6tables OUTPUT DROP. This
+      //     ALWAYS runs on an --ipv6 network, so a green suite can never silently
+      //     omit v6 enforcement.
+      //   - PACKET BLOCK when the v6 substrate is PROVEN reachable (beforeAll
+      //     reached the endpoint over v6 unrestricted): the SAME endpoint's v4
+      //     leg succeeds while its v6 leg is dropped — attributably the profile.
+      if (allowedV6) {
+        const marker = "worker-profile: ip6 rules installed";
+        expect(r.stderr).toContain(marker);
+        // The v6 DROP policy, in the v6 ruleset printed AFTER the marker (the
+        // marker itself only prints once verify_chain confirmed v6 OUTPUT DROP,
+        // so this is belt-and-suspenders over the entrypoint's own check).
+        expect(r.stderr.slice(r.stderr.indexOf(marker))).toMatch(/-P OUTPUT DROP/);
+      }
       if (v6Proven) {
-        expect(r.stderr).toContain("worker-profile: ip6 rules installed");
         expect(probeOf(probes, "allowed-endpoint-tcp").exit).toBe(0); // v4 leg alive
         expect(probeOf(probes, "ipv6-peer-tcp").exit).not.toBe(0); // v6 leg blocked
       }

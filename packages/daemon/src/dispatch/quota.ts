@@ -111,5 +111,9 @@ export function sumUsageTokens(usage: unknown): number | undefined {
     (v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0,
   );
   if (nums.length === 0) return undefined;
-  return nums.reduce((a, b) => a + b, 0);
+  const total = nums.reduce((a, b) => a + b, 0);
+  // Fail-CLOSED on overflow (round-2 finding 9): a sum that leaves the finite
+  // range (hostile 1e308 fields) must not be discarded as "not reportable" —
+  // clamp to MAX_SAFE_INTEGER so it TRIPS any budget rather than evading it.
+  return Number.isFinite(total) ? total : Number.MAX_SAFE_INTEGER;
 }

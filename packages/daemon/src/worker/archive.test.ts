@@ -5,7 +5,15 @@
 // and the union retention rule ("90 days or last 10, whichever MORE").
 // Large fixtures are generated in-script (the E2BIG CI lesson).
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -238,6 +246,52 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     ).rejects.toMatchObject({ stage: "id-validation" });
   });
 
+  it("refuses a SYMLINK archiveRoot that resolves into the workspace (round-2 finding 3)", async () => {
+    const ws = makeWorkspace();
+    const base = tempDir();
+    const inside = join(ws, "archives");
+    mkdirSync(inside, { recursive: true });
+    const linkedRoot = join(base, "root-link");
+    symlinkSync(inside, linkedRoot); // symlink whose target is inside the workspace
+    await expect(
+      archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: linkedRoot,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+    expect(existsSync(ws)).toBe(true);
+  });
+
+  it("uses the caller's AUTHORITATIVE attemptSeq when provided (round-2 finding 6)", async () => {
+    const root = tempDir();
+    await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "iss",
+      attemptId: "att",
+      attemptSeq: 42,
+      recordLedgerRow: () => {},
+    });
+    const sidecar = JSON.parse(
+      readFileSync(join(root, "iss", "att.json"), "utf8"),
+    ) as ArchiveSidecar;
+    expect(sidecar.seq).toBe(42);
+    // A non-safe-integer / negative attemptSeq is refused.
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "iss",
+        attemptId: "att2",
+        attemptSeq: -1,
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+  });
+
   it("assigns a durable per-issue monotonic seq across attempts", async () => {
     const root = tempDir();
     for (const id of ["attempt-a", "attempt-b", "attempt-c"]) {
@@ -396,6 +450,26 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
     expect(report.kept).toHaveLength(10);
     // A truly ordinal-blind sort (by tied timestamp) could delete any of them;
     // seq pins it to the genuine first attempt.
+  });
+
+  it("treats a corrupt/overflowed seq as undatable — never deletes it (round-2 finding 6)", () => {
+    const root = tempDir();
+    const issueDir = join(root, "issue-corrupt");
+    mkdirSync(issueDir, { recursive: true });
+    // A sidecar with a non-safe-integer seq cannot be ordered → undatable.
+    writeFileSync(join(issueDir, "bad.tar.gz"), "bytes");
+    writeFileSync(
+      join(issueDir, "bad.json"),
+      // A seq beyond MAX_SAFE_INTEGER, written as raw JSON so no JS number
+      // literal loses precision at parse-authoring time.
+      '{"issueId":"issue-corrupt","attemptId":"bad","archiveWrittenAt":"' +
+        new Date(NOW - 200 * DAY).toISOString() +
+        '","seq":9007199254740993}',
+    );
+    for (let i = 0; i < 11; i++) seedArchive(root, "issue-corrupt", `a-${i}`, 95 + i, 100 + i);
+    const report = pruneArchives({ archiveRoot: root, now: nowFn });
+    expect(report.undatable).toContain(join(issueDir, "bad.tar.gz"));
+    expect(existsSync(join(issueDir, "bad.tar.gz"))).toBe(true);
   });
 
   it("keeps an archive whose sidecar lacks a seq (unsequenced = undatable, fail-closed)", () => {

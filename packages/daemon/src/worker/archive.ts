@@ -35,6 +35,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -148,10 +149,24 @@ export interface ArchiveSidecar {
 
 export interface ArchiveAttemptOptions {
   workspaceDir: string;
-  /** Root under which per-issue archive directories live. */
+  /**
+   * Root under which per-issue archive directories live. A FIXED daemon
+   * location (one root per install) — exactly-once and retention are scoped to
+   * it; the caller does not vary it per attempt. Archival runs under the
+   * WP-104 single-writer lock (WP-114 scheduler), so no two archivals race for
+   * one issue.
+   */
   archiveRoot: string;
   issueId: string;
   attemptId: string;
+  /**
+   * The attempt's AUTHORITATIVE ordinal from the attempt record (the WP-114
+   * scheduler passes it), used as the retention sequence — race-free and
+   * durable, unlike scanning the dir. Omit only in tests / standalone use,
+   * where a best-effort dir-scan ordinal is assigned instead. Must be a
+   * non-negative safe integer when provided.
+   */
+  attemptSeq?: number;
   /**
    * Persists the ledger row referencing the written archive. MUST durably
    * record before returning; a throw here retains BOTH the archive file and
@@ -189,6 +204,31 @@ function nextStamp(now: () => Date, prev: string | null): string {
 }
 
 /**
+ * Resolve a directory path to its real location (following symlinks), falling
+ * back to the deepest existing ancestor when the path does not fully exist yet
+ * (archiveRoot is created later). Lexical `resolve()` alone misses a symlink
+ * that redirects the tree (round-2 finding 3).
+ */
+function realDirPath(p: string): string {
+  const lexical = resolve(p);
+  try {
+    return realpathSync(lexical);
+  } catch {
+    const parts = lexical.split("/").filter((s) => s.length > 0);
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const prefix = "/" + parts.slice(0, i).join("/");
+      try {
+        const realPrefix = realpathSync(prefix);
+        return resolve(realPrefix + "/" + parts.slice(i).join("/"));
+      } catch {
+        /* keep shrinking */
+      }
+    }
+    return lexical;
+  }
+}
+
+/**
  * The single archival step (A.4#5). See the module header for the order and
  * failure semantics. Returns only after the workspace is destroyed.
  */
@@ -202,12 +242,16 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // final step destroys the workspace recursively, so an archiveRoot under it
   // would delete the very archive the ledger row references — reporting
   // success while the audit record is gone. Refuse before writing anything.
-  const wsResolved = resolve(opts.workspaceDir);
-  const rootResolved = resolve(opts.archiveRoot);
+  // realpath BOTH so a SYMLINK archiveRoot pointing into the workspace is
+  // caught (round-2 finding 3: `resolve()` normalized spelling but did not
+  // follow symlinks). Resolve the deepest existing prefix when a path does not
+  // fully exist yet.
+  const wsResolved = realDirPath(opts.workspaceDir);
+  const rootResolved = realDirPath(opts.archiveRoot);
   if (rootResolved === wsResolved || rootResolved.startsWith(`${wsResolved}/`)) {
     throw new ArchivalError(
       "id-validation",
-      `archiveRoot ${JSON.stringify(opts.archiveRoot)} is inside the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
+      `archiveRoot ${JSON.stringify(opts.archiveRoot)} resolves inside the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
     );
   }
 
@@ -259,7 +303,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     issueId: opts.issueId,
     attemptId: opts.attemptId,
     archiveWrittenAt,
-    seq: nextIssueSeq(issueDir, opts.attemptId),
+    seq: resolveSeq(opts.attemptSeq, issueDir, opts.attemptId),
     sha256,
     compressedBytes,
     workspaceBytes,
@@ -331,12 +375,30 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
 }
 
 /**
- * The next per-issue archival ordinal: one more than the highest `seq` among
- * the issue's existing sidecars (0-based first attempt). Scans the issue dir,
- * which already holds only this issue's archives. Assigned durably so
- * retention can order by attempt sequence regardless of timestamp ties.
+ * The retention sequence for this archival (round-2 finding 6):
+ *   - if the caller supplied the attempt's AUTHORITATIVE ordinal, use it — it
+ *     is race-free and durable (the WP-114 scheduler owns it), rejected unless
+ *     a non-negative safe integer;
+ *   - otherwise assign a best-effort dir-scan ordinal (max existing safe seq +
+ *     1). The dir-scan is safe under the single-writer-per-issue assumption
+ *     documented on ArchiveAttemptOptions.archiveRoot; a corrupt/overflowing
+ *     sibling seq is ignored (not treated as the max), so it cannot poison the
+ *     next ordinal, and the result is clamped to a safe integer.
  */
-function nextIssueSeq(issueDir: string, currentAttemptId: string): number {
+function resolveSeq(
+  attemptSeq: number | undefined,
+  issueDir: string,
+  currentAttemptId: string,
+): number {
+  if (attemptSeq !== undefined) {
+    if (!Number.isSafeInteger(attemptSeq) || attemptSeq < 0) {
+      throw new ArchivalError(
+        "id-validation",
+        `attemptSeq ${String(attemptSeq)} must be a non-negative safe integer`,
+      );
+    }
+    return attemptSeq;
+  }
   let max = -1;
   let names: string[];
   try {
@@ -349,14 +411,14 @@ function nextIssueSeq(issueDir: string, currentAttemptId: string): number {
     if (name === `${currentAttemptId}.json`) continue; // not yet written
     try {
       const sidecar = JSON.parse(readFileSync(join(issueDir, name), "utf8")) as ArchiveSidecar;
-      if (typeof sidecar.seq === "number" && Number.isFinite(sidecar.seq) && sidecar.seq > max) {
-        max = sidecar.seq;
-      }
+      // Only a valid safe-integer seq counts toward the max — a corrupt or
+      // overflowed sibling cannot drag the next ordinal into a tie.
+      if (Number.isSafeInteger(sidecar.seq) && sidecar.seq > max) max = sidecar.seq;
     } catch {
       /* an unreadable sibling sidecar does not block sequencing */
     }
   }
-  return max + 1;
+  return max + 1 <= Number.MAX_SAFE_INTEGER ? max + 1 : Number.MAX_SAFE_INTEGER;
 }
 
 export interface PruneReport {
@@ -405,17 +467,27 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
     }
     if (!stat.isDirectory()) continue;
     const entries = readdirSync(issueDir).filter((n) => n.endsWith(".tar.gz"));
-    const dated: { path: string; sidecarPath: string; writtenMs: number; seq: number }[] = [];
+    const dated: {
+      path: string;
+      sidecarPath: string;
+      writtenMs: number;
+      seq: number;
+      attemptId: string;
+    }[] = [];
     for (const name of entries) {
       const archivePath = join(issueDir, name);
-      const sidecarPath = join(issueDir, `${name.slice(0, -".tar.gz".length)}.json`);
+      const attemptId = name.slice(0, -".tar.gz".length);
+      const sidecarPath = join(issueDir, `${attemptId}.json`);
       let writtenMs: number | null = null;
       let seq: number | null = null;
       try {
         const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as ArchiveSidecar;
         const t = Date.parse(sidecar.archiveWrittenAt);
         if (Number.isFinite(t)) writtenMs = t;
-        if (typeof sidecar.seq === "number" && Number.isFinite(sidecar.seq)) seq = sidecar.seq;
+        // Only a SAFE-INTEGER seq is orderable; a corrupt/overflowed seq is
+        // treated as unsequenced → undatable (fail-closed), never deleted
+        // (round-2 finding 6).
+        if (Number.isSafeInteger(sidecar.seq)) seq = sidecar.seq;
       } catch {
         writtenMs = null;
       }
@@ -425,12 +497,17 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
         report.undatable.push(archivePath);
         continue;
       }
-      dated.push({ path: archivePath, sidecarPath, writtenMs, seq });
+      dated.push({ path: archivePath, sidecarPath, writtenMs, seq, attemptId });
     }
     // Newest first BY SEQUENCE (the attempt order), so "last 10 attempts" is
     // exact even when archive timestamps tie to the millisecond (round-1
-    // finding 11). Timestamp is only the AGE input, never the count ordering.
-    dated.sort((a, b) => b.seq - a.seq);
+    // finding 11). A tie on seq (should not happen under single-writer, but a
+    // corrupt store might) breaks deterministically by attemptId so the choice
+    // is stable, never arbitrary (round-2 finding 6). Timestamp is only the AGE
+    // input, never the count ordering.
+    dated.sort((a, b) =>
+      b.seq - a.seq !== 0 ? b.seq - a.seq : a.attemptId < b.attemptId ? -1 : 1,
+    );
     dated.forEach((entry, index) => {
       const withinAge = entry.writtenMs >= cutoffMs;
       const withinCount = index < retainLast;

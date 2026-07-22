@@ -170,6 +170,14 @@ describe("sumUsageTokens (token-budget accounting)", () => {
     ).toBe(10);
   });
 
+  it("fails CLOSED on an overflowing sum — clamps to MAX_SAFE_INTEGER, never discards (round-2 finding 9)", () => {
+    // Hostile 1e308 fields sum to Infinity; discarding it would EVADE the
+    // budget. Clamping to MAX_SAFE_INTEGER trips any finite budget instead.
+    const total = sumUsageTokens({ input_tokens: 1e308, output_tokens: 1e308 });
+    expect(total).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isFinite(total)).toBe(true);
+  });
+
   it("the claude result parser reports the cumulative total incl. cache tokens", () => {
     const ev = claudeAdapter().parseLine(
       '{"type":"result","result":"done","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}',

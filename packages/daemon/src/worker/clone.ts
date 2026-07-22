@@ -51,10 +51,12 @@ export interface WorkerCloneIsolationRecord {
   noHardlinkedObjects: boolean;
   /** core.hooksPath is persisted to the disabling value in the clone config. */
   hooksDisabledByConfig: boolean;
-  /** No credential.helper configured in the clone's local config. */
+  /** No credential.helper configured in the clone's EFFECTIVE local config (includes resolved). */
   noCredentialHelper: boolean;
-  /** No remote URL carries userinfo (user:token@host). */
+  /** No remote URL (fetch or push) carries userinfo (user:token@host). */
   remotesCredentialFree: boolean;
+  /** No http.<url>.extraheader (Authorization channel) in the effective config. */
+  noHttpExtraheader: boolean;
   /** Filesystem scan found no GitHub credential material (see scan). */
   credentialMaterialPaths: string[];
 }
@@ -68,7 +70,7 @@ const CLONE_ENV_BASE = {
   LC_ALL: "C",
 } as const;
 
-function git(cwd: string | null, args: string[]): string {
+function gitRaw(cwd: string | null, args: string[]): string {
   const env: Record<string, string> = { ...CLONE_ENV_BASE };
   const path = process.env["PATH"];
   if (typeof path === "string") env["PATH"] = path;
@@ -76,9 +78,41 @@ function git(cwd: string | null, args: string[]): string {
     env,
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 16 * 1024 * 1024,
-  })
-    .toString()
-    .trim();
+  }).toString();
+}
+
+function git(cwd: string | null, args: string[]): string {
+  return gitRaw(cwd, args).trim();
+}
+
+/**
+ * The clone's EFFECTIVE local git config as (key, value) pairs — read via
+ * `git config --list -z`, which RESOLVES `[include]`/`[includeIf]` directives
+ * (so a credential channel hidden in an included file is visible) and never
+ * interprets a value as an option (closing the option-shaped-remote-name
+ * injection). Global/system config is neutralized to /dev/null by the env, so
+ * only the repository config + its includes are read. Keys are lower-cased by
+ * git (subsection case preserved). (round-2 finding 4)
+ */
+function effectiveGitConfig(dir: string): { key: string; value: string }[] {
+  let raw: string;
+  try {
+    // `--includes` is REQUIRED: for an explicit scope (--local) git defaults
+    // include-expansion OFF for inspection, yet FOLLOWS includes during normal
+    // operations (fetch/push). Without it, an attacker's included extraheader
+    // would be used by git but invisible here (round-2 finding 4).
+    raw = gitRaw(dir, ["config", "--local", "--includes", "--list", "-z"]);
+  } catch {
+    return [];
+  }
+  const out: { key: string; value: string }[] = [];
+  for (const chunk of raw.split("\0")) {
+    if (chunk.length === 0) continue;
+    const nl = chunk.indexOf("\n");
+    if (nl === -1) out.push({ key: chunk, value: "" });
+    else out.push({ key: chunk.slice(0, nl), value: chunk.slice(nl + 1) });
+  }
+  return out;
 }
 
 /** Does a git URL / path carry userinfo (a `user[:secret]@` segment)? */
@@ -167,18 +201,19 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     );
   }
 
-  // A --local clone (without --no-hardlinks) HARDLINKS its loose objects to the
+  // A --local clone (without --no-hardlinks) HARDLINKS its object files to the
   // source, so the object store is not standalone even though no alternates
   // file exists (round-1 finding 10). A full --no-local clone transfers a pack
-  // and writes fresh objects with link count 1. Independently attest that no
-  // loose object is hardlinked (nlink > 1) — this catches a provisioning
-  // command regression that dropped --no-hardlinks, without needing the source
-  // path. (Packed objects carry no such sharing.)
-  const noHardlinkedObjects = !hasHardlinkedLooseObject(join(gitPath, "objects"));
+  // and writes fresh files with link count 1. Independently attest that NO
+  // object file is hardlinked (nlink > 1) — both loose objects AND packs, since
+  // a `git gc`'d source hardlinks its .pack/.idx into the clone (round-2
+  // finding 7). Catches a provisioning-command regression that dropped
+  // --no-hardlinks, without needing the source path.
+  const noHardlinkedObjects = !hasHardlinkedObject(join(gitPath, "objects"));
   if (!noHardlinkedObjects) {
     throw new WorkerCloneError(
-      "workspace has hardlinked loose objects (nlink>1) — a --local hardlink clone shares its " +
-        "object store and is never a worker workspace (CAM-EXEC-02)",
+      "workspace has a hardlinked object file (nlink>1, loose or packed) — a --local hardlink " +
+        "clone shares its object store and is never a worker workspace (CAM-EXEC-02)",
     );
   }
 
@@ -195,57 +230,36 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     );
   }
 
-  // credential.helper: the clone carries exactly the one EMPTY reset entry
-  // written at clone time (or none at all) — any non-empty helper value is a
-  // credential channel and is refused.
-  let helperValues: string[] = [];
-  try {
-    helperValues = git(dir, ["config", "--local", "--get-all", "credential.helper"])
-      .split("\n")
-      .filter((v) => v.length > 0);
-  } catch {
-    helperValues = []; // unset entirely is fine
+  // Scan the EFFECTIVE local config (includes resolved) ONCE for every
+  // credential channel Camino could have left in the clone (round-2 finding 4):
+  //   - credential.helper — a non-empty helper value;
+  //   - remote.<name>.url / .pushurl — a url carrying userinfo (fetch OR push);
+  //   - http.<url>.extraheader — an Authorization header channel.
+  const config = effectiveGitConfig(dir);
+  let noCredentialHelper = true;
+  let remotesCredentialFree = true;
+  let noHttpExtraheader = true;
+  for (const { key, value } of config) {
+    const lk = key.toLowerCase();
+    if (lk === "credential.helper" && value.length > 0) noCredentialHelper = false;
+    if (/^remote\..+\.(pushurl|url)$/.test(lk) && urlCarriesUserinfo(value)) {
+      remotesCredentialFree = false;
+    }
+    if (/^http\.(.+\.)?extraheader$/.test(lk) && value.length > 0) noHttpExtraheader = false;
   }
-  const noCredentialHelper = helperValues.length === 0;
   if (!noCredentialHelper) {
     throw new WorkerCloneError(
       "workspace clone config carries a credential helper — refused (CAM-EXEC-02)",
     );
   }
-
-  let remotesCredentialFree = true;
-  let remotes: string[] = [];
-  try {
-    remotes = git(dir, ["remote"])
-      .split("\n")
-      .filter((r) => r.length > 0);
-  } catch {
-    remotes = [];
-  }
-  for (const remote of remotes) {
-    // Both FETCH and PUSH urls (round-1 finding 2): `get-url` alone returns the
-    // fetch url, so a credential hidden in remote.<name>.pushurl was invisible.
-    // --all lists every configured url; --push adds the push urls.
-    const urls = new Set<string>();
-    for (const flags of [
-      ["get-url", "--all"],
-      ["get-url", "--push", "--all"],
-    ]) {
-      try {
-        for (const u of git(dir, ["remote", ...flags, remote]).split("\n")) {
-          if (u.length > 0) urls.add(u);
-        }
-      } catch {
-        /* a remote with no push url configured errors here — nothing to add */
-      }
-    }
-    for (const url of urls) {
-      if (urlCarriesUserinfo(url)) remotesCredentialFree = false;
-    }
-  }
   if (!remotesCredentialFree) {
     throw new WorkerCloneError(
       "a workspace remote URL (fetch or push) carries userinfo — workers hold zero GitHub credentials (CAM-EXEC-02)",
+    );
+  }
+  if (!noHttpExtraheader) {
+    throw new WorkerCloneError(
+      "workspace clone config carries an http.extraheader (Authorization channel) — refused (CAM-EXEC-02)",
     );
   }
 
@@ -263,17 +277,36 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     hooksDisabledByConfig,
     noCredentialHelper,
     remotesCredentialFree,
+    noHttpExtraheader,
     credentialMaterialPaths,
   };
 }
 
 /**
- * Is any LOOSE object under `objectsDir` hardlinked (st_nlink > 1)? A --local
- * hardlink clone shares its loose objects with the source (nlink 2); a full
- * --no-local clone writes fresh objects (nlink 1) and a pack. Bounded: loose
- * objects live in 256 `??/` fan-out dirs; we stop at the first hardlink found.
+ * Is any OBJECT file under `objectsDir` hardlinked (st_nlink > 1)? A --local
+ * hardlink clone shares its object files with the source (nlink 2); a full
+ * --no-local clone writes fresh files (nlink 1). Scans BOTH the loose-object
+ * `??/` fan-out dirs AND `pack/` (a `git gc`'d source hardlinks its .pack/.idx
+ * into the clone — round-2 finding 7). Bounded; stops at the first hardlink.
  */
-function hasHardlinkedLooseObject(objectsDir: string): boolean {
+function hasHardlinkedObject(objectsDir: string): boolean {
+  const anyHardlinkIn = (subDir: string, nameFilter?: RegExp): boolean => {
+    let names: string[];
+    try {
+      names = readdirSync(subDir);
+    } catch {
+      return false;
+    }
+    for (const name of names) {
+      if (nameFilter && !nameFilter.test(name)) continue;
+      try {
+        if (lstatSync(join(subDir, name)).nlink > 1) return true;
+      } catch {
+        /* raced/removed object — ignore */
+      }
+    }
+    return false;
+  };
   let fanoutDirs: string[];
   try {
     fanoutDirs = readdirSync(objectsDir);
@@ -281,23 +314,11 @@ function hasHardlinkedLooseObject(objectsDir: string): boolean {
     return false; // no objects dir → nothing shared
   }
   for (const fan of fanoutDirs) {
-    // Only the 2-hex fan-out dirs hold loose objects; skip pack/, info/, etc.
-    if (!/^[0-9a-f]{2}$/.test(fan)) continue;
-    const fanDir = join(objectsDir, fan);
-    let names: string[];
-    try {
-      names = readdirSync(fanDir);
-    } catch {
-      continue;
-    }
-    for (const name of names) {
-      try {
-        if (lstatSync(join(fanDir, name)).nlink > 1) return true;
-      } catch {
-        /* raced/removed object — ignore */
-      }
-    }
+    if (!/^[0-9a-f]{2}$/.test(fan)) continue; // 2-hex loose fan-out dirs
+    if (anyHardlinkIn(join(objectsDir, fan))) return true;
   }
+  // Packed objects: .pack / .idx (and .rev) files under objects/pack.
+  if (anyHardlinkIn(join(objectsDir, "pack"))) return true;
   return false;
 }
 
@@ -319,12 +340,32 @@ const GIT_CONFIG_FILE_NAMES = new Set(["config", ".gitconfig"]);
  * boundary (the container mounts no host HOME), not an unbounded denylist.
  */
 const CREDENTIAL_CONTENT_FILE_NAMES = new Set(["hosts.yml", "hosts.json", ".npmrc"]);
-const CREDENTIAL_CONTENT_MARKERS = [
-  /oauth_token/i, // gh CLI hosts.yml
-  /_authtoken\s*=/i, // .npmrc registry token
-  /_auth\s*=/i, // .npmrc basic auth
-  /_password\s*=/i,
-];
+// A credential KEY (`_authToken`/`_auth`/`_password`/`oauth_token`) followed by
+// `=` or `:` and a captured VALUE — handles npmrc (`//host/:_authToken=v`, the
+// key itself contains a `:`) and yaml (`oauth_token: v`) alike. Checked per
+// NON-COMMENT line; a missing/empty/placeholder value is NOT a finding, so a
+// commented-out or example line is not a false positive (round-2 finding 11).
+const CREDENTIAL_ASSIGNMENT_RE =
+  /(?:_authtoken|_auth|_password|oauth_token)["'\s]*[:=]["'\s]*([^\s"']+)/iu;
+const PLACEHOLDER_VALUES = new Set([
+  "example",
+  "changeme",
+  "xxx",
+  "your_token_here",
+  "todo",
+  "null",
+]);
+
+/** Does file text carry a credential assignment with a real value (comment-aware)? */
+function contentHasCredential(text: string): boolean {
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#") || line.startsWith(";")) continue; // comment/blank
+    const m = CREDENTIAL_ASSIGNMENT_RE.exec(line);
+    if (m && !PLACEHOLDER_VALUES.has(m[1]!.toLowerCase())) return true; // a real value present
+  }
+  return false;
+}
 
 // Depth/entry caps so a hostile tree cannot drive an unbounded walk; a
 // beyond-cap tree is itself reported (fail-closed: "not fully scanned" is a
@@ -334,11 +375,19 @@ const SCAN_MAX_ENTRIES = 200_000;
 
 /**
  * Walk the workspace for GitHub credential MATERIAL (the CAM-EXEC-02
- * filesystem assertion): stored-credential files by name, and git config
- * files whose content opens a credential channel (a credential.helper
- * setting, a URL with userinfo, or an http extraheader carrying an
- * Authorization value). Returns the offending workspace-relative paths —
+ * filesystem assertion): stored-credential files by name, git config files
+ * whose content opens a credential channel, token-carrying `.npmrc`/`hosts.yml`
+ * (comment-aware), and credential-NAMED SYMLINKS (a `.npmrc → secrets.txt`
+ * alias — round-2 finding 4). Returns the offending workspace-relative paths —
  * NEVER file contents, so the report cannot itself leak a secret.
+ *
+ * BOUNDARY, stated (round-2 finding 4): literal content scanning cannot catch
+ * every ENCODING of a token a repo could commit (unicode-escaped YAML keys,
+ * base64, split values) — that is the same regenerating surface the WP-003
+ * unicode work named. This scan is DEFENSE-IN-DEPTH; the real guarantee is
+ * that the worker CONTAINER mounts no host HOME (egress.ts), so a vendor CLI
+ * cannot reach the host's real credentials regardless of workspace content, and
+ * a repo committing its OWN token has leaked its own secret, not Camino's.
  */
 export function scanForGithubCredentialMaterial(dir: string): string[] {
   const findings: string[] = [];
@@ -372,7 +421,18 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
         walk(absChild, relChild, depth + 1);
         continue;
       }
-      if (!stat.isFile()) continue; // symlinks/special files are not read
+      // A credential-NAMED symlink is flagged without following it (round-2
+      // finding 4): a `.npmrc → secrets.txt` alias otherwise hid the token in a
+      // non-credential-named target. Fail-closed on the NAME; the target is
+      // never read (no symlink-follow / TOCTOU).
+      if (
+        stat.isSymbolicLink() &&
+        (CREDENTIAL_FILE_NAMES.has(name) || CREDENTIAL_CONTENT_FILE_NAMES.has(name))
+      ) {
+        findings.push(`${relChild} (credential-named symlink)`);
+        continue;
+      }
+      if (!stat.isFile()) continue; // other symlinks/special files are not read
       if (CREDENTIAL_FILE_NAMES.has(name)) {
         findings.push(relChild);
         continue;
@@ -397,8 +457,9 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
           continue;
         }
         // Token-free files (a public-registry .npmrc, a gh hosts.yml with no
-        // oauth_token) are NOT flagged — only a token marker is a finding.
-        if (CREDENTIAL_CONTENT_MARKERS.some((re) => re.test(text))) findings.push(relChild);
+        // oauth_token) and comment-only/example lines are NOT flagged — only a
+        // real credential assignment is a finding (round-2 finding 11).
+        if (contentHasCredential(text)) findings.push(relChild);
       }
     }
   };
