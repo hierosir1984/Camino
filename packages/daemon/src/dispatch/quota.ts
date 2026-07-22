@@ -80,3 +80,24 @@ export function classifyByQuotaSignal(text: string): boolean {
 export function classifyErrorTextForQuota(text: string): boolean {
   return classifyByQuotaSignal(text) || EXHAUSTION_PHRASE_MARKERS.some((re) => re.test(text));
 }
+
+/**
+ * Sum a vendor usage object's input+output token counts (WP-107, CAM-EXEC-03
+ * "tokens where reportable"). Total over hostile/absent shapes: any non-record
+ * usage or non-finite field yields undefined ("not reportable"), never a
+ * throw and never a partial figure treated as authoritative. Cache-read /
+ * cache-creation token fields are deliberately EXCLUDED — providers meter
+ * them separately, and a budget must not breach on tokens the run did not
+ * newly consume.
+ */
+export function sumUsageTokens(usage: unknown): number | undefined {
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
+  const rec = usage as Record<string, unknown>;
+  const input = rec["input_tokens"];
+  const output = rec["output_tokens"];
+  const nums = [input, output].filter(
+    (v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0,
+  );
+  if (nums.length === 0) return undefined;
+  return nums.reduce((a, b) => a + b, 0);
+}

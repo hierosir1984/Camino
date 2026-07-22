@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyErrorTextForQuota } from "../quota.js";
+import { classifyErrorTextForQuota, sumUsageTokens } from "../quota.js";
 
 /**
  * Codex CLI (official), headless.
@@ -98,7 +98,15 @@ export function codexAdapter(
       }
       if (type === "turn.completed") {
         // The genuine success TERMINAL of a codex turn (round-11 finding 1).
-        return { kind: "other", text: type, terminalSuccess: true };
+        // Its usage object is turn-cumulative — the "tokens where reportable"
+        // seam (WP-107, CAM-EXEC-03).
+        const tokens = sumUsageTokens(obj["usage"]);
+        return {
+          kind: "other",
+          text: type,
+          terminalSuccess: true,
+          ...(tokens !== undefined ? { tokensTotal: tokens } : {}),
+        };
       }
       if (type === "thread.started") {
         return { kind: "other", text: type };

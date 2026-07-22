@@ -20,6 +20,8 @@ import { createInterface } from "node:readline";
 import type {
   AdapterContext,
   AdapterSpec,
+  AttemptBudget,
+  BudgetBreachRecord,
   DispatchRecord,
   KillConfirmRecord,
   LeaseDisposition,
@@ -81,6 +83,16 @@ export interface DispatchOptions {
   cancelAfterFirstEventMs?: number;
   /** Hard cap so a real dispatch can never run away. Classified `killed`, never `cancelled`. */
   timeoutMs?: number;
+  /**
+   * Per-attempt budget (CAM-EXEC-03, WP-107): wall-clock ALWAYS enforced;
+   * tokens enforced where the vendor stream reports usage
+   * (StreamEvent.tokensTotal). A breach runs kill-confirm and classifies
+   * `killed-budget` — distinct from `cancelled` (user decision) and `killed`
+   * (harness runaway cap) so the state machine's kill-and-escalate row
+   * (A.2#10/A.3#5) fires on exactly the budget case, never an auto-retry.
+   * Classification stays HERE, centralized, per the WP-105 principle.
+   */
+  budget?: AttemptBudget;
   killConfirm?: KillConfirmTimings;
   /** Sink for live transcript lines (raw). Guarded: a throwing sink cannot crash the dispatch. */
   onLine?: (channel: "stdout" | "stderr", line: string) => void;
@@ -427,20 +439,27 @@ export async function dispatch(
   // State the whole body shares.
   let child: ChildProcess | undefined;
   let exited = false;
-  let killReason: "cancel" | "timeout" | null = null;
+  let killReason: "cancel" | "timeout" | "budget" | null = null;
   let killRecord: KillConfirmRecord | undefined;
   let killPromise: Promise<void> | null = null;
   let cancelTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
+  let budgetTimer: NodeJS.Timeout | undefined;
+  // Set exactly once, by whichever budget check trips first; consulted only
+  // when killReason === "budget" (evidence for the escalation record).
+  let budgetBreach: BudgetBreachRecord | undefined;
   // Abort may fire during the plan()/spawn window, before a child exists
   // (round-1 review finding 3): remember it and apply it the instant we can.
   let pendingCancel = false;
 
-  const requestKill = (reason: "cancel" | "timeout") => {
+  const requestKill = (reason: "cancel" | "timeout" | "budget") => {
     if (killReason) return;
     if (!child || exited) {
       // No live child yet (or already exited): remember a cancel so the
-      // post-spawn check applies it; a timeout with no child is moot.
+      // post-spawn check applies it; a timeout/budget kill with no child is
+      // moot (a budget breach with no live process has nothing to kill; the
+      // classification below still fires off budgetBreach if it was set
+      // before natural exit — see the outcome ordering note there).
       if (reason === "cancel") pendingCancel = true;
       return;
     }
@@ -470,6 +489,23 @@ export async function dispatch(
     cancelAfterMs = typeof rawCancel === "number" ? rawCancel : undefined;
     const rawTimeout = opts.timeoutMs; // one read
     timeoutMs = typeof rawTimeout === "number" ? rawTimeout : undefined;
+    // Budget snapshot (one read each, validated plain numbers — same
+    // discipline as every other option). Fail-closed coercion: a budget
+    // object whose wallClockMs is corrupt clamps to 0 (immediate breach),
+    // never to "unenforced" — wall-clock is ALWAYS enforced when a budget is
+    // supplied (CAM-EXEC-03). A corrupt tokens value likewise becomes 0
+    // (breach on the first usage report) rather than silently absent.
+    const rawBudget = opts.budget; // one read
+    let budgetWallClockMs: number | undefined;
+    let budgetTokens: number | undefined;
+    if (rawBudget !== undefined && rawBudget !== null) {
+      budgetWallClockMs = clampMs(rawBudget.wallClockMs, 0);
+      const rawTokens = rawBudget.tokens; // one read
+      if (rawTokens !== undefined) {
+        const n = typeof rawTokens === "number" ? rawTokens : Number(rawTokens);
+        budgetTokens = Number.isFinite(n) && n >= 0 ? n : 0;
+      }
+    }
     onLine = opts.onLine; // snapshot the sink once (round-5 finding 1)
     posture = composeWorkerEnv(process.env, {}, { officialCli }).posture;
 
@@ -507,6 +543,10 @@ export async function dispatch(
     const tailRing: StreamEvent[] = [];
     let totalEvents = 0;
     let anyEventQuota = false;
+    // Highest run-cumulative token figure any event reported (CAM-EXEC-03
+    // "tokens where reportable"). Streams that report nothing leave it 0 and
+    // the token budget is simply not exercisable — wall-clock still is.
+    let tokensObserved = 0;
     // A quota failure is "pending" (unrecovered) until a genuine SUCCESS
     // terminal clears it. A later NON-quota event (a generic error / footer
     // like codex turn.failed) is NOT recovery — only a success `result` clears
@@ -551,12 +591,32 @@ export async function dispatch(
       } catch {
         terminalOk = false;
       }
+      let tokens: number | undefined;
+      try {
+        const t = ev.tokensTotal;
+        if (typeof t === "number" && Number.isFinite(t) && t >= 0) tokens = t;
+      } catch {
+        tokens = undefined;
+      }
       const snap: StreamEvent = {
         kind,
         text,
         ...(sig ? { quotaSignal: true } : {}),
         ...(terminalOk ? { terminalSuccess: true } : {}),
+        ...(tokens !== undefined ? { tokensTotal: tokens } : {}),
       };
+      if (tokens !== undefined && tokens > tokensObserved) tokensObserved = tokens;
+      // Token-budget check rides event recording so a mid-stream cumulative
+      // report kills the dispatch in flight. Exhaustion IS breach (>=): a
+      // budget of N is spent at N. Deliberately NOT gated on `exited`: a
+      // usage report parsed during the post-exit drain that exceeds the
+      // budget still classifies `killed-budget` below — an over-budget
+      // attempt is NEVER silently accepted as succeeded (kill-and-escalate,
+      // CAM-EXEC-03); with the process already gone, the kill itself is moot.
+      if (budgetTokens !== undefined && tokens !== undefined && tokensObserved >= budgetTokens) {
+        budgetBreach ??= { kind: "tokens", limit: budgetTokens, observed: tokensObserved };
+        requestKill("budget");
+      }
       if (sig) {
         anyEventQuota = true;
         pendingQuota = true;
@@ -679,6 +739,17 @@ export async function dispatch(
     if (timeoutMs != null) {
       timeoutTimer = setTimeout(() => requestKill("timeout"), timeoutMs);
     }
+    if (budgetWallClockMs !== undefined) {
+      // The wall-clock budget measures the WORKER's duration: once the child
+      // has exited (or another kill is in flight), the budget clock stops —
+      // a slow post-exit drain must not turn an in-budget run into a breach.
+      const limit = budgetWallClockMs;
+      budgetTimer = setTimeout(() => {
+        if (exited || killReason) return;
+        budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
+        requestKill("budget");
+      }, limit);
+    }
 
     const exitCode = await new Promise<number | null>((resolve) => {
       child!.once("exit", (code) => {
@@ -771,7 +842,15 @@ export async function dispatch(
     // than forcing a synchronous label; WP-105 keeps the conservative
     // synchronous label at the seam.
     let outcome: DispatchOutcome;
-    if (killReason === "timeout") {
+    if (budgetBreach) {
+      // A budget breach outranks every other classification (CAM-EXEC-03:
+      // kill-and-escalate, never a retry, never silent acceptance). This
+      // covers both the in-flight kill (killReason === "budget") and a
+      // breach detected from a usage report parsed after natural exit —
+      // exit code 0 with an over-budget usage figure is `killed-budget`,
+      // not `succeeded`.
+      outcome = "killed-budget";
+    } else if (killReason === "timeout") {
       outcome = "killed";
     } else if (killReason === "cancel") {
       outcome = "cancelled";
@@ -803,6 +882,7 @@ export async function dispatch(
       durationMs: Date.now() - started,
       events,
       quotaSignalSeen: anyEventQuota,
+      ...(budgetBreach ? { budgetBreach } : {}),
     };
 
     // Lease settlement is LAST, strictly after the group-gone determination
@@ -835,6 +915,10 @@ export async function dispatch(
       durationMs: Date.now() - started,
       events: [],
       quotaSignalSeen: false, // exception path makes no stream claims (events: [])
+      // Evidence only: the exception path keeps requirement-failed as its
+      // outcome (it makes no stream claims), but a breach already recorded
+      // before the throw is preserved for the escalation record.
+      ...(budgetBreach ? { budgetBreach } : {}),
       unexpectedError: safeStringify(err),
     };
     await settleFor(record);
@@ -842,6 +926,7 @@ export async function dispatch(
   } finally {
     if (cancelTimer) clearTimeout(cancelTimer);
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (budgetTimer) clearTimeout(budgetTimer);
     // Even removeEventListener can throw on a hostile duck-typed signal
     // (round-2 finding 11) — the finally must never replace the returned record
     // with a throw.

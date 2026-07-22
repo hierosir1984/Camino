@@ -1,0 +1,146 @@
+// WP-107 · composer unit tests (no docker): the argument vector the worker
+// container is launched with, and every fail-closed refusal. The packet-level
+// proof that these arguments produce the isolation they claim is
+// egress.worker.test.ts (docker-backed).
+import { describe, expect, it } from "vitest";
+import {
+  WORKER_CONTAINER_CAPS,
+  WORKER_PIDS_LIMIT,
+  WORKER_WORKSPACE_MOUNT,
+  WorkerContainerConfigError,
+  isValidAllowlistHost,
+  isValidAllowlistPort,
+  renderAllowlistEnv,
+  renderWorkerRunArgs,
+} from "./egress.js";
+
+const BASE = {
+  image: "camino-worker-profile:test",
+  network: "camino-net",
+  allowlist: [{ host: "registry.invalid", port: 443 }],
+};
+
+describe("renderWorkerRunArgs", () => {
+  it("composes the hardened run shape: cap-drop ALL + bootstrap caps, no-new-privileges, pids-limit, init", () => {
+    const args = renderWorkerRunArgs(BASE, ["/bin/true"]);
+    const joined = args.join(" ");
+    expect(args.slice(0, 3)).toEqual(["run", "--rm", "--init"]);
+    expect(joined).toContain("--cap-drop ALL");
+    for (const cap of WORKER_CONTAINER_CAPS) expect(joined).toContain(`--cap-add ${cap}`);
+    expect(joined).toContain("--security-opt no-new-privileges:true");
+    expect(joined).toContain(`--pids-limit ${WORKER_PIDS_LIMIT}`);
+    expect(joined).toContain("--network camino-net");
+    expect(joined).toContain("-e CAMINO_EGRESS_ALLOWLIST=registry.invalid:443");
+    expect(args[args.length - 2]).toBe(BASE.image);
+    expect(args[args.length - 1]).toBe("/bin/true");
+  });
+
+  it("mounts the workspace rw at the fixed mount point and sets the workdir", () => {
+    const args = renderWorkerRunArgs({ ...BASE, workspaceHostPath: "/tmp/ws" }, ["/bin/true"]);
+    const joined = args.join(" ");
+    expect(joined).toContain(`-v /tmp/ws:${WORKER_WORKSPACE_MOUNT}`);
+    expect(joined).not.toContain(`-v /tmp/ws:${WORKER_WORKSPACE_MOUNT}:ro`);
+    expect(joined).toContain(`-w ${WORKER_WORKSPACE_MOUNT}`);
+  });
+
+  it("composes provider-auth mounts read-only unconditionally (CAM-EXEC-02)", () => {
+    const args = renderWorkerRunArgs(
+      {
+        ...BASE,
+        providerAuthMounts: [{ hostPath: "/home/user/.claude", containerPath: "/auth/claude" }],
+      },
+      ["/bin/true"],
+    );
+    expect(args.join(" ")).toContain("-v /home/user/.claude:/auth/claude:ro");
+    // There is no input shape that yields a writable auth mount: the `:ro`
+    // suffix is appended by the composer, not taken from the caller.
+  });
+
+  it("refuses shared/reserved networks whose namespace the bootstrap would rewrite", () => {
+    for (const network of ["host", "none", "bridge", "container:abc", ""]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, network }, ["/bin/true"])).toThrow(
+        WorkerContainerConfigError,
+      );
+    }
+  });
+
+  it("refuses mounts over bootstrap paths and over the workspace", () => {
+    for (const containerPath of [
+      "/",
+      "/usr/local/bin",
+      "/etc",
+      "/sbin/sub",
+      WORKER_WORKSPACE_MOUNT,
+    ]) {
+      expect(() =>
+        renderWorkerRunArgs(
+          { ...BASE, providerAuthMounts: [{ hostPath: "/tmp/x", containerPath }] },
+          ["/bin/true"],
+        ),
+      ).toThrow(WorkerContainerConfigError);
+    }
+    // Relative or colon-carrying paths would corrupt the -v contract.
+    expect(() =>
+      renderWorkerRunArgs(
+        { ...BASE, providerAuthMounts: [{ hostPath: "relative/path", containerPath: "/auth" }] },
+        ["/bin/true"],
+      ),
+    ).toThrow(WorkerContainerConfigError);
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, workspaceHostPath: "/tmp/a:b" }, ["/bin/true"]),
+    ).toThrow(WorkerContainerConfigError);
+  });
+
+  it("refuses caller env keys that shadow the composed allowlist, and malformed keys", () => {
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, env: { CAMINO_EGRESS_ALLOWLIST: "evil:1" } }, ["/bin/true"]),
+    ).toThrow(WorkerContainerConfigError);
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, env: { CAMINO_EGRESS_X: "y" } }, ["/bin/true"]),
+    ).toThrow(WorkerContainerConfigError);
+    expect(() => renderWorkerRunArgs({ ...BASE, env: { "BAD KEY": "y" } }, ["/bin/true"])).toThrow(
+      WorkerContainerConfigError,
+    );
+  });
+});
+
+describe("renderAllowlistEnv", () => {
+  it("renders host:port pairs and rejects contract-corrupting shapes", () => {
+    expect(
+      renderAllowlistEnv([
+        { host: "registry.invalid", port: 443 },
+        { host: "10.0.0.7", port: 8080 },
+      ]),
+    ).toBe("registry.invalid:443 10.0.0.7:8080");
+    expect(renderAllowlistEnv([])).toBe("");
+    for (const host of ["has space", "colon:inside", "-leading", "trailing-", ""]) {
+      expect(() => renderAllowlistEnv([{ host, port: 443 }])).toThrow(WorkerContainerConfigError);
+    }
+    for (const port of [0, -1, 65536, 1.5, Number.NaN]) {
+      expect(() => renderAllowlistEnv([{ host: "ok.invalid", port }])).toThrow(
+        WorkerContainerConfigError,
+      );
+    }
+  });
+});
+
+describe("host/port predicates", () => {
+  it("accept DNS names and IPv4 literals, reject everything contract-corrupting", () => {
+    expect(isValidAllowlistHost("registry.npmjs.org")).toBe(true);
+    expect(isValidAllowlistHost("10.1.2.3")).toBe(true);
+    expect(isValidAllowlistHost("a")).toBe(true);
+    expect(isValidAllowlistHost("evil host")).toBe(false);
+    expect(isValidAllowlistHost("host:443")).toBe(false);
+    expect(isValidAllowlistPort(443)).toBe(true);
+    expect(isValidAllowlistPort(0)).toBe(false);
+  });
+});
+
+describe("worker container policy constants", () => {
+  it("are frozen (barrel immutability at the source)", () => {
+    expect(Object.isFrozen(WORKER_CONTAINER_CAPS)).toBe(true);
+    expect(() => (WORKER_CONTAINER_CAPS as unknown as string[]).push("SYS_ADMIN")).toThrow(
+      TypeError,
+    );
+  });
+});

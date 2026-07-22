@@ -1,5 +1,5 @@
 import type { AdapterContext, AdapterSpec, SpawnPlan, StreamEvent } from "@camino/shared";
-import { classifyErrorTextForQuota } from "../quota.js";
+import { classifyErrorTextForQuota, sumUsageTokens } from "../quota.js";
 
 /**
  * Claude Code (official CLI), headless.
@@ -89,6 +89,11 @@ export function claudeAdapter(
         case "result": {
           const text = String(obj["result"] ?? obj["subtype"] ?? "result");
           const isError = obj["is_error"] === true || obj["subtype"] === "error_max_turns";
+          // The result event's usage is RUN-CUMULATIVE (claude emits it once,
+          // last) — the "tokens where reportable" seam (WP-107, CAM-EXEC-03).
+          // Per-message assistant usage is NOT reported: summing it would
+          // double-count against this figure.
+          const tokens = sumUsageTokens(obj["usage"]);
           // In an ERROR result, trust the provider's exhaustion phrases
           // ("Credit balance is too low", "usage limit reached"). A non-error
           // result IS the success terminal (claude emits it once, last).
@@ -96,6 +101,7 @@ export function claudeAdapter(
             kind: isError ? "error" : "result",
             text: text.slice(0, 400),
             ...(isError ? errText(text) : { terminalSuccess: true as const }),
+            ...(tokens !== undefined ? { tokensTotal: tokens } : {}),
           };
         }
         case "error": {

@@ -20,6 +20,12 @@
 //   quota               — emit a rate-limit event and exit nonzero.
 //   quota-raw           — rate-limit signal on a non-JSON line only.
 //   flood               — emit MOCK_FLOOD events (bounded-retention test).
+//   tokens-stream       — stream rising CUMULATIVE token usage forever
+//                         (SIGTERM-cooperative) → a token budget must kill
+//                         mid-flight (WP-107, CAM-EXEC-03).
+//   tokens-final        — report a large cumulative usage figure on the final
+//                         result and exit 0 → an over-budget run must
+//                         classify killed-budget even at natural exit 0.
 //
 // Every mode writes its pid to `.mock-pid` in the workspace at startup: the
 // leader is the group leader (detached spawn), so tests can probe
@@ -161,6 +167,23 @@ if (mode === "hang") {
     process.exit(0);
   };
   void loop();
+} else if (mode === "tokens-stream") {
+  // Rising cumulative usage, forever: a token budget must kill mid-flight.
+  // Cooperative on SIGTERM so kill-confirm succeeds without escalation.
+  process.on("SIGTERM", () => process.exit(0));
+  emit("assistant", "starting token-metered task");
+  let total = 0;
+  setInterval(() => {
+    total += 500;
+    process.stdout.write(JSON.stringify({ type: "other", text: "usage", tokens: total }) + "\n");
+  }, 50);
+} else if (mode === "tokens-final") {
+  // The usage figure arrives ONLY on the final result (the claude shape) and
+  // the process exits 0 — an over-budget figure must still classify
+  // killed-budget, never succeeded.
+  emitSync("assistant", "doing metered work");
+  writeSync(1, JSON.stringify({ type: "result", text: "done", tokens: 999_999 }) + "\n");
+  process.exit(0);
 } else if (mode === "quota") {
   emit("assistant", "attempting");
   emit("error", "429 rate_limit_exceeded: usage limit reached, retry later");

@@ -30,17 +30,48 @@ export interface StreamEvent {
    * quota-blocked (round-11 finding 1).
    */
   terminalSuccess?: boolean;
+  /**
+   * CUMULATIVE tokens consumed by the dispatch so far, when the vendor stream
+   * reports usage (CAM-EXEC-03 "tokens where reportable" — WP-107). Parsers
+   * set this ONLY on events carrying a run-cumulative figure (claude `result`
+   * usage, codex `turn.completed` usage), never by summing per-message
+   * numbers (double-counting would breach budgets that were not breached).
+   * The lifecycle's budget monitor takes the max across events.
+   */
+  tokensTotal?: number;
 }
 
 /**
  * How a dispatch ended, classified per CAM-EXEC-06: a provider rate limit is
  * `quota-blocked`, NEVER `requirement-failed` — blaming the worker for the
  * provider's throttle would corrupt the outcome ledger. `cancelled` (external
- * cancel) and `killed` (harness timeout) are distinct so a timeout can never
- * masquerade as a user decision.
+ * cancel), `killed` (harness runaway cap), and `killed-budget` (per-attempt
+ * budget breach — CAM-EXEC-03, WP-107) are distinct so neither a timeout nor
+ * a budget breach can masquerade as a user decision, and a budget breach maps
+ * 1:1 to the Appendix A.3 `killed-budget` terminal (kill-and-escalate, never
+ * an automatic retry).
  */
 export type DispatchOutcome =
-  "succeeded" | "requirement-failed" | "quota-blocked" | "cancelled" | "killed";
+  "succeeded" | "requirement-failed" | "quota-blocked" | "cancelled" | "killed" | "killed-budget";
+
+/**
+ * Per-attempt budget (CAM-EXEC-03, WP-107): wall-clock ALWAYS; tokens only
+ * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach
+ * runs the kill-confirm sequence and classifies `killed-budget`.
+ */
+export interface AttemptBudget {
+  /** Wall-clock ceiling for the dispatch, in milliseconds. Required. */
+  wallClockMs: number;
+  /** Cumulative-token ceiling; enforced only when the stream reports usage. */
+  tokens?: number;
+}
+
+/** Which budget tripped, with the limit and the observed value (evidence). */
+export interface BudgetBreachRecord {
+  kind: "wall-clock" | "tokens";
+  limit: number;
+  observed: number;
+}
 
 /** The headless spawn plan an adapter builds for one dispatch. */
 export interface SpawnPlan {
@@ -230,6 +261,12 @@ export interface DispatchRecord {
    * recovered dispatch as blocked (round-7 finding 2).
    */
   quotaSignalSeen: boolean;
+  /**
+   * Present iff the outcome is `killed-budget`: which budget tripped, the
+   * configured limit, and the observed value (CAM-EXEC-03 evidence for the
+   * escalation record).
+   */
+  budgetBreach?: BudgetBreachRecord;
   /** Present iff a LeaseHandle was supplied to the dispatch. */
   lease?: LeaseDisposition;
 }

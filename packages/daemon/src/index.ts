@@ -95,3 +95,53 @@ export type {
 } from "./canon-ledger.js";
 export { CanonFactsStore } from "./canon-facts.js";
 export type { CanonFactsStoreOptions } from "./canon-facts.js";
+
+// WP-107: worker isolation — clone provisioning, container egress, per-repo
+// config, per-attempt budgets, single archival step (CAM-EXEC-02/03/05).
+export {
+  WorkerCloneError,
+  WORKER_CLONE_HOOKS_PATH,
+  provisionWorkerClone,
+  assertWorkerCloneIsolation,
+  scanForGithubCredentialMaterial,
+  urlCarriesUserinfo,
+} from "./worker/clone.js";
+export type { WorkerCloneIsolationRecord, ProvisionWorkerCloneOptions } from "./worker/clone.js";
+export {
+  WorkerContainerConfigError,
+  WORKER_CONTAINER_CAPS,
+  WORKER_PIDS_LIMIT,
+  WORKER_WORKSPACE_MOUNT,
+  isValidAllowlistHost,
+  isValidAllowlistPort,
+  renderAllowlistEnv,
+  renderWorkerRunArgs,
+} from "./worker/egress.js";
+export type { EgressAllowlistEntry, WorkerContainerRun } from "./worker/egress.js";
+export {
+  RepoConfigError,
+  REPO_CONFIG_PATH,
+  MAX_EGRESS_ALLOWLIST_ENTRIES,
+  parseRepoEgressConfig,
+  loadRepoEgressConfig,
+} from "./worker/repo-config.js";
+export type { WorkerEgressConfig } from "./worker/repo-config.js";
+export { BudgetConfigError, validateAttemptBudget, dispatchWithBudget } from "./worker/budget.js";
+export type { BudgetBreachEscalation, BudgetedDispatchResult } from "./worker/budget.js";
+export {
+  ArchivalError,
+  DEFAULT_ARCHIVE_QUOTAS,
+  archiveAttempt,
+  pruneArchives,
+  workspaceSizeBytes,
+} from "./worker/archive.js";
+export type {
+  ArchivalStage,
+  ArchiveQuotas,
+  ArchiveLedgerRow,
+  ArchiveSidecar,
+  ArchiveAttemptOptions,
+  ArchivalRecord,
+  PruneReport,
+  PruneOptions,
+} from "./worker/archive.js";

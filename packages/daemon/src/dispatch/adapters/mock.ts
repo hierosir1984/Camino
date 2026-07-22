@@ -38,7 +38,7 @@ export function mockAdapter(mode?: string): AdapterSpec {
         return null;
       }
       try {
-        const obj = JSON.parse(trimmed) as { type?: string; text?: string };
+        const obj = JSON.parse(trimmed) as { type?: string; text?: string; tokens?: number };
         const kind = ((): StreamEvent["kind"] => {
           switch (obj.type) {
             case "assistant":
@@ -55,7 +55,13 @@ export function mockAdapter(mode?: string): AdapterSpec {
         const eq = kind === "error" && classifyErrorTextForQuota(text) ? { quotaSignal: true } : {};
         // The mock's `result` event stands in for a success terminal (round-11).
         const term = kind === "result" ? { terminalSuccess: true as const } : {};
-        return { kind, text, ...eq, ...term };
+        // A `tokens` field stands in for vendor CUMULATIVE usage reporting
+        // (the WP-107 "tokens where reportable" seam).
+        const tokens =
+          typeof obj.tokens === "number" && Number.isFinite(obj.tokens) && obj.tokens >= 0
+            ? { tokensTotal: obj.tokens }
+            : {};
+        return { kind, text, ...eq, ...term, ...tokens };
       } catch {
         return null;
       }

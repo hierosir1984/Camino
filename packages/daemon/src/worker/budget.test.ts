@@ -1,0 +1,167 @@
+// WP-107 · CAM-EXEC-03 budget fixtures: wall-clock ALWAYS (kill-confirmed
+// mid-flight), tokens WHERE REPORTABLE (mid-stream kill on cumulative usage;
+// over-budget final report never classifies succeeded), breach → the A.2#10 /
+// A.3#5 kill-and-escalate rows with NO automatic retry — pinned against the
+// core tables themselves, not just this module's behavior.
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { attemptMachine, issueMachine, transition } from "@camino/core";
+import type { IssueEvent } from "@camino/core";
+import { mockAdapter } from "../dispatch/adapters/mock.js";
+import { BudgetConfigError, dispatchWithBudget, validateAttemptBudget } from "./budget.js";
+
+// Budget kills use short kill-confirm timings so the suite stays fast; the
+// production 30s grace is pinned by the WP-105 lifecycle tests.
+const FAST_KILL = { graceMs: 3_000, sigkillWaitMs: 3_000 };
+
+let dirs: string[] = [];
+function workdir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "camino-wp107-budget-"));
+  execFileSync("git", ["-C", dir, "init", "--quiet"], { stdio: "ignore" });
+  dirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  dirs = [];
+});
+
+describe("validateAttemptBudget", () => {
+  it("requires a finite positive wall-clock (always enforced) and sane tokens", () => {
+    expect(() => validateAttemptBudget({ wallClockMs: 0 })).toThrow(BudgetConfigError);
+    expect(() => validateAttemptBudget({ wallClockMs: Number.NaN })).toThrow(BudgetConfigError);
+    expect(() => validateAttemptBudget({ wallClockMs: -5 })).toThrow(BudgetConfigError);
+    expect(() => validateAttemptBudget({ wallClockMs: 1000, tokens: 0 })).toThrow(
+      BudgetConfigError,
+    );
+    expect(() => validateAttemptBudget({ wallClockMs: 1000, tokens: Number.NaN })).toThrow(
+      BudgetConfigError,
+    );
+    expect(() => validateAttemptBudget({ wallClockMs: 1000 })).not.toThrow();
+    expect(() => validateAttemptBudget({ wallClockMs: 1000, tokens: 50_000 })).not.toThrow();
+  });
+});
+
+describe("dispatchWithBudget (CAM-EXEC-03)", () => {
+  it("wall-clock breach: kill-confirm runs, outcome is killed-budget, escalation events map to A.3#5/A.2#10", async () => {
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("graceful-cancel"),
+      { workdir: workdir(), prompt: "run forever" },
+      { wallClockMs: 700 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "wall-clock", limit: 700 });
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(700);
+    expect(record.killConfirm?.groupGone).toBe(true);
+    expect(escalation).toBeDefined();
+    expect(escalation!.attemptEvent).toEqual({
+      type: "attempt-budget-breached",
+      killConfirmed: true,
+    });
+    // The events drive EXACTLY the appendix rows: attempt running →
+    // killed-budget (A.3#5); issue implementing → escalated (A.2#10).
+    const attemptStep = transition(attemptMachine, "running", escalation!.attemptEvent);
+    expect(attemptStep).toEqual({ ok: true, to: "killed-budget", ref: "A.3#5" });
+    const issueStep = transition(issueMachine, "implementing", escalation!.issueEvent);
+    expect(issueStep).toEqual({ ok: true, to: "escalated", ref: "A.2#10" });
+  }, 30_000);
+
+  it("token breach mid-stream: cumulative usage reports kill the dispatch in flight", async () => {
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("tokens-stream"),
+      { workdir: workdir(), prompt: "stream usage" },
+      { wallClockMs: 60_000, tokens: 2_000 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 2_000 });
+    expect(record.budgetBreach!.observed).toBeGreaterThanOrEqual(2_000);
+    expect(escalation?.attemptEvent.killConfirmed).toBe(true);
+  }, 30_000);
+
+  it("token breach on the final report: exit 0 with over-budget usage is killed-budget, never succeeded", async () => {
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("tokens-final"),
+      { workdir: workdir(), prompt: "report at end" },
+      { wallClockMs: 60_000, tokens: 1_000 },
+      { killConfirm: FAST_KILL },
+    );
+    // The breach can be detected while the process is still alive (killed by
+    // signal → exitCode null) or from the drain after a natural exit 0 — the
+    // classification must be killed-budget EITHER way, never succeeded.
+    expect([0, null]).toContain(record.exitCode);
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach).toMatchObject({ kind: "tokens", limit: 1_000, observed: 999_999 });
+    expect(escalation).toBeDefined();
+  }, 30_000);
+
+  it("a generous budget never manufactures a breach", async () => {
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter(),
+      { workdir: workdir(), prompt: "solve" },
+      { wallClockMs: 60_000, tokens: 1_000_000 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("succeeded");
+    expect(record.budgetBreach).toBeUndefined();
+    expect(escalation).toBeUndefined();
+  }, 30_000);
+
+  it("a provider rate limit under budget stays quota-blocked — a quota wait is not a budget breach", async () => {
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("quota"),
+      { workdir: workdir(), prompt: "rate limited" },
+      { wallClockMs: 60_000, tokens: 1_000_000 },
+      { killConfirm: FAST_KILL },
+    );
+    expect(record.outcome).toBe("quota-blocked");
+    expect(escalation).toBeUndefined();
+  }, 30_000);
+
+  it("refuses a malformed budget before dispatching anything", async () => {
+    await expect(
+      dispatchWithBudget(mockAdapter(), { workdir: workdir(), prompt: "x" }, { wallClockMs: 0 }),
+    ).rejects.toThrow(BudgetConfigError);
+  });
+});
+
+describe("never an automatic retry (A.2#10 pinned against the core table)", () => {
+  it("every attempt-budget-breached row escalates; none re-readies", () => {
+    const issueRows = issueMachine.rows.filter((r) => r.eventType === "attempt-budget-breached");
+    expect(issueRows.length).toBeGreaterThan(0);
+    for (const row of issueRows) expect(row.to).toBe("escalated");
+    const attemptRows = attemptMachine.rows.filter(
+      (r) => r.eventType === "attempt-budget-breached",
+    );
+    expect(attemptRows.length).toBeGreaterThan(0);
+    for (const row of attemptRows) expect(row.to).toBe("killed-budget");
+  });
+
+  it("leaving `escalated` for `ready` requires David's answer — no automatic path resumes dispatch", () => {
+    const outOfEscalated = issueMachine.rows.filter(
+      (r) => Array.isArray(r.from) && r.from.includes("escalated"),
+    );
+    expect(outOfEscalated.length).toBeGreaterThan(0);
+    // The no-auto-retry claim, precisely: every row that can take an
+    // escalated issue back to `ready` (dispatchable) is the human-answer
+    // event. Other exits (cancel, contract edit → replanning, cleanup
+    // failure → blocked) never resume dispatch directly.
+    const toReady = outOfEscalated.filter((r) => r.to === "ready");
+    expect(toReady.length).toBeGreaterThan(0);
+    for (const row of toReady) expect(row.eventType).toBe("escalation-answered");
+    for (const row of outOfEscalated) {
+      if (typeof row.to === "string" && row.to !== "ready") continue;
+      expect(row.eventType).toBe("escalation-answered");
+    }
+  });
+
+  it("an unconfirmed kill cannot take the clean escalation row (guard refuses)", () => {
+    const event: IssueEvent = { type: "attempt-budget-breached", killConfirmed: false };
+    const step = transition(issueMachine, "implementing", event);
+    expect(step.ok).toBe(false);
+  });
+});
