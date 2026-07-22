@@ -210,6 +210,13 @@ if (mode === "hang") {
   writeSync(1, "\n"); // terminate the giant line
   emitSync("result", "done after a giant line");
   process.exit(0);
+} else if (mode === "crlf") {
+  // Three result events terminated by CR, CRLF, and LF respectively — proves
+  // the bounded reader's CR/CRLF delimiter parity (WP-107 round-5 finding 3).
+  writeSync(1, JSON.stringify({ type: "result", text: "cr-line" }) + "\r");
+  writeSync(1, JSON.stringify({ type: "result", text: "crlf-line" }) + "\r\n");
+  writeSync(1, JSON.stringify({ type: "result", text: "lf-line" }) + "\n");
+  process.exit(0);
 } else if (mode === "flood") {
   // Emit many events to exercise the bounded retention cap. Synchronous writes
   // so process.exit() below can't truncate the stream (deterministic count

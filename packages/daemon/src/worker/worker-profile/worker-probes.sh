@@ -64,14 +64,17 @@ fi
 run_probe github-cred-env sh -c '
   env | grep -Eiq "GITHUB_TOKEN|GH_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_PAT|GIT_ASKPASS|GIT_TOKEN" && echo LEAK || echo clean
 '
-# No stored-credential material on disk anywhere the workload can see. The
-# rootfs is scanned with -xdev, but /workspace and the provider-auth mount are
-# SEPARATE filesystems (different devices), which -xdev would skip — so they
-# are passed as explicit start points and each traversed on its own device
-# (round-4 finding 3: -xdev from / alone missed the bind mounts).
+# No stored-credential material on disk ANYWHERE the workload can see —
+# including EVERY bind mount, whatever their number or paths (round-4 finding
+# 3; generalized round-5 finding 5). Instead of -xdev + an enumerated mount
+# list (which missed a second provider-auth mount), traverse the whole tree and
+# PRUNE only the pseudo-filesystems (/proc, /sys, /dev) — so /workspace and any
+# /auth/* mounts, on their own devices, are all covered without enumeration.
 run_probe github-cred-fs sh -c '
-  found=$(find / "$CAMINO_WORKSPACE_DIR" "$CAMINO_PROVIDER_AUTH_DIR" -xdev \
-    \( -name ".git-credentials" -o -name ".netrc" -o -name "_netrc" \) 2>/dev/null | head -1)
+  found=$(find / \
+      -path /proc -prune -o -path /sys -prune -o -path /dev -prune -o \
+      \( -name ".git-credentials" -o -name ".netrc" -o -name "_netrc" \) -print \
+      2>/dev/null | head -1)
   [ -z "$found" ] && echo clean || echo "$found"
 '
 

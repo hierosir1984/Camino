@@ -394,6 +394,28 @@ describe("CAM-EXEC-02 — zero GitHub credentials + provider auth read-only", ()
   );
 
   it(
+    "the fs credential probe actually TRAVERSES the workspace mount (discriminating — round-5 finding 5)",
+    async () => {
+      // Plant a .git-credentials in the workspace (a separate bind-mount
+      // filesystem). If the probe truly traverses /workspace, it must REPORT
+      // it (not "clean"); a probe that only scanned the rootfs would miss it,
+      // so this proves the -xdev mount-root traversal fix is load-bearing.
+      const planted = path.join(workspaceHostDir, ".git-credentials");
+      writeFileSync(planted, "https://x:tok@github.invalid\n");
+      try {
+        const r = await profiledWorkerRun([{ host: ALLOWED, port: ENDPOINT_PORT }]);
+        const probes = parseProbes(r.stdout);
+        expect(probeOf(probes, "github-cred-fs").out).not.toBe("clean");
+        expect(probeOf(probes, "github-cred-fs").out).toContain(".git-credentials");
+      } finally {
+        const { rmSync } = await import("node:fs");
+        rmSync(planted, { force: true });
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
     "provider auth is read-only: a write from the workspace FAILS while the workspace itself is writable",
     async () => {
       const r = await profiledWorkerRun([{ host: ALLOWED, port: ENDPOINT_PORT }]);

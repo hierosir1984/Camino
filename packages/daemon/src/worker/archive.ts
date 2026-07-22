@@ -169,8 +169,11 @@ export interface ArchiveAttemptOptions {
   attemptSeq?: number;
   /**
    * Persists the ledger row referencing the written archive. MUST durably
-   * record before returning; a throw here retains BOTH the archive file and
-   * the workspace (fail-closed — the destroy step is never reached).
+   * record before returning; a throw here retains the archive and the
+   * workspace (fail-closed — the destroy step is never reached). MUST be
+   * IDEMPOTENT per (issueId, attemptId) (round-5 finding 1): the archival step
+   * is retriable, and a retry after a sidecar/destroy failure re-invokes it —
+   * the WP-104 idempotency contract / WP-109 event store dedups the row.
    */
   recordLedgerRow: (row: ArchiveLedgerRow) => void | Promise<void>;
   quotas?: ArchiveQuotas;
@@ -201,6 +204,53 @@ function nextStamp(now: () => Date, prev: string | null): string {
   const t = now().getTime();
   const floor = prev === null ? t : Math.max(t, Date.parse(prev) + 1);
   return new Date(floor).toISOString();
+}
+
+/** Best-effort remove that NEVER throws — used where a cleanup failure must not mask the primary error. */
+function safeRemove(p: string): void {
+  try {
+    rmSync(p, { recursive: true, force: true });
+  } catch {
+    /* best-effort; the caller's primary error stands */
+  }
+}
+
+/**
+ * Remove `p`, and if the removal ITSELF fails (a non-writable dir, EISDIR),
+ * throw a routable ArchivalError rather than letting a raw fs error escape the
+ * staged contract (round-5 finding 2).
+ */
+function removeOrThrow(p: string, context: string): void {
+  try {
+    rmSync(p, { recursive: true, force: true });
+  } catch (err) {
+    throw new ArchivalError(
+      "archive-write",
+      `${context}: could not remove ${p} (${(err as Error).message.slice(0, 200)}) — refused (fail-closed)`,
+    );
+  }
+}
+
+/**
+ * Is `sidecarPath` a COMPLETE, valid sidecar for this attempt (round-5 finding
+ * 1)? Requires it to parse AND carry the matching issueId/attemptId and a safe
+ * seq — a missing, truncated, malformed, or one-byte sidecar reads as
+ * INCOMPLETE (so the pre-write recovery redoes the archival), never as "already
+ * complete".
+ */
+function sidecarIsComplete(sidecarPath: string, issueId: string, attemptId: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(sidecarPath, "utf8");
+  } catch {
+    return false; // absent / unreadable
+  }
+  try {
+    const s = JSON.parse(raw) as Partial<ArchiveSidecar>;
+    return s.issueId === issueId && s.attemptId === attemptId && Number.isSafeInteger(s.seq);
+  } catch {
+    return false; // malformed
+  }
 }
 
 /**
@@ -296,25 +346,29 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   const finalPath = join(issueDir, `${opts.attemptId}.tar.gz`);
   const sidecarPath = join(issueDir, `${opts.attemptId}.json`);
   const tmpPath = join(issueDir, `.${opts.attemptId}.tar.gz.partial`);
+  // The SIDECAR is written LAST — after the ledger row (round-5 finding 1). So
+  // "archive + a VALID sidecar present" proves the ledger row was recorded (a
+  // completed invocation), while "archive without a valid sidecar" is an
+  // INCOMPLETE prior run (tar-then-crash, or a ledger failure) that a retry
+  // must be able to redo. The complete-check PARSES the sidecar rather than
+  // trusting its existence, so a malformed/one-byte sidecar reads as
+  // incomplete, not complete.
   if (existsSync(finalPath)) {
-    if (existsSync(sidecarPath)) {
-      // A COMPLETE prior archive (archive + sidecar): archival happens exactly
-      // once — a second call for the same attempt is a sequencing bug upstream,
-      // refused loudly.
+    if (sidecarIsComplete(sidecarPath, opts.issueId, opts.attemptId)) {
       throw new ArchivalError("archive-write", `archive already exists at ${finalPath}`);
     }
-    // An INCOMPLETE prior run (round-4 finding 2): the archive was written but
-    // its sidecar was not (a prior sidecar-write failure or crash before the
-    // ledger row — nothing references this archive yet). Remove the stale
-    // archive and proceed, so a corrected retry is not blocked forever.
-    rmSync(finalPath, { force: true });
+    // Incomplete: remove the stale archive (+ any partial sidecar) and redo.
+    // GUARDED (round-5 finding 2): a non-writable dir must yield a routable
+    // ArchivalError, never a raw EACCES.
+    removeOrThrow(finalPath, "recovering an incomplete prior archive");
+    removeOrThrow(sidecarPath, "recovering an incomplete prior sidecar");
   }
   try {
     execFileSync("tar", ["-czf", tmpPath, "-C", opts.workspaceDir, "."], {
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (err) {
-    rmSync(tmpPath, { force: true });
+    safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-write",
       `tar failed: ${(err as Error).message.slice(0, 300)} — workspace retained`,
@@ -322,41 +376,29 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   }
   const compressedBytes = statSync(tmpPath).size;
   if (compressedBytes > quotas.archiveMaxCompressedBytes) {
-    rmSync(tmpPath, { force: true });
+    safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-quota",
       `archive is ${compressedBytes} bytes compressed, over the ${quotas.archiveMaxCompressedBytes}-byte cap (registry item 11) — workspace retained for escalation`,
     );
   }
   const sha256 = createHash("sha256").update(readFileSync(tmpPath)).digest("hex");
-  renameSync(tmpPath, finalPath);
-  const archiveWrittenAt = nextStamp(now, null);
-  const sidecar: ArchiveSidecar = {
-    issueId: opts.issueId,
-    attemptId: opts.attemptId,
-    archiveWrittenAt,
-    seq,
-    sha256,
-    compressedBytes,
-    workspaceBytes,
-  };
-  // The sidecar write is STAGED like every other sub-step (round-4 finding 2):
-  // an ordinary EACCES/ENOSPC here must throw a routable ArchivalError, not a
-  // raw Error, and must NOT leave an unreferenced archive that blocks the
-  // retry. Roll the archive back on failure — nothing references it yet (the
-  // ledger row is Step 2), so removing it returns to a clean, retriable state.
   try {
-    writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2) + "\n");
+    renameSync(tmpPath, finalPath);
   } catch (err) {
-    rmSync(finalPath, { force: true });
-    rmSync(sidecarPath, { force: true });
+    safeRemove(tmpPath);
     throw new ArchivalError(
       "archive-write",
-      `sidecar write failed after the archive was written (rolled back): ${(err as Error).message.slice(0, 300)} — workspace retained`,
+      `archive install failed: ${(err as Error).message.slice(0, 300)} — workspace retained`,
     );
   }
+  const archiveWrittenAt = nextStamp(now, null);
 
-  // Step 2 — ledger row referencing the archive. A throw retains everything.
+  // Step 2 — ledger row referencing the archive, BEFORE the sidecar (A.4#5
+  // order: archive → ledger → destroy). A throw here leaves the archive with
+  // NO sidecar, so the retry recovers (round-5 finding 1). recordLedgerRow MUST
+  // be idempotent per (issueId, attemptId) — the archival step is retriable and
+  // the WP-104 idempotency contract dedups the row.
   try {
     await opts.recordLedgerRow({
       issueId: opts.issueId,
@@ -370,10 +412,33 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   } catch (err) {
     throw new ArchivalError(
       "ledger-row",
-      `ledger row failed after the archive was written: ${(err as Error).message.slice(0, 300)} — archive and workspace retained`,
+      `ledger row failed after the archive was written: ${(err as Error).message.slice(0, 300)} — archive (no sidecar) and workspace retained; retry recovers`,
     );
   }
   const ledgerRowAt = nextStamp(now, archiveWrittenAt);
+
+  // Sidecar written AFTER the ledger row. On failure DON'T roll back the
+  // archive — the ledger row already references it durably; removing it would
+  // orphan that reference. Throw a staged error; the archive is kept and
+  // retention treats a sidecar-less archive as UNDATABLE (never pruned,
+  // fail-closed), and a retry recompletes it.
+  const sidecar: ArchiveSidecar = {
+    issueId: opts.issueId,
+    attemptId: opts.attemptId,
+    archiveWrittenAt,
+    seq,
+    sha256,
+    compressedBytes,
+    workspaceBytes,
+  };
+  try {
+    writeFileSync(sidecarPath, JSON.stringify(sidecar, null, 2) + "\n");
+  } catch (err) {
+    throw new ArchivalError(
+      "ledger-row",
+      `sidecar write failed after the ledger row: ${(err as Error).message.slice(0, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
+    );
+  }
 
   // Step 3 — destroy the workspace, strictly last. A failure here is NOT
   // "retained" — recursive deletion is not transactional, so a mid-way failure

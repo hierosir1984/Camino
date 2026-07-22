@@ -901,18 +901,42 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     }
   });
 
-  it("bounds a single ENORMOUS line pre-parser — no unbounded buffer (WP-107 round-4 finding 1)", async () => {
+  it("bounds a single ENORMOUS line pre-parser — DISCRIMINATING via onLine (WP-107 round-4/5)", async () => {
     const ws = makeWorkspace();
     try {
-      // The mock emits one 8 MiB line (no newline) then a normal result. The
-      // dispatch must succeed WITHOUT any retained event carrying the whole
-      // 8 MiB — the bounded reader truncates the line before the parser.
-      const rec = await dispatch(mockAdapter("bigline"), { workdir: ws, prompt: "bigline" });
+      // The mock emits one 8 MiB line (no newline) then a normal result. Capture
+      // the RAW line the reader hands to onLine — whole-line buffering (the old
+      // readline impl) would pass the full 8 MiB here; the bounded reader passes
+      // a truncated ~1 M-char line. This DIRECTLY tests the reader, not the
+      // parser (round-5 finding 4: the parser returns null for the giant line,
+      // so an events-only assertion did not discriminate).
+      let maxRawLine = 0;
+      const rec = await dispatch(
+        mockAdapter("bigline"),
+        { workdir: ws, prompt: "bigline" },
+        { onLine: (_ch, line) => (maxRawLine = Math.max(maxRawLine, line.length)) },
+      );
       expect(rec.outcome).toBe("succeeded");
       expect(rec.finalText).toContain("done after a giant line");
-      // No retained event text approaches the emitted size; each is bounded.
-      const maxEventText = Math.max(0, ...rec.events.map((e) => e.text.length));
-      expect(maxEventText).toBeLessThan(1_100_000); // << the 8 MiB emitted
+      // The reader truncated the 8 MiB line to the cap (+ the mark), far below
+      // the emitted size — proof memory is bounded pre-parser.
+      expect(maxRawLine).toBeLessThanOrEqual(1_000_000 + 64);
+      expect(maxRawLine).toBeGreaterThan(0);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("splits CR, LF, and CRLF records (readline parity — round-5 finding 3)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // CR-only and CRLF-delimited JSON events must each parse as separate
+      // events, not be concatenated. The mock's crlf mode emits three result
+      // events terminated by \r, \r\n, and \n respectively.
+      const rec = await dispatch(mockAdapter("crlf"), { workdir: ws, prompt: "crlf" });
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.streamedEvents).toBe(3); // CR, CRLF, LF each a distinct record
+      expect(rec.finalText).toContain("lf-line");
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }

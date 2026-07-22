@@ -6,6 +6,7 @@
 // Large fixtures are generated in-script (the E2BIG CI lesson).
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -20,6 +21,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
 import { attemptMachine, transition } from "@camino/core";
 import {
+  ArchivalError,
   DEFAULT_ARCHIVE_QUOTAS,
   archiveAttempt,
   pruneArchives,
@@ -173,6 +175,81 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     // refusing "already exists" forever.
     expect(record.archivePath).toBe(join(issueDir, "a.tar.gz"));
     expect(existsSync(join(issueDir, "a.json"))).toBe(true); // now complete
+  });
+
+  it("a ledger-row failure leaves NO sidecar, so a retry recovers and records the row (round-5 finding 1)", async () => {
+    const root = tempDir();
+    let calls = 0;
+    // First call: ledger fails AFTER the archive is written.
+    await expect(
+      archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {
+          calls += 1;
+          throw new Error("ledger store down");
+        },
+      }),
+    ).rejects.toMatchObject({ stage: "ledger-row" });
+    // The archive exists but NO sidecar (ledger never completed) — so it is NOT
+    // mistaken for a completed invocation.
+    expect(existsSync(join(root, "i", "a.tar.gz"))).toBe(true);
+    expect(existsSync(join(root, "i", "a.json"))).toBe(false);
+    // Retry (ledger now works): it recovers the incomplete archive and records
+    // the row — it does NOT refuse "already exists" forever.
+    const record = await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {
+        calls += 1;
+      },
+    });
+    expect(record.archivePath).toBe(join(root, "i", "a.tar.gz"));
+    expect(existsSync(join(root, "i", "a.json"))).toBe(true); // now complete
+    expect(calls).toBe(2); // the row write was retried
+  });
+
+  it("a cleanup failure during recovery yields a staged ArchivalError, not a raw error (round-5 finding 2)", async () => {
+    const root = tempDir();
+    const issueDir = join(root, "i");
+    mkdirSync(issueDir, { recursive: true });
+    writeFileSync(join(issueDir, "a.tar.gz"), "stale-incomplete"); // no sidecar → recovery path
+    chmodSync(issueDir, 0o555); // non-writable: the recovery rm will fail
+    try {
+      const err = await archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ArchivalError);
+      expect((err as ArchivalError).stage).toBe("archive-write");
+    } finally {
+      chmodSync(issueDir, 0o755); // restore so afterEach can clean up
+    }
+  });
+
+  it("a MALFORMED sidecar reads as incomplete, so a retry recovers (round-5 finding 1)", async () => {
+    const root = tempDir();
+    const issueDir = join(root, "i");
+    mkdirSync(issueDir, { recursive: true });
+    writeFileSync(join(issueDir, "a.tar.gz"), "stale");
+    writeFileSync(join(issueDir, "a.json"), "{"); // one-byte, invalid JSON
+    const record = await archiveAttempt({
+      workspaceDir: makeWorkspace(),
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    expect(record.archivePath).toBe(join(issueDir, "a.tar.gz"));
+    const sidecar = JSON.parse(readFileSync(join(issueDir, "a.json"), "utf8")) as ArchiveSidecar;
+    expect(sidecar.attemptId).toBe("a"); // rewritten, now valid
   });
 
   it("a COMPLETE prior archive (archive + sidecar) still refuses a second call", async () => {

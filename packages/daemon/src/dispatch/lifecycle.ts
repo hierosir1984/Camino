@@ -756,55 +756,83 @@ export async function dispatch(
     // pre-parse buffer.
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
       stream.setEncoding("utf8");
+      // Line-terminator parity with readline (round-5 finding 3): LF, CR, AND
+      // CRLF all terminate a line. A CR at a chunk boundary is HELD (pendingCR)
+      // until the next chunk resolves whether it is a lone CR or the CR of a
+      // CRLF. `partial` accumulates line CONTENT only (never a terminator), so
+      // the cap counts content, not delimiters (an exactly-MAX line with CRLF
+      // is not falsely truncated).
       let partial = "";
       let skipping = false; // discarding the tail of an over-long line
+      let pendingCR = false; // a CR held at a chunk boundary
       let closed = false;
-      const emit = (line: string) => {
-        if (closed) return;
-        handleLine(channel, line.endsWith("\r") ? line.slice(0, -1) : line);
+      const accumulate = (s: string) => {
+        if (skipping || s.length === 0) return;
+        const room = MAX_LINE_CHARS - partial.length;
+        if (s.length <= room) {
+          partial += s;
+        } else {
+          if (!closed)
+            handleLine(channel, partial + s.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
+          partial = "";
+          skipping = true; // discard until the next terminator
+        }
+      };
+      const emitLine = () => {
+        if (skipping) {
+          skipping = false; // this terminator ends the over-long line
+          return;
+        }
+        const line = partial;
+        partial = "";
+        if (!closed) handleLine(channel, line);
       };
       const onData = (chunk: string) => {
         if (closed) return;
         let data = chunk;
-        for (;;) {
-          const nl = data.indexOf("\n");
-          if (nl === -1) {
-            if (skipping) return; // whole chunk is over-long-line tail
-            const room = MAX_LINE_CHARS - partial.length;
-            if (data.length <= room) {
-              partial += data;
-            } else {
-              emit(partial + data.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
-              partial = "";
-              skipping = true; // discard until the next newline
+        if (pendingCR) {
+          pendingCR = false;
+          emitLine(); // the held CR terminated the pending line
+          if (data.charCodeAt(0) === 10) data = data.slice(1); // it was CRLF split across chunks
+        }
+        let start = 0;
+        while (start < data.length) {
+          let nl = -1;
+          for (let i = start; i < data.length; i++) {
+            const ch = data.charCodeAt(i);
+            if (ch === 10 || ch === 13) {
+              nl = i;
+              break;
             }
+          }
+          if (nl === -1) {
+            accumulate(data.slice(start));
             return;
           }
-          const seg = data.slice(0, nl);
-          data = data.slice(nl + 1);
-          if (skipping) {
-            skipping = false; // this newline ends the over-long line
-            continue;
+          accumulate(data.slice(start, nl));
+          if (data.charCodeAt(nl) === 13) {
+            // CR: could be lone CR or the start of CRLF.
+            if (nl === data.length - 1) {
+              pendingCR = true; // hold; the next chunk (or end) resolves it
+              return;
+            }
+            emitLine();
+            start = data.charCodeAt(nl + 1) === 10 ? nl + 2 : nl + 1;
+          } else {
+            emitLine(); // LF
+            start = nl + 1;
           }
-          const full = partial + seg;
-          partial = "";
-          emit(
-            full.length > MAX_LINE_CHARS
-              ? full.slice(0, MAX_LINE_CHARS) + LINE_TRUNCATED_MARK
-              : full,
-          );
         }
       };
       stream.on("data", onData);
       streamsClosed.push(
         new Promise<void>((resolve) => {
           const done = () => {
-            // A final partial line without a trailing newline (readline
-            // parity): emit it once at end.
-            if (!closed && !skipping && partial.length > 0) {
-              const last = partial;
-              partial = "";
-              emit(last);
+            // A final line without a trailing terminator, or one held by a CR
+            // at the very end (readline parity): emit it once at end.
+            if (!closed && !skipping && (partial.length > 0 || pendingCR)) {
+              pendingCR = false;
+              emitLine();
             }
             resolve();
           };
