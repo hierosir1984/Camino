@@ -40,7 +40,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
 import type { AttemptEvent } from "@camino/core";
 
@@ -133,6 +133,14 @@ export interface ArchiveSidecar {
   issueId: string;
   attemptId: string;
   archiveWrittenAt: string;
+  /**
+   * Durable per-issue monotonic ordinal, assigned at archive time (max
+   * existing + 1). Retention orders by THIS, so "last 10 attempts" is precise
+   * even when archive timestamps tie to the millisecond (round-1 finding 11) —
+   * archival happens once per attempt, in attempt order, so the sequence is
+   * the attempt order.
+   */
+  seq: number;
   sha256: string;
   compressedBytes: number;
   workspaceBytes: number;
@@ -190,6 +198,19 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   assertSafeId("issueId", opts.issueId);
   assertSafeId("attemptId", opts.attemptId);
 
+  // The archive must NOT live inside the workspace (round-1 finding 4): the
+  // final step destroys the workspace recursively, so an archiveRoot under it
+  // would delete the very archive the ledger row references — reporting
+  // success while the audit record is gone. Refuse before writing anything.
+  const wsResolved = resolve(opts.workspaceDir);
+  const rootResolved = resolve(opts.archiveRoot);
+  if (rootResolved === wsResolved || rootResolved.startsWith(`${wsResolved}/`)) {
+    throw new ArchivalError(
+      "id-validation",
+      `archiveRoot ${JSON.stringify(opts.archiveRoot)} is inside the workspace ${JSON.stringify(opts.workspaceDir)} — workspace teardown would delete the archive (fail-closed)`,
+    );
+  }
+
   // Step 0 — workspace quota (registry item 11: workspace ≤ 2 GB). An
   // over-quota workspace is an abnormal condition: refusing here routes it to
   // the cleanup-failed/escalation path with the workspace intact, rather than
@@ -238,6 +259,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     issueId: opts.issueId,
     attemptId: opts.attemptId,
     archiveWrittenAt,
+    seq: nextIssueSeq(issueDir, opts.attemptId),
     sha256,
     compressedBytes,
     workspaceBytes,
@@ -263,18 +285,29 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   }
   const ledgerRowAt = nextStamp(now, archiveWrittenAt);
 
-  // Step 3 — destroy the workspace, strictly last.
+  // Step 3 — destroy the workspace, strictly last. A failure here is NOT
+  // "retained" — recursive deletion is not transactional, so a mid-way failure
+  // may have removed some files (round-1 finding 4, second part). The archive
+  // and ledger row are already durable, so this is a cleanup-failed teardown
+  // (A.2 "cleanup failure during teardown → blocked"), not a lost archive;
+  // workspaceRetained:false says the workspace is in an indeterminate,
+  // partially-removed state that the janitor must reconcile.
   try {
     rmSync(opts.workspaceDir, { recursive: true, force: true });
   } catch (err) {
     throw new ArchivalError(
       "workspace-destroy",
-      `workspace destroy failed after archive + ledger row: ${(err as Error).message.slice(0, 300)}`,
+      `workspace destroy failed after archive + ledger row (workspace may be partially removed): ${(err as Error).message.slice(0, 300)}`,
+      false,
     );
   }
   if (existsSync(opts.workspaceDir)) {
     // force:true can mask persistent trees; verify the deletion actually took.
-    throw new ArchivalError("workspace-destroy", "workspace still present after destroy");
+    throw new ArchivalError(
+      "workspace-destroy",
+      "workspace still present after destroy (partially removed) — janitor must reconcile",
+      false,
+    );
   }
   const workspaceDestroyedAt = nextStamp(now, ledgerRowAt);
 
@@ -297,10 +330,39 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   };
 }
 
+/**
+ * The next per-issue archival ordinal: one more than the highest `seq` among
+ * the issue's existing sidecars (0-based first attempt). Scans the issue dir,
+ * which already holds only this issue's archives. Assigned durably so
+ * retention can order by attempt sequence regardless of timestamp ties.
+ */
+function nextIssueSeq(issueDir: string, currentAttemptId: string): number {
+  let max = -1;
+  let names: string[];
+  try {
+    names = readdirSync(issueDir);
+  } catch {
+    return 0;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    if (name === `${currentAttemptId}.json`) continue; // not yet written
+    try {
+      const sidecar = JSON.parse(readFileSync(join(issueDir, name), "utf8")) as ArchiveSidecar;
+      if (typeof sidecar.seq === "number" && Number.isFinite(sidecar.seq) && sidecar.seq > max) {
+        max = sidecar.seq;
+      }
+    } catch {
+      /* an unreadable sibling sidecar does not block sequencing */
+    }
+  }
+  return max + 1;
+}
+
 export interface PruneReport {
   kept: string[]; // archive paths retained
   deleted: string[]; // archive paths deleted (age AND count windows both exceeded)
-  /** Archives with a missing/unreadable sidecar — KEPT fail-closed, reported. */
+  /** Archives with a missing/unreadable/unsequenced sidecar — KEPT fail-closed, reported. */
   undatable: string[];
 }
 
@@ -343,26 +405,32 @@ export function pruneArchives(opts: PruneOptions): PruneReport {
     }
     if (!stat.isDirectory()) continue;
     const entries = readdirSync(issueDir).filter((n) => n.endsWith(".tar.gz"));
-    const dated: { path: string; sidecarPath: string; writtenMs: number }[] = [];
+    const dated: { path: string; sidecarPath: string; writtenMs: number; seq: number }[] = [];
     for (const name of entries) {
       const archivePath = join(issueDir, name);
       const sidecarPath = join(issueDir, `${name.slice(0, -".tar.gz".length)}.json`);
       let writtenMs: number | null = null;
+      let seq: number | null = null;
       try {
         const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as ArchiveSidecar;
         const t = Date.parse(sidecar.archiveWrittenAt);
         if (Number.isFinite(t)) writtenMs = t;
+        if (typeof sidecar.seq === "number" && Number.isFinite(sidecar.seq)) seq = sidecar.seq;
       } catch {
         writtenMs = null;
       }
-      if (writtenMs === null) {
-        report.undatable.push(archivePath); // fail-closed: never delete the undatable
+      // Undatable OR unsequenced → cannot be ordered for the count window;
+      // never delete it (fail-closed), only report.
+      if (writtenMs === null || seq === null) {
+        report.undatable.push(archivePath);
         continue;
       }
-      dated.push({ path: archivePath, sidecarPath, writtenMs });
+      dated.push({ path: archivePath, sidecarPath, writtenMs, seq });
     }
-    // Newest first; the first retainLast are inside the count window.
-    dated.sort((a, b) => b.writtenMs - a.writtenMs);
+    // Newest first BY SEQUENCE (the attempt order), so "last 10 attempts" is
+    // exact even when archive timestamps tie to the millisecond (round-1
+    // finding 11). Timestamp is only the AGE input, never the count ordering.
+    dated.sort((a, b) => b.seq - a.seq);
     dated.forEach((entry, index) => {
       const withinAge = entry.writtenMs >= cutoffMs;
       const withinCount = index < retainLast;

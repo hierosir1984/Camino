@@ -82,20 +82,32 @@ export function classifyErrorTextForQuota(text: string): boolean {
 }
 
 /**
- * Sum a vendor usage object's input+output token counts (WP-107, CAM-EXEC-03
- * "tokens where reportable"). Total over hostile/absent shapes: any non-record
- * usage or non-finite field yields undefined ("not reportable"), never a
- * throw and never a partial figure treated as authoritative. Cache-read /
- * cache-creation token fields are deliberately EXCLUDED — providers meter
- * them separately, and a budget must not breach on tokens the run did not
- * newly consume.
+ * ALL token-count fields of a vendor usage object that count toward what the
+ * run processed. A per-attempt token BUDGET is a runaway guard, so it must sum
+ * EVERY consumed-token variant — Anthropic's total input is
+ * `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, plus
+ * `output_tokens` (prompt-caching docs). Excluding the cache fields let a run
+ * that consumed thousands of cache-read tokens slip a small budget (round-1
+ * finding 6). Cheaper-per-token ≠ not-consumed; a hard cap counts them all.
+ */
+const USAGE_TOKEN_FIELDS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+] as const;
+
+/**
+ * Sum a vendor usage object's token counts (WP-107, CAM-EXEC-03 "tokens where
+ * reportable"). Total over hostile/absent shapes: any non-record usage yields
+ * undefined ("not reportable"); a non-finite/negative field is skipped, never a
+ * throw and never a partial figure treated as authoritative. Returns undefined
+ * only when NO recognized token field is present.
  */
 export function sumUsageTokens(usage: unknown): number | undefined {
   if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
   const rec = usage as Record<string, unknown>;
-  const input = rec["input_tokens"];
-  const output = rec["output_tokens"];
-  const nums = [input, output].filter(
+  const nums = USAGE_TOKEN_FIELDS.map((f) => rec[f]).filter(
     (v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0,
   );
   if (nums.length === 0) return undefined;

@@ -47,6 +47,8 @@ export interface WorkerCloneIsolationRecord {
   gitIsRealDirectory: boolean;
   /** No `objects/info/alternates` — a shared/reference clone records one. */
   noAlternates: boolean;
+  /** No loose object is hardlinked (nlink>1) — a --local hardlink clone shares its store. */
+  noHardlinkedObjects: boolean;
   /** core.hooksPath is persisted to the disabling value in the clone config. */
   hooksDisabledByConfig: boolean;
   /** No credential.helper configured in the clone's local config. */
@@ -165,6 +167,21 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     );
   }
 
+  // A --local clone (without --no-hardlinks) HARDLINKS its loose objects to the
+  // source, so the object store is not standalone even though no alternates
+  // file exists (round-1 finding 10). A full --no-local clone transfers a pack
+  // and writes fresh objects with link count 1. Independently attest that no
+  // loose object is hardlinked (nlink > 1) — this catches a provisioning
+  // command regression that dropped --no-hardlinks, without needing the source
+  // path. (Packed objects carry no such sharing.)
+  const noHardlinkedObjects = !hasHardlinkedLooseObject(join(gitPath, "objects"));
+  if (!noHardlinkedObjects) {
+    throw new WorkerCloneError(
+      "workspace has hardlinked loose objects (nlink>1) — a --local hardlink clone shares its " +
+        "object store and is never a worker workspace (CAM-EXEC-02)",
+    );
+  }
+
   let hooksPath = "";
   try {
     hooksPath = git(dir, ["config", "--local", "--get", "core.hooksPath"]);
@@ -206,17 +223,29 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     remotes = [];
   }
   for (const remote of remotes) {
-    let url = "";
-    try {
-      url = git(dir, ["remote", "get-url", remote]);
-    } catch {
-      continue;
+    // Both FETCH and PUSH urls (round-1 finding 2): `get-url` alone returns the
+    // fetch url, so a credential hidden in remote.<name>.pushurl was invisible.
+    // --all lists every configured url; --push adds the push urls.
+    const urls = new Set<string>();
+    for (const flags of [
+      ["get-url", "--all"],
+      ["get-url", "--push", "--all"],
+    ]) {
+      try {
+        for (const u of git(dir, ["remote", ...flags, remote]).split("\n")) {
+          if (u.length > 0) urls.add(u);
+        }
+      } catch {
+        /* a remote with no push url configured errors here — nothing to add */
+      }
     }
-    if (urlCarriesUserinfo(url)) remotesCredentialFree = false;
+    for (const url of urls) {
+      if (urlCarriesUserinfo(url)) remotesCredentialFree = false;
+    }
   }
   if (!remotesCredentialFree) {
     throw new WorkerCloneError(
-      "a workspace remote URL carries userinfo — workers hold zero GitHub credentials (CAM-EXEC-02)",
+      "a workspace remote URL (fetch or push) carries userinfo — workers hold zero GitHub credentials (CAM-EXEC-02)",
     );
   }
 
@@ -230,6 +259,7 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
   return {
     gitIsRealDirectory,
     noAlternates,
+    noHardlinkedObjects,
     hooksDisabledByConfig,
     noCredentialHelper,
     remotesCredentialFree,
@@ -237,11 +267,64 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
   };
 }
 
-/** File NAMES that are stored-credential files wherever they appear. */
+/**
+ * Is any LOOSE object under `objectsDir` hardlinked (st_nlink > 1)? A --local
+ * hardlink clone shares its loose objects with the source (nlink 2); a full
+ * --no-local clone writes fresh objects (nlink 1) and a pack. Bounded: loose
+ * objects live in 256 `??/` fan-out dirs; we stop at the first hardlink found.
+ */
+function hasHardlinkedLooseObject(objectsDir: string): boolean {
+  let fanoutDirs: string[];
+  try {
+    fanoutDirs = readdirSync(objectsDir);
+  } catch {
+    return false; // no objects dir → nothing shared
+  }
+  for (const fan of fanoutDirs) {
+    // Only the 2-hex fan-out dirs hold loose objects; skip pack/, info/, etc.
+    if (!/^[0-9a-f]{2}$/.test(fan)) continue;
+    const fanDir = join(objectsDir, fan);
+    let names: string[];
+    try {
+      names = readdirSync(fanDir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      try {
+        if (lstatSync(join(fanDir, name)).nlink > 1) return true;
+      } catch {
+        /* raced/removed object — ignore */
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * File NAMES that are stored-credential files wherever they appear — these
+ * exist ONLY to hold credentials, so the name alone is the finding (contents
+ * are never read or reported).
+ */
 const CREDENTIAL_FILE_NAMES = new Set([".git-credentials", ".netrc", "_netrc"]);
 
 /** Git config file names whose CONTENT is checked for credential channels. */
 const GIT_CONFIG_FILE_NAMES = new Set(["config", ".gitconfig"]);
+
+/**
+ * Files that MAY hold a token but also have legitimate token-free uses (a
+ * public-registry `.npmrc`, a gh `hosts.yml` config). Matched by name, then
+ * CONTENT-checked for a token so a token-free file is NOT a false positive
+ * (round-1 finding 2). Kept bounded — this is defense-in-depth over the real
+ * boundary (the container mounts no host HOME), not an unbounded denylist.
+ */
+const CREDENTIAL_CONTENT_FILE_NAMES = new Set(["hosts.yml", "hosts.json", ".npmrc"]);
+const CREDENTIAL_CONTENT_MARKERS = [
+  /oauth_token/i, // gh CLI hosts.yml
+  /_authtoken\s*=/i, // .npmrc registry token
+  /_auth\s*=/i, // .npmrc basic auth
+  /_password\s*=/i,
+];
 
 // Depth/entry caps so a hostile tree cannot drive an unbounded walk; a
 // beyond-cap tree is itself reported (fail-closed: "not fully scanned" is a
@@ -303,6 +386,19 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
           continue;
         }
         if (gitConfigOpensCredentialChannel(text)) findings.push(relChild);
+        continue;
+      }
+      if (CREDENTIAL_CONTENT_FILE_NAMES.has(name)) {
+        let text = "";
+        try {
+          text = readFileSync(absChild, "utf8");
+        } catch {
+          findings.push(`${relChild} (unreadable credential-candidate — not scanned)`);
+          continue;
+        }
+        // Token-free files (a public-registry .npmrc, a gh hosts.yml with no
+        // oauth_token) are NOT flagged — only a token marker is a finding.
+        if (CREDENTIAL_CONTENT_MARKERS.some((re) => re.test(text))) findings.push(relChild);
       }
     }
   };

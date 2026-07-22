@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   WORKER_CONTAINER_CAPS,
   WORKER_PIDS_LIMIT,
+  WORKER_PROFILE_ENTRYPOINT,
   WORKER_WORKSPACE_MOUNT,
   WorkerContainerConfigError,
   isValidAllowlistHost,
@@ -30,6 +31,9 @@ describe("renderWorkerRunArgs", () => {
     expect(joined).toContain("--security-opt no-new-privileges:true");
     expect(joined).toContain(`--pids-limit ${WORKER_PIDS_LIMIT}`);
     expect(joined).toContain("--network camino-net");
+    // The isolation entrypoint is PINNED (round-1 finding 1): any image runs
+    // the rule-install bootstrap; the image's own ENTRYPOINT cannot skip it.
+    expect(joined).toContain(`--entrypoint ${WORKER_PROFILE_ENTRYPOINT}`);
     expect(joined).toContain("-e CAMINO_EGRESS_ALLOWLIST=registry.invalid:443");
     expect(args[args.length - 2]).toBe(BASE.image);
     expect(args[args.length - 1]).toBe("/bin/true");
@@ -71,6 +75,7 @@ describe("renderWorkerRunArgs", () => {
       "/etc",
       "/sbin/sub",
       WORKER_WORKSPACE_MOUNT,
+      `${WORKER_WORKSPACE_MOUNT}/auth`, // inside the rw workspace mount
     ]) {
       expect(() =>
         renderWorkerRunArgs(
@@ -91,7 +96,62 @@ describe("renderWorkerRunArgs", () => {
     ).toThrow(WorkerContainerConfigError);
   });
 
-  it("refuses caller env keys that shadow the composed allowlist, and malformed keys", () => {
+  it("canonicalizes the mount target before the bootstrap-path check (round-1 finding 1)", () => {
+    // `/tmp/../usr/local/bin/...` normalizes onto a protected path — Docker
+    // does this, so the composer must too, or it's a bootstrap bypass.
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          providerAuthMounts: [
+            { hostPath: "/tmp/x", containerPath: "/tmp/../usr/local/bin/worker" },
+          ],
+        },
+        ["/bin/true"],
+      ),
+    ).toThrow(/bootstrap path/);
+  });
+
+  it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {
+    // The auth source lives INSIDE the workspace tree: its :ro mount would be
+    // writable through the rw /workspace alias.
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          workspaceHostPath: "/tmp/attempt/workspace",
+          providerAuthMounts: [
+            { hostPath: "/tmp/attempt/workspace/auth", containerPath: "/auth/provider" },
+          ],
+        },
+        ["/bin/true"],
+      ),
+    ).toThrow(/overlaps the rw workspace/);
+    // The reverse (workspace inside the auth source) is equally refused.
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          workspaceHostPath: "/tmp/shared/ws",
+          providerAuthMounts: [{ hostPath: "/tmp/shared", containerPath: "/auth/provider" }],
+        },
+        ["/bin/true"],
+      ),
+    ).toThrow(/overlaps the rw workspace/);
+    // Disjoint sources are fine.
+    expect(() =>
+      renderWorkerRunArgs(
+        {
+          ...BASE,
+          workspaceHostPath: "/tmp/attempt/workspace",
+          providerAuthMounts: [{ hostPath: "/tmp/attempt/auth", containerPath: "/auth/provider" }],
+        },
+        ["/bin/true"],
+      ),
+    ).not.toThrow();
+  });
+
+  it("refuses caller env keys: reserved, malformed, AND credential-shaped (round-1 finding 2)", () => {
     expect(() =>
       renderWorkerRunArgs({ ...BASE, env: { CAMINO_EGRESS_ALLOWLIST: "evil:1" } }, ["/bin/true"]),
     ).toThrow(WorkerContainerConfigError);
@@ -101,6 +161,17 @@ describe("renderWorkerRunArgs", () => {
     expect(() => renderWorkerRunArgs({ ...BASE, env: { "BAD KEY": "y" } }, ["/bin/true"])).toThrow(
       WorkerContainerConfigError,
     );
+    // Zero GitHub credentials at the container boundary: a credential-shaped
+    // key handed as `-e` is refused (the daemon env layer strips the same set).
+    for (const key of ["GITHUB_TOKEN", "GH_TOKEN", "GIT_ASKPASS", "AWS_SECRET_ACCESS_KEY"]) {
+      expect(() =>
+        renderWorkerRunArgs({ ...BASE, env: { [key]: "secret" } }, ["/bin/true"]),
+      ).toThrow(/credential-shaped/);
+    }
+    // A benign key is still allowed.
+    expect(() =>
+      renderWorkerRunArgs({ ...BASE, env: { CI: "true" } }, ["/bin/true"]),
+    ).not.toThrow();
   });
 });
 

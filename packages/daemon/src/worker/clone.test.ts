@@ -76,6 +76,7 @@ describe("provisionWorkerClone (CAM-EXEC-02 positive path)", () => {
     expect(record).toEqual({
       gitIsRealDirectory: true,
       noAlternates: true,
+      noHardlinkedObjects: true,
       hooksDisabledByConfig: true,
       noCredentialHelper: true,
       remotesCredentialFree: true,
@@ -146,6 +147,17 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/alternates/);
   });
 
+  it("rejects a --local hardlink clone (shared object store, no alternates) — round-1 finding 10", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    // A plain --local clone HARDLINKS its loose objects to the source (no
+    // alternates file), so the alternates check alone misses it.
+    execFileSync("git", ["clone", "--local", "--", source, dest], { env: GIT_ENV });
+    git(dest, "config", "--local", "core.hooksPath", "/dev/null");
+    git(dest, "config", "--local", "credential.helper", "");
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink/);
+  });
+
   it("rejects a plain clone without the hooks-disabling config", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();
@@ -153,11 +165,28 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hooks/);
   });
 
-  it("rejects a clone whose remote URL carries userinfo", () => {
+  it("rejects a clone whose remote FETCH URL carries userinfo", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();
     provisionWorkerClone({ sourceRepo: source, destDir: dest });
     git(dest, "remote", "set-url", "origin", "https://x-access-token:tok@github.invalid/o/r.git");
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/userinfo/);
+  });
+
+  it("rejects a clone whose remote PUSH URL carries userinfo (round-1 finding 2)", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Fetch url stays clean; the secret hides in pushurl, which `get-url`
+    // (fetch-only) missed before the --push enumeration.
+    git(
+      dest,
+      "remote",
+      "set-url",
+      "--push",
+      "origin",
+      "https://x-access-token:tok@github.invalid/o/r.git",
+    );
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/userinfo/);
   });
 
@@ -201,6 +230,29 @@ describe("scanForGithubCredentialMaterial", () => {
     const dir2 = tempDir();
     writeFileSync(join(dir2, "config"), '[remote "origin"]\n\turl = https://u:t@host.invalid/r\n');
     expect(scanForGithubCredentialMaterial(dir2)).toEqual(["config"]);
+  });
+
+  it("flags a gh hosts.yml with an oauth_token but not a token-free one (round-1 finding 2)", () => {
+    const withToken = tempDir();
+    mkdirSync(join(withToken, ".config", "gh"), { recursive: true });
+    writeFileSync(
+      join(withToken, ".config", "gh", "hosts.yml"),
+      "github.com:\n  oauth_token: gho_SECRET\n  user: someone\n",
+    );
+    expect(scanForGithubCredentialMaterial(withToken)).toEqual([".config/gh/hosts.yml"]);
+    // A token-free hosts.yml (or an unrelated one) is NOT a false positive.
+    const clean = tempDir();
+    writeFileSync(join(clean, "hosts.yml"), "web1: 10.0.0.1\nweb2: 10.0.0.2\n");
+    expect(scanForGithubCredentialMaterial(clean)).toEqual([]);
+  });
+
+  it("flags an .npmrc with an auth token but not a token-free one", () => {
+    const withToken = tempDir();
+    writeFileSync(join(withToken, ".npmrc"), "//registry.npmjs.org/:_authToken=npm_SECRET\n");
+    expect(scanForGithubCredentialMaterial(withToken)).toEqual([".npmrc"]);
+    const clean = tempDir();
+    writeFileSync(join(clean, ".npmrc"), "registry=https://registry.npmjs.org/\n");
+    expect(scanForGithubCredentialMaterial(clean)).toEqual([]);
   });
 
   it("reports an empty result on a clean tree", () => {

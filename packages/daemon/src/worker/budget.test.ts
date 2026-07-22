@@ -127,6 +127,20 @@ describe("dispatchWithBudget (CAM-EXEC-03)", () => {
       dispatchWithBudget(mockAdapter(), { workdir: workdir(), prompt: "x" }, { wallClockMs: 0 }),
     ).rejects.toThrow(BudgetConfigError);
   });
+
+  it("a budget breach at the SAME boundary as a generic timeout classifies killed-budget (round-1 finding 7)", async () => {
+    // Equal wall-clock budget and timeout: the budget must win so A.2#10
+    // kill-and-escalate fires, never a generic `killed`.
+    const { record, escalation } = await dispatchWithBudget(
+      mockAdapter("graceful-cancel"),
+      { workdir: workdir(), prompt: "run forever" },
+      { wallClockMs: 600 },
+      { killConfirm: FAST_KILL, timeoutMs: 600 },
+    );
+    expect(record.outcome).toBe("killed-budget");
+    expect(record.budgetBreach?.kind).toBe("wall-clock");
+    expect(escalation).toBeDefined();
+  }, 30_000);
 });
 
 describe("never an automatic retry (A.2#10 pinned against the core table)", () => {

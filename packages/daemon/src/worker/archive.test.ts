@@ -100,6 +100,7 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     ) as ArchiveSidecar;
     expect(sidecar.attemptId).toBe("attempt-1");
     expect(sidecar.sha256).toBe(record.sha256);
+    expect(sidecar.seq).toBe(0); // first archive of this issue
     // Strict sub-step order, and the ready-made event passes the core guard
     // from every terminal state.
     expect(Date.parse(record.archiveWrittenAt)).toBeLessThan(Date.parse(record.ledgerRowAt));
@@ -213,6 +214,50 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     ).rejects.toMatchObject({ stage: "archive-write" });
   });
 
+  it("refuses an archiveRoot inside the workspace — cleanup would delete the archive (round-1 finding 4)", async () => {
+    const ws = makeWorkspace();
+    await expect(
+      archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: join(ws, "archives"),
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+    expect(existsSync(ws)).toBe(true); // nothing was destroyed
+    // A `..` path that resolves back inside the workspace is also refused.
+    await expect(
+      archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: join(ws, "sub", ".."),
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ stage: "id-validation" });
+  });
+
+  it("assigns a durable per-issue monotonic seq across attempts", async () => {
+    const root = tempDir();
+    for (const id of ["attempt-a", "attempt-b", "attempt-c"]) {
+      await archiveAttempt({
+        workspaceDir: makeWorkspace(),
+        archiveRoot: root,
+        issueId: "issue-x",
+        attemptId: id,
+        recordLedgerRow: () => {},
+      });
+    }
+    const seqs = ["attempt-a", "attempt-b", "attempt-c"].map((id) => {
+      const s = JSON.parse(
+        readFileSync(join(root, "issue-x", `${id}.json`), "utf8"),
+      ) as ArchiveSidecar;
+      return s.seq;
+    });
+    expect(seqs).toEqual([0, 1, 2]);
+  });
+
   it("production defaults are exactly the registry item 11 values", () => {
     expect(DEFAULT_ARCHIVE_QUOTAS.workspaceMaxBytes).toBe(
       REGISTRY_ITEM_11_QUOTAS.workspace.maxBytes,
@@ -240,7 +285,13 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
   const DAY = 24 * 60 * 60 * 1000;
   const NOW = Date.parse("2026-07-22T00:00:00.000Z");
 
-  function seedArchive(root: string, issueId: string, attemptId: string, ageDays: number): string {
+  function seedArchive(
+    root: string,
+    issueId: string,
+    attemptId: string,
+    ageDays: number,
+    seq?: number,
+  ): string {
     const issueDir = join(root, issueId);
     mkdirSync(issueDir, { recursive: true });
     const archivePath = join(issueDir, `${attemptId}.tar.gz`);
@@ -249,6 +300,10 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
       issueId,
       attemptId,
       archiveWrittenAt: new Date(NOW - ageDays * DAY).toISOString(),
+      // Default seq correlates with recency (younger age → higher seq), so
+      // the age-based cases below order the same by seq. The tie-break test
+      // passes an explicit seq to decouple order from timestamp.
+      seq: seq ?? 1_000_000 - Math.round(ageDays),
       sha256: "0".repeat(64),
       compressedBytes: 10,
       workspaceBytes: 10,
@@ -326,5 +381,40 @@ describe("pruneArchives (retention: 90 days OR last 10 per issue — whichever M
     const report = pruneArchives({ archiveRoot: root, now: nowFn });
     expect(report.kept).toContain(keepByAge);
     expect(report.deleted).toContain(dropBoth);
+  });
+
+  it("orders the last-10 window by attempt SEQUENCE, not by tied timestamps (round-1 finding 11)", () => {
+    const root = tempDir();
+    // 11 attempts, ALL the same (old) timestamp — only the durable seq
+    // distinguishes their order. The lowest seq (first attempt) is the one
+    // outside the newest-10 window and must be the single deletion.
+    for (let i = 0; i < 11; i++) {
+      seedArchive(root, "issue-seq", `attempt-${String(i).padStart(2, "0")}`, 200, /* seq */ i);
+    }
+    const report = pruneArchives({ archiveRoot: root, now: nowFn });
+    expect(report.deleted.map((p) => p.split("/").pop())).toEqual(["attempt-00.tar.gz"]);
+    expect(report.kept).toHaveLength(10);
+    // A truly ordinal-blind sort (by tied timestamp) could delete any of them;
+    // seq pins it to the genuine first attempt.
+  });
+
+  it("keeps an archive whose sidecar lacks a seq (unsequenced = undatable, fail-closed)", () => {
+    const root = tempDir();
+    const issueDir = join(root, "issue-noseq");
+    mkdirSync(issueDir, { recursive: true });
+    writeFileSync(join(issueDir, "legacy.tar.gz"), "bytes");
+    // A sidecar with a timestamp but NO seq cannot be ordered → never deleted.
+    writeFileSync(
+      join(issueDir, "legacy.json"),
+      JSON.stringify({
+        issueId: "issue-noseq",
+        attemptId: "legacy",
+        archiveWrittenAt: new Date(NOW - 200 * DAY).toISOString(),
+      }),
+    );
+    for (let i = 0; i < 11; i++) seedArchive(root, "issue-noseq", `a-${i}`, 95 + i, 100 + i);
+    const report = pruneArchives({ archiveRoot: root, now: nowFn });
+    expect(report.undatable).toContain(join(issueDir, "legacy.tar.gz"));
+    expect(existsSync(join(issueDir, "legacy.tar.gz"))).toBe(true);
   });
 });

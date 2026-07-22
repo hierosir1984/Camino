@@ -57,8 +57,11 @@ for entry in $CAMINO_EGRESS_ALLOWLIST; do
   fi
 
   # Resolve now (rules are not installed yet, so the network's DNS still
-  # answers). Pipeline status is awk's, so failure shows as empty output.
-  ips=$("$GETENT" hosts "$host" | awk '{ print $1 }')
+  # answers). Use `ahostsv4` — NOT `hosts` — so we get the IPv4 address even on
+  # a dual-stack (--ipv6) network, where `getent hosts` returns the AAAA record
+  # first and a v4 filter would find nothing. ahostsv4 emits IPv4 STREAM/DGRAM
+  # lines; dedupe them. (getent runs before the rules install.)
+  ips=$("$GETENT" ahostsv4 "$host" | awk '{ print $1 }' | sort -u)
   v4=""
   for ip in $ips; do
     case $ip in
@@ -159,6 +162,10 @@ fi
 echo "worker-profile: rules installed" >&2
 "$IPTABLES" -S OUTPUT >&2
 "$IPTABLES" -S INPUT >&2
+if [ "$HAVE_V6" -eq 1 ]; then
+  echo "worker-profile: ip6 rules installed" >&2
+  "$IP6TABLES" -S OUTPUT >&2
+fi
 
 # The workload env shares nothing bootstrap-only: the allowlist was consumed
 # above and the rules are now kernel state (WP-005 privilege-separation

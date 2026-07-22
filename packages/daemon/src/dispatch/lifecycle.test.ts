@@ -35,9 +35,27 @@ function anyGroupAlive(pgid: number): boolean {
   }
 }
 
-/** The mock CLI writes its pid (== the group id under detached spawn) here. */
+/**
+ * The mock CLI writes its pid (== the group id under detached spawn) here at
+ * startup. A dispatch that cancels/times out in the spawn window can return
+ * BEFORE the mock's synchronous write lands under heavy machine load (observed
+ * as an ENOENT flake when many suites run in parallel). Poll briefly; if the
+ * file never appears, the mock never established a group, so return NaN —
+ * anyGroupAlive(NaN) is false, i.e. "group gone", the correct semantics.
+ */
 function mockPid(ws: string): number {
-  return Number(readFileSync(join(ws, ".mock-pid"), "utf8"));
+  const path = join(ws, ".mock-pid");
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 80; attempt++) {
+    try {
+      const raw = readFileSync(path, "utf8").trim();
+      if (raw.length > 0) return Number(raw);
+    } catch {
+      /* not written yet */
+    }
+    Atomics.wait(sleeper, 0, 0, 25); // 25ms, up to ~2s total
+  }
+  return Number.NaN;
 }
 
 describe("dispatch lifecycle (mock adapter, no quota)", () => {

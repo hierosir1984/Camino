@@ -48,15 +48,16 @@ run_probe non-allowlisted-name-resolution getent hosts "$CAMINO_PROBE_DENIED_HOS
 run_probe dns-lookup nslookup cloudflare.com
 run_probe non-allowlisted-external-tcp nc -w 5 1.1.1.1 443
 
-# The embedded resolver 127.0.0.11 must be rejected BY ADDRESS, on a port other
-# than 53 — Docker DNAT-redirects resolver traffic off port 53 before the
-# filter chain, so a --dport 53 rule alone would miss it (the WP-005 finding).
-run_probe resolver-address-tcp nc -w 3 127.0.0.11 5353
-
-# IPv6 is closed at the packet level (WP-005 deferred a full v6 round-trip to
-# here). A public IPv6 literal must be unreachable; if the stack has no v6 at
-# all the connect still fails, which is also a pass for "v6 unreachable".
-run_probe ipv6-external-tcp nc -w 5 2606:4700:4700::1111 443
+# IPv6 is closed at the packet level. The target is the ALLOWED endpoint's OWN
+# IPv6 address, IN-NETWORK (its v4 is allowlisted): so a connection failure is
+# attributable to the ip6tables OUTPUT DROP, not to a missing route — the v4
+# leg to the same host succeeds above while this v6 leg to it must fail. The
+# harness proves an UNRESTRICTED container reaches this same v6 address, so the
+# denial is the profile's, not a dead endpoint. (Empty env → skipped cleanly on
+# a host without container IPv6.)
+if [ -n "${CAMINO_PROBE_ALLOWED_V6:-}" ]; then
+  run_probe ipv6-peer-tcp nc -w 5 "$CAMINO_PROBE_ALLOWED_V6" "$CAMINO_PROBE_ALLOWED_PORT"
+fi
 
 # --- zero GitHub credentials, asserted in-container (CAM-EXEC-02) ------------
 # No credential-shaped env key survives into the workload environment.

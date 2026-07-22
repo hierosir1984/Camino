@@ -111,6 +111,7 @@ export {
   WorkerContainerConfigError,
   WORKER_CONTAINER_CAPS,
   WORKER_PIDS_LIMIT,
+  WORKER_PROFILE_ENTRYPOINT,
   WORKER_WORKSPACE_MOUNT,
   isValidAllowlistHost,
   isValidAllowlistPort,

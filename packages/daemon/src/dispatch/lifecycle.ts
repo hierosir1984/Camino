@@ -736,19 +736,25 @@ export async function dispatch(
     if (child.stdout) consume("stdout", child.stdout);
     if (child.stderr) consume("stderr", child.stderr);
 
-    if (timeoutMs != null) {
-      timeoutTimer = setTimeout(() => requestKill("timeout"), timeoutMs);
-    }
+    // Arm the BUDGET timer BEFORE the generic timeout timer (round-1 finding
+    // 7): at an equal deadline, timers fire in insertion order, so the budget
+    // callback runs first and sets killReason="budget" — a budget breach at
+    // the same boundary as a runaway timeout is classified `killed-budget`
+    // (kill-and-escalate), never a generic `killed`.
     if (budgetWallClockMs !== undefined) {
-      // The wall-clock budget measures the WORKER's duration: once the child
-      // has exited (or another kill is in flight), the budget clock stops —
-      // a slow post-exit drain must not turn an in-budget run into a breach.
+      // Wall-clock is measured from dispatch START (round-1 finding 5): the
+      // budget covers plan()/spawn time too, so arm for the REMAINING budget,
+      // clamped to 0 (an already-over-budget dispatch breaches immediately).
       const limit = budgetWallClockMs;
+      const remaining = Math.max(0, limit - (Date.now() - started));
       budgetTimer = setTimeout(() => {
         if (exited || killReason) return;
         budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
         requestKill("budget");
-      }, limit);
+      }, remaining);
+    }
+    if (timeoutMs != null) {
+      timeoutTimer = setTimeout(() => requestKill("timeout"), timeoutMs);
     }
 
     const exitCode = await new Promise<number | null>((resolve) => {

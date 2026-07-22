@@ -70,11 +70,24 @@ export interface BudgetedDispatchResult {
  * Appendix A escalation events alongside the record. There is deliberately
  * no retry affordance on this API.
  *
- * `killConfirmed` is reported honestly from the record's group-gone evidence:
- * when the group could NOT be confirmed gone, the A.2/A.3 guards will refuse
- * the transition and the caller lands on the cleanup-failed path (A.2 "any
- * active | cleanup failure during teardown | blocked") instead of a clean
- * escalation — a failed kill is never papered over.
+ * `killConfirmed` = the worker process GROUP is confirmed gone
+ * (processGroupConfirmedGone), which is the operative "worker is stopped"
+ * property the A.2#10 / A.3#5 guard requires before escalating. It is TRUE
+ * either because a kill-confirm sequence ran and confirmed group-gone, or
+ * because the worker exited on its own before the breach was detected (a late
+ * usage report) — in both cases the worker is stopped, so escalation (never
+ * auto-retry) is the correct next step. When the group can NOT be confirmed
+ * gone, killConfirmed is FALSE and the guard refuses the clean escalation,
+ * routing to the cleanup-failed path (A.2 "cleanup failure during teardown →
+ * blocked") — a failed kill is never papered over.
+ *
+ * BOUNDARY (round-1 finding 9), the same group-vs-tree boundary WP-105 states
+ * throughout: "group gone" is process-GROUP scope. A descendant that changed
+ * its own process group (setpgid/setsid) is invisible to the group probe —
+ * and is exactly the residual THIS work package's container closes (kill the
+ * container ⇒ reap every pid). So in the delivered architecture the escaped
+ * descendant cannot outlive the attempt; at this daemon-side seam the claim is
+ * scoped to the group and does not overreach.
  */
 export async function dispatchWithBudget(
   adapter: AdapterSpec,

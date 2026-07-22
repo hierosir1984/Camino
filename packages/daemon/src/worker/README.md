@@ -58,9 +58,26 @@ established-egress bypass).
   guarantees the _order_ and the _retention_, and fails closed (workspace
   retained) if the row is not recorded.
 - **Container parameters are Camino-composed, not worker-supplied.** The
-  composer still refuses the reachable bootstrap-subversion shapes (shared
-  network, bootstrap-path mount, reserved env key). A worker's untrusted input
-  is the _code_ that runs unprivileged after the rules install.
+  composer refuses the reachable bootstrap-subversion shapes: a shared network,
+  a bootstrap-path mount (canonicalized, so `/tmp/../usr/local/bin` cannot slip
+  through), a reserved or credential-shaped env key, an overlapping mount
+  source that would alias a `:ro` mount through the rw workspace, and an image
+  whose ENTRYPOINT could skip the profile (the entrypoint is **pinned**). A
+  worker's untrusted input is the _code_ that runs unprivileged after the rules
+  install.
+- **Egress is an IP:port allowlist (L3/L4), not an L7 host-identity filter.**
+  Per-repo hosts are resolved to IPs at container setup and permitted by
+  address; there is no HTTP Host / TLS SNI check. So a non-allowlisted virtual
+  host sharing an allowed host's IP **and** port (a shared CDN/hosting IP)
+  remains reachable, and IPs are pinned at setup (no re-resolution mid-run). An
+  L7 filtering proxy would close the shared-IP gap and is a **deferred**
+  follow-up (recorded for David), not part of WP-107 — the same L3/L4 posture
+  the WP-005 spike established and that is the accepted v1 for a per-repo
+  registry/docs allowlist.
+- **Token budgets bind only where the vendor reports cumulative usage.** The
+  figure sums every consumed-token variant Anthropic reports (input, output,
+  cache-creation, cache-read), so a run riding cache-read tokens cannot slip a
+  small budget; wall-clock is always enforced, measured from dispatch start.
 
 ## Running the suites
 

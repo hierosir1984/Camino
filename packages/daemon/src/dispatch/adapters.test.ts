@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
-import { classifyByQuotaSignal, classifyErrorTextForQuota } from "./quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota, sumUsageTokens } from "./quota.js";
 import { committedSince, headSha, makeWorkspace } from "./workspace.js";
 
 // Per-provider quota classification (CAM-EXEC-06), provoked without spending
@@ -128,6 +128,55 @@ describe("per-provider quota classification", () => {
     );
     expect(errorResult?.kind).toBe("error");
     expect(errorResult?.quotaSignal).toBe(true); // trusted in the error result
+  });
+});
+
+// WP-107 CAM-EXEC-03 "tokens where reportable" (round-1 finding 6): the token
+// figure a budget checks must count EVERY consumed-token variant, or a run
+// riding cache-read tokens evades a small budget.
+describe("sumUsageTokens (token-budget accounting)", () => {
+  it("sums input + output + cache_creation + cache_read (Anthropic total)", () => {
+    expect(
+      sumUsageTokens({
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 2000,
+        cache_creation_input_tokens: 500,
+      }),
+    ).toBe(2502);
+  });
+
+  it("does not let cache-read tokens evade the count (the finding-6 receipt)", () => {
+    // 2000 cache-read tokens + a 1000 budget must be over budget, not under.
+    const total = sumUsageTokens({
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_input_tokens: 2000,
+      cache_creation_input_tokens: 0,
+    });
+    expect(total).toBe(2002);
+    expect(total).toBeGreaterThan(1000);
+  });
+
+  it("is total over hostile/absent shapes (undefined = not reportable, never a throw)", () => {
+    expect(sumUsageTokens(undefined)).toBeUndefined();
+    expect(sumUsageTokens(null)).toBeUndefined();
+    expect(sumUsageTokens("nope")).toBeUndefined();
+    expect(sumUsageTokens({})).toBeUndefined();
+    expect(sumUsageTokens({ other: 5 })).toBeUndefined();
+    // A negative/non-finite field is skipped, not thrown on.
+    expect(
+      sumUsageTokens({ input_tokens: 10, output_tokens: -1, cache_read_input_tokens: NaN }),
+    ).toBe(10);
+  });
+
+  it("the claude result parser reports the cumulative total incl. cache tokens", () => {
+    const ev = claudeAdapter().parseLine(
+      '{"type":"result","result":"done","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}',
+      "stdout",
+    );
+    expect(ev?.terminalSuccess).toBe(true);
+    expect(ev?.tokensTotal).toBe(135);
   });
 });
 

@@ -46,6 +46,7 @@ const PROBE_MOUNT = "/probes.sh";
 
 let allowedIp = "";
 let deniedIp = "";
+let allowedV6 = "";
 /** A rw workspace dir and a ro provider-auth dir on the host, per run. */
 let workspaceHostDir = "";
 let providerAuthHostDir = "";
@@ -163,10 +164,14 @@ async function profiledWorkerRun(allowlist: { host: string; port: number }[]) {
         CAMINO_PROBE_WRONG_PORT: String(WRONG_PORT),
         CAMINO_WORKSPACE_DIR: WORKER_WORKSPACE_MOUNT,
         CAMINO_PROVIDER_AUTH_DIR: AUTH_MOUNT,
+        // The allowed endpoint's OWN IPv6 address (in-network): the v6 leg to
+        // it must fail while the v4 leg is allowlisted — a packet-level proof
+        // IPv6 is closed, not merely absent (round-1 finding 12).
+        ...(allowedV6 ? { CAMINO_PROBE_ALLOWED_V6: allowedV6 } : {}),
         // A GitHub-credential-shaped env key the container MUST strip is not
-        // injected here: the composer refuses reserved CAMINO_EGRESS_* keys,
-        // and the daemon env layer (WP-105) already strips credential keys —
-        // this suite asserts the in-container RESULT (github-cred-env: clean).
+        // injected here: the composer now REFUSES credential-shaped keys
+        // (asserted in egress.test.ts), and this suite asserts the in-container
+        // RESULT (github-cred-env: clean).
       },
     },
     ["/bin/sh", PROBE_MOUNT],
@@ -177,7 +182,10 @@ async function profiledWorkerRun(allowlist: { host: string; port: number }[]) {
 beforeAll(async () => {
   await requireDockerDaemon();
   await dockerOrThrow(["build", "-t", IMAGE, PROFILE_DIR]);
-  await dockerOrThrow(["network", "create", NET]);
+  // An IPv6-enabled network so the IPv6 block is proven at the packet level
+  // (round-1 finding 12): containers get v6 addresses and reach each other over
+  // v6, so the profile's ip6tables DROP is testable without host v6 egress.
+  await dockerOrThrow(["network", "create", "--ipv6", "--subnet", "fd00:107:6::/64", NET]);
   await startEndpoint(ALLOWED, ALLOWED_BODY, WRONG_PORT);
   await startEndpoint(DENIED, DENIED_BODY);
   const ipOf = async (name: string): Promise<string> => {
@@ -194,8 +202,18 @@ beforeAll(async () => {
     }
     return ip;
   };
+  const v6Of = async (name: string): Promise<string> =>
+    (
+      await dockerOrThrow([
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}",
+        name,
+      ])
+    ).stdout.trim();
   allowedIp = await ipOf(ALLOWED);
   deniedIp = await ipOf(DENIED);
+  allowedV6 = await v6Of(ALLOWED); // may be "" if the host lacks container IPv6
 
   // Host-side scratch: a world-writable workspace (so the in-container uid
   // 1000 can write regardless of host uid mapping) and a provider-auth dir
@@ -240,6 +258,44 @@ describe("control — the environment substrate works without the profile", () =
     },
     TEST_TIMEOUT,
   );
+
+  it(
+    "an UNRESTRICTED container resolves names via 127.0.0.11 and reaches the endpoint over IPv6",
+    async () => {
+      // Resolver control: nslookup works absent the profile, so the profiled
+      // nslookup failure is attributable to the by-address resolver reject.
+      const dns = await docker([
+        "run",
+        "--rm",
+        "--network",
+        NET,
+        "--entrypoint",
+        "/bin/sh",
+        IMAGE,
+        "-c",
+        `nslookup ${ALLOWED} >/dev/null 2>&1 && echo RESOLVED || echo failed`,
+      ]);
+      expect(dns.stdout.trim()).toBe("RESOLVED");
+
+      // IPv6 control: an unrestricted container reaches the allowed endpoint's
+      // own v6 address, so the profiled v6 failure is the profile's block.
+      if (allowedV6) {
+        const v6 = await docker([
+          "run",
+          "--rm",
+          "--network",
+          NET,
+          "--entrypoint",
+          "/bin/sh",
+          IMAGE,
+          "-c",
+          `nc -w 5 ${allowedV6} ${ENDPOINT_PORT} </dev/null && echo REACHED || echo failed`,
+        ]);
+        expect(v6.stdout.trim()).toBe("REACHED");
+      }
+    },
+    TEST_TIMEOUT,
+  );
 });
 
 describe("CAM-EXEC-03 — worker egress is allowlist-positive (per-repo config)", () => {
@@ -273,15 +329,22 @@ describe("CAM-EXEC-03 — worker egress is allowlist-positive (per-repo config)"
       expect(probeOf(probes, "non-allowlisted-sibling-tcp").exit).not.toBe(0);
       expect(probeOf(probes, "allowed-host-wrong-port-tcp").exit).not.toBe(0);
       expect(probeOf(probes, "non-allowlisted-name-resolution").exit).not.toBe(0);
-      expect(probeOf(probes, "dns-lookup").exit).not.toBe(0);
       expect(probeOf(probes, "non-allowlisted-external-tcp").exit).not.toBe(0);
 
-      // The embedded resolver rejected BY ADDRESS on a non-53 port (the
-      // WP-005 finding: Docker DNAT's resolver traffic off port 53).
-      expect(probeOf(probes, "resolver-address-tcp").exit).not.toBe(0);
+      // The embedded resolver is closed: nslookup (which queries 127.0.0.11)
+      // fails under the profile. The by-ADDRESS reject rule (all ports, ahead
+      // of the loopback accept) is asserted present by assertRuleOrder above;
+      // the unrestricted-resolver control test proves nslookup WOULD work
+      // absent the profile, so this failure is the profile's.
+      expect(probeOf(probes, "dns-lookup").exit).not.toBe(0);
 
-      // IPv6 closed at the packet level (WP-005 deferred this here).
-      expect(probeOf(probes, "ipv6-external-tcp").exit).not.toBe(0);
+      // IPv6 closed at the packet level (round-1 finding 12): the allowed
+      // endpoint's OWN v6 address is unreachable while its v4 is allowlisted.
+      // Skipped only if the host gave no container IPv6 (allowedV6 empty).
+      if (allowedV6) {
+        expect(r.stderr).toContain("worker-profile: ip6 rules installed");
+        expect(probeOf(probes, "ipv6-peer-tcp").exit).not.toBe(0);
+      }
     },
     TEST_TIMEOUT,
   );
@@ -388,8 +451,31 @@ describe("CAM-EXEC-03 — inbound default-deny closes the established-egress byp
     return r.code;
   }
 
+  /**
+   * Is the listener inside `name` actually UP? Probe it over LOOPBACK from
+   * INSIDE the container (docker exec, same netns): loopback is allowed, so a
+   * success proves the listener is bound and serving — attributing the
+   * external peer failure to INPUT drop, not a dead listener (round-1 finding
+   * 12). exec runs as the image default (root), which still only sees the
+   * container's own rules.
+   */
+  async function loopbackAlive(name: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const r = await docker([
+        "exec",
+        name,
+        "/bin/sh",
+        "-c",
+        `nc -w 3 127.0.0.1 ${LISTEN_PORT} </dev/null`,
+      ]);
+      if (r.code === 0) return true;
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+    return false;
+  }
+
   it(
-    "a peer can reach an UNRESTRICTED listener but NOT a profiled worker listener on the same port",
+    "a peer can reach an UNRESTRICTED listener but NOT a profiled worker listener that is PROVEN up",
     async () => {
       const controlName = `${ALLOWED}-listen`;
       const workerName = `${DENIED}-listen`;
@@ -398,9 +484,7 @@ describe("CAM-EXEC-03 — inbound default-deny closes the established-egress byp
       const controlIp = await ipOf(controlName);
       const workerIp = await ipOf(workerName);
 
-      // Wait until the CONTROL listener accepts — proves the substrate + the
-      // busybox listener work; the profiled worker's listener starts the same
-      // way, so once the control is up the worker's rules are installed too.
+      // Substrate: an unrestricted listener is reachable from a peer.
       let controlCode = 1;
       for (let attempt = 0; attempt < 30; attempt++) {
         controlCode = await peerConnect(controlIp);
@@ -409,8 +493,14 @@ describe("CAM-EXEC-03 — inbound default-deny closes the established-egress byp
       }
       expect(controlCode, "unrestricted listener reachable (substrate works)").toBe(0);
 
-      // The profiled worker's INPUT default-deny drops the inbound SYN, so the
-      // peer connect fails even though something IS listening — closing the
+      // ATTRIBUTION: the profiled worker's listener is genuinely UP — proven by
+      // a loopback connect from inside its own netns — so the peer failure
+      // below is the INPUT drop, not a listener that never started (the flaw
+      // round-1 finding 12 called out: /bin/false would also "deny").
+      expect(await loopbackAlive(workerName), "profiled listener is up on loopback").toBe(true);
+
+      // The profiled worker's INPUT default-deny drops the inbound SYN, so a
+      // peer cannot reach the (proven-live) listener — closing the
       // inbound-reply egress bypass at the packet level.
       const workerCode = await peerConnect(workerIp);
       expect(workerCode, "profiled worker listener is unreachable from a peer").not.toBe(0);
