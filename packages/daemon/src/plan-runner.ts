@@ -32,7 +32,15 @@
  * with no stream and constructionComplete false. Filesystem containment
  * of workers is the WP-107 container's job, not this protocol's.
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  mkdtempSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PLAN_STREAM_FILENAME, sha256Hex } from "@camino/shared";
@@ -42,13 +50,13 @@ import type { DispatchOptions } from "./dispatch/lifecycle.js";
 import { PlanningError, PlanningService } from "./planning.js";
 
 /**
- * Hard cap on the stream file in BYTES, checked against the file's stat
- * size BEFORE the read/decode (r6 finding 1: a code-unit check after a
- * full read is not a pre-allocation bound — multi-byte UTF-8 crossed it
- * threefold). With per-record bounds of 4000 chars this is thousands of
- * records — far beyond any human-approvable plan — and it makes the
- * quadratic tail's operand bounded in code rather than in prose
- * (r5 finding 7).
+ * Hard cap on the stream file in BYTES, enforced by a single bounded read
+ * of at most cap+1 bytes — never a stat-then-read pair a concurrent
+ * append could race (r6 finding 1; r7 verification), and never a
+ * post-decode code-unit check (multi-byte UTF-8 crossed that threefold).
+ * With per-record bounds of 4000 chars this is thousands of records — far
+ * beyond any human-approvable plan — and it makes the quadratic tail's
+ * operand bounded in code rather than in prose (r5 finding 7).
  */
 export const MAX_STREAM_BYTES = 4 * 1024 * 1024;
 
@@ -171,30 +179,43 @@ export async function runPlannerCompile(options: PlannerRunOptions): Promise<Pla
    */
   let consumedHash = sha256Hex("");
 
+  // One reusable read buffer, one byte over the cap: the byte bound is
+  // enforced BY CONSTRUCTION of a single bounded read — there is no
+  // stat-then-read pair for a concurrent append to race (the r7
+  // verification's counterexample), and the runner can never allocate or
+  // decode more than cap+1 bytes regardless of how fast the file grows.
+  const readBuffer = Buffer.allocUnsafe(MAX_STREAM_BYTES + 1);
+
   const drain = (final: boolean): void => {
     if (shrunk) return;
-    let byteSize: number;
+    let bytesRead: number;
     try {
-      byteSize = statSync(streamPath).size;
+      const fd = openSync(streamPath, "r");
+      try {
+        bytesRead = readSync(fd, readBuffer, 0, MAX_STREAM_BYTES + 1, 0);
+      } finally {
+        closeSync(fd);
+      }
     } catch {
       return; // not created yet
     }
-    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7), and
-    // enforced in BYTES against the stat size BEFORE the read/decode
-    // (r6 finding 1) — a runaway worker cannot make the runner allocate
-    // past the cap. Offsets below are string (code-unit) indices; the byte
-    // size is never compared against them.
-    if (byteSize > MAX_STREAM_BYTES) {
+    // The bounded-size claim is ENFORCED, not assumed (r5 finding 7; r6
+    // finding 1). Offsets below are string (code-unit) indices; the byte
+    // count is never compared against them. A multi-byte character split
+    // at the read boundary can only sit in the unterminated tail, which
+    // mid-run drains never consume — and a file within the cap is always
+    // read whole, so the final drain never sees a split.
+    if (bytesRead > MAX_STREAM_BYTES) {
       shrunk = true;
       refused.push({
         line: lineNumber + 1,
         problem:
-          `stream file is ${byteSize} bytes, over the ${MAX_STREAM_BYTES}-byte bound — ` +
+          `stream file exceeds the ${MAX_STREAM_BYTES}-byte bound — ` +
           "runaway worker output; further records refused",
       });
       return;
     }
-    const text = readFileSync(streamPath, "utf8");
+    const text = readBuffer.toString("utf8", 0, bytesRead);
     if (text.length < offset) {
       shrunk = true;
       refused.push({
