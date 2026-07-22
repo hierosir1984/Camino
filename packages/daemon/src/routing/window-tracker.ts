@@ -208,15 +208,18 @@ export interface QuotaWindowTrackerOptions {
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date;
   /**
-   * The daemon's durable cross-process writer lock (WP-104). When present,
-   * every recordDispatch asserts it is still held — the same wiring as the
-   * event store: multi-process writers are outside the daemon's
-   * single-writer posture, and the production composition passes the lock
-   * (round-7 review finding 2). Unit tests may open a tracker without it;
-   * the in-database dispatch guard additionally converts any residual
-   * check/insert race into replay semantics rather than a rewrite.
+   * The daemon's durable cross-process writer lock (WP-104) — a REQUIRED
+   * decision, not an optional that can be forgotten (round-8 review
+   * finding 1: an optional lock claimed as "the production path" was wired
+   * nowhere). Pass the held lock (the WP-114 dispatch composition wires
+   * the recovery writer lock when it feeds DispatchRecords through this
+   * store), or pass `null` EXPLICITLY for a test/tooling context that
+   * accepts the single-writer risk. Every recordDispatch asserts a
+   * supplied lock is still held; the in-database dispatch guard
+   * additionally converts any residual check/insert race into replay
+   * semantics rather than a rewrite.
    */
-  readonly writerLock?: { assertHeld(context: string): void };
+  readonly writerLock: { assertHeld(context: string): void } | null;
   /**
    * Window shapes per family; defaults to the seeded capability registry
    * (CAPABILITY_SEED quotaWindows). Injectable so tests can exercise
@@ -260,9 +263,9 @@ export class QuotaWindowTracker {
   readonly #writerLock: { assertHeld(context: string): void } | undefined;
   readonly #insert: Database.Statement;
 
-  constructor(path: string, options: QuotaWindowTrackerOptions = {}) {
+  constructor(path: string, options: QuotaWindowTrackerOptions) {
     this.#now = options.now ?? (() => new Date());
-    this.#writerLock = options.writerLock;
+    this.#writerLock = options.writerLock ?? undefined;
     this.#shapes = options.windowShapes ?? ((family) => CAPABILITY_SEED[family].quotaWindows.value);
     this.#db = new Database(path);
     // Every refusal path closes the native handle (WP-104 store pattern).

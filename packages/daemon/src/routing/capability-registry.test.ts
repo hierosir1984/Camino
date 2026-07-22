@@ -244,11 +244,45 @@ describe("buildCapabilityRegistry — live composition", () => {
     expect(flippedToAccepted.providers.xai.sanctionedPath.value.status).toBe("recorded-accepted");
   });
 
+  it("states the rebuild obligation for EVERY sanctioned-path refusal class (round-8 finding 2)", () => {
+    // The annotation branches on the gate's structured cause, so refusal
+    // wordings without the hyphenated term (a null or array record field)
+    // carry the obligation too.
+    for (const badRecord of [null, [], "accepted", 42]) {
+      const gatePath = join(tempDir(), "attestations.json");
+      writeFileSync(gatePath, JSON.stringify({ xaiSanctionedPath: badRecord }));
+      const gated = buildRegistryForTest({ attestationsPath: gatePath, ...ALL_PRESENT });
+      const view = buildCapabilityRegistry({
+        adapters: gated,
+        attestationsPath: acceptedAttestations(), // record repaired by assembly time
+      });
+      expect(view.providers.xai.enablement.enabled).toBe(false);
+      expect(
+        view.providers.xai.enablement.reason,
+        `record ${JSON.stringify(badRecord)} must carry the rebuild obligation`,
+      ).toContain("rebuild the adapter registry to re-gate");
+      expect(view.providers.xai.sanctionedPath.value.status).toBe("recorded-accepted");
+    }
+    // A CLI-absence refusal is NOT a sanctioned-path lag and must not
+    // carry the obligation.
+    const cliAbsent = buildRegistryForTest({
+      attestationsPath: acceptedAttestations(),
+      resolveCli: (bin) => (bin === "grok" ? null : `/attested/${bin}`),
+    });
+    const view = buildCapabilityRegistry({
+      adapters: cliAbsent,
+      attestationsPath: acceptedAttestations(),
+    });
+    expect(view.providers.xai.enablement.reason).toContain("not found on PATH");
+    expect(view.providers.xai.enablement.reason).not.toContain("rebuild the adapter registry");
+  });
+
   it("computes every window-state read at the single assembly instant (round-6 finding 4)", () => {
     // The tracker's own clock is far in the future; the registry's instant
     // must govern, so a recovery recorded after the assembly instant is
     // invisible in the assembled snapshot.
     const tracker = new QuotaWindowTracker(join(tempDir(), "windows.sqlite"), {
+      writerLock: null,
       now: () => new Date("2026-07-22T20:00:00Z"),
     });
     try {
@@ -308,6 +342,7 @@ describe("buildCapabilityRegistry — live composition", () => {
 
   it("stamps the assembly instant and includes live window state when a tracker is supplied", () => {
     const tracker = new QuotaWindowTracker(join(tempDir(), "windows.sqlite"), {
+      writerLock: null,
       now: () => new Date("2026-07-22T10:00:00Z"),
     });
     try {

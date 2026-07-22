@@ -84,6 +84,15 @@ export interface AdapterSpec {
   readonly enabled: boolean;
   /** Recorded reason whenever `enabled` is false (CAM-EXEC-01 negative path). */
   readonly disabledReason?: string;
+  /**
+   * STRUCTURED cause of a registry-gate refusal, set by buildRegistry()'s
+   * gate alongside the human-readable reason: "cli-absent" (the executable
+   * did not resolve) or "sanctioned-path" (the recorded provider
+   * disposition is not accepted). Consumers that must branch on the cause
+   * — the WP-106 capability registry's rebuild-obligation annotation —
+   * read this, never the reason text (round-8 review finding 2).
+   */
+  readonly disabledCause?: "cli-absent" | "sanctioned-path";
   /** Build the headless spawn plan for one dispatch. */
   plan(ctx: AdapterContext): SpawnPlan;
   /**

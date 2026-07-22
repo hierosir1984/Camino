@@ -36,7 +36,7 @@ const oneHourShape = (): readonly WindowShape[] => [
 describe("observation log", () => {
   it("records dispatches durably and reads them back after reopen", () => {
     const path = tempPath();
-    const tracker = new QuotaWindowTracker(path);
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
     tracker.recordDispatch("anthropic", {
       dispatchId: "d1",
       outcome: "succeeded",
@@ -53,7 +53,7 @@ describe("observation log", () => {
     });
     tracker.close();
 
-    const reopened = new QuotaWindowTracker(path);
+    const reopened = new QuotaWindowTracker(path, { writerLock: null });
     try {
       const observations = reopened.observations("anthropic");
       expect(observations).toHaveLength(2);
@@ -72,7 +72,7 @@ describe("observation log", () => {
 
   it("is append-only at the database layer", () => {
     const path = tempPath();
-    const tracker = new QuotaWindowTracker(path);
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
     tracker.recordDispatch("openai", {
       dispatchId: "d3",
       outcome: "succeeded",
@@ -93,7 +93,7 @@ describe("observation log", () => {
   });
 
   it("refuses unknown families, unknown outcomes, and invalid durations", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       expect(() =>
         tracker.recordDispatch("openrouter" as ProviderFamily, {
@@ -133,7 +133,7 @@ describe("observation log", () => {
   });
 
   it("marks a quota-blocked outcome as a quota signal even if the caller forgot the flag", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       const observation = tracker.recordDispatch("xai", {
         dispatchId: "d7",
@@ -151,7 +151,10 @@ describe("observation log", () => {
 
 describe("idempotent recording (round-5 finding 1)", () => {
   it("replays of the same dispatch id with identical content return the existing row", () => {
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       const input = {
         dispatchId: "attempt-42",
@@ -182,7 +185,7 @@ describe("idempotent recording (round-5 finding 1)", () => {
   });
 
   it("refuses the same dispatch id with different content as conflicting evidence", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "attempt-1",
@@ -207,7 +210,7 @@ describe("idempotent recording (round-5 finding 1)", () => {
   });
 
   it("refuses missing or malformed dispatch ids", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       for (const dispatchId of [undefined, "", "a".repeat(201), "x\0y", "\ud800"]) {
         expect(() =>
@@ -229,7 +232,7 @@ describe("idempotent recording (round-5 finding 1)", () => {
 describe("append-only guards for the dispatch key (round-6 findings 1, 5)", () => {
   it("refuses INSERT OR REPLACE that conflicts on dispatch_id", () => {
     const path = tempPath();
-    const tracker = new QuotaWindowTracker(path);
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
     tracker.recordDispatch("openai", {
       dispatchId: "victim",
       outcome: "succeeded",
@@ -261,18 +264,20 @@ describe("append-only guards for the dispatch key (round-6 findings 1, 5)", () =
 
   it("refuses an older-version store with the version message, not a tamper message", () => {
     const path = tempPath();
-    new QuotaWindowTracker(path).close();
+    new QuotaWindowTracker(path, { writerLock: null }).close();
     const db = new Database(path);
     db.pragma("user_version = 1");
     db.close();
-    expect(() => new QuotaWindowTracker(path)).toThrow(/schema version 1; this daemon expects 2/);
+    expect(() => new QuotaWindowTracker(path, { writerLock: null })).toThrow(
+      /schema version 1; this daemon expects 2/,
+    );
   });
 });
 
 describe("replay timestamp semantics (round-6 finding 2)", () => {
   it("treats a clock-derived instant as the store's, not caller content — later replays still match", () => {
     let clock = at(HOUR);
-    const tracker = new QuotaWindowTracker(tempPath(), { now: () => clock });
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null, now: () => clock });
     try {
       const input = {
         dispatchId: "durable-1",
@@ -293,7 +298,7 @@ describe("replay timestamp semantics (round-6 finding 2)", () => {
   });
 
   it("still refuses a replay whose EXPLICIT instant differs — that is caller content", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       tracker.recordDispatch("openai", {
         dispatchId: "explicit-1",
@@ -367,6 +372,7 @@ describe("writer lock and clock independence (round-7 findings 2, 3)", () => {
     // store-owned must not require a live clock.
     let clockCalls = 0;
     const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
       now: () => {
         clockCalls++;
         if (clockCalls > 1) throw new Error("clock unavailable");
@@ -392,7 +398,7 @@ describe("writer lock and clock independence (round-7 findings 2, 3)", () => {
 
 describe("as-of semantics (round-5 finding 2)", () => {
   it("ignores future-dated observations until their instant arrives", () => {
-    const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // xai: shapeless
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "af-1",
@@ -426,7 +432,10 @@ describe("as-of semantics (round-5 finding 2)", () => {
 
 describe("window consumption estimates", () => {
   it("reports full consumption until one window duration after an exhaustion (conservative reset)", () => {
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d8",
@@ -458,7 +467,7 @@ describe("window consumption estimates", () => {
   });
 
   it("keeps the longer window exhausted after the shorter one frees (Claude 5h + weekly shapes)", () => {
-    const tracker = new QuotaWindowTracker(tempPath()); // seed shapes for anthropic
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // seed shapes for anthropic
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d9",
@@ -487,7 +496,10 @@ describe("window consumption estimates", () => {
   });
 
   it("refines capacity from the ledger: pre-exhaustion usage becomes the conservative capacity sample", () => {
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       // 30 minutes of dispatch time inside the hour preceding exhaustion.
       tracker.recordDispatch("openai", {
@@ -547,7 +559,10 @@ describe("window consumption estimates", () => {
   });
 
   it("states 'no capacity estimate' instead of guessing when no exhaustion was ever observed", () => {
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d15",
@@ -569,7 +584,10 @@ describe("window consumption estimates", () => {
   });
 
   it("exposes a recovered transient signal as pressure without forcing exhaustion (WP-105 round-7 channel)", () => {
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d16",
@@ -588,7 +606,7 @@ describe("window consumption estimates", () => {
   });
 
   it("refines a shapeless provider (Grok Build) into a scheduler-consumable observed shape", () => {
-    const tracker = new QuotaWindowTracker(tempPath()); // seed: xai has no recorded shape
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // seed: xai has no recorded shape
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "d17",
@@ -651,7 +669,10 @@ describe("window consumption estimates", () => {
   it("keeps the reset bound pinned to the LATEST exhaustion by timestamp, not insertion order", () => {
     // Round-1 review finding 1: a backfilled older exhaustion must not
     // displace a newer one and un-pin the window early.
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d21",
@@ -682,7 +703,10 @@ describe("window consumption estimates", () => {
   it("clips a dispatch longer than the window to the window (usage and capacity are interval overlaps)", () => {
     // Round-1 review finding 2: a two-hour dispatch must contribute at most
     // one hour to a one-hour window — as usage and as a capacity sample.
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("openai", {
         dispatchId: "d23",
@@ -720,7 +744,10 @@ describe("window consumption estimates", () => {
   it("excludes rows recorded after an exhaustion from its capacity sample even at equal timestamps", () => {
     // Round-1 review finding 2 (tie handling): "pre-exhaustion" is
     // timestamp-then-insertion order.
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("anthropic", {
         dispatchId: "d26",
@@ -749,7 +776,7 @@ describe("window consumption estimates", () => {
   });
 
   it("computes recovery gaps in timestamp order — backfills cannot make a gap negative", () => {
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "d28",
@@ -782,7 +809,7 @@ describe("window consumption estimates", () => {
     // Round-2 review finding 1: a succeeded dispatch whose interval BEGAN
     // before the exhaustion proves nothing about the quota freeing — it
     // must not synthesize a shape or refine one.
-    const tracker = new QuotaWindowTracker(tempPath()); // xai: no seeded shape
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // xai: no seeded shape
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "d31",
@@ -827,11 +854,13 @@ describe("window consumption estimates", () => {
     // Round-2 review finding 2: the append-only promise rests on the
     // triggers, so adoption verifies schema DEFINITIONS, not user_version.
     const path = tempPath();
-    new QuotaWindowTracker(path).close();
+    new QuotaWindowTracker(path, { writerLock: null }).close();
     const db = new Database(path);
     db.exec("DROP TRIGGER window_obs_append_only_replace");
     db.close();
-    expect(() => new QuotaWindowTracker(path)).toThrow(/tampered or foreign store/);
+    expect(() => new QuotaWindowTracker(path, { writerLock: null })).toThrow(
+      /tampered or foreign store/,
+    );
   });
 
   it("refuses a negative-seq row that would collide with the autoincrement sentinel", () => {
@@ -839,7 +868,7 @@ describe("window consumption estimates", () => {
     // later append look like a replacement. The CHECK refuses it outright,
     // and ordinary appends keep working afterwards.
     const path = tempPath();
-    const tracker = new QuotaWindowTracker(path);
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
     try {
       const db = new Database(path);
       try {
@@ -870,7 +899,7 @@ describe("window consumption estimates", () => {
   it("keeps an unresolved exhaustion pinned on a synthesized shape until recovery evidence exists", () => {
     // Round-3 review finding 1: the synthesized duration is a guess, and a
     // guess must not expire a pin. Only observed recovery evidence does.
-    const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // xai: shapeless
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "d36",
@@ -929,7 +958,7 @@ describe("window consumption estimates", () => {
   it("rounds durations UP so rounding cannot manufacture a post-exhaustion start", () => {
     // Round-3 review finding 1 (rounding): a 0.4ms dispatch stores as 1ms —
     // the interval can only widen, never shrink past the exhaustion.
-    const tracker = new QuotaWindowTracker(tempPath());
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null });
     try {
       const observation = tracker.recordDispatch("xai", {
         dispatchId: "d41",
@@ -947,7 +976,10 @@ describe("window consumption estimates", () => {
   it("uses the LATEST exhaustion's capacity sample, not the historical maximum", () => {
     // Round-3 review finding 2 (capacity drift): an old large sample must
     // not mask a later, smaller observed capacity.
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("openai", {
         dispatchId: "d42",
@@ -998,7 +1030,7 @@ describe("window consumption estimates", () => {
   it("does not release a pin for an equal-timestamp success recorded BEFORE the exhaustion", () => {
     // Round-4 review finding 1: "after the exhaustion" is recorded order
     // (timestamp-then-seq), not timestamp alone.
-    const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless
+    const tracker = new QuotaWindowTracker(tempPath(), { writerLock: null }); // xai: shapeless
     try {
       tracker.recordDispatch("xai", {
         dispatchId: "d47",
@@ -1041,7 +1073,10 @@ describe("window consumption estimates", () => {
   it("yields no capacity estimate when the LATEST exhaustion carries no measured usage", () => {
     // Round-4 review finding 3: a zero-sample latest exhaustion must not
     // resurrect a stale historical sample.
-    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    const tracker = new QuotaWindowTracker(tempPath(), {
+      writerLock: null,
+      windowShapes: oneHourShape,
+    });
     try {
       tracker.recordDispatch("openai", {
         dispatchId: "d51",
@@ -1085,7 +1120,7 @@ describe("window consumption estimates", () => {
 
   it("refuses seq replacement through INSERT OR REPLACE (append-only, the PR #45 fold)", () => {
     const path = tempPath();
-    const tracker = new QuotaWindowTracker(path);
+    const tracker = new QuotaWindowTracker(path, { writerLock: null });
     tracker.recordDispatch("openai", {
       dispatchId: "d55",
       outcome: "succeeded",
@@ -1110,7 +1145,7 @@ describe("window consumption estimates", () => {
             .run(at(0).toISOString()),
         ).toThrow(/append-only/);
       }
-      const tracker2 = new QuotaWindowTracker(path);
+      const tracker2 = new QuotaWindowTracker(path, { writerLock: null });
       try {
         expect(
           tracker2.recordDispatch("openai", {

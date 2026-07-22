@@ -117,7 +117,16 @@ function enablementOf(
   } catch {
     reason = "disabled reason unavailable";
   }
-  if (family === "xai" && liveXai.accepted && /sanctioned-path/.test(reason)) {
+  let cause: string | undefined;
+  try {
+    cause = spec.disabledCause;
+  } catch {
+    cause = undefined;
+  }
+  // Branch on the gate's STRUCTURED cause, never the reason text — two
+  // attestation states word their reasons without the hyphenated term and
+  // slipped past a text match (round-8 review finding 2).
+  if (family === "xai" && liveXai.accepted && cause === "sanctioned-path") {
     reason = `${reason} (the attestation record reads accepted at assembly; rebuild the adapter registry to re-gate)`;
   }
   return { enabled: false, reason };
