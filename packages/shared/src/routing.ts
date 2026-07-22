@@ -206,9 +206,14 @@ export interface PolicyViolation {
 }
 
 /**
- * A PLAIN object: Object.prototype or null prototype only. Class instances
- * are refused outright — their behavior (getters, methods) is invisible to
- * the JSON snapshot that actually persists (round-2 review finding 7).
+ * A PLAIN object: THIS REALM's Object.prototype, or a null prototype.
+ * Class instances are refused — their behavior (getters, methods) is
+ * invisible to the JSON snapshot that actually persists (round-2 review
+ * finding 7). NAMED CONTRACT (round-3 finding 6): this validator's domain
+ * is same-realm, JSON-shaped values. A value from another realm, or any
+ * value whose serialized form is what matters, is validated via its JSON
+ * round-trip — which is exactly what RoutingPolicyStore.setPolicyTable
+ * does before anything persists.
  */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
@@ -230,13 +235,12 @@ const MODEL_ID_MAX_LENGTH = 200;
 
 /**
  * Shape defects of a pinned model identifier (see the PolicyAssignment
- * boundary note). Refuses every code point in the Unicode "Other" and
- * "Separator" categories — controls, FORMAT characters (zero-width,
- * bidirectional overrides), separators (including ordinary spaces and
- * U+2028/U+2029), surrogates, private-use, and unassigned — not just
- * C0/C1 (round-2 review finding 5): a model identifier is a machine
- * token, and an invisible or reordering code point in one is never
- * legitimate.
+ * boundary note). ALLOWLIST, not deny-list (the WP-000/ESLint-fence
+ * lesson: deny-lists over Unicode regenerate forever — rounds 2 and 3
+ * each found another invisible class): every provider model identifier
+ * in existence is a printable non-space ASCII token, so exactly that is
+ * admitted. Widening the allowlist, should a provider ever ship a
+ * non-ASCII identifier, is a reviewed one-line change.
  */
 function modelIdProblem(model: unknown): string | null {
   if (model === null) return null;
@@ -246,11 +250,8 @@ function modelIdProblem(model: unknown): string | null {
   if (model.length > MODEL_ID_MAX_LENGTH) {
     return `model identifier exceeds ${MODEL_ID_MAX_LENGTH} UTF-16 units`;
   }
-  if (!model.isWellFormed()) {
-    return "model contains unpaired surrogate code units";
-  }
-  if (/[\p{C}\p{Z}]/u.test(model)) {
-    return "model contains control, format, separator, or non-character code points";
+  if (!/^[\x21-\x7e]+$/.test(model)) {
+    return "model must contain only printable non-space ASCII characters";
   }
   return null;
 }
@@ -636,12 +637,13 @@ export interface ModelInfo {
  *   unknown-reset — the limit's PERIOD is stated (durationMs) but its reset
  *                   semantics are not (e.g. a documented "weekly limit"
  *                   that may reset on a calendar boundary)
- * The estimator applies the same CONSERVATIVE bounds to both: consumption
- * pinned for at most one period after an exhaustion (a calendar reset can
- * only come sooner), and usage measured over the trailing period (a
- * superset of usage since any in-period calendar reset) — both over-state,
- * never under-state, so an unknown reset never weakens the pause rule
- * (round-2 review finding 4).
+ * The estimator (QuotaWindowTracker) pins consumption at 1.0 for one full
+ * period after an exhaustion under EITHER kind — no reset can take longer
+ * than the stated period — but computes usage FRACTIONS only for rolling
+ * windows: with unknown reset semantics a capacity sample can straddle an
+ * unseen reset and over-state capacity, which would under-state
+ * consumption, so no fraction is claimed there (round-2 finding 4,
+ * corrected by round-3 finding 2).
  */
 export interface WindowShape {
   readonly id: string;

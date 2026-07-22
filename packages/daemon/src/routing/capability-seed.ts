@@ -58,7 +58,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       },
       quotaWindows: {
         value: [
-          { id: "session-5h", kind: "rolling", durationMs: 5 * HOUR_MS },
+          { id: "session-5h", kind: "unknown-reset", durationMs: 5 * HOUR_MS },
           { id: "weekly", kind: "unknown-reset", durationMs: 7 * DAY_MS },
         ],
         snapshotAt: "2026-07-17",
@@ -66,11 +66,12 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
         confidence: "documented",
         recheckTriggers: [
           "provider announcement changing usage-limit structure",
+          "provider documentation stating reset semantics (upgrades kind to rolling)",
           "ledger observation contradicting the recorded shape (QuotaWindowTracker)",
         ],
         notes: [
           "Window CAPACITY is deliberately unstated: it varies by plan and is estimated from ledger observation, never assumed.",
-          "The weekly limit's PERIOD is stated by the source; its reset semantics are not — kind unknown-reset receives the conservative rolling bounds (see WindowShape), refined from ledger observation.",
+          "Both windows' PERIODS are stated by the source; neither's reset semantics are — kind unknown-reset yields a one-period pin after exhaustion and no usage fraction (see WindowShape), refined from ledger observation.",
         ],
       },
       harnessFeatures: {
@@ -149,7 +150,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       },
       quotaWindows: {
         value: [
-          { id: "session-5h", kind: "rolling", durationMs: 5 * HOUR_MS },
+          { id: "session-5h", kind: "unknown-reset", durationMs: 5 * HOUR_MS },
           { id: "weekly", kind: "unknown-reset", durationMs: 7 * DAY_MS },
         ],
         snapshotAt: "2026-07-22",
@@ -157,10 +158,11 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
         confidence: "documented",
         recheckTriggers: [
           "provider announcement changing usage-limit structure",
+          "provider documentation stating reset semantics (upgrades kind to rolling)",
           "ledger observation contradicting the recorded shape (QuotaWindowTracker)",
         ],
         notes: [
-          "The cited page states a five-hour window and 'additional weekly limits'. Only the weekly PERIOD is asserted here; reset semantics are not stated by the source, so the window is recorded kind unknown-reset and receives the conservative rolling bounds (see WindowShape), refined from ledger observation (round-2 review finding 4).",
+          "The cited page states a five-hour window and 'additional weekly limits'. Only the PERIODS are asserted here; reset semantics are stated for neither window, so both are recorded kind unknown-reset — a one-period pin after exhaustion and no usage fraction (see WindowShape) — refined from ledger observation (round-2 finding 4, round-3 finding 7).",
         ],
       },
       harnessFeatures: {

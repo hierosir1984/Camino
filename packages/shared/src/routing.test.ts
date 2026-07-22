@@ -237,14 +237,20 @@ describe("validatePolicyTable — structural refusals", () => {
     // padding, control characters, and unbounded length are all shape
     // defects. (Harness ACCEPTANCE of a clean id is the named dispatch-time
     // boundary — see the PolicyAssignment doc.)
+    // ALLOWLIST regression (round-3 finding 5): rounds 2 and 3 each found
+    // another invisible class a deny-list missed, so the validator now
+    // admits printable non-space ASCII only.
     const cases: Array<[unknown, RegExp]> = [
-      ["\u0000", /control, format, separator/],
-      ["\ud800", /unpaired surrogate/],
-      ["  gpt-5.6-sol", /control, format, separator/],
-      ["gpt\n5", /control, format, separator/],
-      ["gpt\u200bmodel", /control, format, separator/], // zero-width space
-      ["\u202egpt", /control, format, separator/], // bidirectional override
-      ["a\u2028b", /control, format, separator/], // line separator
+      ["\u0000", /printable non-space ASCII/],
+      ["\ud800", /printable non-space ASCII/], // unpaired surrogate
+      ["  gpt-5.6-sol", /printable non-space ASCII/],
+      ["gpt\n5", /printable non-space ASCII/],
+      ["gpt\u200bmodel", /printable non-space ASCII/], // zero-width space
+      ["\u202egpt", /printable non-space ASCII/], // bidirectional override
+      ["a\u2028b", /printable non-space ASCII/], // line separator
+      ["gpt\u034fmodel", /printable non-space ASCII/], // combining grapheme joiner
+      ["gpt\ufe0fmodel", /printable non-space ASCII/], // variation selector 16
+      ["gpt\u3164model", /printable non-space ASCII/], // Hangul filler
       ["x".repeat(300), /exceeds/],
       [42, /must be null/],
       [undefined, /must be null/],

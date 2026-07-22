@@ -13,34 +13,29 @@
  *     (backfills); every estimate below therefore orders by TIMESTAMP, with
  *     insertion seq only as the tie-break (round-1 review findings 1–2).
  *   - It ESTIMATES window consumption from those observations alone, and
- *     the guarantee is scoped to the ledger: WITHIN the recorded
- *     observations, the estimate never under-states. Usage is measured by
- *     interval overlap — a dispatch occupies [end − duration, end] and only
- *     the part inside a window counts toward that window — and capacity is
- *     inferred from exhaustions: each contributes the overlap-measured
- *     usage that preceded it inside one window, which UNDER-measures true
- *     capacity (activity outside Camino is invisible, and the window may
- *     not have been empty at the sample's start), so the largest sample is
- *     the tightest safe lower bound and dividing by it OVER-states
- *     consumption. Activity outside Camino is explicitly out of scope: the
- *     live quota-blocked classification remains the authoritative backstop
+ *     claims only what the data supports (the per-rule statement and its
+ *     receipts live on windowState): a stated-period pin after every
+ *     exhaustion; observed-evidence pins for synthesized shapes; usage
+ *     fractions ONLY for windows whose reset semantics are known rolling,
+ *     measured by interval overlap against the LATEST exhaustion's
+ *     capacity sample; honest `null` everywhere else. Durations are
+ *     recorded rounded UP, so an interval can only widen — never shrink
+ *     into a false post-exhaustion start. Activity outside Camino is
+ *     explicitly out of scope, and a capacity reduction after the latest
+ *     observed signal is invisible until the next one: the live
+ *     quota-blocked classification remains the authoritative backstop
  *     (CAM-EXEC-06 — exhaustion queues work regardless of any estimate).
- *     With no capacity evidence, the estimate is honestly `null`.
- *   - After an observed exhaustion (latest by timestamp), consumption
- *     reports 1.0 until one full window duration has passed — a rolling
- *     window has fully freed at most one duration later (conservative
- *     reset bound).
  *   - A provider with NO recorded window shape (Grok Build) is still
  *     schedulable: once a GENUINE recovery has been observed — a succeeded
  *     dispatch whose whole interval lies after an exhaustion; a success
  *     that was already in flight when the limit tripped proves nothing —
  *     the largest exhaustion→recovery gap is synthesized as an
- *     "observed-recovery" window (the ledger-refined shape registry item
- *     13 names), so the reset bound and consumption estimates apply to it
- *     like any seeded shape. Before any gap exists, `windows` stays empty and
- *     `lastQuotaBlockedAt` tells the scheduler "exhausted, reset horizon
- *     unknown" — resuming on evidence (a later successful dispatch) is the
- *     WP-114 scheduler's policy, stated here as its boundary.
+ *     "observed-recovery" window whose PIN expires only on further
+ *     recovery evidence, never on the guessed duration. Before any gap
+ *     exists, `windows` stays empty and `lastQuotaBlockedAt` tells the
+ *     scheduler "exhausted, reset horizon unknown" — resuming on evidence
+ *     (a later successful dispatch) is the WP-114 scheduler's policy,
+ *     stated here as its boundary.
  *
  * The 85% dispatch-pause rule that consumes these estimates is the WP-114
  * scheduler's (CAM-ROUTE-06); the shared threshold value lives in
@@ -61,16 +56,16 @@ const OUTCOMES: readonly DispatchOutcome[] = [
   "killed",
 ];
 
-// The BEFORE INSERT guard closes the `INSERT OR REPLACE` route around the
-// UPDATE/DELETE triggers: REPLACE deletes a conflicting row WITHOUT firing
-// the DELETE trigger unless recursive triggers are on, so an explicit-seq
-// replace would silently rewrite history (the PR #45 append-only fold,
-// reproduced against this store by the round-1 review, finding 4).
-// Ordinary autoincrement inserts reach the trigger with NEW.seq = -1 (the
-// not-yet-assigned sentinel), so the guard requires NEW.seq >= 0 — and the
-// CHECK (seq > 0) refuses an explicit negative-seq row that would collide
-// with the sentinel and brick every later append (round-2 review finding 3;
-// both properties probed directly against better-sqlite3).
+// The BEFORE INSERT guard refuses EVERY caller-supplied seq: ordinary
+// autoincrement inserts reach the trigger with NEW.seq = -1 (the
+// not-yet-assigned sentinel), and anything >= 0 is an explicit value. That
+// closes, in one rule, the INSERT OR REPLACE rewrite (REPLACE deletes the
+// conflicting row without firing the DELETE trigger — the PR #45 fold,
+// round-1 finding 4), gap-forgery at fresh positions, and the
+// max-rowid poisoning that would make every later autoincrement fail
+// SQLITE_FULL (round-3 finding 4). The CHECK (seq > 0) separately refuses
+// negative forgeries that would collide with the sentinel (round-2 finding
+// 3). All shapes probed directly against better-sqlite3 before coding.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS window_observations (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT CHECK (seq > 0),
@@ -97,9 +92,9 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS window_obs_append_only_replace
 BEFORE INSERT ON window_observations
-WHEN NEW.seq >= 0 AND EXISTS (SELECT 1 FROM window_observations WHERE seq = NEW.seq)
+WHEN NEW.seq >= 0
 BEGIN
-  SELECT RAISE(ABORT, 'window observations are append-only: seq replacement rejected');
+  SELECT RAISE(ABORT, 'window observations are append-only: explicit seq rejected');
 END;
 `;
 
@@ -158,10 +153,11 @@ export interface WindowConsumptionEstimate {
    * capacity evidence exists yet (basis "no-capacity-estimate").
    */
   readonly estimatedConsumption: number | null;
-  readonly basis: "exhaustion-observed" | "usage-fraction" | "no-capacity-estimate";
+  readonly basis:
+    "exhaustion-observed" | "usage-fraction" | "no-capacity-estimate" | "reset-semantics-unknown";
   /** Dispatch time overlapping the current window (interval-clipped). */
   readonly observedUsageMs: number;
-  /** Largest observed pre-exhaustion usage — a lower bound of true capacity, if any. */
+  /** The LATEST exhaustion's pre-exhaustion usage — a lower bound of capacity at that time, if any. */
   readonly capacityEstimateMs: number | null;
   /** Present iff basis is "exhaustion-observed": the conservative reset bound. */
   readonly estimatedResetAt?: string;
@@ -276,6 +272,20 @@ export class QuotaWindowTracker {
           );
         }
       }
+      // Structural integrity is DELEGATED to SQLite's own checker (the
+      // WP-003 delegate-to-fsck lesson): integrity_check catches b-tree
+      // corruption and table/index inconsistencies — including a rootpage
+      // swap that conceals rows behind an intact-looking schema (round-3
+      // finding 3). What no in-process check can catch is a WELL-FORMED
+      // forged file (rootpage redirection to a consistent fake b-tree is
+      // the same class as byte-editing rows in place); that is the
+      // filesystem-writer boundary named above.
+      const integrity = this.#db.pragma("integrity_check", { simple: true }) as string;
+      if (integrity !== "ok") {
+        throw new Error(
+          `window-observation store ${path} fails integrity_check (${integrity}) — refusing to open`,
+        );
+      }
       this.#insert = this.#db.prepare(
         `INSERT INTO window_observations (family, observed_at, duration_ms, outcome, quota_signal)
          VALUES (@family, @observedAt, @durationMs, @outcome, @quotaSignal)`,
@@ -308,7 +318,7 @@ export class QuotaWindowTracker {
     const result = this.#insert.run({
       family: checkedFamily,
       observedAt,
-      durationMs: Math.round(input.durationMs),
+      durationMs: Math.ceil(input.durationMs),
       outcome: input.outcome,
       quotaSignal: quotaSignalSeen ? 1 : 0,
     });
@@ -316,7 +326,7 @@ export class QuotaWindowTracker {
       seq: Number(result.lastInsertRowid),
       family: checkedFamily,
       observedAt,
-      durationMs: Math.round(input.durationMs),
+      durationMs: Math.ceil(input.durationMs),
       outcome: input.outcome,
       quotaSignalSeen,
     };
@@ -374,6 +384,28 @@ export class QuotaWindowTracker {
    * pauses dispatch when any window's estimate reaches
    * QUOTA_PAUSE_THRESHOLD (CAM-ROUTE-06); quota-blocked outcomes queue
    * work regardless of estimates (CAM-EXEC-06).
+   *
+   * Estimation rules, per shape (round-3 review findings 1–2):
+   *   - SEEDED shape after an exhaustion: pinned at 1.0 for one full
+   *     period — sound for ANY reset semantics of a stated period, since
+   *     no reset can take longer than the period itself.
+   *   - SYNTHESIZED (observed-recovery) shape: its duration is an
+   *     observation, not a stated period, so an exhaustion stays pinned
+   *     until a GENUINE recovery is observed after it — the pin never
+   *     expires on a guess, and a backfilled shorter gap cannot un-pin a
+   *     still-exhausted provider (estimatedResetAt remains the estimate).
+   *   - kind "unknown-reset" past its pin: estimatedConsumption is null,
+   *     basis "reset-semantics-unknown". A trailing-period usage fraction
+   *     is UNSOUND there: a capacity sample whose window straddles an
+   *     unseen reset can over-state capacity and so under-state
+   *     consumption. No fraction is claimed that the data cannot support.
+   *   - kind "rolling" past its pin: observed usage over the LATEST
+   *     exhaustion's capacity sample (temporal relevance beats the global
+   *     maximum under capacity drift; every sample is a lower bound, so
+   *     the fraction still over-states). NAMED BOUNDARY: a capacity
+   *     REDUCTION after the latest observed exhaustion is invisible until
+   *     the next signal — estimates lag it, and the live quota-blocked
+   *     classification is the backstop that re-pins.
    */
   windowState(family: ProviderFamily, options: { now?: Date } = {}): ProviderWindowState {
     const checkedFamily = validFamily(family);
@@ -393,15 +425,27 @@ export class QuotaWindowTracker {
     const latestSignal = latestOf(all.filter((o) => o.quotaSignalSeen));
 
     // A provider with no recorded shape gets the ledger-observed one: the
-    // largest exhaustion→success gap bounds the reset horizon (registry
+    // largest exhaustion→recovery gap estimates the reset horizon (registry
     // item 13's "shapes refined from ledger observation").
     let shapes = this.#shapes(checkedFamily);
+    let synthesized = false;
     if (shapes.length === 0) {
       const gaps = this.recoveryGapsMs(checkedFamily).filter((gap) => gap > 0);
       if (gaps.length > 0) {
         shapes = [{ id: "observed-recovery", kind: "rolling", durationMs: Math.max(...gaps) }];
+        synthesized = true;
       }
     }
+
+    // Has a GENUINE recovery (whole interval after the exhaustion) been
+    // observed after the LATEST exhaustion? Governs the synthesized pin.
+    const recoveryAfterLatestBlock =
+      latestBlocked !== undefined &&
+      all.some((o) => {
+        if (o.outcome !== "succeeded") return false;
+        const endMs = Date.parse(o.observedAt);
+        return endMs - o.durationMs >= Date.parse(latestBlocked.observedAt);
+      });
 
     const windows = shapes.map((shape): WindowConsumptionEstimate => {
       const usageIn = (endMs: number, upTo?: WindowObservation): number =>
@@ -415,11 +459,17 @@ export class QuotaWindowTracker {
           })
           .reduce((sum, o) => sum + overlapMs(o, endMs - shape.durationMs, endMs), 0);
 
-      // Conservative reset bound: after the latest exhaustion, the rolling
-      // window has fully freed at most one duration later.
+      // Pin after an exhaustion. A seeded shape un-pins after one full
+      // period (sound for any reset semantics of a stated period); a
+      // synthesized shape un-pins only on OBSERVED recovery evidence — its
+      // duration is a guess, and a guess must not expire a pin (round-3
+      // review finding 1).
       if (latestBlocked !== undefined) {
         const blockedMs = Date.parse(latestBlocked.observedAt);
-        if (nowMs < blockedMs + shape.durationMs) {
+        const pinned = synthesized
+          ? !recoveryAfterLatestBlock
+          : nowMs < blockedMs + shape.durationMs;
+        if (pinned) {
           return {
             shape,
             estimatedConsumption: 1,
@@ -431,16 +481,34 @@ export class QuotaWindowTracker {
         }
       }
 
-      // Capacity refinement from the ledger: each exhaustion contributes
-      // the interval-clipped usage that preceded it inside one window.
-      // Samples are lower bounds of true capacity (see the module header),
-      // so the LARGEST sample is the tightest safe estimate — and it still
-      // over-states consumption, never under-states it.
-      const samples = blocked
-        .map((b) => usageIn(Date.parse(b.observedAt), b))
-        .filter((sample) => sample > 0);
-      const capacityEstimateMs = samples.length > 0 ? Math.max(...samples) : null;
       const observedUsageMs = usageIn(nowMs);
+
+      // No usage fraction for a window whose reset semantics are unknown:
+      // a capacity sample straddling an unseen reset can over-state
+      // capacity and so under-state consumption (round-3 review finding 2).
+      if (shape.kind === "unknown-reset") {
+        return {
+          shape,
+          estimatedConsumption: null,
+          basis: "reset-semantics-unknown",
+          observedUsageMs,
+          capacityEstimateMs: null,
+        };
+      }
+
+      // Capacity refinement from the ledger: the LATEST exhaustion's
+      // interval-clipped pre-exhaustion usage (see the windowState doc for
+      // why latest beats the global maximum under capacity drift; every
+      // sample is a lower bound, so the fraction still over-states).
+      const orderedBlocked = blocked.slice().sort(byInstantThenSeq);
+      let capacityEstimateMs: number | null = null;
+      for (let i = orderedBlocked.length - 1; i >= 0; i--) {
+        const sample = usageIn(Date.parse(orderedBlocked[i]!.observedAt), orderedBlocked[i]!);
+        if (sample > 0) {
+          capacityEstimateMs = sample;
+          break;
+        }
+      }
       if (capacityEstimateMs === null) {
         return {
           shape,

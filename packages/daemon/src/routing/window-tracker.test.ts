@@ -183,11 +183,13 @@ describe("window consumption estimates", () => {
       });
       const sixHoursLater = tracker.windowState("anthropic", { now: at(6 * HOUR) });
       const byId = new Map(sixHoursLater.windows.map((w) => [w.shape.id, w]));
-      // The 5-hour window has freed (nothing dispatched in the last hour);
-      // the weekly window stays pinned at full for its whole duration.
+      // The 5-hour window's pin has expired (any reset semantics of a
+      // 5-hour period has fully reset by now) — and because its reset
+      // semantics are UNKNOWN, no usage fraction is claimed (round-3
+      // finding 2). The weekly window stays pinned for its whole period.
       expect(byId.get("session-5h")).toMatchObject({
-        basis: "usage-fraction",
-        estimatedConsumption: 0,
+        basis: "reset-semantics-unknown",
+        estimatedConsumption: null,
       });
       expect(byId.get("weekly")).toMatchObject({
         estimatedConsumption: 1,
@@ -551,6 +553,123 @@ describe("window consumption estimates", () => {
     }
   });
 
+  it("keeps an unresolved exhaustion pinned on a synthesized shape until recovery evidence exists", () => {
+    // Round-3 review finding 1: the synthesized duration is a guess, and a
+    // guess must not expire a pin. Only observed recovery evidence does.
+    const tracker = new QuotaWindowTracker(tempPath()); // xai: shapeless
+    try {
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(0),
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(10 * MINUTE), // genuine recovery → 10-minute observed gap
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(30 * MINUTE), // NEW exhaustion, no recovery after it
+      });
+      // Far beyond the synthesized 10-minute duration: still pinned.
+      const hoursLater = tracker.windowState("xai", { now: at(10 * HOUR) });
+      expect(hoursLater.windows[0]).toMatchObject({
+        estimatedConsumption: 1,
+        basis: "exhaustion-observed",
+      });
+      // A backfilled SHORTER gap must not un-pin it either.
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(5 * MINUTE), // backfill: shrinks nothing that matters
+      });
+      expect(
+        tracker.windowState("xai", { now: at(10 * HOUR) }).windows[0]?.estimatedConsumption,
+      ).toBe(1);
+      // Recovery evidence AFTER the latest exhaustion un-pins.
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(11 * HOUR),
+      });
+      expect(
+        tracker.windowState("xai", { now: at(11 * HOUR + MINUTE) }).windows[0]?.basis,
+      ).not.toBe("exhaustion-observed");
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("rounds durations UP so rounding cannot manufacture a post-exhaustion start", () => {
+    // Round-3 review finding 1 (rounding): a 0.4ms dispatch stores as 1ms —
+    // the interval can only widen, never shrink past the exhaustion.
+    const tracker = new QuotaWindowTracker(tempPath());
+    try {
+      const observation = tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: 0.4,
+        quotaSignalSeen: false,
+        at: at(0),
+      });
+      expect(observation.durationMs).toBe(1);
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("uses the LATEST exhaustion's capacity sample, not the historical maximum", () => {
+    // Round-3 review finding 2 (capacity drift): an old large sample must
+    // not mask a later, smaller observed capacity.
+    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    try {
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 40 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(40 * MINUTE),
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(41 * MINUTE), // sample ≈ 40min
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 20 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(4 * HOUR),
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(4 * HOUR + MINUTE), // later, smaller sample ≈ 20min
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 10 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(6 * HOUR),
+      });
+      const state = tracker.windowState("openai", { now: at(6 * HOUR + MINUTE) });
+      expect(state.windows[0]).toMatchObject({
+        basis: "usage-fraction",
+        capacityEstimateMs: 20 * MINUTE,
+        estimatedConsumption: 0.5, // 10min against the LATEST 20min sample
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
   it("refuses seq replacement through INSERT OR REPLACE (append-only, the PR #45 fold)", () => {
     const path = tempPath();
     const tracker = new QuotaWindowTracker(path);
@@ -563,14 +682,33 @@ describe("window consumption estimates", () => {
     tracker.close();
     const db = new Database(path);
     try {
-      expect(() =>
-        db
-          .prepare(
-            `INSERT OR REPLACE INTO window_observations (seq, family, observed_at, duration_ms, outcome, quota_signal)
-             VALUES (1, 'openai', ?, 999999, 'quota-blocked', 1)`,
-          )
-          .run(at(0).toISOString()),
-      ).toThrow(/append-only/);
+      // Existing-seq replacement, fresh-position forgery, and max-rowid
+      // poisoning (which would make every later autoincrement fail
+      // SQLITE_FULL — round-3 finding 4) are all the same refused shape:
+      // a caller-supplied seq.
+      for (const seq of ["1", "50", "9223372036854775807"]) {
+        expect(() =>
+          db
+            .prepare(
+              `INSERT OR REPLACE INTO window_observations (seq, family, observed_at, duration_ms, outcome, quota_signal)
+               VALUES (${seq}, 'openai', ?, 999999, 'quota-blocked', 1)`,
+            )
+            .run(at(0).toISOString()),
+        ).toThrow(/append-only/);
+      }
+      const tracker2 = new QuotaWindowTracker(path);
+      try {
+        expect(
+          tracker2.recordDispatch("openai", {
+            outcome: "succeeded",
+            durationMs: 1,
+            quotaSignalSeen: false,
+            at: at(MINUTE),
+          }).seq,
+        ).toBeGreaterThan(0);
+      } finally {
+        tracker2.close();
+      }
     } finally {
       db.close();
     }

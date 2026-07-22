@@ -117,6 +117,12 @@ describe("capability seed — time-varying, source-linked attributes", () => {
         7 * 24 * 3_600_000,
       ]);
       expect(windows.confidence).toBe("documented");
+      // The sources state PERIODS, not reset semantics — so every seeded
+      // window is kind unknown-reset until a source or the ledger upgrades
+      // it (round-3 review finding 7).
+      for (const window of windows.value) {
+        expect(window.kind).toBe("unknown-reset");
+      }
     }
     // No documented Grok Build shape: tracked purely from adapter signals,
     // synthesized by the tracker once a recovery gap is observed.
