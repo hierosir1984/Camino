@@ -290,7 +290,7 @@ describe("window consumption estimates", () => {
     }
   });
 
-  it("tracks a shapeless provider (Grok Build) via signals and recovery gaps", () => {
+  it("refines a shapeless provider (Grok Build) into a scheduler-consumable observed shape", () => {
     const tracker = new QuotaWindowTracker(tempPath()); // seed: xai has no recorded shape
     try {
       tracker.recordDispatch("xai", {
@@ -305,20 +305,190 @@ describe("window consumption estimates", () => {
         quotaSignalSeen: false,
         at: at(30 * MINUTE),
       });
+      // Before any recovery gap exists, no shape is claimed — exhausted
+      // with an unknown reset horizon (the stated WP-114 boundary).
+      const beforeRecovery = tracker.windowState("xai", { now: at(45 * MINUTE) });
+      expect(beforeRecovery.windows).toEqual([]);
+      expect(beforeRecovery.lastQuotaBlockedAt).toBe(at(0).toISOString());
+
       tracker.recordDispatch("xai", {
         outcome: "succeeded",
         durationMs: MINUTE,
         quotaSignalSeen: false,
         at: at(90 * MINUTE),
       });
-      const state = tracker.windowState("xai", { now: at(2 * HOUR) });
-      expect(state.windows).toEqual([]); // no shape is claimed
-      expect(state.lastQuotaBlockedAt).toBe(at(0).toISOString());
-      // The exhaustion→success gap is the shape evidence registry item 13
-      // names for refinement (a failed dispatch is not recovery).
+      // The exhaustion→success gap (a failed dispatch is not recovery) is
+      // the registry-item-13 refinement evidence — and it becomes a live
+      // window shape the scheduler can apply the pause threshold to.
+      expect(tracker.recoveryGapsMs("xai")).toEqual([90 * MINUTE]);
+      const refined = tracker.windowState("xai", { now: at(2 * HOUR) });
+      expect(refined.windows).toHaveLength(1);
+      expect(refined.windows[0]?.shape).toEqual({
+        id: "observed-recovery",
+        kind: "rolling",
+        durationMs: 90 * MINUTE,
+      });
+      // A fresh exhaustion now pins the observed window until its
+      // conservative reset bound.
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(3 * HOUR),
+      });
+      const pinned = tracker.windowState("xai", { now: at(3 * HOUR + 30 * MINUTE) });
+      expect(pinned.windows[0]).toMatchObject({
+        estimatedConsumption: 1,
+        basis: "exhaustion-observed",
+        estimatedResetAt: at(4 * HOUR + 30 * MINUTE).toISOString(),
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("keeps the reset bound pinned to the LATEST exhaustion by timestamp, not insertion order", () => {
+    // Round-1 review finding 1: a backfilled older exhaustion must not
+    // displace a newer one and un-pin the window early.
+    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    try {
+      tracker.recordDispatch("anthropic", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(2 * HOUR),
+      });
+      tracker.recordDispatch("anthropic", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(0), // backfill, inserted after
+      });
+      const state = tracker.windowState("anthropic", { now: at(2 * HOUR + 30 * MINUTE) });
+      expect(state.lastQuotaBlockedAt).toBe(at(2 * HOUR).toISOString());
+      expect(state.windows[0]).toMatchObject({
+        estimatedConsumption: 1,
+        basis: "exhaustion-observed",
+        estimatedResetAt: at(3 * HOUR).toISOString(),
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("clips a dispatch longer than the window to the window (usage and capacity are interval overlaps)", () => {
+    // Round-1 review finding 2: a two-hour dispatch must contribute at most
+    // one hour to a one-hour window — as usage and as a capacity sample.
+    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    try {
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 2 * HOUR,
+        quotaSignalSeen: false,
+        at: at(HOUR), // ran 23:00→01:00; ends at T0+1h
+      });
+      tracker.recordDispatch("openai", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(HOUR),
+      });
+      const afterReset = tracker.windowState("openai", { now: at(2 * HOUR + MINUTE) });
+      expect(afterReset.windows[0]?.capacityEstimateMs).toBe(HOUR); // clipped, not 2h
+      tracker.recordDispatch("openai", {
+        outcome: "succeeded",
+        durationMs: 30 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(3 * HOUR),
+      });
+      const later = tracker.windowState("openai", { now: at(3 * HOUR + MINUTE) });
+      expect(later.windows[0]).toMatchObject({
+        basis: "usage-fraction",
+        estimatedConsumption: 0.5, // 30min / 1h-clipped capacity — not 25%
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("excludes rows recorded after an exhaustion from its capacity sample even at equal timestamps", () => {
+    // Round-1 review finding 2 (tie handling): "pre-exhaustion" is
+    // timestamp-then-insertion order.
+    const tracker = new QuotaWindowTracker(tempPath(), { windowShapes: oneHourShape });
+    try {
+      tracker.recordDispatch("anthropic", {
+        outcome: "quota-blocked",
+        durationMs: 0,
+        quotaSignalSeen: true,
+        at: at(HOUR),
+      });
+      tracker.recordDispatch("anthropic", {
+        outcome: "succeeded",
+        durationMs: 40 * MINUTE,
+        quotaSignalSeen: false,
+        at: at(HOUR), // same instant, inserted after the exhaustion
+      });
+      // Past the reset bound: the only would-be sample is the post-exhaustion
+      // row, which must not count — so no capacity evidence exists.
+      const state = tracker.windowState("anthropic", { now: at(2 * HOUR + MINUTE) });
+      expect(state.windows[0]).toMatchObject({
+        basis: "no-capacity-estimate",
+        estimatedConsumption: null,
+      });
+    } finally {
+      tracker.close();
+    }
+  });
+
+  it("computes recovery gaps in timestamp order — backfills cannot make a gap negative", () => {
+    const tracker = new QuotaWindowTracker(tempPath());
+    try {
+      tracker.recordDispatch("xai", {
+        outcome: "quota-blocked",
+        durationMs: MINUTE,
+        quotaSignalSeen: true,
+        at: at(2 * HOUR),
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(HOUR), // backfilled success BEFORE the exhaustion
+      });
+      tracker.recordDispatch("xai", {
+        outcome: "succeeded",
+        durationMs: MINUTE,
+        quotaSignalSeen: false,
+        at: at(3 * HOUR + 30 * MINUTE),
+      });
       expect(tracker.recoveryGapsMs("xai")).toEqual([90 * MINUTE]);
     } finally {
       tracker.close();
+    }
+  });
+
+  it("refuses seq replacement through INSERT OR REPLACE (append-only, the PR #45 fold)", () => {
+    const path = tempPath();
+    const tracker = new QuotaWindowTracker(path);
+    tracker.recordDispatch("openai", {
+      outcome: "succeeded",
+      durationMs: 1_000,
+      quotaSignalSeen: false,
+      at: at(0),
+    });
+    tracker.close();
+    const db = new Database(path);
+    try {
+      expect(() =>
+        db
+          .prepare(
+            `INSERT OR REPLACE INTO window_observations (seq, family, observed_at, duration_ms, outcome, quota_signal)
+             VALUES (1, 'openai', ?, 999999, 'quota-blocked', 1)`,
+          )
+          .run(at(0).toISOString()),
+      ).toThrow(/append-only/);
+    } finally {
+      db.close();
     }
   });
 });

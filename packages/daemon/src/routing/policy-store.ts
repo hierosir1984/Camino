@@ -156,6 +156,14 @@ export class RoutingPolicyStore {
    * Store a project's policy table (the user edit). Structural defects
    * refuse the write with every violation listed; an accepted write
    * returns the cross-family properties the table trades away, if any.
+   *
+   * Ordering matters (round-1 review finding 3): the candidate is
+   * serialized FIRST and every check — structural validation and the
+   * cross-family measurement — runs on the parsed round-trip, i.e. the
+   * exact snapshot future reads will see. A live object whose getters,
+   * toJSON handler, or prototype-inherited fields present one shape to
+   * validation and serialize to another therefore cannot be persisted:
+   * nothing is written until every check has passed on the snapshot.
    */
   setPolicyTable(projectId: string, candidate: unknown, actor: string): SetPolicyResult {
     try {
@@ -169,7 +177,27 @@ export class RoutingPolicyStore {
         violations: [],
       };
     }
-    const violations = validatePolicyTable(candidate);
+    let tableJson: string | undefined;
+    try {
+      tableJson = JSON.stringify(candidate);
+    } catch (error) {
+      return {
+        ok: false,
+        code: "invalid-table",
+        reason: `policy table is not JSON-serializable: ${(error as Error).message}`,
+        violations: [],
+      };
+    }
+    if (typeof tableJson !== "string") {
+      return {
+        ok: false,
+        code: "invalid-table",
+        reason: "policy table must serialize to JSON",
+        violations: [],
+      };
+    }
+    const snapshot: unknown = JSON.parse(tableJson);
+    const violations = validatePolicyTable(snapshot);
     if (violations.length > 0) {
       return {
         ok: false,
@@ -178,16 +206,13 @@ export class RoutingPolicyStore {
         violations,
       };
     }
-    // Canonical retention: serialize exactly once; the parsed round-trip is
-    // what future reads see, so measure geometry on that same value.
-    const tableJson = JSON.stringify(candidate);
-    const table = JSON.parse(tableJson) as PolicyTable;
+    const recordedViolations = crossFamilyViolations(snapshot as PolicyTable);
     const updatedAt = this.#now().toISOString();
     if (!/^\d{4}-\d{2}-\d{2}T/.test(updatedAt)) {
       throw new TypeError("routing-policy clock must yield a valid Date");
     }
     this.#upsert.run({ projectId, tableJson, updatedAt, updatedBy: actor });
-    return { ok: true, crossFamilyViolations: crossFamilyViolations(table) };
+    return { ok: true, crossFamilyViolations: recordedViolations };
   }
 
   /** Delete a project's stored table, returning it to the shipped defaults. */
@@ -241,14 +266,34 @@ export class RoutingPolicyStore {
   /**
    * The routing decision for one role under one project's effective policy
    * (the WP-114 dispatch lookup): role × task features → (harness, model,
-   * reasoning tier), with the policy's provenance attached.
+   * reasoning tier), with the policy's provenance and the recorded
+   * cross-family trade-offs OF THE RESOLVED CELL attached — so a dispatcher
+   * sees at lookup time what the edited policy gave up, rather than only on
+   * the edit path (round-1 review finding 9).
+   *
+   * NAMED BOUNDARY: this is a POLICY lookup. Composing it with live
+   * enablement (capability registry), window estimates (tracker), lease
+   * state, and failure/family-switch counters is the WP-114 scheduler's —
+   * that component owns those stores and the dispatch decision; this store
+   * deliberately does not reach into them.
    */
   resolve(
     projectId: string,
     role: RoutingRole,
     features: TaskFeatures,
-  ): { readonly assignment: PolicyAssignment; readonly source: "default" | "project" } {
+  ): {
+    readonly assignment: PolicyAssignment;
+    readonly source: "default" | "project";
+    readonly crossFamilyViolations: readonly CrossFamilyViolation[];
+  } {
     const policy = this.getEffectivePolicy(projectId);
-    return { assignment: resolveAssignment(policy.table, role, features), source: policy.source };
+    return {
+      assignment: resolveAssignment(policy.table, role, features),
+      source: policy.source,
+      crossFamilyViolations: policy.crossFamilyViolations.filter(
+        (violation) =>
+          violation.template === features.template && violation.riskTier === features.riskTier,
+      ),
+    };
   }
 }

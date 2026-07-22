@@ -128,14 +128,22 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       family: "openai",
       harness: "codex-cli",
       models: {
-        value: [],
+        value: [
+          { id: "gpt-5.6-sol", contextWindowTokens: 1_050_000, maxOutputTokens: 128_000 },
+          { id: "gpt-5.6-terra", contextWindowTokens: 1_050_000, maxOutputTokens: 128_000 },
+          { id: "gpt-5.6-luna", contextWindowTokens: 1_050_000, maxOutputTokens: 128_000 },
+        ],
         snapshotAt: "2026-07-22",
         source:
-          "not yet recorded — the harness selects its own default model; the adapter pins a model only when the policy table names one (-c model=)",
-        confidence: "unverified",
+          "OpenAI model reference, developers.openai.com/api/docs/models/gpt-5.6-{sol,terra,luna} (retrieved 2026-07-22; each page states the context window and max output tokens)",
+        confidence: "documented",
         recheckTriggers: [
-          "provider model-catalog documentation review",
-          "adapter transcript observation of served model ids",
+          "provider model-catalog documentation change",
+          "adapter transcript reporting an unlisted served model id",
+        ],
+        notes: [
+          "The harness selects its own default model when the policy table pins none (-c model= pins one).",
+          "GPT-5.3-Codex-Spark (research preview) is deliberately not listed: plan-gated availability, no stable documented limits at snapshot time.",
         ],
       },
       quotaWindows: {
@@ -143,15 +151,15 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           { id: "session-5h", kind: "rolling", durationMs: 5 * HOUR_MS },
           { id: "weekly-7d", kind: "rolling", durationMs: 7 * DAY_MS },
         ],
-        snapshotAt: "2026-07-17",
-        source: `${REGISTRY_ITEM_13} (Codex windows tracked from adapter rate-limit signals)`,
-        confidence: "provisional",
+        snapshotAt: "2026-07-22",
+        source: `ChatGPT Codex pricing documentation, learn.chatgpt.com/docs/pricing (retrieved 2026-07-22): usage limits for local messages and cloud chats share a five-hour window, with additional weekly limits; window set per ${REGISTRY_ITEM_13}`,
+        confidence: "documented",
         recheckTriggers: [
           "provider announcement changing usage-limit structure",
           "ledger observation contradicting the recorded shape (QuotaWindowTracker)",
         ],
         notes: [
-          "Shape is provisional: registry item 13 names the windows to track; durations are confirmed or corrected from ledger observation.",
+          "The cited page states a five-hour window and 'additional weekly limits'; the weekly RESET semantics (rolling vs fixed) are not stated and are refined from ledger observation.",
         ],
       },
       harnessFeatures: {
@@ -204,14 +212,21 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
       family: "xai",
       harness: "grok-build",
       models: {
-        value: [],
+        value: [
+          { id: "grok-4.5", contextWindowTokens: 500_000 },
+          { id: "grok-build-0.1", contextWindowTokens: 256_000 },
+        ],
         snapshotAt: "2026-07-22",
         source:
-          "not yet recorded — the harness selects its own default model; the adapter pins a model only when the policy table names one (-m)",
-        confidence: "unverified",
+          "xAI model catalog, docs.x.ai/docs/models (retrieved 2026-07-22; context windows stated per model); grok-4.5 is named as the model powering Grok Build at docs.x.ai/build/overview",
+        confidence: "documented",
         recheckTriggers: [
-          "provider model-catalog documentation review (docs.x.ai)",
-          "adapter transcript observation of served model ids",
+          "provider model-catalog documentation change (docs.x.ai)",
+          "adapter transcript reporting an unlisted served model id",
+        ],
+        notes: [
+          "The harness selects its own default model when the policy table pins none (-m pins one).",
+          "Max output tokens are not stated in the cited catalog and are deliberately absent rather than guessed.",
         ],
       },
       quotaWindows: {
@@ -224,7 +239,7 @@ export const CAPABILITY_SEED: Readonly<Record<ProviderFamily, ProviderCapability
           "ledger observation of exhaustion/recovery gaps establishing a shape (QuotaWindowTracker)",
         ],
         notes: [
-          "With no recorded shape, scheduling relies on live rate-limit signals alone: an exhaustion signal queues work (CAM-EXEC-06) and the tracker records the recovery gap as shape evidence.",
+          "With no recorded shape, scheduling relies on live rate-limit signals: an exhaustion signal queues work (CAM-EXEC-06), and the tracker records exhaustion→success recovery gaps as shape evidence — once one exists, it synthesizes an 'observed-recovery' window from the largest gap so the pause threshold applies (registry item 13 refinement).",
         ],
       },
       harnessFeatures: {

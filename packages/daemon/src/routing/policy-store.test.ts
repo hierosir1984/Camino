@@ -165,6 +165,61 @@ describe("refusals", () => {
     }
   });
 
+  it("refuses candidates whose live shape diverges from their serialized snapshot", () => {
+    // Round-1 review finding 3: validation must run on the exact snapshot
+    // that would persist, so toJSON handlers and prototype-inherited fields
+    // cannot pass validation as one shape and store another.
+    const store = new RoutingPolicyStore(tempPath(), CLOCK);
+    try {
+      const withToJson = Object.assign(copyOfDefaults(), {
+        toJSON: () => ({ providerAllowlist: ["anthropic"], cells: {} }),
+      });
+      const toJsonResult = store.setPolicyTable("project-a", withToJson, "David");
+      expect(toJsonResult.ok).toBe(false);
+      expect(store.getEffectivePolicy("project-a").source).toBe("default");
+
+      const prototypeCarrier = Object.create(copyOfDefaults()) as unknown;
+      const protoResult = store.setPolicyTable("project-a", prototypeCarrier, "David");
+      expect(protoResult.ok).toBe(false);
+      expect(store.getEffectivePolicy("project-a").source).toBe("default");
+
+      const circular: Record<string, unknown> = copyOfDefaults();
+      circular["cells"] = circular; // JSON-unserializable
+      const circularResult = store.setPolicyTable("project-a", circular, "David");
+      expect(circularResult).toMatchObject({ ok: false, code: "invalid-table" });
+      expect(store.getEffectivePolicy("project-a").source).toBe("default");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("surfaces the resolved cell's recorded cross-family trade-offs at lookup time", () => {
+    // Round-1 review finding 9: the dispatch lookup must not hide what the
+    // edit path recorded.
+    const store = new RoutingPolicyStore(tempPath(), CLOCK);
+    try {
+      const edited = copyOfDefaults();
+      edited.cells["feature"]!["high"]!["reviewer"]!.harness = "claude-code"; // implementer's family
+      expect(store.setPolicyTable("project-a", edited, "David").ok).toBe(true);
+      const affected = store.resolve("project-a", "reviewer", {
+        template: "feature",
+        riskTier: "high",
+      });
+      expect(affected.crossFamilyViolations).toHaveLength(1);
+      expect(affected.crossFamilyViolations[0]).toMatchObject({
+        constraint: "implement-review",
+        requirement: "CAM-VAL-06b",
+      });
+      const untouched = store.resolve("project-a", "reviewer", {
+        template: "feature",
+        riskTier: "low",
+      });
+      expect(untouched.crossFamilyViolations).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("refuses malformed request fields (empty, NUL, unpaired surrogate)", () => {
     const store = new RoutingPolicyStore(tempPath(), CLOCK);
     try {

@@ -160,7 +160,14 @@ export interface TaskFeatures {
  * One routing decision: (harness, model, reasoning tier) — CAM-ROUTE-02's
  * output tuple. `model: null` means the harness's own current default model
  * (what that resolves to is a capability-registry observation, not policy);
- * a string pins a provider model identifier the harness accepts.
+ * a string pins a provider model identifier to pass to the harness.
+ *
+ * NAMED BOUNDARY: a pinned identifier is SHAPE-validated only (well-formed,
+ * printable, bounded — validatePolicyTable). Whether the harness accepts it
+ * is proven at dispatch — the CLI refuses an unknown id and the failure
+ * surfaces there — and the capability registry's `models` attribute is the
+ * advisory catalog a UI offers; the table does not gate on it, because the
+ * catalog is itself a time-varying observation.
  */
 export interface PolicyAssignment {
   readonly harness: OfficialAdapterName;
@@ -203,6 +210,40 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Own-property read: validation must never be satisfied by a
+ * prototype-inherited field, because JSON round-trips drop inherited
+ * fields and the persisted shape would differ from the validated one
+ * (round-1 review findings 3/10).
+ */
+function ownField(obj: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+}
+
+const MODEL_ID_MAX_LENGTH = 200;
+
+/** Shape defects of a pinned model identifier (see the PolicyAssignment boundary note). */
+function modelIdProblem(model: unknown): string | null {
+  if (model === null) return null;
+  if (typeof model !== "string" || model.length === 0) {
+    return "model must be null (harness default) or a non-empty string";
+  }
+  if (model.length > MODEL_ID_MAX_LENGTH) {
+    return `model identifier exceeds ${MODEL_ID_MAX_LENGTH} UTF-16 units`;
+  }
+  if (!model.isWellFormed()) {
+    return "model contains unpaired surrogate code units";
+  }
+  // eslint-disable-next-line no-control-regex -- refusing control characters is the point
+  if (/[\u0000-\u001F\u007F-\u009F]/.test(model)) {
+    return "model contains control characters";
+  }
+  if (model !== model.trim()) {
+    return "model must not carry leading or trailing whitespace";
+  }
+  return null;
+}
+
+/**
  * Structural validation for a candidate policy table (user-edited JSON).
  * Returns every defect found — unknown or missing keys, bad tier or harness
  * names, empty or unknown allowlist entries, assignments outside the
@@ -217,7 +258,18 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
     return [{ path: "", reason: "policy table must be a plain object" }];
   }
 
-  const allowlist = candidate["providerAllowlist"];
+  // Unknown TOP-LEVEL fields are refused like unknown nested ones —
+  // including an own "__proto__" key arriving via JSON.parse (round-1
+  // review finding 10). All reads below are own-property reads, so a
+  // prototype-inherited field can neither satisfy validation nor smuggle
+  // extra shape past it.
+  for (const key of Object.keys(candidate)) {
+    if (key !== "providerAllowlist" && key !== "cells") {
+      violations.push({ path: key, reason: "unknown policy-table field" });
+    }
+  }
+
+  const allowlist = ownField(candidate, "providerAllowlist");
   const allowedFamilies = new Set<ProviderFamily>();
   if (!Array.isArray(allowlist)) {
     violations.push({ path: "providerAllowlist", reason: "must be an array of provider families" });
@@ -245,7 +297,7 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
     }
   }
 
-  const cells = candidate["cells"];
+  const cells = ownField(candidate, "cells");
   if (!isPlainObject(cells)) {
     violations.push({ path: "cells", reason: "must enumerate every template × risk tier × role" });
     return violations;
@@ -256,7 +308,7 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
     }
   }
   for (const template of TASK_TEMPLATES) {
-    const byRisk = cells[template];
+    const byRisk = ownField(cells, template);
     if (!isPlainObject(byRisk)) {
       violations.push({ path: `cells.${template}`, reason: "missing template enumeration" });
       continue;
@@ -267,7 +319,7 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
       }
     }
     for (const risk of RISK_TIERS) {
-      const byRole = byRisk[risk];
+      const byRole = ownField(byRisk, risk);
       if (!isPlainObject(byRole)) {
         violations.push({ path: `cells.${template}.${risk}`, reason: "missing risk enumeration" });
         continue;
@@ -282,7 +334,7 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
       }
       for (const role of ROUTING_ROLES) {
         const cellPath = `cells.${template}.${risk}.${role}`;
-        const assignment = byRole[role];
+        const assignment = ownField(byRole, role);
         if (!isPlainObject(assignment)) {
           violations.push({ path: cellPath, reason: "missing assignment" });
           continue;
@@ -292,7 +344,7 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
             violations.push({ path: `${cellPath}.${key}`, reason: `unknown assignment field` });
           }
         }
-        const harness = assignment["harness"];
+        const harness = ownField(assignment, "harness");
         if (!(OFFICIAL_ADAPTER_NAMES as readonly unknown[]).includes(harness)) {
           // The API-key adapter interface ([F], CAM-EXEC-01 interface clause)
           // will widen this set when an implementation ships; v1 routes only
@@ -310,17 +362,15 @@ export function validatePolicyTable(candidate: unknown): PolicyViolation[] {
             reason: `harness family "${HARNESS_FAMILY[harness as OfficialAdapterName]}" is not in the project's provider allowlist`,
           });
         }
-        const model = assignment["model"];
-        if (model !== null && (typeof model !== "string" || model.length === 0)) {
-          violations.push({
-            path: `${cellPath}.model`,
-            reason: "model must be null (harness default) or a non-empty string",
-          });
+        const modelProblem = modelIdProblem(ownField(assignment, "model"));
+        if (modelProblem !== null) {
+          violations.push({ path: `${cellPath}.model`, reason: modelProblem });
         }
-        if (!(REASONING_TIERS as readonly unknown[]).includes(assignment["reasoningTier"])) {
+        const reasoningTier = ownField(assignment, "reasoningTier");
+        if (!(REASONING_TIERS as readonly unknown[]).includes(reasoningTier)) {
           violations.push({
             path: `${cellPath}.reasoningTier`,
-            reason: `unknown reasoning tier: ${JSON.stringify(assignment["reasoningTier"])}`,
+            reason: `unknown reasoning tier: ${JSON.stringify(reasoningTier)}`,
           });
         }
       }

@@ -202,6 +202,65 @@ describe("validatePolicyTable — structural refusals", () => {
     expect(violations.some((v) => v.reason.includes("unknown provider family"))).toBe(true);
   });
 
+  it("refuses unknown top-level fields, including an own __proto__ key from JSON", () => {
+    // Round-1 review finding 10: top-level unknowns were silently accepted.
+    const extra = editableCopy() as unknown as Record<string, unknown>;
+    extra["extra"] = true;
+    expect(validatePolicyTable(extra)).toEqual([
+      { path: "extra", reason: "unknown policy-table field" },
+    ]);
+    const withProto = JSON.parse(
+      `{"__proto__":{},${JSON.stringify(editableCopy()).slice(1)}`,
+    ) as unknown;
+    expect(validatePolicyTable(withProto)).toEqual([
+      { path: "__proto__", reason: "unknown policy-table field" },
+    ]);
+  });
+
+  it("is not satisfied by prototype-inherited fields (validates the shape that would persist)", () => {
+    // Round-1 review finding 3: JSON round-trips drop inherited fields, so
+    // validation must not read through the prototype chain.
+    const carrier = Object.create(editableCopy()) as Record<string, unknown>;
+    const violations = validatePolicyTable(carrier);
+    expect(violations.some((v) => v.path === "cells")).toBe(true);
+    expect(violations.some((v) => v.path === "providerAllowlist")).toBe(true);
+  });
+
+  it("refuses model identifiers that are not clean printable strings", () => {
+    // Round-1 review finding 7: NUL, unpaired surrogates, whitespace
+    // padding, control characters, and unbounded length are all shape
+    // defects. (Harness ACCEPTANCE of a clean id is the named dispatch-time
+    // boundary — see the PolicyAssignment doc.)
+    const cases: Array<[unknown, RegExp]> = [
+      ["\u0000", /control characters/],
+      ["\ud800", /unpaired surrogate/],
+      ["  gpt-5.6-sol", /whitespace/],
+      ["gpt\n5", /control characters/],
+      ["x".repeat(300), /exceeds/],
+      [42, /must be null/],
+      [undefined, /must be null/],
+    ];
+    for (const [model, expected] of cases) {
+      const table = editableCopy();
+      if (model === undefined) {
+        delete table.cells["feature"]!["low"]!["planner"]!["model"];
+      } else {
+        table.cells["feature"]!["low"]!["planner"]!["model"] = model;
+      }
+      const violations = validatePolicyTable(table);
+      expect(
+        violations.some(
+          (v) => v.path === "cells.feature.low.planner.model" && expected.test(v.reason),
+        ),
+        `model ${JSON.stringify(model)} must be refused with ${expected}`,
+      ).toBe(true);
+    }
+    // A clean pinned identifier is accepted.
+    const table = editableCopy();
+    table.cells["feature"]!["low"]!["planner"]!["model"] = "claude-opus-4-8";
+    expect(validatePolicyTable(table)).toEqual([]);
+  });
+
   it("refuses missing cells, unknown keys, bad tiers, and bad models", () => {
     const table = editableCopy();
     delete table.cells["quick-task"]!["medium"]!["verifier"];

@@ -86,31 +86,40 @@ describe("capability seed — time-varying, source-linked attributes", () => {
     }
   });
 
-  it("records grounded values as documented/observed and gaps as unverified — never guessed", () => {
-    // Anthropic model catalog carries context limits from a dated source.
-    const models = CAPABILITY_SEED.anthropic.models;
-    expect(models.confidence).toBe("documented");
-    expect(models.value.length).toBeGreaterThan(0);
-    for (const model of models.value) {
-      expect(model.contextWindowTokens).toBeGreaterThan(0);
-      expect(model.maxOutputTokens).toBeGreaterThan(0);
+  it("carries a dated, documented model catalog with context limits for every provider (CAM-ROUTE-01)", () => {
+    for (const family of PROVIDER_FAMILIES) {
+      const models = CAPABILITY_SEED[family].models;
+      expect(models.confidence, `${family} model catalog`).toBe("documented");
+      expect(models.value.length, `${family} must list at least one model`).toBeGreaterThan(0);
+      for (const model of models.value) {
+        expect(model.id.length).toBeGreaterThan(0);
+        expect(
+          model.contextWindowTokens,
+          `${family}/${model.id} context limit must come from the cited source`,
+        ).toBeGreaterThan(0);
+      }
     }
-    // Providers with no grounded catalog say so instead of inventing one.
-    expect(CAPABILITY_SEED.openai.models.confidence).toBe("unverified");
-    expect(CAPABILITY_SEED.openai.models.value).toEqual([]);
-    expect(CAPABILITY_SEED.xai.models.confidence).toBe("unverified");
+    // Values absent from the cited source stay absent — never guessed: the
+    // xAI catalog states context windows but not output caps.
+    for (const model of CAPABILITY_SEED.xai.models.value) {
+      expect(model.maxOutputTokens).toBeUndefined();
+    }
+    expect(CAPABILITY_SEED.anthropic.models.value.map((m) => m.id)).toContain("claude-opus-4-8");
+    expect(CAPABILITY_SEED.openai.models.value.map((m) => m.id)).toContain("gpt-5.6-sol");
+    expect(CAPABILITY_SEED.xai.models.value.map((m) => m.id)).toContain("grok-4.5");
   });
 
-  it("pins the registry-item-13 window shapes: Claude 5-hour + weekly; Codex provisional; Grok unrecorded", () => {
-    const claude = CAPABILITY_SEED.anthropic.quotaWindows;
-    expect(claude.value.map((w) => w.durationMs).sort((a, b) => a - b)).toEqual([
-      5 * 3_600_000,
-      7 * 24 * 3_600_000,
-    ]);
-    expect(claude.confidence).toBe("documented");
-    expect(CAPABILITY_SEED.openai.quotaWindows.confidence).toBe("provisional");
-    expect(CAPABILITY_SEED.openai.quotaWindows.value.length).toBe(2);
-    // No documented Grok Build shape: tracked purely from adapter signals.
+  it("pins the registry-item-13 window shapes: Claude and Codex 5-hour + weekly documented; Grok unrecorded", () => {
+    for (const family of ["anthropic", "openai"] as const) {
+      const windows = CAPABILITY_SEED[family].quotaWindows;
+      expect(windows.value.map((w) => w.durationMs).sort((a, b) => a - b)).toEqual([
+        5 * 3_600_000,
+        7 * 24 * 3_600_000,
+      ]);
+      expect(windows.confidence).toBe("documented");
+    }
+    // No documented Grok Build shape: tracked purely from adapter signals,
+    // synthesized by the tracker once a recovery gap is observed.
     expect(CAPABILITY_SEED.xai.quotaWindows.value).toEqual([]);
     expect(CAPABILITY_SEED.xai.quotaWindows.confidence).toBe("unverified");
   });
