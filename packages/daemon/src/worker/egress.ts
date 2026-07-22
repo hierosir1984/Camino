@@ -66,12 +66,6 @@ export interface EgressAllowlistEntry {
 const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const NETWORK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
-// A Docker network ID (short 12 or full 64 hex). `docker run --network` resolves
-// a value by NAME *or* ID, so a bare ID for the `host`/`none`/`bridge` network
-// slips past the reserved-NAME check (round-10 finding 1). Requiring a name makes
-// that check authoritative; the network's DRIVER/ownership is attested where the
-// network is CREATED (WP-005/WP-114), which this composer does not run.
-const DOCKER_NETWORK_ID_RE = /^[0-9a-f]{12}([0-9a-f]{52})?$/i;
 
 /** Is `host` a safe allowlist host token (DNS name / IPv4 literal)? */
 export function isValidAllowlistHost(host: string): boolean {
@@ -130,7 +124,11 @@ export const WORKER_PROFILE_ENTRYPOINT = "/usr/local/bin/worker-profile-entrypoi
  * The FULL capability set of the worker container — everything else is
  * dropped (`--cap-drop ALL`). NET_ADMIN + NET_RAW: iptables rule install
  * (bootstrap only); SETUID + SETGID: the su-exec privilege drop to the
- * workload user. The workload itself runs unprivileged with NO effective
+ * workload user; KILL: the init (Tini, pid 1) runs as root but the workload runs
+ * as a DROPPED uid — without CAP_KILL, root-pid-1 signalling a different-uid
+ * process is "Operation not permitted", so the cooperative SIGTERM + grace never
+ * reaches the worker and only the outer SIGKILL/`docker kill` contains it
+ * (round-11 finding 7). The workload itself runs unprivileged with NO effective
  * capabilities, and no-new-privileges makes that irreversible.
  */
 export const WORKER_CONTAINER_CAPS = Object.freeze([
@@ -138,6 +136,7 @@ export const WORKER_CONTAINER_CAPS = Object.freeze([
   "NET_RAW",
   "SETUID",
   "SETGID",
+  "KILL",
 ] as const);
 
 /** Bound on in-container process count (tree containment, AMEND-10). */
@@ -168,19 +167,40 @@ export interface WorkerContainerRun {
   name?: string;
 }
 
-function assertSafeNetwork(network: string): void {
-  if (!network) throw new WorkerContainerConfigError("worker run requires a user-defined network");
-  if (DOCKER_NETWORK_ID_RE.test(network)) {
+// An image reference: [HOST[:PORT]/]NAME[:TAG][@sha256:DIGEST]. It MUST start with
+// an alphanumeric (round-11 finding 1): `docker run` parses options until the
+// first non-option arg (the image), so an OPTION-SHAPED image like `--entrypoint`
+// is consumed as another flag and a later token becomes the image — the pinned
+// `--entrypoint` is skipped and the workload runs as root with no bootstrap.
+// docker run has no `--` terminator before the image, so the shape must be fenced.
+const IMAGE_REF_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:@/-]*$/;
+
+function assertSafeImage(image: string): void {
+  if (!image || !IMAGE_REF_RE.test(image)) {
     throw new WorkerContainerConfigError(
-      `worker network ${JSON.stringify(network)} looks like a Docker network ID — a network must be ` +
-        "referenced by its owned NAME, never an ID (an ID can resolve to host/none/bridge, bypassing " +
-        "the reserved-name check; round-10 finding 1)",
+      `worker image ${JSON.stringify(image)} is not a valid image reference — it must start with an ` +
+        "alphanumeric and contain only image-ref characters (an option-shaped image would skip the " +
+        "pinned --entrypoint; round-11 finding 1, fail-closed)",
     );
   }
+}
+
+// BOUNDARY, stated (round-11 finding 8): `docker run --network` resolves a value
+// by NAME *or* by ID (including any UNIQUE ID PREFIX, 4–64 hex). The composer
+// therefore CANNOT tell an owned-network name from a built-in network's ID by
+// SHAPE — a hex-ID-shape reject was both incomplete (missed short prefixes) and
+// over-broad (rejected legitimate all-hex names). The network's DRIVER and
+// OWNERSHIP (an isolated, Camino-created user-defined bridge, never host/none/
+// bridge) are attested where the network is CREATED and passed in — WP-005/
+// WP-114 owns that lifecycle; this pure arg-renderer does not run `docker network
+// inspect`. Here we only fence the SHAPE and the reserved LITERAL names.
+function assertSafeNetwork(network: string): void {
+  if (!network) throw new WorkerContainerConfigError("worker run requires a user-defined network");
   if (network.includes(":") || !NETWORK_NAME_RE.test(network) || RESERVED_NETWORKS.has(network)) {
     throw new WorkerContainerConfigError(
       `worker network ${JSON.stringify(network)} rejected — requires an owned, isolated ` +
-        "user-defined bridge (not host/none/bridge/container:<id>; fail-closed)",
+        "user-defined bridge (not host/none/bridge/container:<id>; fail-closed). Its driver/ownership " +
+        "is attested by the network's creator (WP-005/WP-114), not this composer (round-11 finding 8)",
     );
   }
 }
@@ -299,6 +319,7 @@ export function renderAllowlistEnv(allowlist: EgressAllowlistEntry[]): string {
  * 1/2/3 closed here.
  */
 export function renderWorkerRunArgs(run: WorkerContainerRun, cmd: string[]): string[] {
+  assertSafeImage(run.image);
   assertSafeNetwork(run.network);
   const args = [
     "run",

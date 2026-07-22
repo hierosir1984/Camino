@@ -661,22 +661,25 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(calls).toBe(0);
   });
 
-  it("RESUMES a destroy when the sidecar is valid but the workspace still exists (round-6 finding 1)", async () => {
+  it("RESUMES a destroy when the sidecar is valid and the SAME-inode workspace still exists (round-6 finding 1; round-11 finding 3)", async () => {
     const root = tempDir();
     const ws = makeWorkspace();
-    // Complete a normal archival but keep the workspace (simulate a prior
-    // destroy failure): the archive + a valid sidecar are durable, workspace present.
-    await archiveAttempt({
-      workspaceDir: ws,
-      archiveRoot: root,
-      issueId: "i",
-      attemptId: "a",
-      recordLedgerRow: () => {},
-    });
-    expect(existsSync(ws)).toBe(false); // normal path destroyed it
-    // Recreate the workspace to model "destroy failed / didn't run".
-    mkdirSync(ws, { recursive: true });
-    writeFileSync(join(ws, "leftover"), "x");
+    // Model a GENUINE destroy failure (not a rm+recreate, which would be a
+    // different inode): make the workspace un-deletable so the first archival
+    // writes the archive + valid sidecar but the destroy throws, leaving the
+    // SAME-inode workspace in place — the real resume state.
+    chmodSync(ws, 0o500); // r-x, no write → cannot unlink contents
+    await expect(
+      archiveAttempt({
+        workspaceDir: ws,
+        archiveRoot: root,
+        issueId: "i",
+        attemptId: "a",
+        recordLedgerRow: () => {},
+      }),
+    ).rejects.toMatchObject({ name: "ArchivalError", stage: "workspace-destroy" });
+    expect(existsSync(ws)).toBe(true); // destroy failed; the SAME inode remains
+    chmodSync(ws, 0o700); // restore so the resume can delete
     let calls = 0;
     const record = await archiveAttempt({
       workspaceDir: ws,
@@ -687,9 +690,35 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
         calls += 1;
       },
     });
-    expect(existsSync(ws)).toBe(false); // resume destroyed it
+    expect(existsSync(ws)).toBe(false); // resume destroyed the SAME-inode workspace
     expect(record.archivePath).toBe(join(root, "i", "a.tar.gz"));
     expect(calls).toBe(0); // ledger NOT re-recorded on resume
+  });
+
+  it("a resume REFUSES a workspace RECREATED at the same pathname (different inode) — round-11 finding 3", async () => {
+    const root = tempDir();
+    const ws = makeWorkspace();
+    await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    });
+    expect(existsSync(ws)).toBe(false); // normal destroy
+    // Recreate an UNRELATED directory at the same pathname (a DIFFERENT inode).
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "victim.txt"), "must-not-be-deleted\n");
+    const err = await archiveAttempt({
+      workspaceDir: ws,
+      archiveRoot: root,
+      issueId: "i",
+      attemptId: "a",
+      recordLedgerRow: () => {},
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ArchivalError);
+    expect((err as Error).message).toMatch(/replaced|inode changed/i);
+    expect(existsSync(join(ws, "victim.txt"))).toBe(true); // the recreated dir is untouched
   });
 
   it("a re-invocation with a DIFFERENT workspace does NOT destroy the recorded one (round-7 finding 1)", async () => {

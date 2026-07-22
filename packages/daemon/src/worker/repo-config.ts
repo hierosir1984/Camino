@@ -15,7 +15,7 @@
 // cannot land changes to it, so this file is user-authored configuration.
 // It is still parsed defensively (schema refusal on unknown keys, entry
 // caps, safe host/port shapes) because a config error must fail loudly.
-import { lstatSync, readFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, lstatSync, openSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { load as loadYaml } from "js-yaml";
 import { type EgressAllowlistEntry, isValidAllowlistHost, isValidAllowlistPort } from "./egress.js";
@@ -49,7 +49,7 @@ export function parseRepoEgressConfig(text: string | null): WorkerEgressConfig {
     doc = loadYaml(text);
   } catch (err) {
     throw new RepoConfigError(
-      `${REPO_CONFIG_PATH} is not valid YAML: ${(err as Error).message.slice(0, 300)}`,
+      `${REPO_CONFIG_PATH} is not valid YAML: ${describeConfigError(err, 300)}`,
     );
   }
   if (doc === null || doc === undefined) return { allow: [] };
@@ -126,7 +126,7 @@ export function loadRepoEgressConfig(repoDir: string): WorkerEgressConfig {
     try {
       st = lstatSync(join(repoDir, rel));
     } catch {
-      st = null; // absent — the readFileSync below yields the deny-all baseline
+      st = null; // absent — the read below yields the deny-all baseline
     }
     if (st?.isSymbolicLink()) {
       throw new RepoConfigError(
@@ -134,17 +134,51 @@ export function loadRepoEgressConfig(repoDir: string): WorkerEgressConfig {
       );
     }
   }
+  // Read the config file with O_NOFOLLOW so the FINAL component cannot be a symlink
+  // AT OPEN TIME — atomic, closing the lstat→open race for `config.yml` itself
+  // (round-11 finding 13). ELOOP here means it became a symlink; refuse.
+  //
+  // BOUNDARY, stated: a symlinked `.camino` PARENT swapped between the lstat above
+  // and this open is a check→use race that presupposes a concurrent DAEMON-SIDE
+  // writer of the checked-out repo tree — the repo checkout is daemon-owned and
+  // single-writer (composed before the container-confined worker runs), so that
+  // race is outside the worker threat model. The lstat above closes the reachable
+  // (static) symlinked-parent misconfiguration; O_NOFOLLOW closes the file itself.
   let text: string | null;
+  let fd: number | undefined;
   try {
-    text = readFileSync(join(repoDir, REPO_CONFIG_PATH), "utf8");
+    fd = openSync(join(repoDir, REPO_CONFIG_PATH), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    text = readFileSync(fd, "utf8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
       text = null; // absent file = deny-all baseline
+    } else if (code === "ELOOP") {
+      throw new RepoConfigError(
+        `${REPO_CONFIG_PATH} is a symlink (O_NOFOLLOW) — the per-repo config must be a real file (fail-closed): a symlink could redirect egress policy outside quarantine's protection`,
+      );
     } else {
       throw new RepoConfigError(
-        `${REPO_CONFIG_PATH} exists but cannot be read: ${(err as Error).message.slice(0, 200)}`,
+        `${REPO_CONFIG_PATH} exists but cannot be read: ${describeConfigError(err)}`,
       );
+    }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best-effort close */
+      }
     }
   }
   return parseRepoEgressConfig(text);
+}
+
+/** Stringify ANY thrown value safely (parity with archive.ts describeError). */
+function describeConfigError(err: unknown, max = 200): string {
+  try {
+    return String(err instanceof Error ? err.message : err).slice(0, max);
+  } catch {
+    return "unstringifiable error";
+  }
 }

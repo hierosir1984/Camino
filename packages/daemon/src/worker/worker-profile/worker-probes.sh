@@ -21,6 +21,11 @@
 # read-only assertion (writes CAN happen where allowed).
 set -u
 
+# This script's own path (run as `sh <path>`), so the content credential scan can
+# exclude itself — it carries the very patterns it searches for (round-11 finding 9).
+CAMINO_PROBE_SELF="$0"
+export CAMINO_PROBE_SELF
+
 run_probe() {
   name=$1
   shift
@@ -77,23 +82,27 @@ run_probe github-cred-fs sh -c '
       2>/dev/null | head -1)
   [ -z "$found" ] && echo clean || echo "$found"
 '
-# Names are not enough (round-10 finding 7): a mounted gh hosts file holds a
-# GitHub token under a host stanza, and a git-credentials-style URL embeds one — a
-# read-only mount blocks WRITES, not disclosure. Scan the CONTENT of the mounted
-# credential-bearing roots (the workspace, the provider-auth dir, HOME) for
-# GitHub-SPECIFIC material, so the legitimately-mounted (non-GitHub) provider auth
-# is not a false hit: the gh token prefixes anywhere, OR a host stanza naming the
-# GitHub host that also carries a token line. Binary files are skipped (grep -I).
+# Names are not enough (round-10 finding 7, hardened round-11 finding 9): a mounted
+# gh hosts file holds a GitHub token under a host stanza, and a git-credentials URL
+# embeds one (incl. a LEGACY 40-hex token as the URL password) — a read-only mount
+# blocks WRITES, not disclosure. Scan the CONTENT of the credential-bearing roots
+# for GitHub-SPECIFIC material, so the legitimately-mounted (non-GitHub) provider
+# auth is not a false hit. Covers ALL auth mounts by scanning the whole /auth
+# subtree (the allowlist forces every auth mount under it), the workspace and HOME;
+# EXCLUDES this probe script (it contains the patterns). Binary files skipped (-I).
 run_probe github-cred-content sh -c '
   roots=""
-  for d in "${CAMINO_WORKSPACE_DIR:-}" "${CAMINO_PROVIDER_AUTH_DIR:-}" "${HOME:-}"; do
-    [ -n "$d" ] && [ -d "$d" ] && roots="$roots $d"
+  for d in /auth "${CAMINO_WORKSPACE_DIR:-}" "${HOME:-}"; do
+    [ -d "$d" ] && roots="$roots $d"
   done
   [ -z "$roots" ] && { echo clean; exit 0; }
-  ghhost=$(printf "%s\043com" "github.")   # the GitHub host, built so this script never self-matches
-  found=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}" $roots 2>/dev/null | head -1)
+  self="${CAMINO_PROBE_SELF:-/nonexistent}"
+  # Modern gh token prefixes anywhere; OR a github.com URL carrying userinfo
+  # (user:secret@github.com — catches a legacy 40-hex token as the password).
+  found=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|://[^/@[:space:]]+:[^/@[:space:]]+@github\.com" $roots 2>/dev/null | grep -vxF "$self" | head -1)
   if [ -z "$found" ]; then
-    for f in $(grep -rIlF "$ghhost" $roots 2>/dev/null); do
+    # A github.com host stanza (gh hosts.yml) that also carries a token line.
+    for f in $(grep -rIlF "github.com" $roots 2>/dev/null | grep -vxF "$self"); do
       if grep -qiE "oauth_token|(^|[^a-z])token[[:space:]]*[:=]" "$f" 2>/dev/null; then
         found=$f
         break

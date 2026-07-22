@@ -200,18 +200,40 @@ describe("renderWorkerRunArgs", () => {
     ).not.toThrow();
   });
 
-  it("rejects a network referenced by ID, not name — an ID can resolve to host/none (round-10 finding 1)", () => {
-    // `docker run --network <id>` resolves by ID, so a bare hex ID for the host
-    // network slips past the reserved-NAME check. Short (12) and full (64) IDs.
-    for (const network of ["a1b2c3d4e5f6", "0123456789abcdef".repeat(4)]) {
-      expect(() => renderWorkerRunArgs({ ...BASE, network }, ["/bin/true"])).toThrow(
-        /network ID|referenced by its owned NAME/,
+  it("rejects an OPTION-SHAPED image so the pinned --entrypoint cannot be skipped (round-11 finding 1)", () => {
+    // `docker run` parses options until the first non-option arg (the image); an
+    // image like `--entrypoint` is consumed as a flag and a later token becomes
+    // the image, skipping the pinned entrypoint → root shell, no bootstrap.
+    for (const image of ["--entrypoint", "-v", "--privileged", "", " alpine", "a b"]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, image }, ["/bin/true"])).toThrow(
+        WorkerContainerConfigError,
       );
     }
-    // A normal owned name that merely contains hex is still fine.
-    expect(() =>
-      renderWorkerRunArgs({ ...BASE, network: "camino-worker-a1b2c3" }, ["/bin/true"]),
-    ).not.toThrow();
+    // Legitimate references still pass (registry, port, tag, digest).
+    for (const image of [
+      "alpine:3.20",
+      "registry.example.com:5000/org/img:tag",
+      "img@sha256:" + "a".repeat(64),
+    ]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, image }, ["/bin/true"])).not.toThrow();
+    }
+  });
+
+  it("the composer fences the network SHAPE + reserved names but does NOT infer name-vs-ID (round-11 finding 8 boundary)", () => {
+    // Reserved literal names are refused.
+    for (const network of ["host", "none", "bridge", "default"]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, network }, ["/bin/true"])).toThrow(
+        WorkerContainerConfigError,
+      );
+    }
+    // A hex-shaped value is NOT rejected on shape alone: it may be a legitimate
+    // owned name, and Docker resolves any unique ID prefix, so the composer cannot
+    // tell them apart — driver/ownership is the creator's attestation (WP-005/114),
+    // named in assertSafeNetwork. (Round 10's hex-ID reject was both incomplete and
+    // over-broad; removed.)
+    for (const network of ["feedfacecafe", "camino-worker-a1b2c3"]) {
+      expect(() => renderWorkerRunArgs({ ...BASE, network }, ["/bin/true"])).not.toThrow();
+    }
   });
 
   it("refuses a provider-auth host source overlapping the rw workspace (round-1 finding 3)", () => {

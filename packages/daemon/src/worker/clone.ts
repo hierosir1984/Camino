@@ -226,19 +226,6 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     );
   }
 
-  let hooksPath = "";
-  try {
-    hooksPath = git(dir, ["config", "--local", "--get", "core.hooksPath"]);
-  } catch {
-    hooksPath = "";
-  }
-  const hooksDisabledByConfig = hooksPath === WORKER_CLONE_HOOKS_PATH;
-  if (!hooksDisabledByConfig) {
-    throw new WorkerCloneError(
-      `workspace clone config does not disable hooks (core.hooksPath=${JSON.stringify(hooksPath)}; want ${WORKER_CLONE_HOOKS_PATH})`,
-    );
-  }
-
   // Scan the EFFECTIVE local config (includes resolved) for the git credential
   // and command-execution channels a clone could carry (round-2 finding 4;
   // widened round-3 finding 4):
@@ -268,8 +255,15 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
   let remotesCredentialFree = true;
   let noHttpExtraheader = true;
   let noSshCommand = true;
+  // core.hooksPath read from the EFFECTIVE config (round-11 finding 10): a
+  // `git config --local --get` does NOT process includes, so an [include]d file
+  // that re-sets core.hooksPath to an attacker path would be missed while the
+  // local value still read /dev/null. The LAST value in the effective list wins
+  // (git's last-wins precedence), so track it across all entries.
+  let effectiveHooksPath: string | null = null;
   for (const { key, value } of config) {
     const lk = key.toLowerCase();
+    if (lk === "core.hookspath") effectiveHooksPath = value;
     if (/^credential\.(.+\.)?helper$/.test(lk) && value.length > 0) noCredentialHelper = false;
     if (/^remote\..+\.(pushurl|url)$/.test(lk) && urlCarriesUserinfo(value)) {
       remotesCredentialFree = false;
@@ -280,6 +274,12 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
     if (insteadOf && urlCarriesUserinfo(insteadOf[1]!)) remotesCredentialFree = false;
     if (/^http\.(.+\.)?extraheader$/.test(lk) && value.length > 0) noHttpExtraheader = false;
     if (/(^|\.)sshcommand$/.test(lk) && value.length > 0) noSshCommand = false;
+  }
+  const hooksDisabledByConfig = effectiveHooksPath === WORKER_CLONE_HOOKS_PATH;
+  if (!hooksDisabledByConfig) {
+    throw new WorkerCloneError(
+      `workspace clone config does not disable hooks (effective core.hooksPath=${JSON.stringify(effectiveHooksPath)}; want ${WORKER_CLONE_HOOKS_PATH})`,
+    );
   }
   if (!noCredentialHelper) {
     throw new WorkerCloneError(

@@ -5,8 +5,8 @@
 // lives, so no caller can misclassify a budget kill. THIS module is the
 // policy seam above it:
 //
-//   - it validates the budget shape fail-closed (wall-clock is ALWAYS
-//     enforced — a dispatch without a finite positive wall-clock budget is
+//   - it validates the budget shape fail-closed (a wall-clock budget is
+//     REQUIRED — a dispatch without a finite positive wall-clock budget is
 //     refused, since "tokens where reportable" means token budgets alone can
 //     never be the only guard);
 //   - it maps a killed-budget outcome onto the Appendix A events the state
@@ -16,6 +16,21 @@
 //     no code path that dispatches twice — and the core tables it feeds have
 //     no row from a budget breach back to `ready` ("never an automatic
 //     retry", pinned by budget.test.ts walking the tables).
+//
+// BOUNDARY, stated (round-11 findings 4/5/6): the wall-clock guard is an
+// IN-PROCESS event-loop timer plus a reliable POST-REAP exit-handling check. It
+// is authoritative under a HEALTHY event loop. Under a GROSS daemon event-loop
+// stall — which a WORKER cannot induce (the bounded pre-parser line reader caps
+// per-line synchronous work) — its timing is best-effort: a stall can (a) miss a
+// LEADER-ONLY overrun (the leader exits during the stall and is reaped before we
+// observe it), (b) lose same-boundary precedence to a coincident timeout, or (c),
+// if a just-exited zombie leader lingers inside the small on-time window,
+// over-attribute (fail-SAFE: it escalates a run for human review, never silently
+// credits an overrun). The exit-handling check DOES reliably catch DESCENDANT
+// overruns even under a stall. The authoritative out-of-process bound is the
+// container / WP-114 supervisor (kill the container ⇒ reap every pid), the same
+// group-vs-tree boundary this WP states throughout. A daemon-side stall is a
+// daemon-health concern, not a worker-exploitable one.
 import type { AdapterContext, AdapterSpec, AttemptBudget, DispatchRecord } from "@camino/shared";
 import type { AttemptEvent, IssueEvent } from "@camino/core";
 import {

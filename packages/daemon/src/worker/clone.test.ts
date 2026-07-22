@@ -181,6 +181,19 @@ describe("assertWorkerCloneIsolation (CAM-EXEC-02 negative fixtures)", () => {
     expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hardlink/);
   });
 
+  it("rejects an [include]d core.hooksPath that overrides the local /dev/null (round-11 finding 10)", () => {
+    const source = makeSourceRepo();
+    const dest = cloneDest();
+    provisionWorkerClone({ sourceRepo: source, destDir: dest });
+    // Plant an included config that re-sets core.hooksPath to an attacker path,
+    // and reference it via [include]. `git config --local --get` would miss this
+    // (it does not process includes); the effective config must catch it.
+    writeFileSync(join(dest, ".git", "evil.inc"), "[core]\n\thooksPath = .attacker-hooks\n");
+    git(dest, "config", "--local", "include.path", "evil.inc");
+    expect(git(dest, "config", "--get", "core.hooksPath")).toBe(".attacker-hooks"); // effective value IS overridden
+    expect(() => assertWorkerCloneIsolation(dest)).toThrow(/hooks/i);
+  });
+
   it("rejects a clone whose objects dir is a SYMLINK to an external store — not self-contained (round-10 finding 6)", () => {
     const source = makeSourceRepo();
     const dest = cloneDest();

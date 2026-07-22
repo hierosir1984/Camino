@@ -192,6 +192,13 @@ export interface ArchiveSidecar {
    * (round-6 finding 1).
    */
   workspacePath: string;
+  /**
+   * The workspace's stable (dev,ino) at archive time. A resume-destroy compares
+   * against this, not just the pathname (round-11 finding 3): a directory
+   * rm+recreated at the same path is a DIFFERENT inode and must not be destroyed.
+   */
+  workspaceDev?: number;
+  workspaceIno?: number;
   archiveWrittenAt: string;
   /**
    * Durable per-issue monotonic ordinal, assigned at archive time (max
@@ -392,12 +399,22 @@ function sha256File(path: string): string {
  * Re-validate the archive IMMEDIATELY before a destroy, from the FILE itself —
  * never from sidecar byte-fields a caller/corruption could forge (round-10
  * findings 2/3/5). The recordLedgerRow callback ran between the archive write and
- * this point and is treated as capable of mutating the tree, so nothing about the
- * archive is trusted from before it. Requires: a present REGULAR file (no
- * symlink/dir/fifo), an ACTUAL size within the compressed cap (not the sidecar's
- * claimed size — a 1-byte claim over a 500 MB file must not pass), and a STREAMING
- * sha256 that matches. Returns the verified real size. Any doubt → staged refusal,
- * workspace retained → reconciliation.
+ * this point, so nothing about the archive is trusted from before it. Requires: a
+ * present REGULAR, non-hardlinked file (no symlink/dir/fifo, nlink 1), an ACTUAL
+ * size within the compressed cap (not the sidecar's claimed size — a 1-byte claim
+ * over a 500 MB file must not pass), and a STREAMING sha256 that matches. Returns
+ * the verified real size. Any doubt → staged refusal, workspace retained.
+ *
+ * BOUNDARY, stated (round-11 findings 2/11/13/14 — the WP-104 single-writer
+ * precedent): the archiveRoot and workspace are DAEMON-OWNED, single-writer trees
+ * (archival runs under the WP-104 lock; the worker is container-confined and
+ * cannot reach them). A path→fd or inode swap performed by ANOTHER daemon-side
+ * process DURING this verification (a check→use race) presupposes daemon-side
+ * write access to Camino's own trees, which is outside the worker threat model
+ * (if the daemon is compromised, all bets are off). These checks close the
+ * REACHABLE misconfiguration/corruption (a wrong-type/oversized/mismatched or
+ * hardlinked archive; a rm+recreated workspace); they are not, and do not claim
+ * to be, a defense against a concurrent daemon-side mutator.
  */
 function verifyArchiveIntact(
   finalPath: string,
@@ -418,6 +435,15 @@ function verifyArchiveIntact(
     throw new ArchivalError(
       "archive-write",
       `attempt ${attemptId}: the archive ${finalPath} is not a regular file (${describeFileType(st)}) — refusing to destroy the workspace (fail-closed)`,
+    );
+  }
+  if (st.nlink > 1) {
+    // A hardlinked archive (round-11 finding 14): another name for the same inode
+    // can mutate the bytes after this verification, invalidating the ledger hash.
+    // A freshly written archive has nlink 1; refuse an aliased one.
+    throw new ArchivalError(
+      "archive-write",
+      `attempt ${attemptId}: the archive ${finalPath} is hardlinked (nlink=${st.nlink}) — an external alias could mutate it after verification; refusing to destroy the workspace (fail-closed)`,
     );
   }
   if (st.size > archiveMaxCompressedBytes) {
@@ -554,6 +580,18 @@ function realDirPath(p: string): string {
  */
 export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<ArchivalRecord> {
   const now = opts.now ?? (() => new Date());
+  // Validate the clock BEFORE any destructive step (round-11 finding 15): the
+  // strictly-increasing stamps add ~1ms per sub-step, and `new Date(t).toISOString()`
+  // throws a raw RangeError past the max valid Date. A clock at/near the ceiling
+  // (an injected/corrupt clock) would let `nextStamp` throw AFTER the workspace was
+  // destroyed. Refuse up-front so the failure is staged and the workspace retained.
+  const nowMs = now().getTime();
+  if (!Number.isFinite(nowMs) || nowMs > MAX_TIMESTAMP_MS - 100_000) {
+    throw new ArchivalError(
+      "id-validation",
+      `clock is out of range (${String(nowMs)}) — refusing before any destructive step (fail-closed)`,
+    );
+  }
   // Registry item 11 is a HARD CEILING (round-9 finding 7): an injected `quotas`
   // override may only TIGHTEN the registry limits, never loosen them, so a
   // caller (or a test) can never archive a workspace/archive that exceeds the
@@ -734,6 +772,18 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
         prior.sha256,
         quotas.archiveMaxCompressedBytes,
       );
+      // Beyond the pathname, the workspace at that path must still be the EXACT
+      // SAME INODE the attempt archived (round-11 finding 3): a directory
+      // rm+recreated at the same path is a different (dev,ino) and must NOT be
+      // destroyed. Enforced when the sidecar recorded the identity. Checked LAST,
+      // immediately before the destroy.
+      if (prior.workspaceDev !== undefined && prior.workspaceIno !== undefined) {
+        assertWorkspaceUnchanged(
+          workspaceReal,
+          { dev: prior.workspaceDev, ino: prior.workspaceIno },
+          opts.attemptId,
+        );
+      }
       // Stamps reconstructed from the sidecar; the ledger row is NOT re-recorded.
       const archiveWrittenAt = prior.archiveWrittenAt;
       const ledgerRowAt = nextStamp(now, archiveWrittenAt);
@@ -819,6 +869,8 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
     issueId: opts.issueId,
     attemptId: opts.attemptId,
     workspacePath: workspaceReal,
+    workspaceDev: workspaceIdentity.dev,
+    workspaceIno: workspaceIdentity.ino,
     archiveWrittenAt,
     seq,
     sha256,

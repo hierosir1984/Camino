@@ -393,6 +393,29 @@ describe("CAM-EXEC-02 — zero GitHub credentials + provider auth read-only", ()
       const probes = parseProbes(r.stdout);
       expect(probeOf(probes, "github-cred-env").out).toBe("clean");
       expect(probeOf(probes, "github-cred-fs").out).toBe("clean");
+      expect(probeOf(probes, "github-cred-content").out).toBe("clean");
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    "the CONTENT credential probe detects a GitHub token that no filename check would catch (round-11 finding 9)",
+    async () => {
+      // A gh-style hosts.yml with a modern token, under a filename the name-based
+      // probe ignores. If the content scan works, it must REPORT it (not "clean").
+      const planted = path.join(workspaceHostDir, "config", "gh", "hosts.yml");
+      const { mkdirSync, rmSync } = await import("node:fs");
+      mkdirSync(path.dirname(planted), { recursive: true });
+      writeFileSync(planted, `github.com:\n  oauth_token: ghp_${"A".repeat(36)}\n`);
+      try {
+        const r = await profiledWorkerRun([{ host: ALLOWED, port: ENDPOINT_PORT }]);
+        const probes = parseProbes(r.stdout);
+        expect(probeOf(probes, "github-cred-fs").out).toBe("clean"); // filename check misses it
+        expect(probeOf(probes, "github-cred-content").out).not.toBe("clean"); // content check catches it
+        expect(probeOf(probes, "github-cred-content").out).toContain("hosts.yml");
+      } finally {
+        rmSync(path.join(workspaceHostDir, "config"), { recursive: true, force: true });
+      }
     },
     TEST_TIMEOUT,
   );

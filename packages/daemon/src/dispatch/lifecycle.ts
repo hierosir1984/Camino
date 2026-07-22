@@ -138,11 +138,14 @@ const MAX_LINE_CHARS = 1_000_000;
 const LINE_TRUNCATED_MARK = "…[camino:line-truncated]";
 
 // A budget timer that fires more than this far past its deadline was delayed by a
-// daemon event-loop STALL (far above normal timer jitter/scheduling, ~tens of
-// ms). Past it, the wall-clock breach is re-confirmed on the next tick to reject a
-// not-yet-reaped zombie leader (round-10 finding 9); within it, the breach fires
-// synchronously so it keeps precedence over a same-boundary timeout.
-const STALL_GRACE_MS = 250;
+// daemon event-loop STALL. Within it (normal timer jitter), the breach fires
+// SYNCHRONOUSLY so it keeps precedence over a same-boundary timeout (round-1
+// finding 7). Past it, the timer does NOTHING and the stall case is decided by the
+// reliable post-reap exit-handling check below — because a leader that exited IN
+// TIME but is not yet reaped is a zombie that a late groupAlive() would misread
+// (round-10 finding 9, round-11 finding 5). Kept small so a load-delayed zombie
+// (tens–hundreds of ms) falls to the reliable path rather than the synchronous one.
+const STALL_GRACE_MS = 50;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -878,11 +881,13 @@ export async function dispatch(
         if (killReason || budgetBreach) return;
         const pid = child?.pid;
         if (pid == null || !groupAlive(pid)) return;
-        // ON-TIME path only. When the loop is healthy the timer fires at the
-        // deadline while the group is genuinely alive (the leader is still running,
-        // or a real descendant is) — no exit/reap can be pending, so groupAlive()
-        // is trustworthy. Breach SYNCHRONOUSLY so the budget takes precedence over a
+        // ON-TIME path only. When the loop is healthy the timer fires within
+        // ~jitter of the deadline while the group is genuinely alive (the leader is
+        // still running, or a real descendant is), so groupAlive() is trustworthy
+        // and we breach SYNCHRONOUSLY — the budget takes precedence over a
         // same-boundary timeout (round-1 finding 7), which fires right after this.
+        // The window is kept SMALL (STALL_GRACE_MS) precisely so a load-delayed
+        // zombie leader cannot linger inside it and be misread as alive.
         //
         // If the timer fired LATE (a daemon event-loop STALL delayed it past
         // limit+STALL_GRACE_MS), we do NOTHING here: a leader that exited IN TIME
