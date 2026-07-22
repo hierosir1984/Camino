@@ -54,7 +54,8 @@ async function api(
 beforeEach(async () => {
   const dir = mkdtempSync(join(tmpdir(), "camino-register-http-"));
   // One shared fixed clock: an honest waiver co-timestamped with its finding
-  // must still bind (round 3, finding 4 — the recency guard is "no earlier than").
+  // must still bind — waiver binding does not depend on timestamps (the
+  // cross-log recency guard was removed; binding is by tuple/context/seq).
   const now = () => new Date("2026-07-03T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });

@@ -35,12 +35,12 @@ let service: RegisterService;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "camino-register-"));
-  // One shared, FIXED clock across every store, deliberately (round 3, finding
-  // 4): the fact store and the disposition store stamp the SAME millisecond, so
-  // an honest service-recorded waiver is co-timestamped with its finding and
-  // MUST still bind (the recency guard is "no earlier than", and the service
-  // decided against the live projection). A strictly-after guard would leave
-  // this waiver persisted-but-inert; this fixture would catch that regression.
+  // One shared, FIXED clock across every store, deliberately: the fact store
+  // and the disposition store stamp the SAME millisecond, so an honest
+  // service-recorded waiver is co-timestamped with its finding and MUST still
+  // bind. Waiver binding does not depend on timestamps at all (the cross-log
+  // recency guard was removed — see foldDisposition); this fixture guards
+  // against any regression that reintroduces a timestamp dependence.
   const now = () => new Date("2026-07-03T00:00:00.000Z");
   canonLedger = new CanonLedgerStore(join(dir, "canon-ledger.sqlite"), { now });
   canonFacts = new CanonFactsStore(join(dir, "canon-facts.sqlite"), { now });

@@ -22,8 +22,9 @@ process can bind the port. If the user's browser loads the origin during such a 
 page served by that process runs *as the GUI's origin* and can register a **service
 worker** — a script the browser persists per-origin and re-activates on every later visit,
 even after the port returns to the real daemon. A worker planted this way can read what the
-page holds (the per-launch GUI token as it is entered), intercept every request, and drive
-the API with the user's own credentials.
+page holds (the persisted GUI token as it is entered — note the token is NOT rotated per
+launch today; see §4.4), intercept every request, and drive the API with the user's own
+credentials.
 
 This needs no filesystem write, so the token-file (0600) and GUI-tree (plain-tree + inode
 pin) boundaries do not cover it. The WP-102 mitigation — `worker-src 'none'` in the CSP —

@@ -126,9 +126,10 @@ class DispositionLog {
     requirementId: string,
     event: GapDispositionEventName,
     payload: Record<string, unknown>,
-    // Disposition timestamps default AFTER the FactLog's (2026-07-02) so an
-    // honest waiver is recorded no earlier than the finding it waives; a
-    // pre-seed test passes an earlier value explicitly.
+    // The recordedAt is deliberately IRRELEVANT to whether a waiver binds
+    // (the cross-log timestamp guard was removed — see foldDisposition): a
+    // waiver binds by (tuple, context, waivedThroughSeq). The default and the
+    // explicit overrides here just exercise that timestamps do not matter.
     recordedAt = "2026-07-03T00:00:00.000Z",
   ): GapDispositionRecord {
     this.#seq += 1;

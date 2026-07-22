@@ -62,9 +62,10 @@
  * Partial mitigation here: `worker-src 'none'` (the legitimate GUI never uses a
  * worker). It does NOT evict a worker already registered by a squatter.
  *
- * WP-122 designed the complete fix — see docs/design/18-gui-origin-isolation.md,
- * which SUPERSEDES the sketch in this paragraph. Two corrections that document
- * establishes and this comment must not contradict: (1) a per-launch PATH nonce
+ * WP-122 documented the fix DIRECTION — see docs/design/18-gui-origin-isolation.md,
+ * a design SKETCH (its mechanics are not yet complete) that SUPERSEDES the sketch
+ * in this paragraph. Two corrections that document establishes and this comment
+ * must not contradict: (1) a per-launch PATH nonce
  * does NOT isolate — service workers partition by origin, not path — so the
  * origin itself must rotate (a per-launch `*.localhost` subdomain nonce); (2) the
  * GUI token is NOT rotated per launch today (`loadOrCreateToken` reuses the
