@@ -14,7 +14,12 @@ import { classifyErrorTextForQuota, sumUsageTokens } from "../quota.js";
  * CAM-SEC-06); the adapter passes no credential-shaped env.
  */
 export function claudeAdapter(
-  opts: { enabled?: boolean; disabledReason?: string; resolvedPath?: string } = {},
+  opts: {
+    enabled?: boolean;
+    disabledReason?: string;
+    disabledCause?: "cli-absent" | "sanctioned-path";
+    resolvedPath?: string;
+  } = {},
 ): AdapterSpec {
   // Spawn the ABSOLUTE executable the registry resolved at gate time, never the
   // bare name re-resolved against the worker's untrusted cwd (round-8 finding
@@ -25,6 +30,7 @@ export function claudeAdapter(
     name: "claude-code",
     enabled: opts.enabled ?? true,
     ...(opts.disabledReason ? { disabledReason: opts.disabledReason } : {}),
+    ...(opts.disabledCause ? { disabledCause: opts.disabledCause } : {}),
     plan(ctx: AdapterContext): SpawnPlan {
       const args = [
         "-p",

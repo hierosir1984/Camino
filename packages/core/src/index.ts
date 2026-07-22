@@ -99,6 +99,7 @@ export {
   foldLedgerView,
   recordedAtProblem,
   safeErrorLabel,
+  singleLineTextProblem,
   verifyLedgerLog,
 } from "./canon-intent.js";
 export type {
@@ -122,6 +123,24 @@ export {
 } from "./canon-status.js";
 export type { ExplainedStatus, FactValidation, ProjectionRule } from "./canon-status.js";
 
+// WP-122: gap register — projection + disposition decisions (CAM-CANON-05,
+// CAM-CORE-09/10).
+export {
+  decideGapDisposition,
+  gapDispositionPayloadProblem,
+  projectGapRegister,
+  statusTupleEquals,
+  statusTupleProblem,
+  verifyGapDispositionLog,
+} from "./gap-register.js";
+export type {
+  GapDispositionDecision,
+  GapDispositionLogDivergence,
+  GapDispositionRef,
+  GapFactRef,
+  GapRegisterRow,
+} from "./gap-register.js";
+
 export {
   STANDALONE_FOLD_AGE_DAYS,
   STANDALONE_FOLD_REQUIREMENT_THRESHOLD,
@@ -140,3 +159,26 @@ export type {
   RenderCanonOptions,
   StandaloneFoldDecision,
 } from "./canon-render.js";
+
+// WP-110: pure planning decisions — segmentation, dependency cycles named,
+// checklist totality, the approval gate (CAM-PLAN-01/-02/-11).
+export {
+  segmentPrd,
+  dependencyGraphProblems,
+  findDependencyCycle,
+  formatCycle,
+  checklistProblems,
+  clarificationReferenceProblems,
+  templateProblems,
+  decidePlanApproval,
+  plantedAmbiguityCoverage,
+} from "./plan-validate.js";
+export type {
+  PrdSegment,
+  PlanGateInput,
+  ApprovalRefusal,
+  GateAttestedFacts,
+  ApprovalDecision,
+  PlantedAmbiguity,
+  AmbiguityCoverage,
+} from "./plan-validate.js";

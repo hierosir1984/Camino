@@ -1,4 +1,4 @@
-/* Placeholder GUI styles (WP-102) — replaced by the real app in WP-122+. */
+/* Camino GUI styles (WP-102 shell + WP-122 gap register). */
 :root {
   color-scheme: light dark;
   font-family: system-ui, sans-serif;
@@ -12,7 +12,7 @@ body {
 }
 
 main {
-  max-width: 36rem;
+  max-width: 72rem;
   width: 100%;
   padding: 3rem 1.5rem;
 }
@@ -68,4 +68,90 @@ dd {
 #message {
   min-height: 1.5rem;
   opacity: 0.85;
+}
+
+/* ——— Gap register (WP-122) ——— */
+
+#register-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+#register-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+
+#register-filters select,
+#register-filters input {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+}
+
+#register-count {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+#register-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+#register-table th,
+#register-table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.6rem 0.75rem;
+  border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.requirement-id,
+.tuple-implementation,
+.tuple-evidence,
+.tuple-intent,
+.disposition-value {
+  font-family: ui-monospace, monospace;
+}
+
+.requirement-statement {
+  margin-top: 0.2rem;
+}
+
+.requirement-assumption,
+.provenance-fact,
+.provenance-empty,
+.disposition-reason {
+  font-size: 0.8rem;
+  opacity: 0.75;
+  margin-top: 0.2rem;
+}
+
+.col-actions {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 11rem;
+}
+
+.col-actions button {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+.action-reason {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.5rem;
+}
+
+.action-descope {
+  opacity: 0.7;
 }

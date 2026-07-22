@@ -1,10 +1,12 @@
 <!doctype html>
 <!--
-  Placeholder GUI shell (WP-102). Proves the daemon-served GUI contract
-  end-to-end: token handoff, authenticated API calls, CSRF header on
-  state-changing calls. The React + Vite application replaces this in
-  WP-122/123/124; the daemon serving path and auth flow stay the same.
-  CSP is self-only, so all script/style lives in separate files.
+  Camino GUI shell (WP-102 auth flow + WP-122 gap register). Framework-
+  free by deliberate choice for this surface (registry item 9 scopes the
+  register to "table with filters + disposition actions only"); a bundler
+  pipeline arrives with the board/inbox work (WP-123) if that surface
+  needs one. CSP is self-only, so all script/style lives in separate
+  files; all dynamic content is rendered via textContent (never markup
+  built from data).
 -->
 <html lang="en">
   <head>
@@ -16,7 +18,7 @@
   <body>
     <main>
       <h1>Camino</h1>
-      <p class="tagline">Local mission control — daemon shell (WP-102 placeholder GUI)</p>
+      <p class="tagline">Local mission control</p>
 
       <section id="connect" hidden>
         <h2>Connect</h2>
@@ -46,6 +48,70 @@
         </dl>
         <button id="shutdown">Stop daemon</button>
         <button id="disconnect" class="secondary">Forget token</button>
+      </section>
+
+      <!-- Gap register (WP-122): requirement → status tuple → evidence
+           provenance → disposition, rendered exclusively from
+           /api/register (the ledger projection — CAM-CORE-10). -->
+      <section id="register" hidden>
+        <h2>Gap register</h2>
+        <p id="register-unavailable" hidden>
+          The register has no repository context yet — repository head tracking arrives with a later
+          work package. Rows appear once a context is recorded.
+        </p>
+        <div id="register-controls" hidden>
+          <fieldset id="register-filters">
+            <legend>Filters</legend>
+            <label>
+              Disposition
+              <select id="filter-disposition">
+                <option value="">all</option>
+                <option value="open">open</option>
+                <option value="fix-queued">fix-queued</option>
+                <option value="disputed">disputed</option>
+                <option value="false-positive-waived">false-positive-waived</option>
+              </select>
+            </label>
+            <label>
+              Implementation
+              <select id="filter-implementation">
+                <option value="">all</option>
+                <option value="absent">absent</option>
+                <option value="present-on">present-on</option>
+                <option value="on-main">on-main</option>
+                <option value="suspected-absent">suspected-absent</option>
+              </select>
+            </label>
+            <label>
+              Evidence
+              <select id="filter-evidence">
+                <option value="">all</option>
+                <option value="unverified">unverified</option>
+                <option value="verified-live">verified-live</option>
+                <option value="stale">stale</option>
+                <option value="blocked">blocked</option>
+              </select>
+            </label>
+            <label>
+              Search
+              <input id="filter-text" type="search" placeholder="id or statement" />
+            </label>
+          </fieldset>
+          <p id="register-count" role="status"></p>
+          <table id="register-table">
+            <thead>
+              <tr>
+                <th scope="col">Requirement</th>
+                <th scope="col">Status tuple</th>
+                <th scope="col">Evidence provenance</th>
+                <th scope="col">Disposition</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="register-rows"></tbody>
+          </table>
+          <p id="register-empty" hidden>No register rows match the current filters.</p>
+        </div>
       </section>
 
       <p id="message" role="status"></p>

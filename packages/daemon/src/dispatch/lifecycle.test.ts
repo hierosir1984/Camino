@@ -194,13 +194,23 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
     const ws = makeWorkspace();
     try {
       const ac = new AbortController();
-      const pending = dispatch(
+      // Abort on the mock's first stdout line, NOT a fixed delay: the mock
+      // writes .mock-pid and installs its SIGTERM-ignore handler before its
+      // first emit, so an event-keyed abort can neither race the pid file
+      // (ENOENT on a loaded host) nor SIGTERM the mock mid-bootstrap — the
+      // same readiness pattern as the orphan-mode handshake in mock-cli.mjs.
+      const rec = await dispatch(
         mockAdapter("hang"),
         { workdir: ws, prompt: "run forever" },
-        { signal: ac.signal, killConfirm: FAST_KILL, timeoutMs: 30_000 },
+        {
+          signal: ac.signal,
+          killConfirm: FAST_KILL,
+          timeoutMs: 30_000,
+          onLine: (channel) => {
+            if (channel === "stdout") ac.abort();
+          },
+        },
       );
-      setTimeout(() => ac.abort(), 300);
-      const rec = await pending;
       expect(rec.outcome).toBe("cancelled"); // not "killed": abort is a cancel
       expect(rec.killConfirm?.groupGone).toBe(true);
       expect(anyGroupAlive(mockPid(ws))).toBe(false);

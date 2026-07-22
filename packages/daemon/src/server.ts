@@ -52,21 +52,28 @@
  * that exists; the headers are guaranteed on every response the application
  * itself produces.
  *
- * KNOWN LIMITATION — loopback-origin service-worker squatting (round 5, finding
- * 1): the daemon's origin (http://127.0.0.1:<port>) is not exclusively owned by
- * the daemon across restarts. A malicious LOCAL process can bind the port while
- * the daemon is stopped and, if the user's browser loads that origin, register a
- * persistent service worker that survives the port returning to the real daemon
- * and can then read the GUI token and drive the API. This needs no filesystem
- * write, so it is outside the token/GUI directory boundaries. Partial mitigation
- * here: `worker-src 'none'` (the legitimate GUI never uses a worker; the token
- * is per-launch). It does NOT evict a worker already registered by a squatter.
- * The complete fix is an origin a squatter cannot pre-seed — an ephemeral
- * per-launch port, or a per-launch path/subdomain nonce — which changes the
- * daemon⇄GUI addressing contract. DECISION (David, 2026-07-19): DEFERRED to the
- * real GUI/launch work (WP-122+), where the addressing contract is designed;
- * this shell keeps the `worker-src 'none'` partial mitigation and the
- * placeholder GUI uses no service worker.
+ * KNOWN LIMITATION — loopback-origin service-worker squatting (WP-102 review
+ * round 5, finding 1): the daemon's origin (http://127.0.0.1:<port>) is not
+ * exclusively owned by the daemon across restarts. A malicious LOCAL process can
+ * bind the port while the daemon is stopped and, if the user's browser loads that
+ * origin, register a persistent service worker that survives the port returning
+ * to the real daemon and can then read the GUI token and drive the API. This
+ * needs no filesystem write, so it is outside the token/GUI directory boundaries.
+ * Partial mitigation here: `worker-src 'none'` (the legitimate GUI never uses a
+ * worker). It does NOT evict a worker already registered by a squatter.
+ *
+ * WP-122 documented the fix DIRECTION — see docs/design/18-gui-origin-isolation.md,
+ * a design SKETCH (its mechanics are not yet complete) that SUPERSEDES the sketch
+ * in this paragraph. Two corrections that document establishes and this comment
+ * must not contradict: (1) a per-launch PATH nonce
+ * does NOT isolate — service workers partition by origin, not path — so the
+ * origin itself must rotate (a per-launch `*.localhost` subdomain nonce); (2) the
+ * GUI token is NOT rotated per launch today (`loadOrCreateToken` reuses the
+ * on-disk token), so token rotation is a REQUIRED companion of that design, not
+ * an existing property. DECISION (David, 2026-07-19): the addressing/token
+ * mechanics are DEFERRED to the WP that implements design 18 (placement ruling
+ * pending); this shell keeps the `worker-src 'none'` partial mitigation and the
+ * GUI uses no service worker.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
@@ -77,6 +84,9 @@ import Fastify from "fastify";
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { BIND_HOST } from "./config.js";
+import { RegisterActionError } from "./register-service.js";
+import type { RegisterActionInput as RegisterActionInputShape } from "./register-service.js";
+import type { RegisterAsOf, RegisterService } from "./register-service.js";
 import { generateToken } from "./token.js";
 
 export interface BuildServerOptions {
@@ -84,6 +94,29 @@ export interface BuildServerOptions {
   token: string;
   /** Directory served as the GUI build; missing directory → 503 hint page. */
   guiRoot?: string;
+  /**
+   * The gap-register surface (WP-122). Optional so the bare shell keeps
+   * working; when absent, /api/register answers 503 register-not-wired —
+   * an explicit refusal, not a 404 that could be mistaken for a routing
+   * bug. All register routes sit behind the same global policy hook as
+   * every other route (token + CSRF, by construction).
+   */
+  register?: RegisterService;
+  /**
+   * Run once when the Fastify instance closes (SIGINT/SIGTERM, /api/shutdown,
+   * or a listen failure that reaches close). Registered as an `onClose` hook
+   * BEFORE `listen()` — the daemon's durable stores hang their teardown here
+   * so it fires on every shutdown path, not just the signal handlers. Must be
+   * best-effort internally: a throw is logged, never left to crash close.
+   */
+  onClose?: () => void | Promise<void>;
+  /**
+   * Invoked when a client POSTs /api/shutdown. The process owner (main.ts)
+   * passes its `stop` here so the HTTP shutdown path shares the single
+   * teardown-aware, force-guarded exit route as SIGTERM/SIGINT (round 4,
+   * finding 2). When absent, the endpoint closes the instance directly.
+   */
+  onShutdownRequest?: () => void;
   logger?: boolean;
 }
 
@@ -282,6 +315,24 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
     bodyLimit: 1024 * 1024,
   });
 
+  // Store teardown rides an onClose hook registered HERE — before the caller
+  // ever gets the instance to listen() on — so it cannot hit Fastify's
+  // "already listening, cannot addHook" refusal (round 1, finding 1: main.ts
+  // registered it after startDaemonServer had already listened, crashing the
+  // daemon on boot). It fires on every close path: signals, /api/shutdown, and
+  // a post-listen failure. Best-effort: a throwing closer is logged, never
+  // propagated into close().
+  if (options.onClose !== undefined) {
+    const onClose = options.onClose;
+    app.addHook("onClose", async () => {
+      try {
+        await onClose();
+      } catch (error) {
+        app.log.error(error, "daemon store teardown failed during close");
+      }
+    });
+  }
+
   const csrfToken = generateToken();
   const guiRoot = options.guiRoot;
   const guiExists = guiRoot !== undefined && existsSync(guiRoot);
@@ -416,16 +467,114 @@ export function buildServer(options: BuildServerOptions): FastifyInstance {
 
   // Graceful stop, so the GUI can shut the daemon down — and so the shell
   // ships with a real state-changing endpoint under the full policy stack.
+  // When the process owner supplies `onShutdownRequest` (main.ts), route
+  // through it so shutdown shares the ONE stop path — the same teardown-aware,
+  // force-guarded exit as a signal (round 4, finding 2: closing the app here
+  // directly left the HTTP shutdown path unable to report a teardown failure or
+  // guarantee process exit). Absent it (the bare WP-102 shell / tests), fall
+  // back to closing the instance directly.
+  const onShutdownRequest = options.onShutdownRequest;
   let stopping = false;
   app.post("/api/shutdown", async () => {
     if (!stopping) {
       stopping = true;
       setImmediate(() => {
-        void app.close();
+        if (onShutdownRequest !== undefined) onShutdownRequest();
+        else void app.close();
       });
     }
     return { stopping: true };
   });
+
+  // ——— Gap register (WP-122, CAM-CANON-05 / CAM-CORE-09 / CAM-CORE-10) ———
+  // The GUI's ONLY canon/requirement read path: everything below returns
+  // ledger projections computed by the register service; no repo canon
+  // text is reachable from these handlers (see register-service.ts for
+  // the full CAM-CORE-10 construction argument).
+  const register = options.register;
+  const registerErrorStatus: Record<RegisterActionError["code"], number> = {
+    unavailable: 503,
+    malformed: 400,
+    "register-advanced": 409,
+    "unknown-row": 404,
+    refused: 409,
+  };
+  const sendRegisterError = (reply: FastifyReply, error: unknown): FastifyReply => {
+    if (error instanceof RegisterActionError) {
+      return reply
+        .code(registerErrorStatus[error.code])
+        .send({ error: error.code, problem: error.message });
+    }
+    throw error; // genuine daemon bug → the generic error handler
+  };
+  /** Body must be a plain JSON object (Fastify parsed it; refuse arrays/null). */
+  const plainBody = (body: unknown): Record<string, unknown> | null =>
+    body !== null && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : null;
+  /**
+   * Read a body field by OWN property only (round 2, finding 4): never inherit
+   * from a polluted Object.prototype. A missing field reads as undefined, which
+   * the register service then validates and refuses — an empty `{}` body can
+   * never borrow an `action`/`asOf` from the prototype chain.
+   */
+  const field = (body: Record<string, unknown>, key: string): unknown =>
+    Object.hasOwn(body, key) ? body[key] : undefined;
+
+  app.get("/api/register", async (request, reply) => {
+    if (register === undefined) {
+      return reply.code(503).send({ error: "register-not-wired" });
+    }
+    return register.snapshot();
+  });
+
+  app.post<{ Params: { requirementId: string } }>(
+    "/api/register/:requirementId/disposition",
+    async (request, reply) => {
+      if (register === undefined) {
+        return reply.code(503).send({ error: "register-not-wired" });
+      }
+      const body = plainBody(request.body);
+      if (body === null) {
+        return reply.code(400).send({ error: "malformed", problem: "body must be a JSON object" });
+      }
+      try {
+        // Own-property reads only (round 2, finding 4); the service validates
+        // every field at runtime (action membership, reason hygiene, asOf
+        // shape) — the casts only name the wire shape.
+        const waived = field(body, "waivedThroughSeq");
+        return register.recordDisposition(request.params.requirementId, {
+          action: field(body, "action") as RegisterActionInputShape["action"],
+          reason: field(body, "reason") as string,
+          asOf: field(body, "asOf") as RegisterAsOf,
+          ...(waived === undefined ? {} : { waivedThroughSeq: waived as number }),
+        });
+      } catch (error) {
+        return sendRegisterError(reply, error);
+      }
+    },
+  );
+
+  app.post<{ Params: { requirementId: string } }>(
+    "/api/register/:requirementId/descope",
+    async (request, reply) => {
+      if (register === undefined) {
+        return reply.code(503).send({ error: "register-not-wired" });
+      }
+      const body = plainBody(request.body);
+      if (body === null) {
+        return reply.code(400).send({ error: "malformed", problem: "body must be a JSON object" });
+      }
+      try {
+        return register.descope(request.params.requirementId, {
+          reason: field(body, "reason") as string,
+          asOf: field(body, "asOf") as RegisterAsOf,
+        });
+      } catch (error) {
+        return sendRegisterError(reply, error);
+      }
+    },
+  );
 
   if (guiValid) {
     // Serve from the single resolved real path (round 4, finding 2). Two

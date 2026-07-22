@@ -134,7 +134,7 @@ Container profile for validation: default-deny egress with an allowlist; literal
 
 ---
 
-## 3. Phase 1 — Walking skeleton (26 work packages)
+## 3. Phase 1 — Walking skeleton (27 work packages)
 
 Phase-1 exit (PRD §7): one real feature mission (3–6 issues) delivered end-to-end on a real repository — plan approved with its falsification review attached, issues implemented by ≥2 adapter families, validated in clean environments, merged via merge-by-push through the integration branch to main with David approving against rendered evidence packets **in the viewer**, fold rendered, gap register populated; chaos suite (CAM-STATE-06) passing; economics instrumentation live — all under the walking-skeleton posture: **one repo, PAT, polling, training mode**.
 
@@ -305,10 +305,11 @@ Integration branch `mission/<id>` + mission PR opened at branch creation; quick-
 - Registers its §4.4 kill-point integration fixtures (**branch create**, PR create/close, labels, comments classes — branch-create exercised against real ref creation on the fixture repo) into the WP-104 chaos matrix — **CAM-STATE-06** tie (r3 correction 4).
 
 #### WP-121 · ExternalEdit detection + intent reconciliation
-Polling detection (commits, branch create/delete, PR field changes, protection changes, non-ff moves) on watched branches; canon-impact scan of external commits → proposed-delta questions to David; affected issues pause pending impact assessment.
+Polling detection (commits, branch create/delete, PR field changes, protection changes, non-ff moves) on watched branches; canon-impact scan of external commits → proposed-delta questions to David; affected issues pause pending impact assessment. **Also wires the gap register's production context source** (David 2026-07-22): the poller already tracks the configured repo's main-branch head, which is exactly the reader-context head the register (WP-122) projects the MAIN context against — so this WP supplies it and the production register becomes populated instead of `available:false`.
 **Accept:**
 - Non-Camino pushes raise ExternalEdit events (detection, not prevention); transient A→B→A between polls documented as the v1 limitation — **CAM-MERGE-11**.
 - Fixture external commit adding user-visible behavior → proposed-delta question, no automatic canon change; fixture deletion of a verified requirement's implementation → `suspected-absent` + register question — **CAM-CANON-06**.
+- The register's production `contextSource` is wired from the repo-head poller (a real main-context head SHA, refreshed each poll), so `GET /api/register` returns `available:true` and renders tuples on the configured repo; the production-render acceptance of **CAM-CORE-09/CAM-CORE-10** — deferred at WP-122 (which shipped `available:false` until a head source existed) — **closes here (issue #29 closes on this WP's merge)**.
 
 ### Track E — Surface & instrumentation
 
@@ -338,6 +339,14 @@ Per-attempt outcome ledger; mission economics; attention accounting with the ove
 - Every mission records David-minutes, tokens, dollars/quota, wall-clock, outcome, per-issue delivered flags — **CAM-OBS-01**.
 - Budgets per registry item 3: 15 min routine attention per merged issue-equivalent (trailing 30-day), 45 min per mission plan; **2 consecutive over-budget weeks emit the explicit-choice escalation** (raise budget / pause autonomy expansion / tighten ceremony) whose answer is recorded as an event — rendered via the WP-123 inbox — **CAM-OBS-02**.
 
+#### WP-127 · GUI origin isolation: per-launch nonce origin + token rotation
+Completes and implements the WP-102 deferred residual (David 2026-07-19 deferred "to WP-122+"; WP-122 produced the design SKETCH at `docs/design/18-gui-origin-isolation.md` with an open-problems §7). This WP first RESOLVES design 18 §7 (the dual-stack-exclusive single-listener mechanics, the `*.localhost` resolution probe/fallback specification, the token-rotation-after-lock lifecycle, and the atomic token-file replacement) then implements it: the daemon serves the GUI at a per-launch `<nonce>.localhost:<port>` origin a local squatter cannot pre-seed, binds both loopback families exclusively, rotates the GUI token per launch, and answers stale/legacy authorities with a launch-hint page. Hardens **CAM-CORE-01**'s loopback surface; the interim `worker-src 'none'` mitigation stays until this ships.
+**Accept:**
+- The served origin changes every launch and the daemon owns both loopback families exclusively on the port (startup fails closed if either is taken); a request bearing a *previous* launch's authority is refused; a fixture asserting startup refuses when `[::1]:<port>` is pre-bound — **CAM-CORE-01** (origin-isolation clause).
+- The GUI token is rotated per launch (a prior launch's token no longer authenticates) and rotation happens only after the writer lock is held, so a losing concurrent launch cannot corrupt the winner's token custody; atomic token-file replacement survives an interrupted rotation.
+- `*.localhost` resolution is probed at launch with a documented `CAMINO_GUI_HOST=127.0.0.1` opt-out fallback (which explicitly forgoes isolation); the fixed override may only be `127.0.0.1`, never a reusable `*.localhost` value.
+- Named residual retained honestly: a service worker already planted on a *stale* origin can still serve cached content to a user who revisits that origin (the nonce keeps it off the current session; it does not evict it).
+
 ### Exit
 
 #### WP-126 · Phase-1 exit: first real mission end-to-end
@@ -359,7 +368,7 @@ Run the PRD §7 Phase-1 exit on a real repository, clause by clause.
 
 | Requirement | WP | Requirement | WP |
 |---|---|---|---|
-| CAM-CORE-01 | 102 | CAM-MERGE-01 | 120 |
+| CAM-CORE-01 | 102, 127 | CAM-MERGE-01 | 120 |
 | CAM-CORE-02 | 103 | CAM-MERGE-02 | 119 |
 | CAM-CORE-03 | 123 | CAM-MERGE-03 | 119 |
 | CAM-CORE-04 | 123, 126 | CAM-MERGE-04 | 120 |
@@ -367,8 +376,8 @@ Run the PRD §7 Phase-1 exit on a real repository, clause by clause.
 | CAM-CORE-06 | 103 | CAM-MERGE-06 | 119 |
 | CAM-CORE-07 | 124 | CAM-MERGE-07 | 120 |
 | CAM-CORE-08 | 103 | CAM-MERGE-08 | 118 |
-| CAM-CORE-09 | 122 | CAM-MERGE-10 | 119 |
-| CAM-CORE-10 | 122 | CAM-MERGE-11 | 121 |
+| CAM-CORE-09 | 122, 121 | CAM-MERGE-10 | 119 |
+| CAM-CORE-10 | 122, 121 | CAM-MERGE-11 | 121 |
 | CAM-PLAN-01 | 110 | CAM-MERGE-12 | 120 |
 | CAM-PLAN-02 | 110 | CAM-MERGE-13 | 120 |
 | CAM-PLAN-03 | 111 | CAM-CANON-01 | 109 |
@@ -449,11 +458,12 @@ Explicit graph — a WP starts when its dependencies are merged; issue links enc
 | 118 | 103, **115** (risk-model statement in onboarding material) |
 | 119 | 104, 108, 116, 117, 118 |
 | 120 | **104** (chaos-matrix registration), 109, 111, 119 |
-| 121 | 109, 118 |
+| 121 | 109, 118, **122** (wires the register's production context source; closes #29) |
 | 122 | 102, 109 |
 | 123 | 101, 102, **116** (renders evidence-packet artifacts in the inbox) |
 | 124 | 116, 123 |
 | 125 | 101, 105, 106, 114, **123** (escalation-artifact contract) |
+| 127 | 102, 122 |
 | 126 | all of the above |
 
 Waves (parallel projection; no WP shares a wave with any dependency; r3 correction 2 applied):
@@ -461,13 +471,13 @@ Waves (parallel projection; no WP shares a wave with any dependency; r3 correcti
 1. **W1:** 101, 102
 2. **W2:** 103, 104, 109 · 105 (after Phase 0)
 3. **W3:** 106, 107, 110, 122
-4. **W4:** 108, 113, 114
+4. **W4:** 108, 113, 114, **127**
 5. **W5:** 111, 112, 115, 116
 6. **W6:** 117, 118, 123
 7. **W7:** 119, 124, 125
 8. **W8:** 120, 121* → then **126**
 
-\* 121's dependencies (109, 118) clear at the end of W6, so its earliest slot is W7; it is placed in W8 to keep David's per-wave review load flat. 118 sits in W6 because it consumes WP-115's risk-model statement in its onboarding material; 123 follows 116 because the inbox renders packet artifacts; 124/125 follow 123.
+\* 121's dependencies (109, 118, 122) clear at the end of W6 (118 is the latest, in W6), so its earliest slot is W7; it is placed in W8 to keep David's per-wave review load flat. 118 sits in W6 because it consumes WP-115's risk-model statement in its onboarding material; 123 follows 116 because the inbox renders packet artifacts; 124/125 follow 123. **127** (GUI origin isolation) sits in W4 — its dependencies 102 (W1) and 122 (W3) both clear before it, and it lands the addressing/token contract before WP-123 (W6) builds daily-use GUI habits on top of it.
 
 ## 6. What happens on approval
 
@@ -480,3 +490,20 @@ Waves (parallel projection; no WP shares a wave with any dependency; r3 correcti
 - **Round 1** (Codex gpt-5.6-sol xhigh, 2026-07-16): "safe to build on: **no**" — 19 findings; all accepted and folded into v2 (two with recorded nuances: urgent-lane P1 structure vs CAM-PLAN-10 [P2] workflow; xAI recording semantics).
 - **Round 2** (same reviewer, 2026-07-16): "safe to build on: **no**" — 13 findings; regression table on round 1: 13 resolved, 6 partial, 0 unresolved; P1 ID inventory, scaffold-vs-§6, and Phase-1 exit fidelity independently CONFIRMED. All 13 findings folded into v3, including: the artifact-level dependency edges (packet schema, contract, quarantined diff, lease interface) with re-cut waves; §4.4 full-table idempotency + workflow-dispatch at-most-once clause with satisfiable WP-104 timing; the xAI item moved into the WP-000 entry gate; CAM-SEC-05's onboarding clause; CAM-AUTON-01's post-revocation reset; CAM-MERGE-13's checklist; CAM-CANON-09's visibility boundaries; enumerated registry globs + all three risk tiers + register filters; registry items 14/17 re-homed; CAM-ROUTE-08 dual ownership (000 gate + 105 runbook); the CI-enforced core import fence; the WP-125 single-package rescope; and allowlist-positive egress + read-only provider-auth fixtures.
 - **Round 3** (same reviewer, verify-only, 2026-07-16): "safe to build on: **with corrections**" — r2 regressions: 10 resolved, 3 partial; r1 partials: 4 resolved, 2 partial; 2 new defects (both graph/ownership mechanics); wave consistency and all changed matrix rows independently verified clean. The four listed corrections are folded into this v4: (1) the xAI gate goes green only on the actual contractual confirmation, with a David-approved BUILD.md amendment as the sole alternative; (2) dependency edges 114→104, 115→104, 120→104, 123→116, 125→123 added and waves recut (123 after 116; 124/125 after 123); (3) WP-125 carries an enforced daemon-only diff fence and reuses the WP-123 escalation contract unchanged; (4) real-backend kill-point ownership assigned — branch-create → WP-120, CI/workflow-dispatch → WP-119 — both registering into the WP-104 chaos matrix consumed by WP-126.
+
+## 8. Amendments
+
+### 2026-07-22 — WP-110 decision package (approved by David on PR #57)
+
+The WP-110 falsification review (ten rounds; record on PR #57) established that five obligation halves of WP-110's mapped criteria are delivered by consumer WPs, and that two items were unowned. David approved pinning each into its owning issue as an additional acceptance criterion; the issue bodies carry the same text under "Amendment — 2026-07-22":
+
+1. **WP-114 (#21):** every attempt record carries a `ContractRef` (issueId, contractVersion, contractHash) for the contract it executes — CAM-PLAN-04 attempt half, pinned in `CONTRACT_REFERENCE_OBLIGATIONS`.
+2. **WP-120 (#27):** issue and mission PR bodies embed their `ContractRef`(s) — CAM-PLAN-04 PR half; #27 gains the direct blocked-by edge on #17.
+3. **WP-119 (#26):** push-time policy verifies the PR body's `ContractRef` against the candidate's frozen contract — CAM-PLAN-04 enforcement half.
+4. **WP-113 (#20):** context packs render `dependencyInterfacesFor(issueId, contractVersion)` for the attempt's contract — CAM-PLAN-11 visibility half.
+5. **WP-112 (#19):** change control defines which dependency contract version an in-flight dependent sees after an edit (conservative default: revalidate) — CAM-PLAN-11 version-policy half.
+6. **WP-123 (#30):** the board renders the WP-110 plan view (streaming construction, flagged rows, acknowledgment state) — CAM-PLAN-01 board half; #30 gains the direct blocked-by edge on #17.
+7. **WP-114 (#21), additionally:** recovery composition — `PlanStore` and `PlanningService.resumePendingWork()` join `openRecoveredState` with chaos-matrix coverage, as the first WP that runs planning state in the daemon process.
+8. **WP-122 (#29):** the GUI wave's bundler decision resolves browser compatibility of `@camino/shared`'s node:crypto-backed hashing (split entry, polyfill, or server-only posture).
+
+The quoted-verbatim sections of the issues are unchanged; amendments are appended sections. §5's dependency table gains no new rows beyond the two issue-link edges above (114→110 and 112/113→110 already existed).
