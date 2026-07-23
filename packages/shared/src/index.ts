@@ -259,6 +259,7 @@ export type { ContractTerms, IssueContract, ContractRef } from "./contract.js";
 export {
   CHANGED_PATH_KINDS,
   GIT_OBJECT_NAME_PATTERN_SOURCE,
+  MAX_CHANGED_PATHS,
   WORKER_ATTRIBUTION_TRAILER_KEY,
   isGitObjectName,
   workerAttributionTrailer,

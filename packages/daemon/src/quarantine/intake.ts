@@ -20,13 +20,14 @@ import {
   changedPathsWithStatus,
   commitCandidate,
   distinctObjectCount,
-  fetchFootprint,
+  fetchedObjectCount,
   fetchOid,
   fsckTree,
   initPristineRepo,
   objectSize,
   parentShas,
   QuarantineGitError,
+  storeSizeBytes,
   subjectOf,
   symlinkTargetBytes,
   treeEntryCount,
@@ -115,7 +116,11 @@ export function runIntake(
   // so nothing but those two commits' trees crosses the boundary.
   const pristineDir = initPristineRepo();
   fetchOid(pristineDir, baseRepo, assignment.base, true);
+  // Store size AFTER the base fetch, BEFORE the worker fetch: the delta after the
+  // worker fetch is the ACTUAL packed bytes it transferred (review r3 finding 4).
+  const bytesBeforeWorker = storeSizeBytes(pristineDir);
   const workerHead = fetchOid(pristineDir, workerRepo, workerHeadOid, true);
+  const fetchBytes = storeSizeBytes(pristineDir) - bytesBeforeWorker;
 
   const rejections: Rejection[] = [];
 
@@ -148,12 +153,13 @@ export function runIntake(
   // are not valid UTF-8 decode to U+FFFD and are rejected by checkNameAliases,
   // so they cannot be silently deduped/collapsed (WP-003 r2).
   const entries = treeLeaves(pristineDir, treeSha);
-  // Registry-item-11 FETCH budget consults the DISTINCT transfer footprint —
-  // distinct objects (incl. the commit) and their total bytes (blobs + trees +
-  // commit), measured in one pass (review r1 finding 8 / r2 finding 6). The
-  // per-issue tree POLICY budget consults the materialized entry count (with
-  // repetition), a distinct measure.
-  const footprint = fetchFootprint(pristineDir, workerHead, treeSha);
+  // Registry-item-11 FETCH budget consults the DISTINCT transfer footprint:
+  // distinct objects incl. the commit (r1 #8 / r2 #6), and the ACTUAL packed
+  // bytes the fetch added to the store (`fetchBytes`, measured above as the
+  // store-size delta — the real compressed transfer, r3 #4). The per-issue tree
+  // POLICY budget consults the materialized entry count (with repetition), a
+  // distinct measure.
+  const fetchObjects = fetchedObjectCount(pristineDir, workerHead, treeSha);
   const entryCount = treeEntryCount(pristineDir, treeSha);
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, assignment.base, workerHead);
@@ -173,7 +179,7 @@ export function runIntake(
   rejections.push(
     // Registry-item-11 fetch budget: a HARD outer cap on the DISTINCT shallow-
     // fetch footprint, independent of the per-issue tree-size policy budget below.
-    ...checkFetchBudget(footprint.objects, footprint.bytes),
+    ...checkFetchBudget(fetchObjects, fetchBytes),
     ...checkScopeAndProtected(changed, assignment.allowedPaths),
     ...checkChangedPathValidity(changed),
     ...checkPathCollisions(entries),

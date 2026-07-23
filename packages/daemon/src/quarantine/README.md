@@ -15,7 +15,7 @@ The pieces:
 | [`intake.ts`](intake.ts)                     | `runIntake` — shallow-fetch → merge-commit check → `git fsck` → fetch-budget + policy checks → squash-rebuild → emit the quarantined diff.                                                                                     |
 | [`policy.ts`](policy.ts)                     | The pure policy checks (collect-all): scope vs contract, protected paths, canonical path identity (ICU fold), reserved/trailing-dot/`.git` aliases, symlink targets, submodule/gitlink block, tree + fetch budgets.            |
 | [`git.ts`](git.ts)                           | Credential-free, hooks-disabled git plumbing, run only in the pristine repo (the worker repo is a fetch source, never a working dir a git command runs in).                                                                    |
-| [`workflow-posture.ts`](workflow-posture.ts) | The candidate-ref CI-posture analyzer (WP-003 case 13, CAM-SEC-03) — carried forward verbatim; **enforcement home is WP-118**.                                                                                                 |
+| [`workflow-posture.ts`](workflow-posture.ts) | The candidate-ref CI-posture analyzer (WP-003 case 13, CAM-SEC-03) — behaviour carried forward (only readonly-param / frozen-`CANDIDATE_REFS` edits); **enforcement home is WP-118**.                                          |
 | [`corpus*.ts`](corpus.test.ts)               | The WP-003 rejection corpus driving the product module — its acceptance gate. Every case and expected rejection is preserved; the sole additions are that a rejected intake emits no diff, and product tests for the r1 fixes. |
 
 The emitted **quarantined diff** schema + validator live in
@@ -129,9 +129,10 @@ foo`) or via a SYMLINK whose target the worker edits — closing that requires
   analyzer (CAM-SEC-03). Whether WP-108 should ship a minimal `uses:`-parser or
   defer the complete local-action closure to WP-118 is a scope decision flagged
   for David.
-- **The workflow-posture analyzer is heuristic and its home is WP-118.** It is
-  the WP-003 spike's analyzer verbatim (3 falsification rounds), carried forward
-  so the entire corpus runs green here. Its onboarding-time **enforcement** —
+- **The workflow-posture analyzer is heuristic and its home is WP-118.** Its
+  behaviour is the WP-003 spike's analyzer (3 falsification rounds) carried
+  forward — the only edits are `readonly` parameters and a frozen
+  `CANDIDATE_REFS`, no logic change — so the entire corpus runs green here. Its onboarding-time **enforcement** —
   running these checks at repo onboarding and gating on them — is WP-118
   (CAM-SEC-03); a truly complete symbolic glob∩namespace / GitHub-Actions
   analyzer is that onboarding check. This module's intake does not gate on it.

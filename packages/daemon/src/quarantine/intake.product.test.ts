@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -588,6 +589,60 @@ describe("round-2 falsification fixes", () => {
     const dir = mkdtempTestDir();
     writeFileSync(join(dir, ".git"), "gitdir: /elsewhere/.git/worktrees/w\n");
     expect(() => assertSelfContainedObjectStore(dir)).toThrow(/gitfile\/symlink|real `\.git`/);
+  });
+});
+
+describe("round-3 falsification fixes", () => {
+  /** Base = app.js + `extra`; head = app.js only (deletes `extra`). Returns {repo, base, head}. */
+  function deletingFixture(extraPath: string): { repo: string; base: string; head: string } {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const extra = hashBlob(repo, "x\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: extra, path: extraPath },
+      ]),
+      [],
+      "base",
+    );
+    const head = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [base],
+      "delete extra",
+    );
+    return { repo, base, head };
+  }
+
+  it("protects a Windows-alias DELETION of a protected path (.gitattributes.) — r3 #1", () => {
+    const fx = deletingFixture(".gitattributes."); // trailing dot resolves to .gitattributes
+    const r = runIntake(fx.repo, fx.head, { base: fx.base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("protected-path");
+  });
+
+  it("rejects a backslash DELETION as a policy result, not a thrown emitter — r3 #3", () => {
+    const fx = deletingFixture("docs\\note"); // backslash path, only seen via the changed set
+    const r = runIntake(fx.repo, fx.head, { base: fx.base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("windows-alias");
+    expect(r.diff).toBeNull();
+  });
+
+  it("refuses a commondir redirect and a symlinked objects store — r3 #2", () => {
+    // commondir file (real .git dir but external common store)
+    const a = mkdtempTestDir();
+    mkdirSync(join(a, ".git"), { recursive: true });
+    writeFileSync(join(a, ".git", "commondir"), "/elsewhere/.git\n");
+    expect(() => assertSelfContainedObjectStore(a)).toThrow(/commondir/);
+
+    // symlinked objects dir
+    const b = mkdtempTestDir();
+    mkdirSync(join(b, ".git"), { recursive: true });
+    symlinkSync("/elsewhere/objects", join(b, ".git", "objects"));
+    expect(() => assertSelfContainedObjectStore(b)).toThrow(/symlink/);
   });
 });
 

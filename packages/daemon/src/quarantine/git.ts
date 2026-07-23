@@ -154,11 +154,42 @@ export function assertSelfContainedObjectStore(repo: string): void {
         "have a real `.git` directory so its object store cannot borrow via commondir (CAM-EXEC-02 / review r2 finding 3)",
     );
   }
+  // The git dir: `<repo>/.git` (non-bare) or `<repo>` itself (bare, no `.git`).
+  const gitDir = dotGitStat !== null ? dotGit : repo;
+
+  // A `commondir` file redirects the object store (and refs) to ANOTHER git dir,
+  // even with a real `.git` directory or a bare repo — git honours it and its
+  // upload-pack then serves objects from that external common store (review r3
+  // finding 2). Refuse its presence.
+  if (existsSync(join(gitDir, "commondir"))) {
+    throw new QuarantineGitError(
+      "fetch source has a `commondir` redirect — refused; its object store is external " +
+        "(CAM-EXEC-02 / review r3 finding 2)",
+    );
+  }
+
+  // A SYMLINKED objects store (or its `info` dir) points the whole store — and
+  // thus any alternates within it — outside the repo, another borrowing form the
+  // direct alternates-file check would miss (review r3 finding 2). Refuse a
+  // symlink at `objects` or `objects/info`.
+  for (const rel of [["objects"], ["objects", "info"]]) {
+    const p = join(gitDir, ...rel);
+    try {
+      if (lstatSync(p).isSymbolicLink()) {
+        throw new QuarantineGitError(
+          `fetch source object store path "${rel.join("/")}" is a symlink — refused; the store must ` +
+            "be local (CAM-EXEC-02 / review r3 finding 2)",
+        );
+      }
+    } catch (err) {
+      if (err instanceof QuarantineGitError) throw err;
+      // absent path ⇒ nothing to borrow through; continue.
+    }
+  }
+
   const candidates = [
-    join(repo, ".git", "objects", "info", "alternates"),
-    join(repo, ".git", "objects", "info", "http-alternates"),
-    join(repo, "objects", "info", "alternates"),
-    join(repo, "objects", "info", "http-alternates"),
+    join(gitDir, "objects", "info", "alternates"),
+    join(gitDir, "objects", "info", "http-alternates"),
   ];
   for (const p of candidates) {
     if (existsSync(p)) {
@@ -266,47 +297,39 @@ export function treeLeaves(dir: string, treeSha: string): TreeEntry[] {
   return parseTree(gitBuf(dir, "ls-tree", "-r", "-l", "-z", treeSha).toString("utf8"));
 }
 
-/** The DISTINCT-object transfer footprint of the shallow fetch of `commit`. */
-export interface FetchFootprint {
-  /** Distinct objects: every subtree + leaf + the root tree + the commit. */
-  objects: number;
-  /** Summed size of ALL those distinct objects — blobs, trees, AND the commit. */
-  bytes: number;
-}
-
 /**
- * Measure the shallow-fetch footprint of `commit`: the count AND total byte size
- * of the DISTINCT objects reachable from its tree, plus the root tree and the
- * commit object itself. `-t` includes intermediate trees (a deep tree is counted
+ * The count of DISTINCT git objects the shallow fetch of `commit` transfers:
+ * every distinct subtree + leaf reachable from its tree, plus the root tree and
+ * the commit object. `-t` includes intermediate trees (a deep tree is counted
  * honestly); DISTINCT ids are counted, so a blob at 5,000 paths is one object,
- * not 5,000 (review r1 finding 8). Bytes are the sizes of ALL distinct objects —
- * blobs, trees, and the commit — not just blob payload (review r2 finding 6),
- * read in ONE `cat-file --batch-check` pass so a worker's object metadata cannot
- * hide from the transfer budget.
+ * not 5,000 (review r1 finding 8), and the fetched commit is included, closing
+ * the off-by-one (r2 finding 6).
  */
-export function fetchFootprint(dir: string, commit: string, treeSha: string): FetchFootprint {
+export function fetchedObjectCount(dir: string, commit: string, treeSha: string): number {
   const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
   const ids = new Set<string>();
   for (const e of parseTree(raw)) ids.add(e.sha);
   ids.add(treeSha); // the root tree ls-tree omits
   ids.add(commit); // the fetched commit object itself
-  let out: string;
-  try {
-    out = execFileSync("git", ["-C", dir, "cat-file", "--batch-check=%(objectsize)"], {
-      env: gitEnv(),
-      input: [...ids].join("\n") + "\n",
-      stdio: ["pipe", "pipe", "pipe"],
-      maxBuffer: 64 * 1024 * 1024,
-    }).toString();
-  } catch (err) {
-    throw new QuarantineGitError(`fetch-footprint measurement failed: ${describe(err)}`);
+  return ids.size;
+}
+
+/**
+ * The on-disk byte size of `dir`'s object store, from `count-objects -v`
+ * (`size` loose + `size-pack`, reported in KiB → bytes). The intake takes this
+ * BEFORE and AFTER the worker-head fetch; the delta is the ACTUAL packed bytes
+ * the fetch transferred — the compressed pack, not the summed uncompressed
+ * object content, which under-counts an incompressible pack at the 500 MB edge
+ * (review r3 finding 4). KiB rounding is negligible against a 500 MB cap.
+ */
+export function storeSizeBytes(dir: string): number {
+  const raw = git(dir, "count-objects", "-v");
+  let kib = 0;
+  for (const line of raw.split("\n")) {
+    const m = /^(size|size-pack):\s*(\d+)/.exec(line.trim());
+    if (m) kib += Number.parseInt(m[2]!, 10);
   }
-  let bytes = 0;
-  for (const line of out.split("\n")) {
-    const n = Number.parseInt(line.trim(), 10);
-    if (Number.isFinite(n)) bytes += n;
-  }
-  return { objects: ids.size, bytes };
+  return kib * 1024;
 }
 
 /** Byte size of one object (`cat-file -s`); 0 if unreadable. */

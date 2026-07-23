@@ -58,10 +58,12 @@ describe("quarantinedDiffProblems", () => {
   });
 
   it("rejects an inherited attributionTrailer or contractRef (own-property only) — r2", () => {
+    // A record with a forged prototype (fields on the prototype) is rejected by
+    // the plain-object guard before field checks — the stronger r3 behaviour.
     const inhTrailer = validDiff();
     delete inhTrailer["attributionTrailer"];
     Object.setPrototypeOf(inhTrailer, { attributionTrailer: workerAttributionTrailer(SHA1_D) });
-    expect(quarantinedDiffProblems(inhTrailer).join(" ")).toMatch(/attributionTrailer/);
+    expect(quarantinedDiffProblems(inhTrailer).join(" ")).toMatch(/plain object/);
 
     const inhRef = validDiff();
     inhRef["contractRef"] = Object.create({
@@ -81,6 +83,26 @@ describe("quarantinedDiffProblems", () => {
       const d = validDiff();
       d["changedPaths"] = [{ path: bad, change: "added" }];
       expect(quarantinedDiffProblems(d).join(" ")).toMatch(/canonical repo-root-relative/);
+    }
+  });
+
+  it("rejects a JSON __proto__ contractRef bypass and a class-instance record — r3", () => {
+    const protoRef = validDiff();
+    protoRef["contractRef"] = JSON.parse(
+      `{"__proto__":{"issueId":"M1.1","contractVersion":1,"contractHash":"${"e".repeat(64)}"}}`,
+    );
+    expect(quarantinedDiffProblems(protoRef).length).toBeGreaterThan(0);
+
+    class Forged {}
+    const inst = Object.assign(new Forged(), validDiff());
+    expect(quarantinedDiffProblems(inst).join(" ")).toMatch(/plain object/);
+  });
+
+  it("rejects base/worker head sha equal to the tree sha (impossible ids) — r3", () => {
+    for (const field of ["baseSha", "workerHeadSha"]) {
+      const d = validDiff();
+      d[field] = d["treeSha"];
+      expect(quarantinedDiffProblems(d).join(" ")).toMatch(/cannot equal its tree/);
     }
   });
 

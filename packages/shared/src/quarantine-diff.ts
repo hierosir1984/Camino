@@ -89,10 +89,27 @@ export function workerAttributionTrailer(workerHeadSha: string): string {
   return `${WORKER_ATTRIBUTION_TRAILER_KEY}: ${workerHeadSha}`;
 }
 
-/** Bound on the changed-path list — a candidate over the tree budget never reaches emit. */
-const MAX_CHANGED_PATHS = 100_000;
+/**
+ * Bound on the changed-path list. The quarantine POLICY check enforces this as a
+ * rejection BEFORE emit (so an over-cardinality candidate fails cleanly, never
+ * throwing here — review r3 finding 3); this validator is the durable backstop.
+ */
+export const MAX_CHANGED_PATHS = 100_000;
 /** Bound on a single stored path length (git's own limit is far higher; this is a sanity cap). */
 const MAX_PATH_LENGTH = 8192;
+
+/**
+ * A PLAIN object: a direct object literal / `Object.create(null)`, not a class
+ * instance and not a record with a forged prototype. A class instance or a
+ * `{"__proto__": {…}}`-shaped record can carry fields on its prototype that read
+ * as present but serialize to `{}`; requiring a plain object (own fields only)
+ * closes that class uniformly (review r2/r3 finding 9).
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
 
 /**
  * Total validator for a quarantined-diff record: an empty result means the
@@ -103,8 +120,8 @@ const MAX_PATH_LENGTH = 8192;
  * fails this, never repairs it — the WP-110 contract-validator precedent).
  */
 export function quarantinedDiffProblems(value: unknown): string[] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return ["quarantinedDiff must be a plain object"];
+  if (!isPlainObject(value)) {
+    return ["quarantinedDiff must be a plain object (no class instance or forged prototype)"];
   }
   const record = value as Record<string, unknown>;
   const problems: string[] = [];
@@ -131,11 +148,20 @@ export function quarantinedDiffProblems(value: unknown): string[] {
   const baseSha = sha("baseSha");
   const treeSha = sha("treeSha");
   const workerHeadSha = sha("workerHeadSha");
-  // A commit object id and its tree object id are different objects — they can
-  // never share an id. Equal candidate/tree is an impossible, forged record
-  // (review r2 finding 9).
-  if (candidateSha !== null && treeSha !== null && candidateSha === treeSha) {
-    problems.push("candidateSha equals treeSha — a commit id cannot equal its tree id");
+  // A commit object id and a tree object id are different objects — they can
+  // never share an id. candidateSha, baseSha, and workerHeadSha all name COMMITS;
+  // none can equal treeSha. Any such equality is an impossible, forged record
+  // (review r2 finding 9, r3 finding 5).
+  if (treeSha !== null) {
+    for (const [name, v] of [
+      ["candidateSha", candidateSha],
+      ["baseSha", baseSha],
+      ["workerHeadSha", workerHeadSha],
+    ] as const) {
+      if (v !== null && v === treeSha) {
+        problems.push(`${name} equals treeSha — a commit id cannot equal its tree id`);
+      }
+    }
   }
   // One repository has ONE object format; mixing 40-hex (sha-1) and 64-hex
   // (sha-256) identities in one record is impossible and forged (review r1 #9).
@@ -171,15 +197,16 @@ export function quarantinedDiffProblems(value: unknown): string[] {
   } else if (contractRef !== null) {
     // Validate the ContractRef over its OWN properties only: contractRefProblems
     // reads fields directly, so a ref whose fields live on the prototype would
-    // pass while serializing to `{}` (review r2 finding 9). Snapshot own enumerable
-    // props first; a non-object contractRef is caught by the snapshot guard.
-    if (typeof contractRef !== "object" || Array.isArray(contractRef)) {
-      problems.push("contractRef must be a plain object or null");
+    // pass while serializing to `{}` (review r2 finding 9). Require a PLAIN object,
+    // then snapshot own props into a NULL-prototype object — the null proto has no
+    // `__proto__` setter, so a JSON `{"__proto__": {…}}` field lands as an own key
+    // (flagged as unknown by contractRefProblems) instead of silently retargeting
+    // the snapshot's prototype (review r3 finding 5).
+    if (!isPlainObject(contractRef)) {
+      problems.push("contractRef must be a plain object or null (no forged prototype)");
     } else {
-      const ownRef: Record<string, unknown> = {};
-      for (const k of Object.keys(contractRef as Record<string, unknown>)) {
-        ownRef[k] = (contractRef as Record<string, unknown>)[k];
-      }
+      const ownRef: Record<string, unknown> = Object.create(null);
+      for (const k of Object.keys(contractRef)) ownRef[k] = contractRef[k];
       for (const p of contractRefProblems(ownRef)) problems.push(`contractRef ${p}`);
     }
   }

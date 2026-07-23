@@ -7,7 +7,7 @@
 // and canonical path-identity uses an ICU-backed fold (see checkPathCollisions)
 // rather than the spike's hand-rolled residual list — the two hard-learned
 // lessons from that spike's r1–r3 review.
-import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
+import { MAX_CHANGED_PATHS, REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
 import { MAX_STORED_PATH_LENGTH } from "./types.js";
 import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
 
@@ -47,6 +47,28 @@ import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
  */
 function foldKey(path: string): string {
   return path.replace(/\\/g, "/").normalize("NFKC").toUpperCase().toLowerCase().replace(/ß/g, "ss");
+}
+
+/**
+ * The canonical identity of ONE path segment for PROTECTED-name matching: strip
+ * the Windows aliases first (a trailing dot/space, and an NTFS `::$DATA` /
+ * `::$INDEX_ALLOCATION` alternate-stream suffix — `stripWindowsAlias`), THEN
+ * fold. So `.gitattributes.`, `.gitattributes::$DATA`, and `.GITATTRIBUTES` all
+ * canonicalize to `.gitattributes` (review r3 finding 1). The collision key
+ * (`foldKey`) deliberately does NOT strip these — a trailing-dot NAME is its own
+ * collision/alias, reported by checkNameAliases — but a PROTECTED identity must
+ * match the resolved target, which is what a target OS opens.
+ */
+function protectedSegment(seg: string): string {
+  return foldKey(stripWindowsAlias(seg));
+}
+
+/** The whole path canonicalized segment-by-segment for protected-name matching. */
+function protectedPathKey(path: string): string {
+  return path
+    .split("/")
+    .map((s) => protectedSegment(s))
+    .join("/");
 }
 
 /** Every prefix (each ancestor directory component + the full path) of a stored path. */
@@ -230,11 +252,13 @@ export function checkSubmodules(
       path: e.path,
       detail: `submodule/gitlink introduced at "${e.path}" (${e.sha})`,
     }));
-  // Match `.gitmodules` by its CANONICAL fold, not exact string, so a
-  // case/normalization alias a target FS resolves to `.gitmodules` (`.GitModules`
-  // on APFS) cannot slip the retarget guard (review r2 finding 4).
+  // Match `.gitmodules` by its CANONICAL identity (Windows-alias-stripped +
+  // folded), not exact string, so a case/normalization alias (`.GitModules`) OR
+  // a Windows alias (`.gitmodules.`, `.gitmodules::$DATA`) a target FS resolves
+  // to `.gitmodules` cannot slip the retarget guard (review r2 finding 4, r3
+  // finding 1).
   for (const p of changed) {
-    if (foldKey(p) === ".gitmodules") {
+    if (protectedPathKey(p) === ".gitmodules") {
       out.push({
         code: "submodule-gitlink",
         path: p,
@@ -280,6 +304,15 @@ export function checkPathLength(entries: readonly TreeEntry[]): Rejection[] {
  */
 export function checkChangedPathValidity(changed: readonly string[]): Rejection[] {
   const out: Rejection[] = [];
+  // Cardinality: a candidate with more changed paths than the emitted-diff schema
+  // admits would throw at emit rather than reject (review r3 finding 3). Bound it
+  // as a policy result. 100,000 matches the @camino/shared MAX_CHANGED_PATHS.
+  if (changed.length > MAX_CHANGED_PATHS) {
+    out.push({
+      code: "entry-budget",
+      detail: `${changed.length} changed paths exceed the diff cap (${MAX_CHANGED_PATHS})`,
+    });
+  }
   for (const path of changed) {
     if (path.includes("�")) {
       out.push({
@@ -293,6 +326,18 @@ export function checkChangedPathValidity(changed: readonly string[]): Rejection[
         code: "path-too-long",
         path: path.slice(0, 80) + "…",
         detail: `changed path is ${path.length} code units (budget ${MAX_STORED_PATH_LENGTH})`,
+      });
+    }
+    // Non-canonical changed path: a backslash (Windows separator) or an empty /
+    // `.` / `..` segment. A DELETED such path is not in the final-tree entries,
+    // so only this check sees it; without it the path reaches the emitter and
+    // THROWS at the schema instead of rejecting cleanly (review r3 finding 3).
+    const segs = path.split("/");
+    if (path.includes("\\") || segs.some((s) => s === "" || s === "." || s === "..")) {
+      out.push({
+        code: "windows-alias",
+        path,
+        detail: `changed path "${path}" is not a canonical repo-root-relative POSIX path`,
       });
     }
   }
@@ -531,7 +576,7 @@ export function isProtectedPath(path: string): boolean {
   // `.GITATTRIBUTES` on such a host. Folding both sides catches the alias a
   // literal match missed (review r2 finding 1); the fold's own residual is the
   // named boundary in checkPathCollisions.
-  const segs = path.split("/").map((s) => foldKey(s));
+  const segs = path.split("/").map((s) => protectedSegment(s));
   const base = segs[segs.length - 1];
   if (base === ".gitattributes") return true;
   if (segs[0] === ".github" && (segs[1] === "workflows" || segs[1] === "actions")) return true;
