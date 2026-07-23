@@ -1,91 +1,121 @@
-// WP-003 quarantine policy checks — pure functions over the parsed final tree
-// and the base↔head diff. Each returns Rejection[] (collect-all, never throws),
-// so one intake run reports every violation a fixture carries.
-import type { Budgets, Rejection, TreeEntry } from "./types.js";
+// WP-108 quarantine — policy checks (CAM-EXEC-04, design §5.1).
+//
+// Pure functions over the parsed final tree and the base↔head diff. Each
+// returns Rejection[] (collect-all, never throws), so one intake run reports
+// every violation a candidate carries. Product promotion of the WP-003 spike:
+// the malformed-object class is delegated to `git fsck` (in git.ts / intake.ts),
+// and canonical path-identity uses an ICU-backed fold (see checkPathCollisions)
+// rather than the spike's hand-rolled residual list — the two hard-learned
+// lessons from that spike's r1–r3 review.
+import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
+import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
 
-// --- path canonicalization (case-fold + Unicode collisions) ---
+// ---------------------------------------------------------------------------
+// canonical path identity — case-fold + Unicode-normalization collisions
+// ---------------------------------------------------------------------------
 
 /**
- * Full case-fold expansions NFKC does not perform. NFKC already folds the Latin
- * ligatures (ﬁ→fi …), the long s (ſ→s), and superscripts, so only `ß`⇄`SS`
- * remains (it has no compatibility decomposition). Not a complete Unicode fold —
- * the product check (WP-108) uses ICU — but it errs toward collapsing, and a
- * false collision is safe while a missed one is not (review r1 #8 / r2 #6).
+ * ICU is the case-fold authority here. Two oracles compose the collision key,
+ * matching the two collision classes real target filesystems produce:
+ *
+ *   - NORMALIZATION + COMPATIBILITY: NFKC folds NFC⇄NFD, the Latin ligatures
+ *     (ﬁ→fi …), the long s (ſ→s), superscripts, and the like into one form;
+ *     a small residual (`ß`→`ss`, Greek final sigma `ς`→`σ`) closes the two
+ *     compatibility-fold gaps NFKC leaves. This yields a per-path KEY.
+ *   - CASE: the keys are grouped with an ICU `Intl.Collator` at
+ *     `sensitivity: "accent"` — case-INsensitive, accent-PRESERVING. So
+ *     `Config.txt`⇄`config.txt` and `straße`⇄`STRASSE` collide, while a
+ *     legitimately distinct `café.txt` and `cafe.txt` do NOT (accents are kept,
+ *     unlike a `sensitivity: "base"` fold, which would over-reject them).
+ *
+ * BOUNDARY, stated (the WP-003 "name the boundary" lesson): JavaScript does not
+ * expose ICU's full `u_strFoldCase`, so this is NFKC + a documented residual
+ * fold + ICU collation-case-folding, NOT a byte-exact model of every
+ * filesystem's own fold table. It errs toward COLLAPSING (a false collision
+ * over-rejects — the safe direction; a MISS would be a missed collision, never
+ * an accept of something worse). Exotic cross-script confusables a complete
+ * fold table would collapse may slip; that residual is accepted and named.
  */
-function foldExpand(s: string): string {
-  // ß→ss (no NFKC decomposition) and Greek final sigma ς→σ (equal under full
-  // case-folding but not NFKC — review r3 #9). Still not a complete Unicode fold;
-  // WP-108 uses ICU.
-  return s.replace(/ß/g, "ss").replace(/ς/g, "σ");
+const CASE_FOLD_COLLATOR = new Intl.Collator("en", { sensitivity: "accent" });
+
+/** NFKC + the two compatibility folds NFKC omits. NO lowercasing — the collator folds case. */
+function normalizationKey(path: string): string {
+  // `\` ⇄ `/` (a Windows separator makes `docs\note` and `docs/note` one file);
+  // NFKC (composition + compatibility); then ß→ss and final-sigma ς→σ, the two
+  // full-fold residuals NFKC does not perform.
+  return path.replace(/\\/g, "/").normalize("NFKC").replace(/ß/g, "ss").replace(/ς/g, "σ");
+}
+
+/** Every prefix (each ancestor directory component + the full path) of a stored path. */
+function pathPrefixes(path: string): string[] {
+  const segs = path.split("/");
+  const out: string[] = [];
+  for (let i = 1; i <= segs.length; i++) out.push(segs.slice(0, i).join("/"));
+  return out;
 }
 
 /**
- * Canonical collision key for one path. Steps, per segment:
- *  - treat `\` as `/` (Windows separator equivalence — review r2 #7);
- *  - NFKC-normalize, apply the residual full-folds, then lowercase.
- * Two stored paths sharing this key would resolve to one file on a
- * case-insensitive / normalizing filesystem. (Paths that are not valid UTF-8
- * are rejected upstream by checkNameAliases, so they never reach here as an
- * ambiguous replacement-char string — review r2 #8.)
- */
-function fullyCanonical(path: string): string {
-  return path
-    .replace(/\\/g, "/")
-    .split("/")
-    .map((s) => foldExpand(s.normalize("NFKC")).toLowerCase())
-    .join("/");
-}
-
-/**
- * Two distinct stored paths that map to the same OS file are an aliasing/overwrite
- * hazard: on a case-insensitive or Unicode-normalizing filesystem one silently
- * shadows the other. Reject any such collision in the final tree, labelling
- * whether the paths differ only by case or by Unicode composition.
+ * Two distinct stored paths that a case-insensitive or Unicode-normalizing
+ * filesystem would resolve to one file are an aliasing/overwrite hazard. Reject
+ * any such collision in the final tree, labelling whether the paths differ only
+ * by case or by Unicode composition/compatibility.
+ *
+ * EVERY path prefix is keyed, not just leaves: a root symlink `A` and a
+ * directory `a/file` collide through the `A`⇄`a` component even though their
+ * leaf paths differ (the WP-003 r3 ancestor-component finding).
  */
 export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] {
-  // Key EVERY path prefix (ancestor directory components + the full path), not
-  // just leaves: a root symlink `A` and a directory `a/file` collide on a
-  // case-insensitive filesystem through the `A` ⇄ `a` component even though
-  // their full leaf paths differ (review r3 #8).
-  const byCanonical = new Map<string, Set<string>>();
+  // De-duplicate prefixes (a shared ancestor appears under many leaves) and
+  // record each with its normalization key.
+  const seen = new Set<string>();
+  const items: { prefix: string; key: string }[] = [];
   for (const e of entries) {
-    const segs = e.path.split("/");
-    for (let i = 1; i <= segs.length; i++) {
-      const prefix = segs.slice(0, i).join("/");
-      const key = fullyCanonical(prefix);
-      const set = byCanonical.get(key) ?? new Set<string>();
-      set.add(prefix);
-      byCanonical.set(key, set);
+    for (const prefix of pathPrefixes(e.path)) {
+      if (seen.has(prefix)) continue;
+      seen.add(prefix);
+      items.push({ prefix, key: normalizationKey(prefix) });
     }
   }
+  // Group by ICU collation equality of the keys. compare() === 0 is an
+  // equivalence relation (equal collation sort-keys), so a stable sort places
+  // every equivalence class in one contiguous run — no union-find needed.
+  items.sort((a, b) => CASE_FOLD_COLLATOR.compare(a.key, b.key));
   const out: Rejection[] = [];
-  for (const set of byCanonical.values()) {
-    if (set.size < 2) continue;
-    const paths = [...set];
-    // Case-only iff lowercasing ALONE (no normalization) already collapses them;
-    // if NFC was needed to make them collide, the difference is Unicode
-    // composition (e.g. composed "é" vs "e"+combining-accent).
-    const caseOnly = new Set(paths.map((p) => p.toLowerCase())).size === 1;
-    out.push({
-      code: caseOnly ? "path-collision-case" : "path-collision-unicode",
-      path: paths.join(" ⇄ "),
-      detail: `paths collide under ${caseOnly ? "case-folding" : "Unicode normalization"}: ${paths.join(", ")}`,
-    });
+  let i = 0;
+  while (i < items.length) {
+    let j = i + 1;
+    while (j < items.length && CASE_FOLD_COLLATOR.compare(items[i]!.key, items[j]!.key) === 0) j++;
+    const group = items.slice(i, j).map((x) => x.prefix);
+    if (group.length >= 2) {
+      // Case-only iff lowercasing ALONE (no normalization) already collapses the
+      // whole group; if normalization/compatibility was needed to make them
+      // collide, the difference is Unicode composition (e.g. composed "é" vs
+      // "e"+combining-accent, or ß⇄SS).
+      const caseOnly = new Set(group.map((p) => p.toLowerCase())).size === 1;
+      out.push({
+        code: caseOnly ? "path-collision-case" : "path-collision-unicode",
+        path: group.join(" ⇄ "),
+        detail: `paths collide under ${caseOnly ? "case-folding" : "Unicode normalization"}: ${group.join(", ")}`,
+      });
+    }
+    i = j;
   }
   return out;
 }
 
-// --- reserved names & trailing-dot/space / Windows-alias segments ---
+// ---------------------------------------------------------------------------
+// reserved names & trailing-dot/space / Windows-alias segments
+// ---------------------------------------------------------------------------
 
 // COM/LPT digits include the superscript forms ¹²³ (U+00B9/B2/B3), which
-// Windows also reserves — COM² etc. (review r1 #7).
+// Windows also reserves — COM² etc. (WP-003 r1).
 const RESERVED = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
 /**
  * Strip the aliases Windows applies before it resolves a name: an NTFS alternate
  * data stream suffix (`name::$DATA`, `.git::$INDEX_ALLOCATION`) and any trailing
  * dots/spaces. `foo.txt::$DATA` and `foo.txt` are the same file; `.git::$INDEX_
- * ALLOCATION` reaches the `.git` dir (review r2 #2).
+ * ALLOCATION` reaches the `.git` dir (WP-003 r2).
  */
 function stripWindowsAlias(seg: string): string {
   const colon = seg.indexOf(":");
@@ -97,9 +127,8 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   const out: Rejection[] = [];
   for (const e of entries) {
     // A path git handed us that did not round-trip as UTF-8 decodes to U+FFFD:
-    // its real bytes are non-portable and its identity is ambiguous (distinct
-    // byte paths would collapse to one string). Reject rather than guess
-    // (review r2 #8).
+    // its real bytes are non-portable and its identity is ambiguous. Reject
+    // rather than guess (WP-003 r2).
     if (e.path.includes("�")) {
       out.push({
         code: "windows-alias",
@@ -110,7 +139,7 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
     for (const seg of e.path.split("/")) {
       // A `\` segment is a Windows path separator slipped past our `/` split,
       // and a `:` is an NTFS ADS marker / invalid POSIX-portable char; either
-      // makes the path mean different things across platforms (review r2 #7, #2).
+      // makes the path mean different things across platforms (WP-003 r2).
       if (seg.includes("\\") || seg.includes(":")) {
         out.push({
           code: "windows-alias",
@@ -139,12 +168,14 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   return out;
 }
 
-// --- `.git` directory aliases ---
+// ---------------------------------------------------------------------------
+// `.git` directory aliases
+// ---------------------------------------------------------------------------
 
 /** A path segment that resolves to a `.git` directory on some platform. */
 function isDotGitSegment(seg: string): boolean {
   // Strip NTFS ADS + trailing dots/spaces first, then match `.git` (any case) or
-  // the 8.3 short-name alias `git~N` (review r1 + r2 #2).
+  // the 8.3 short-name alias `git~N` (WP-003 r1 + r2).
   const s = stripWindowsAlias(seg);
   return /^\.git$/i.test(s) || /^git~[0-9]+$/i.test(s);
 }
@@ -172,14 +203,16 @@ export function checkDotGitPaths(entries: readonly TreeEntry[]): Rejection[] {
   return out;
 }
 
-// --- submodule / gitlink ---
+// ---------------------------------------------------------------------------
+// submodule / gitlink
+// ---------------------------------------------------------------------------
 
 /**
  * A gitlink (mode 160000) pulls in out-of-tree history the intake never vetted.
  * Only a gitlink the worker INTRODUCED or moved is rejected — one already
  * present and unchanged in the assigned base is not the worker's doing
- * (CAM-EXEC-04 says block *introductions*; review r2 #9). `changed` is the
- * base↔head path set.
+ * (CAM-EXEC-04 blocks *introductions*; WP-003 r2). `changed` is the base↔head
+ * path set.
  */
 export function checkSubmodules(
   entries: readonly TreeEntry[],
@@ -194,19 +227,21 @@ export function checkSubmodules(
     }));
 }
 
-// --- symlink target escapes ---
+// ---------------------------------------------------------------------------
+// symlink target escapes
+// ---------------------------------------------------------------------------
 
 /** Does a symlink at `linkPath` with `target` resolve outside the repo root? */
 export function symlinkEscapes(linkPath: string, target: string): boolean {
   if (target.length === 0) return true;
   // A NUL or control byte cannot be a real symlink target (the OS truncates at
   // NUL), so the stored candidate would not materialize faithfully — reject
-  // (review r2 #11).
+  // (WP-003 r2).
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f]/.test(target)) return true;
   if (target.startsWith("/")) return true; // POSIX absolute
   // Any `X:` prefix is a Windows drive path — absolute (`C:\x`) OR drive-relative
-  // (`C:x`, resolved against drive C's cwd, outside our lexical root) (review r1 #6).
+  // (`C:x`, resolved against drive C's cwd, outside our lexical root) (WP-003 r1).
   if (/^[a-zA-Z]:/.test(target)) return true;
   if (target.startsWith("\\")) return true; // UNC / drive-relative
   // Resolve relative to the link's own directory, counting depth from root.
@@ -234,8 +269,8 @@ export function symlinkTargetDanger(linkPath: string, target: string): "escape" 
 /**
  * A real symlink target is a single path, bounded by PATH_MAX (~4 KiB). Anything
  * larger is not a symlink the OS could materialize — and reading it would blow
- * the subprocess buffer before any budget runs (review r3 #7), so the intake
- * does not read oversized targets and we reject on size alone here.
+ * the subprocess buffer before any budget runs (WP-003 r3), so the intake does
+ * not read oversized targets and we reject on size alone here.
  */
 export const SYMLINK_TARGET_MAX_BYTES = 4096;
 
@@ -274,13 +309,17 @@ export function checkSymlinks(
   return out;
 }
 
-// --- size / count budgets ---
+// ---------------------------------------------------------------------------
+// size / count budgets
+// ---------------------------------------------------------------------------
 
 /**
- * `objectCount` is the count of ALL objects in the final tree — every subtree
- * plus every leaf — not just the flattened leaves: a pathologically deep tree
- * has one leaf but arbitrarily many tree objects, which is the resource blow-up the
- * budget must catch (review r1 #5). The intake supplies it from `ls-tree -r -t`.
+ * The FINAL-TREE policy budget (design's "tree size budget"): per-blob size,
+ * total tree bytes, and object count. `objectCount` is ALL objects in the tree
+ * — every subtree plus every leaf — not just flattened leaves: a pathologically
+ * DEEP tree has one leaf but arbitrarily many tree objects, the resource
+ * blow-up the budget must catch (WP-003 r1). The intake supplies it from
+ * `ls-tree -r -t`.
  */
 export function checkBudgets(
   entries: readonly TreeEntry[],
@@ -315,7 +354,51 @@ export function checkBudgets(
   return out;
 }
 
-// --- scope vs contract & protected paths (over CHANGED paths) ---
+/**
+ * The registry-item-11 FETCH budget (PRD §5 item 11: "fetch ≤5,000 objects /
+ * 500 MB") — a HARD outer cap on the shallow-fetch footprint, NOT
+ * contract-overridable. `objectCount` is the final-tree object count (the fetch
+ * pulls exactly the final tree under `--depth=1`); `totalBytes` is the summed
+ * blob size. A breach refuses the candidate: the intake proceeds no further and
+ * discards the pristine store. The numbers come from `@camino/shared`
+ * REGISTRY_ITEM_11_QUOTAS.fetch — one source, no drift.
+ *
+ * BOUNDARY, stated: this is an ADMISSION check computed AFTER the local fetch
+ * completes — it refuses to squash-rebuild an over-budget candidate, but does
+ * not prevent the local git transfer from the worker's already-bounded (≤2 GB
+ * workspace) isolated clone. A pre-transfer/network ceiling is bounded
+ * out-of-process by the WP-107 container + WP-114 supervisor, the same
+ * in-process-best-effort / out-of-process-authoritative split WP-107 states.
+ */
+export const REGISTRY_ITEM_11_FETCH_BUDGET: FetchBudget = Object.freeze({
+  maxObjects: REGISTRY_ITEM_11_QUOTAS.fetch.maxObjects,
+  maxBytes: REGISTRY_ITEM_11_QUOTAS.fetch.maxBytes,
+});
+
+export function checkFetchBudget(
+  objectCount: number,
+  totalBytes: number,
+  budget: FetchBudget = REGISTRY_ITEM_11_FETCH_BUDGET,
+): Rejection[] {
+  const out: Rejection[] = [];
+  if (objectCount > budget.maxObjects) {
+    out.push({
+      code: "fetch-object-budget",
+      detail: `shallow-fetch footprint is ${objectCount} objects (registry-item-11 budget ${budget.maxObjects})`,
+    });
+  }
+  if (totalBytes > budget.maxBytes) {
+    out.push({
+      code: "fetch-size-budget",
+      detail: `shallow-fetch footprint is ${totalBytes} bytes (registry-item-11 budget ${budget.maxBytes})`,
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// scope vs contract & protected paths (over CHANGED paths)
+// ---------------------------------------------------------------------------
 
 /** Minimal glob → RegExp: `**` spans `/`, `*`/`?` do not. */
 function globToRegExp(glob: string): RegExp {
@@ -358,7 +441,7 @@ export function matchesAnyGlob(path: string, globs: readonly string[]): boolean 
 export function isProtectedPath(path: string): boolean {
   // Case-insensitive: a case-insensitive host (macOS/Windows) resolves
   // `.GITATTRIBUTES` / `.GitHub/Workflows` / `.Camino` to the protected path,
-  // and git even applies a `.GITATTRIBUTES` on such a host (review r1 #1).
+  // and git even applies a `.GITATTRIBUTES` on such a host (WP-003 r1).
   const p = path.toLowerCase();
   const base = p.slice(p.lastIndexOf("/") + 1);
   if (base === ".gitattributes") return true;

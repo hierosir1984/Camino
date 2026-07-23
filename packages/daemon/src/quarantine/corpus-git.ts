@@ -1,10 +1,16 @@
-// Git plumbing helpers for the WP-003 quarantine spike.
+// WP-108 quarantine — TEST-SUPPORT git plumbing for the WP-003 corpus fixtures.
 //
-// Every case fixture is constructed with PLUMBING (hash-object / a temp-index
-// write-tree / commit-tree), never by writing working-tree files: the host is a
-// case-insensitive, Unicode-normalizing macOS filesystem, so `File.txt` +
-// `file.txt`, trailing-dot aliases, symlinks, and gitlinks simply cannot exist
-// as committed files here. Plumbing builds the exact trees under test anyway.
+// Every corpus case builds an untrusted "worker repo" with a base and a final
+// head via git PLUMBING (hash-object / a scratch-index write-tree / commit-tree),
+// never by writing working-tree files: the host is a case-insensitive,
+// Unicode-normalizing macOS filesystem, so `File.txt` + `file.txt`, trailing-dot
+// aliases, symlinks, and gitlinks simply cannot exist as committed files here.
+// Plumbing builds the exact trees under test anyway.
+//
+// This module is imported ONLY by corpus-fixtures.ts / corpus.test.ts. It is
+// deliberately separate from the production git.ts (which is credential-free and
+// operates the pristine control-plane repo); these helpers instead stand up the
+// UNTRUSTED worker repos the intake fetches from.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,28 +26,10 @@ export function git(dir: string, ...args: string[]): string {
     .trim();
 }
 
-/** Run git in `dir`, returning raw stdout bytes (for blob contents). */
-export function gitBuf(dir: string, ...args: string[]): Buffer {
-  return execFileSync("git", ["-C", dir, ...args], {
-    stdio: ["ignore", "pipe", "pipe"],
-    maxBuffer: 256 * 1024 * 1024,
-  });
-}
-
-/** True iff object `sha` exists in `dir`'s object store. */
-export function objectExists(dir: string, sha: string): boolean {
-  try {
-    execFileSync("git", ["-C", dir, "cat-file", "-e", sha], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 const tmpDirs: string[] = [];
 
-/** A throwaway git repo with a deterministic identity and hooks disabled. */
-export function initRepo(prefix = "camino-quarantine-"): string {
+/** A throwaway worker repo with a deterministic identity, hooks disabled, serving bare shas. */
+export function initRepo(prefix = "camino-quarantine-worker-"): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   tmpDirs.push(dir);
   execFileSync("git", ["-C", dir, "init", "--quiet", "--initial-branch=main"], { stdio: "ignore" });
@@ -63,14 +51,14 @@ export function initRepo(prefix = "camino-quarantine-"): string {
   return dir;
 }
 
-/** Remove every temp repo created this run (call from afterAll). */
+/** Remove every fixture repo created this run (call from afterAll). */
 export function cleanupRepos(): void {
   for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 }
 
 /** Hash `content` into a blob object and return its sha. */
 export function hashBlob(dir: string, content: string | Buffer): string {
-  const tmp = join(dir, `.blob-${Math.random().toString(36).slice(2)}`);
+  const tmp = join(dir, `.blob-${randomSuffix()}`);
   writeFileSync(tmp, content);
   try {
     return execFileSync("git", ["-C", dir, "hash-object", "-w", tmp], {
@@ -99,7 +87,7 @@ export interface CacheEntry {
  * Unicode-colliding siblings, trailing-dot names, symlinks, and gitlinks.
  */
 export function buildTree(dir: string, entries: CacheEntry[]): string {
-  const indexFile = join(dir, `.idx-${Math.random().toString(36).slice(2)}`);
+  const indexFile = join(dir, `.idx-${randomSuffix()}`);
   const env = { ...process.env, GIT_INDEX_FILE: indexFile };
   const run = (...args: string[]): string =>
     execFileSync("git", ["-C", dir, ...args], { env, stdio: ["ignore", "pipe", "pipe"] })
@@ -115,28 +103,31 @@ export function buildTree(dir: string, entries: CacheEntry[]): string {
 }
 
 /**
- * Run git's own hardened object/path checker over `treeSha`. Returns the first
- * error line, or null if clean. This delegates the whole malformed-object class
- * — `.git` path equivalents (incl. HFS-ignorable characters), mode/type
- * mismatches, broken links — to git's fsck, which is far more complete than any
- * hand-rolled path parser (review r3 #1/#6). We fsck the TREE (not the commit)
- * to avoid the shallow-fetch parent boundary.
+ * Build a tree from MANY entries in ONE git process via `update-index
+ * --index-info` (entries piped on stdin), so a fixture that needs thousands of
+ * entries (e.g. the registry-item-11 fetch-object-budget breach) does not spawn
+ * one subprocess per entry. Generated in-script, never as one giant argv (the
+ * E2BIG-on-Linux lesson).
  */
-export function fsckTree(dir: string, treeSha: string): string | null {
+export function buildTreeBulk(dir: string, entries: CacheEntry[]): string {
+  const indexFile = join(dir, `.idx-${randomSuffix()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: indexFile };
+  // `--index-info` line format: "<mode> <object> <stage>\t<path>".
+  const input = entries.map((e) => `${e.mode} ${e.sha} 0\t${e.path}`).join("\n") + "\n";
   try {
-    execFileSync("git", ["-C", dir, "fsck", "--strict", "--no-dangling", treeSha], {
-      stdio: ["ignore", "pipe", "pipe"],
+    execFileSync("git", ["-C", dir, "update-index", "--index-info"], {
+      env,
+      input,
+      stdio: ["pipe", "ignore", "pipe"],
     });
-    return null;
-  } catch (e) {
-    const err = e as { stderr?: Buffer; stdout?: Buffer };
-    const lines = ((err.stderr?.toString() ?? "") + (err.stdout?.toString() ?? ""))
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-    return (
-      lines.find((l) => /error|fatal|missing|broken|corrupt/i.test(l)) ?? lines[0] ?? "fsck failed"
-    );
+    return execFileSync("git", ["-C", dir, "write-tree"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      .toString()
+      .trim();
+  } finally {
+    rmSync(indexFile, { force: true });
   }
 }
 
@@ -168,4 +159,13 @@ export function commitTree(
   })
     .toString()
     .trim();
+}
+
+// A non-cryptographic unique-enough suffix for scratch file names. Date.now is
+// unavailable in some harnesses; a counter + high-res-ish entropy is plenty for
+// a per-process temp name (fixtures run single-process).
+let counter = 0;
+function randomSuffix(): string {
+  counter += 1;
+  return `${counter}-${process.pid}`;
 }

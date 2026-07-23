@@ -253,6 +253,19 @@ export {
 } from "./contract.js";
 export type { ContractTerms, IssueContract, ContractRef } from "./contract.js";
 
+// WP-108: the quarantined final diff — the named artifact the quarantine intake
+// emits (CAM-EXEC-04); schema + total validator here, produced in `daemon`,
+// consumed by WP-111 (re-classification) and WP-116 (evidence).
+export {
+  CHANGED_PATH_KINDS,
+  GIT_OBJECT_NAME_PATTERN_SOURCE,
+  WORKER_ATTRIBUTION_TRAILER_KEY,
+  isGitObjectName,
+  workerAttributionTrailer,
+  quarantinedDiffProblems,
+} from "./quarantine-diff.js";
+export type { ChangedPath, ChangedPathKind, QuarantinedDiff } from "./quarantine-diff.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,

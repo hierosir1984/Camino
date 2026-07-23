@@ -1,13 +1,15 @@
-// WP-003 quarantine rejection suite — CAM-EXEC-04 (Phase-0), PRD §7 item 3.
+// WP-108 quarantine — the WP-003 rejection corpus, run against the PRODUCT
+// module (CAM-EXEC-04; PRD §7, Phase-0 item 3).
 //
-// Every enumerated case is a fixture that the squash-and-rebuild intake must
-// reject outright, or (for reachable-history) exclude structurally
-// so the carried object never enters the pristine store. A positive control
-// proves a clean in-scope change is accepted and correctly re-authored. This
-// file rides the standard vitest CI glob, so it runs on every PR from here on.
+// The acceptance gate the WP-003 spike declared for the product module: "this
+// exact rejection corpus is the acceptance gate for that module." Every case
+// and assertion is carried forward UNCHANGED from the spike; only the imports
+// point at the product intake / policy / workflow-posture module instead of the
+// prototype. It rides the standard vitest CI glob, so it runs on every PR.
 import { afterAll, describe, expect, it } from "vitest";
-import { git } from "./git.js";
-import { cleanupRepos, objectExists, runIntake } from "./intake.js";
+import { git } from "./corpus-git.js";
+import { cleanupRepos } from "./corpus-git.js";
+import { cleanupPristineRepos, objectExists, runIntake } from "./intake.js";
 import type { QuarantineResult, RejectionCode } from "./types.js";
 import {
   isProtectedPath,
@@ -17,10 +19,13 @@ import {
   checkNameAliases,
   checkDotGitPaths,
 } from "./policy.js";
-import { analyzeWorkflow, CANDIDATE_REFS, scanWorkflowPosture } from "./workflow.js";
-import * as cases from "./cases.js";
+import { analyzeWorkflow, CANDIDATE_REFS, scanWorkflowPosture } from "./workflow-posture.js";
+import * as cases from "./corpus-fixtures.js";
 
-afterAll(() => cleanupRepos());
+afterAll(() => {
+  cleanupRepos();
+  cleanupPristineRepos();
+});
 
 const codes = (r: QuarantineResult): RejectionCode[] => r.rejections.map((x) => x.code);
 
@@ -191,6 +196,7 @@ describe("cases 2–12 — each is rejected with the expected reason and produce
       expect(r.accepted).toBe(false);
       expect(codes(r)).toContain(c.expect);
       expect(r.rebuilt).toBeNull(); // a rejected intake never authors a candidate
+      expect(r.diff).toBeNull(); // …and emits no quarantined diff
     });
   }
 });
@@ -515,9 +521,12 @@ describe("policy units — the security-relevant edge cases", () => {
     expect(checkPathCollisions([e("a/File"), e("a/file")]).map((r) => r.code)).toEqual([
       "path-collision-case",
     ]);
-    expect(checkPathCollisions([e("café"), e("café")]).map((r) => r.code)).toEqual([
-      "path-collision-unicode",
-    ]);
+    expect(
+      checkPathCollisions([
+        e("caf" + String.fromCodePoint(0x00e9)),
+        e("cafe" + String.fromCodePoint(0x0301)),
+      ]).map((r) => r.code),
+    ).toEqual(["path-collision-unicode"]);
     expect(checkPathCollisions([e("a"), e("b")])).toEqual([]);
     // ß ⇄ SS full-fold (r1#8/r2#6) and long-s ſ via NFKC (r2#6) both collide.
     expect(checkPathCollisions([e("straße"), e("STRASSE")]).length).toBe(1);
