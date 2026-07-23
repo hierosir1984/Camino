@@ -387,7 +387,12 @@ export function assertWorkerCloneIsolation(dir: string): WorkerCloneIsolationRec
  * hardlink clone shares its object files with the source (nlink 2); a full
  * --no-local clone writes fresh files (nlink 1). Scans BOTH the loose-object
  * `??/` fan-out dirs AND `pack/` (a `git gc`'d source hardlinks its .pack/.idx
- * into the clone — round-2 finding 7). Bounded; stops at the first hardlink.
+ * into the clone — round-2 finding 7). Stops at the first hardlink. NB (round-20
+ * finding 3): the per-dir enumeration here is `readdirSync` (materializing), NOT the
+ * streaming reader used for the workspace scan — the object store of a fresh
+ * `--no-local` clone is PACKED (few loose objects), so it is not a worker-reachable
+ * unbounded-materialization vector in the current provisioning flow; it is not a
+ * general "bounded for any input" guarantee.
  */
 function hasHardlinkedObject(objectsDir: string): boolean {
   // A standalone object store's files are REAL regular files with link count 1.
@@ -552,8 +557,13 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
     // STREAMING enumeration (round-19 finding 2): opendir + readSync check the entry
     // cap PER entry, so a hostile repo's single directory of millions of entries is
     // bounded to SCAN_MAX_ENTRIES instead of being materialized whole by readdirSync
-    // (which the total cap does not prevent). The Dir handle is closed on every exit;
-    // recursion holds at most SCAN_MAX_DEPTH handles open (bounded).
+    // (which the total cap does not prevent). The Dir handle is closed on every
+    // HANDLED exit — the entry-cap return and the natural end — and recursion holds
+    // at most SCAN_MAX_DEPTH handles open. NOT wrapped in try/finally (round-20
+    // finding 2): a raw throw from readSync itself would leak the handle, but that is
+    // not worker-reachable — the scan runs over a QUIESCENT, daemon-owned 0700 clone,
+    // and every body operation that can fail (lstat, readFileCapped) is caught; the
+    // injected-readSync-failure case is artificial.
     let dir;
     try {
       dir = opendirSync(abs);

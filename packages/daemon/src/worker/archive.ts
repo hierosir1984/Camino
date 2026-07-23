@@ -4,9 +4,12 @@
 // EXACTLY ONE code path archives and destroys workspaces, in the appendix's
 // strict order:
 //
-//   1. archive written under quota   (tar.gz of the whole workspace incl.
-//                                     .git history; refused over the 500 MB
-//                                     compressed cap)
+//   1. archive written under quota   (tar.gz of the workspace's regular files,
+//                                     dirs and symlinks incl. .git history —
+//                                     special files like sockets/FIFOs are what
+//                                     tar archives them as, a socket being skipped
+//                                     with a warning, round-20 finding 5; refused
+//                                     over the 500 MB compressed cap)
 //   2. ledger row REFERENCING it     (through the recordLedgerRow seam — the
 //                                     caller wires the WP-109 event store)
 //   3. workspace destroyed           (never before 1 and 2 both succeeded)
@@ -168,26 +171,24 @@ export function workspaceSizeBytes(dir: string): number {
 const MAX_WORKSPACE_ENTRIES = 1_000_000;
 
 /**
- * A DEPTH bound (round-19 finding 3). Real repos are shallow; an absurdly deep tree
- * is both an abuse vector (unbounded recursion / one open Dir handle per level, since
- * `for await` holds the parent open across a recursive await) and the shape that
- * drives a joined absolute path past PATH_MAX so `lstat` fails and a subtree would
- * SILENTLY vanish from the count/size accounting while tar still archives it.
- */
-const MAX_WORKSPACE_DEPTH = 256;
-
-/**
  * Async twin of workspaceSizeBytes used on the archival path (round-13 finding 1):
  * walks with async fs and YIELDS every YIELD_EVERY entries, so sizing a workspace
  * with a huge file count does not monopolize the daemon loop and defeat another
  * attempt's budget. Same accounting (lstat, symlinks not followed). Enforces
  * MAX_WORKSPACE_ENTRIES via a STREAMING `opendir` enumeration (round-18 finding 1:
- * `readdir` materializes a whole directory before the count check). FAIL-CLOSED
- * (round-19 finding 3): an entry that cannot be `lstat`ed (a joined path past
- * PATH_MAX) or a directory that cannot be opened is REFUSED, not skipped — a skipped
- * subtree would evade BOTH the entry and byte caps while tar still archived it; a
- * DEPTH cap bounds the recursion (and the open-handle count). Together these make the
- * entry cap a HARD bound on everything downstream (tar, hash, destroy).
+ * `readdir` materializes a whole directory before the count check), and makes it a
+ * HARD bound by FAILING CLOSED (round-19 finding 3) on any entry it cannot account
+ * for — a skipped subtree would evade BOTH the entry and byte caps while tar still
+ * archived it.
+ *
+ * Each directory's subdir names are collected and the Dir handle CLOSED before
+ * recursing (round-20 finding 1), so exactly ONE handle is open at a time — the walk
+ * imposes NO depth limit (an earlier arbitrary depth-256 cap wrongly refused a valid
+ * under-quota deep workspace, blocking required archival). RESIDUAL, stated: an entry
+ * whose JOINED absolute path exceeds the OS PATH_MAX makes `lstat`/`opendir` fail, so
+ * it is refused fail-closed (retain + escalate) — tar's RELATIVE traversal could
+ * still archive such a tree, but the absolute-path accounting cannot safely bound it;
+ * this is a rare, deliberately-pathological shape, not a Camino depth/size quota.
  */
 async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise<number> {
   const YIELD_EVERY = 2_000;
@@ -198,17 +199,18 @@ async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise
   const refuse = (why: string): ArchivalError =>
     new ArchivalError(
       "workspace-quota",
-      `refusing archival — ${why} (a defensive bound: empty/deep/long-path trees evade the byte quota but impose unbounded post-worker traversal/tar/hash the container/WP-114 timeout cannot cover); workspace retained for escalation`,
+      `refusing archival — ${why} (workspace retained for escalation)`,
     );
-  const walk = async (abs: string, depth: number): Promise<void> => {
-    if (depth > MAX_WORKSPACE_DEPTH)
-      throw refuse(`tree deeper than ${MAX_WORKSPACE_DEPTH} at ${abs}`);
+  const walk = async (abs: string): Promise<void> => {
+    const subdirs: string[] = [];
     let handle;
     try {
       handle = await opendirAsync(abs);
     } catch (err) {
       throw refuse(`could not enumerate ${abs}: ${describeError(err, 120)}`);
     }
+    // `for await` closes the handle on exhaustion/throw; collect subdirs to recurse
+    // AFTER it closes, so at most one Dir handle is open at any depth.
     for await (const dirent of handle) {
       if (++seen % YIELD_EVERY === 0) await Promise.resolve(); // yield to the loop
       if (seen > maxEntries) throw refuse(`workspace exceeds ${maxEntries} entries`);
@@ -219,11 +221,12 @@ async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise
       } catch (err) {
         throw refuse(`could not stat ${child}: ${describeError(err, 120)}`);
       }
-      if (stat.isDirectory()) await walk(child, depth + 1);
+      if (stat.isDirectory()) subdirs.push(child);
       else total += stat.size;
     }
+    for (const sub of subdirs) await walk(sub);
   };
-  await walk(dir, 0);
+  await walk(dir);
   return total;
 }
 
@@ -349,11 +352,17 @@ export interface ArchiveAttemptOptions {
   attemptSeq?: number;
   /**
    * Persists the ledger row referencing the written archive. MUST durably
-   * record before returning; a throw here retains the archive and the
-   * workspace (fail-closed — the destroy step is never reached). MUST be
-   * IDEMPOTENT per (issueId, attemptId) (round-5 finding 1): the archival step
-   * is retriable, and a retry after a sidecar/destroy failure re-invokes it —
-   * the WP-104 idempotency contract / WP-109 event store dedups the row.
+   * record before returning; a throw here retains the archive and the workspace
+   * (fail-closed — the destroy step is never reached). MUST be IDEMPOTENT per
+   * (issueId, attemptId) (round-5 finding 1): a RECONCILED re-archival (an issue
+   * whose durable ledger state cannot be determined from local files → the janitor
+   * re-runs the whole step) re-invokes this callback, and the WP-104 idempotency
+   * contract / WP-109 event store dedups the row. NB (round-20 finding 4): the
+   * IN-PROCESS recovery paths do NOT re-invoke it — a valid-sidecar resume only
+   * completes the DESTROY (the ledger row is already durable), and an incomplete/
+   * unknown state routes to reconciliation without re-recording. So a repeated
+   * sidecar/destroy failure does not itself call this again; idempotency is required
+   * for the reconciled-re-archival case.
    */
   recordLedgerRow: (row: ArchiveLedgerRow) => void | Promise<void>;
   quotas?: ArchiveQuotas;

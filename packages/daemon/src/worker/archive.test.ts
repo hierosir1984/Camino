@@ -851,30 +851,33 @@ describe("archiveAttempt (A.4#5 single archival step)", () => {
     expect(existsSync(ws)).toBe(true); // retained for escalation, never archived/destroyed
   });
 
-  it("refuses a workspace deeper than the depth cap — fail-closed so a deep subtree cannot evade accounting (round-19 finding 3)", async () => {
+  it("ARCHIVES a deep-but-under-quota workspace — no arbitrary depth cap, and O(1) Dir handles (round-20 finding 1)", async () => {
     const ws = tempDir();
-    // 300 > MAX_WORKSPACE_DEPTH (256). Short names keep the path well under PATH_MAX,
-    // so lstat still SUCCEEDS — the DEPTH cap (not a stat failure) is what refuses;
-    // that is exactly what stops a deep subtree from silently vanishing from the
-    // count/size accounting while tar still traverses it.
+    // 300 levels of short-named dirs with a file at the bottom: well under PATH_MAX,
+    // under every declared quota. An earlier arbitrary depth-256 cap wrongly REFUSED
+    // this valid shape (blocking required archival); the walk must now handle it
+    // (collect-then-recurse keeps exactly one Dir handle open regardless of depth).
     let p = ws;
     for (let i = 0; i < 300; i++) {
       p = join(p, "d");
       mkdirSync(p);
     }
+    writeFileSync(join(p, "deep.txt"), "content at the bottom");
     const root = tempDir();
-    const err = await archiveAttempt({
+    let recorded = false;
+    const record = await archiveAttempt({
       workspaceDir: ws,
       archiveRoot: root,
       issueId: "i",
       attemptId: "a",
       quotas: { workspaceMaxBytes: 1_000_000_000, archiveMaxCompressedBytes: 1_000_000_000 },
-      recordLedgerRow: () => {},
-    }).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(ArchivalError);
-    expect((err as ArchivalError).stage).toBe("workspace-quota");
-    expect((err as Error).message).toMatch(/deeper than/i);
-    expect(existsSync(ws)).toBe(true); // retained for escalation
+      recordLedgerRow: () => {
+        recorded = true;
+      },
+    });
+    expect(recorded).toBe(true);
+    expect(existsSync(record.archivePath)).toBe(true);
+    expect(existsSync(ws)).toBe(false); // archived AND destroyed, not refused
   });
 
   it("refuses an over-cap archive DURING the write, not after, and cleans the partial (round-15 finding 6)", async () => {
