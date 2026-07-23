@@ -1108,18 +1108,29 @@ describe("round-9 falsification fixes", () => {
     expect(() => assertSelfContainedObjectStore(a)).toThrow(/bytes/);
   });
 
-  it("matches git's exact include grammar — accepts `[include.custom]`, refuses `[include]` — r9 #7", () => {
-    // A differently-named section git reads locally (no inclusion) must NOT be
-    // rejected as an include directive.
+  it("refuses ANY include-family config section (blanket rule) — r9 #7 / r11 #1", () => {
+    // A `git clone`-provisioned worker config has NO include of any form, so we
+    // refuse every `[include…]` section rather than hand-parse git's grammar —
+    // incl. the escaped-quote conditional git actually honors (r11 #1).
+    for (const header of [
+      "[include]",
+      '[includeIf "gitdir:/x"]',
+      "[include.custom]",
+      "[include-x]",
+      "[includeIf.custom]",
+      "[includeIf]",
+      '[includeIf "onbranch:main\\"x"]', // escaped quote in condition — git honors
+    ]) {
+      const bad = mkdtempTestDir();
+      mkdirSync(join(bad, ".git", "objects"), { recursive: true });
+      writeFileSync(join(bad, ".git", "config"), `${header}\n\tpath = /etc/x\n`);
+      expect(() => assertSelfContainedObjectStore(bad)).toThrow(/include/);
+    }
+    // A clean config (no include section) is accepted.
     const ok = mkdtempTestDir();
     mkdirSync(join(ok, ".git", "objects"), { recursive: true });
-    writeFileSync(join(ok, ".git", "config"), "[include.custom]\n\tkey = value\n[include-x]\n");
+    writeFileSync(join(ok, ".git", "config"), '[core]\n\tbare = false\n[remote "origin"]\n');
     expect(() => assertSelfContainedObjectStore(ok)).not.toThrow();
-
-    const bad = mkdtempTestDir();
-    mkdirSync(join(bad, ".git", "objects"), { recursive: true });
-    writeFileSync(join(bad, ".git", "config"), "[include]\n\tpath = /etc/x\n");
-    expect(() => assertSelfContainedObjectStore(bad)).toThrow(/include/);
   });
 
   it("does NOT classify a multi-dot long name as an 8.3 alias (FOO~1.T.X) — r9 #8", () => {
@@ -1175,20 +1186,21 @@ describe("round-9 falsification fixes", () => {
     expect(objectFormatOfRepo(unrelated)).toBe("sha1");
   });
 
-  it("only refuses git's actual includeIf grammar (quoted condition) — r10 #6", () => {
-    // `[includeIf.custom]`, `[includeIf-custom]`, and subsection-less `[includeIf]`
-    // are NOT includes git honors — accept them.
-    for (const header of ["[includeIf.custom]", "[includeIf-custom]", "[includeIf]"]) {
-      const ok = mkdtempTestDir();
-      mkdirSync(join(ok, ".git", "objects"), { recursive: true });
-      writeFileSync(join(ok, ".git", "config"), `${header}\n\tkey = v\n`);
-      expect(() => assertSelfContainedObjectStore(ok)).not.toThrow();
-    }
-    // A real conditional include (quoted condition) IS refused.
-    const bad = mkdtempTestDir();
-    mkdirSync(join(bad, ".git", "objects"), { recursive: true });
-    writeFileSync(join(bad, ".git", "config"), '[includeIf "gitdir:/x"]\n\tpath = /etc/x\n');
-    expect(() => assertSelfContainedObjectStore(bad)).toThrow(/include/);
+  it("object-format parse ignores a subsectioned [extensions] and takes the LAST value — r11 #3", () => {
+    // `[extensions "spoof"]` is a DIFFERENT key git ignores for the object format.
+    const spoof = mkdtempTestDir();
+    mkdirSync(join(spoof, ".git"), { recursive: true });
+    writeFileSync(join(spoof, ".git", "config"), '[extensions "spoof"]\n\tobjectformat = sha256\n');
+    expect(objectFormatOfRepo(spoof)).toBe("sha1");
+
+    // A repeated key takes git's LAST value.
+    const repeated = mkdtempTestDir();
+    mkdirSync(join(repeated, ".git"), { recursive: true });
+    writeFileSync(
+      join(repeated, ".git", "config"),
+      "[extensions]\n\tobjectformat = sha256\n\tobjectformat = sha1\n",
+    );
+    expect(objectFormatOfRepo(repeated)).toBe("sha1");
   });
 
   it("storeSizeBytes returns 0 for an absent store but THROWS on an inaccessible one — r10 #4", () => {

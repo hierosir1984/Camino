@@ -197,6 +197,24 @@ function ownDataSnapshot(value: unknown): unknown {
 }
 
 /**
+ * Extract a message that NEVER throws (review r11 finding 2): a thrown non-Error
+ * (`null`, a hostile object) or an `Error` whose `message`/`toString` is a
+ * throwing getter would make `(err as Error).message` itself throw, breaking the
+ * validators' "total" guarantee. Every access is guarded.
+ */
+function safeErrorMessage(err: unknown): string {
+  try {
+    if (err instanceof Error) {
+      const m = err.message;
+      return typeof m === "string" ? m : "error";
+    }
+    return typeof err === "string" ? err : "non-Error thrown";
+  } catch {
+    return "unstringifiable error";
+  }
+}
+
+/**
  * Total validator for a contract record, hash INCLUDED: an empty result
  * means the record is well-formed and its contractHash equals the
  * recomputed hash of its terms. Used at freeze (before insert) and at
@@ -213,7 +231,7 @@ export function contractProblems(value: unknown): string[] {
   try {
     record = ownDataSnapshot(value) as Record<string, unknown>;
   } catch (err) {
-    return [`contract is not JSON-serializable: ${(err as Error).message}`];
+    return [`contract is not JSON-serializable: ${safeErrorMessage(err)}`];
   }
   if (record === null || typeof record !== "object" || Array.isArray(record)) {
     return ["contract must be a plain object"];
@@ -379,7 +397,7 @@ export function contractRefProblems(value: unknown): string[] {
   try {
     record = ownDataSnapshot(value) as Record<string, unknown>;
   } catch (err) {
-    return [`contractRef is not JSON-serializable: ${(err as Error).message}`];
+    return [`contractRef is not JSON-serializable: ${safeErrorMessage(err)}`];
   }
   if (record === null || typeof record !== "object" || Array.isArray(record)) {
     return ["contractRef must be a plain object"];

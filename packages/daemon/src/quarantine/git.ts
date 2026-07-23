@@ -250,20 +250,29 @@ export function objectFormatOfRepo(repo: string): "sha1" | "sha256" {
 }
 
 /**
- * Parse `extensions.objectformat` from git config text — SECTION-AWARE and
- * quote-tolerant (review r10 finding 5). A section-unaware regex would (a) match
- * an unrelated `[user] objectformat = sha256`, mis-initializing the pristine
- * store, and (b) miss git's valid QUOTED value `objectformat = "sha256"`. Only an
- * `objectformat` key inside the `[extensions]` section (no subsection) counts.
+ * Parse `extensions.objectformat` from git config text — SECTION-AWARE,
+ * SUBSECTION-EXACT, quote-tolerant, and LAST-value (review r10 finding 5, r11
+ * finding 3). Only an `objectformat` key inside a `[extensions]` section with NO
+ * subsection counts (`[extensions "spoof"]` is a different key git ignores for
+ * the object format); a repeated key takes git's LAST value, not the first.
+ *
+ * BEST-EFFORT / fail-closed boundary: this reproduces the common config forms,
+ * NOT git's full grammar (line continuations, unusual quoting). We do NOT run git
+ * in the source dir to ask — that would honor the untrusted repo config. A form
+ * we don't reproduce mis-detects the format, which FAILS CLOSED: the fetch into a
+ * mismatched-format pristine store errors and the intake refuses; it never admits
+ * a candidate. (Camino repos are sha-1 for v1; sha-256 support is thus
+ * best-effort.)
  */
 function objectFormatFromConfig(text: string): "sha1" | "sha256" {
   let inExtensions = false;
+  let format: "sha1" | "sha256" = "sha1";
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.replace(/[;#].*$/, "").trim(); // strip inline comments
     if (line.length === 0) continue;
-    const section = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]$/.exec(line);
+    const section = /^\[\s*([A-Za-z0-9.-]+)(\s+"[^"]*")?\s*\]$/.exec(line);
     if (section) {
-      inExtensions = section[1]!.toLowerCase() === "extensions";
+      inExtensions = section[1]!.toLowerCase() === "extensions" && section[2] === undefined;
       continue;
     }
     if (!inExtensions) continue;
@@ -271,10 +280,10 @@ function objectFormatFromConfig(text: string): "sha1" | "sha256" {
     if (kv) {
       let v = kv[1]!.trim();
       if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
-      if (v.toLowerCase() === "sha256") return "sha256";
+      format = v.toLowerCase() === "sha256" ? "sha256" : "sha1"; // LAST value wins
     }
   }
-  return "sha1";
+  return format;
 }
 
 /**
@@ -500,19 +509,20 @@ export function assertSelfContainedObjectStore(repo: string): void {
         "fetch source `.git/config` is unreadable — refused (fail-closed; review r8 finding 1)",
       );
     }
-    // Match git's EXACT include grammar — the `[include]` section (no subsection)
-    // and `[includeIf "<cond>"]` (a QUOTED condition) — NOT a differently-named
-    // section like `[include.custom]` / `[include-custom]`, nor a subsection-less
-    // `[includeIf]` / `[includeIf.custom]`, none of which git honors as an include
-    // (review r9 finding 7, r10 finding 6).
-    if (
-      /^\s*\[\s*include\s*\]/im.test(configText) ||
-      /^\s*\[\s*includeif\s+"[^"]*"\s*\]/im.test(configText)
-    ) {
+    // Refuse ANY `include`-family section header — `[include]`, `[includeIf ...]`,
+    // and every subsectioned/escaped variant. NAMED BOUNDARY: rather than hand-
+    // parse git's include grammar (three rounds of edge cases — a differently-
+    // named `[include.custom]`, a subsection-less `[includeIf]`, an escaped-quote
+    // condition `[includeIf "…\"…"]`; review r9 #7, r10 #6, r11 #1), we make a
+    // BLANKET rule — a `git clone`-provisioned worker config carries NO include of
+    // any form, so refusing every `[include…]` section over-rejects nothing real
+    // while closing the whole surface (an include `path` could be a FIFO the
+    // serving `upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1).
+    if (/^[ \t]*\[[ \t]*include/im.test(configText)) {
       throw new QuarantineGitError(
-        "fetch source `.git/config` uses an `[include]`/`[includeIf]` directive — refused; a worker " +
-          "clone must not indirect its config (an include path could be a FIFO the serving " +
-          "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1)",
+        "fetch source `.git/config` contains an `[include]`/`[includeIf]`-family section — refused; " +
+          "a worker clone must not indirect its config (an include path could be a FIFO the serving " +
+          "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1, r11 finding 1)",
       );
     }
   }

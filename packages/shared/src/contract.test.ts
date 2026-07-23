@@ -274,6 +274,34 @@ describe("contractRefProblems", () => {
     }
   });
 
+  it("stays total when the THROWN error is itself hostile (thrown null / throwing message) — r11 #2", () => {
+    // A getter that throws `null` during serialization: the validator must return
+    // problems, never throw (`(err as Error).message` on null would throw).
+    const throwsNull = {
+      get issueId(): string {
+        throw null;
+      },
+    };
+    expect(() => contractRefProblems(throwsNull)).not.toThrow();
+    expect(contractRefProblems(throwsNull).length).toBeGreaterThan(0);
+    expect(() => contractProblems(throwsNull)).not.toThrow();
+
+    // A value whose serialization throws an Error with a THROWING `message` getter.
+    const hostile = {
+      toJSON(): never {
+        const e = new Error();
+        Object.defineProperty(e, "message", {
+          get(): string {
+            throw new Error("message trap");
+          },
+        });
+        throw e;
+      },
+    };
+    expect(() => contractRefProblems(hostile)).not.toThrow();
+    expect(() => contractProblems(hostile)).not.toThrow();
+  });
+
   it("rejects a NESTED inherited interface and a stateful Proxy ref (JSON snapshot) — r9", () => {
     // A nested interface whose fields are inherited serializes to {} — the
     // top-level own-copy missed it; the JSON snapshot catches it.

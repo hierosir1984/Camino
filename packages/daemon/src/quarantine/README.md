@@ -88,11 +88,12 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   config), so a worker cannot use it to run code during the fetch. The intake
   ALSO refuses a worker `.git/config` that is a FIFO/special node, is over a size
   cap (bounded read, review r9 finding 2), or uses git's `[include]` /
-  `[includeIf "…"]` directive (matched by git's EXACT section grammar — the bare
-  `[include]` and an `[includeIf "<quoted condition>"]` only, not a
-  differently-named `[include.custom]` nor a subsection-less `[includeIf]` git
-  reads locally without inclusion; review r9 finding 7, r10 finding 6): an include
-  `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
+  `[includeIf "…"]`-family section — a BLANKET rule refusing ANY `[include…]`
+  section header (a `git clone`-provisioned worker config has none), rather than
+  hand-parse git's include grammar, which cost three rounds of edge cases (a
+  differently-named `[include.custom]`, a subsection-less `[includeIf]`, an
+  escaped-quote condition; review r9 finding 7, r10 finding 6, r11 finding 1): an
+  include `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
   orphaning a descendant even for a fully stopped worker (review r8 finding 1).
   The remaining repo-config exec/indirection surface
   (e.g. an include pointing OUTSIDE `.git`) is bounded by the fetch env carrying
@@ -128,11 +129,14 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   1, 2). Replacement refs are additionally disabled in the pristine store
   (`core.useReplaceRefs=false`). The OID grammar accepts 40-hex (sha-1) OR 64-hex
   (sha-256), and the pristine store is initialized with the TRUSTED base's object
-  format — read from its config file (a section-aware, quote-tolerant parse of
-  `[extensions] objectformat`, so an unrelated section's key does not mis-init and
-  git's quoted value is honored; review r9 finding 4, r10 finding 5), never via a
-  git-exec that would honor the repo's config — so a sha-256 intake actually
-  fetches.
+  format — read from its config file (a section-aware, SUBSECTION-exact,
+  quote-tolerant, LAST-value parse of `[extensions] objectformat`, so an unrelated
+  or subsectioned section does not mis-init and git's quoted/repeated value is
+  honored; review r9 finding 4, r10 finding 5, r11 finding 3), never via a
+  git-exec that would honor the repo's config. This is BEST-EFFORT (it does not
+  reproduce git's full config grammar, e.g. line continuations); a form it misses
+  FAILS CLOSED — the fetch into a mismatched-format store errors and the intake
+  refuses, never admits — and Camino is sha-1 for v1.
 - **The worker object store must be self-contained — under a stopped-worker
   CUSTODY PRECONDITION.** Before fetching, the intake requires a full non-bare
   clone (a real `.git` directory), refuses a `commondir` redirect, and walks the
@@ -305,8 +309,10 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   `value`). So an inherited-only record (`Object.create(valid)`), a non-enumerable
   `Object.prototype` pollution at ANY nesting level (which makes even `{}` read as
   populated), a stateful/revoked `Proxy`, and a non-serializable value are all
-  normalized or refused, never accepted and never thrown on (review r7 finding 11,
-  r8 finding 5, r9 finding 5, r10 findings 1–3). **Boundary:** a live object that
+  normalized or refused, never accepted and never thrown on — even the CAUGHT
+  error is formatted through a message extractor that itself never throws (a
+  thrown `null`, a hostile `message` getter; review r7 finding 11, r8 finding 5,
+  r9 finding 5, r10 findings 1–3, r11 finding 2). **Boundary:** a live object that
   serializes DIFFERENTLY across calls is a caller-trust surface — the validator
   validates ONE snapshot, and a caller that then adopts the live object rather
   than a serialized record owns that risk (the scope `quarantinedDiffProblems`
