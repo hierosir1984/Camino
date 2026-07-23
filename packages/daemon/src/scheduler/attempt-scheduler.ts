@@ -858,9 +858,9 @@ export class AttemptScheduler {
       // A JANITOR holder with a FRESH heartbeat is a live reconciliation
       // pass (round-3 finding 2): no attempt entity by design; it settles
       // its own lease. A LAPSED janitor lease is a pass whose daemon died
-      // (round-4 finding 3) — janitors never spawn anything, so the
-      // trivial confirm is honestly attestable and unfences the
-      // environment.
+      // (round-4 finding 3) — and reconciliation DOES spawn (archival
+      // tar), so never-spawned is NOT attestable for it (round-5 finding
+      // 1): it is reported below for a real process-group kill-confirm.
       if (lease.holderAttemptId.startsWith("janitor.")) {
         if (leaseLapsed(lease, this.#now().getTime(), LEASE_TTL_MS)) {
           // A dead janitor pass may have left a LIVE archival child (tar —
