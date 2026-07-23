@@ -174,9 +174,11 @@ export function commitTree(
   const date = opts.date ?? "2026-01-01T00:00:00Z";
   const args = ["-C", dir, "commit-tree", tree];
   for (const p of parents) args.push("-p", p);
-  args.push("-m", message);
+  // Message on STDIN (not `-m`): lets a fixture build a commit with a message
+  // larger than the argv limit (e.g. the commit-metadata-budget case).
   return execFileSync("git", args, {
-    stdio: ["ignore", "pipe", "pipe"],
+    input: message,
+    stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
       GIT_AUTHOR_NAME: name,

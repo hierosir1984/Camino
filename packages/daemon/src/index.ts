@@ -188,6 +188,7 @@ export { DEFAULT_BUDGETS, effectiveBudgets, MAX_STORED_PATH_LENGTH } from "./qua
 export {
   checkFetchBudget,
   checkScopeAndProtected,
+  checkChangedPathValidity,
   checkPathCollisions,
   checkNameAliases,
   checkPathLength,

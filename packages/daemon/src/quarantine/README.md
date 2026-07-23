@@ -98,33 +98,69 @@ not scope.
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
   id and **including** the fetched commit, closing the off-by-one and the
-  repeated-path inflation a worker could exploit (review r1 finding 8) — and
-  distinct blob bytes, then refuses an over-cap candidate, discarding the
-  pristine store. It is computed after the **local** fetch from the worker's
-  already-bounded (≤2 GB workspace) isolated clone completes; a
-  pre-transfer/network ceiling is bounded out-of-process by the WP-107 container
-  - WP-114 supervisor — the same in-process-best-effort /
-    out-of-process-authoritative split WP-107 states. The per-issue tree-size
-    **policy** budget is a separate, materialized-entry measure, clamped so an
-    override can only **tighten** it, never widen it (finding 7).
-- **Protected paths include local actions and submodule routing.** Beyond
-  `.gitattributes`, `.github/workflows/**`, and `.camino/**`, the intake protects
-  `.github/actions/**` (local composite/JS actions execute with the referencing
-  workflow's privilege) and rejects any worker change to `.gitmodules` (which
-  retargets an otherwise-unchanged gitlink at an attacker repo) — review r1
-  findings 3, 5. A workflow that references a local action at an ARBITRARY path
-  (`uses: ./scripts/foo`) is not enumerable here; parsing each workflow's
-  `uses: ./…` targets is the WP-118 onboarding analyzer (CAM-SEC-03).
+  repeated-path inflation a worker could exploit (review r1 finding 8) — and the
+  summed bytes of ALL those objects (blobs, trees, AND the commit), so object
+  metadata cannot hide from the budget (review r2 finding 6). Worker-controlled
+  commit metadata is separately bounded: a commit object over 1 MiB is rejected
+  (`commit-metadata-budget`) before it is read, and the authored candidate
+  message is passed on stdin (never argv) and clipped — so an unbounded worker
+  message fails as a clean rejection, not an E2BIG/ENOBUFS throw. The budget is
+  computed after the **local** fetch from the worker's already-bounded (≤2 GB
+  workspace) isolated clone completes; a pre-transfer/network ceiling is bounded
+  out-of-process by the WP-107 container + WP-114 supervisor — the same
+  in-process-best-effort / out-of-process-authoritative split WP-107 states. It
+  is an ADMISSION check: an over-budget candidate is refused, and the caller
+  discards the returned `pristineDir`. The per-issue tree-size **policy** budget
+  is a separate, materialized-entry measure, clamped so an override can only
+  **tighten** it, never widen it — a non-finite or non-positive override (`NaN`,
+  `0`, …) is ignored rather than silently disabling the check (findings 5, 7).
+- **Protected paths are matched on the canonical FOLD, not the literal string.**
+  Beyond `.gitattributes`, `.github/workflows/**`, and `.camino/**`, the intake
+  protects `.github/actions/**` (local composite/JS actions execute with the
+  referencing workflow's privilege) and rejects any worker change to
+  `.gitmodules` (which retargets an otherwise-unchanged gitlink at an attacker
+  repo). Both are compared under the same per-segment case-fold as the collision
+  check, so an alias a target FS resolves to the protected identity —
+  `.gitattributeſ`, `.GitModules` — is caught, not just the exact spelling
+  (review r1 findings 3, 5; r2 findings 1, 4). **Named boundary / escalation:** a
+  workflow may reference a local action at an ARBITRARY path (`uses: ./scripts/
+foo`) or via a SYMLINK whose target the worker edits — closing that requires
+  parsing each workflow's `uses: ./…` targets, which is the WP-118 onboarding
+  analyzer (CAM-SEC-03). Whether WP-108 should ship a minimal `uses:`-parser or
+  defer the complete local-action closure to WP-118 is a scope decision flagged
+  for David.
 - **The workflow-posture analyzer is heuristic and its home is WP-118.** It is
   the WP-003 spike's analyzer verbatim (3 falsification rounds), carried forward
   so the entire corpus runs green here. Its onboarding-time **enforcement** —
   running these checks at repo onboarding and gating on them — is WP-118
   (CAM-SEC-03); a truly complete symbolic glob∩namespace / GitHub-Actions
   analyzer is that onboarding check. This module's intake does not gate on it.
-- **The caller owns the pristine-repo lifecycle.** `runIntake` returns
-  `pristineDir` (so a test can prove a carried-in object is structurally absent,
-  and so the scheduler owns teardown). Use `removePristineRepo` /
-  `cleanupPristineRepos` to reclaim it.
+- **The caller owns the pristine-repo lifecycle; checks are collect-all.** The
+  intake runs every policy check and reports ALL violations (not fail-fast), so a
+  rejected result may carry several codes. It does not auto-delete the pristine
+  store: `runIntake` returns `pristineDir` on both accept and reject (so a caller
+  can prove a carried-in object is structurally absent, and inspect a rejection),
+  and the caller reclaims it with `removePristineRepo` / `cleanupPristineRepos`.
+  A pristine dir created before a thrown refusal is tracked for
+  `cleanupPristineRepos` (review r2 finding 11).
+- **The OID identifies WHICH object was fetched, not that it is the observed
+  head.** `fetchOid` verifies the fetched object is exactly the requested OID and
+  is a commit — so a worker cannot substitute different content under a trusted
+  OID. Binding that OID to the control-plane-**observed** final head of the
+  attempt (that the caller passed the head the worker actually produced) is the
+  caller's job — WP-114 dispatch resolves the worker head and hands it here.
+  Likewise, the assigned `base` defaults to the worker repo only for the corpus
+  fixtures; production passes a SEPARATE trusted `baseRepo` (review r2 finding
+  10).
+- **Canonical path identity is over-reject-safe but NOT a complete fold; a
+  scope decision is flagged for David.** The fold (NFKC + ICU upper/lower +
+  `ß→ss`) catches the common aliases and the round-1/round-2 examples, but ICU's
+  case MAPPING is not full versioned case FOLDING, so recent-Unicode case pairs
+  (e.g. the U+A7CE class) that a case-insensitive volume still aliases may slip
+  (they over-reject-safely nowhere, but under-detect). Making this complete means
+  bundling a versioned Unicode `CaseFolding.txt` table. Whether to fund that in
+  WP-108 or accept the disclosed residual for a personal-tool v1 (the WP-003
+  precedent accepted a weaker residual) is flagged for David.
 
 ## Running the suites
 

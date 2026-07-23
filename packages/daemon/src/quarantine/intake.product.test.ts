@@ -2,7 +2,16 @@
 // (CAM-EXEC-04): the emitted quarantined diff, WP-110 contract binding, the
 // registry-item-11 fetch budget, the credentialed-git / worker-touched-dir
 // boundary, and a production-shape smoke test of the real intake entry.
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import {
@@ -24,6 +33,7 @@ import {
   initRepo,
   type CacheEntry,
 } from "./corpus-git.js";
+import { assertSelfContainedObjectStore } from "./git.js";
 import { cleanupPristineRepos, runIntake } from "./intake.js";
 import {
   checkFetchBudget,
@@ -34,9 +44,11 @@ import {
 import { MAX_STORED_PATH_LENGTH } from "./types.js";
 import type { QuarantineAssignment, TreeEntry } from "./types.js";
 
+const testDirs: string[] = [];
 afterAll(() => {
   cleanupRepos();
   cleanupPristineRepos();
+  for (const d of testDirs) rmSync(d, { recursive: true, force: true });
 });
 
 /** A trusted base with two in-scope files, plus a clean in-scope worker head. */
@@ -455,7 +467,137 @@ describe("round-1 falsification fixes", () => {
   });
 });
 
+describe("round-2 falsification fixes", () => {
+  /** Head = base + one added file at `path`, rebuilt on base. */
+  function headAdding(repo: string, base: string, baseFile: CacheEntry, path: string): string {
+    const blob = hashBlob(repo, "x\n");
+    return commitTree(
+      repo,
+      buildTree(repo, [baseFile, { mode: "100644", sha: blob, path }]),
+      [base],
+      "add",
+    );
+  }
+
+  it("protects a canonical ALIAS of a protected path (.gitattributeſ → .gitattributes) — r2 #1", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const baseFile: CacheEntry = { mode: "100644", sha: app, path: "src/app.js" };
+    const base = commitTree(repo, buildTree(repo, [baseFile]), [], "base");
+    // long-s ⇄ s under NFKC: a case-insensitive/normalizing FS resolves this to
+    // `.gitattributes`, so it must be rejected as protected.
+    const head = headAdding(repo, base, baseFile, ".gitattribute" + String.fromCodePoint(0x017f));
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("protected-path");
+  });
+
+  it("rejects a case-alias .gitmodules retarget (.GitModules) — r2 #4", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const baseFile: CacheEntry = { mode: "100644", sha: app, path: "src/app.js" };
+    const base = commitTree(repo, buildTree(repo, [baseFile]), [], "base");
+    const head = headAdding(repo, base, baseFile, ".GitModules");
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("submodule-gitlink");
+  });
+
+  it("a NaN budget override cannot widen the cap — r2 #5", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const big = hashBlob(repo, "X".repeat(2 * 1024 * 1024)); // 2 MB > 1 MB default
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: big, path: "src/big.bin" },
+      ]),
+      [base],
+      "add big",
+    );
+    const r = runIntake(repo, head, {
+      base,
+      allowedPaths: ["**"],
+      budgets: { maxBlobBytes: Number.NaN }, // NaN must NOT disable the size check
+    });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("blob-size-budget");
+  });
+
+  it("rejects an unbounded commit message as a policy result, not a thrown emitter — r2 #6", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const app2 = hashBlob(repo, "console.log('v2');\n");
+    // A commit message well over MAX_COMMIT_OBJECT_BYTES (built via stdin).
+    const head = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app2, path: "src/app.js" }]),
+      [base],
+      "x".repeat(2 * 1024 * 1024),
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("commit-metadata-budget");
+    expect(r.diff).toBeNull();
+  });
+
+  it("validates a DELETED path (over the cap) as a rejection, not a thrown emitter — r2 #7", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const longName = "many/" + "a".repeat(MAX_STORED_PATH_LENGTH + 200) + ".txt";
+    const longBlob = hashBlob(repo, "y\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: longBlob, path: longName },
+      ]),
+      [],
+      "base",
+    );
+    // Head DELETES the long path (it is not in the final tree, so entry-level
+    // checks never see it — only the changed-path check does).
+    const head = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [base],
+      "delete long",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("path-too-long");
+    expect(r.diff).toBeNull();
+  });
+
+  it("refuses a gitfile `.git` (linked-worktree) worker repo — r2 #3", () => {
+    // assertSelfContainedObjectStore refuses a `.git` that is a FILE, not a dir,
+    // since a commondir redirect could hide a borrowing store.
+    const dir = mkdtempTestDir();
+    writeFileSync(join(dir, ".git"), "gitdir: /elsewhere/.git/worktrees/w\n");
+    expect(() => assertSelfContainedObjectStore(dir)).toThrow(/gitfile\/symlink|real `\.git`/);
+  });
+});
+
 // --- helpers ---
+
+function mkdtempTestDir(): string {
+  const d = mkdtempSync(join(tmpdir(), "camino-gitfile-"));
+  testDirs.push(d);
+  return d;
+}
 
 function buildBase(repo: string, appContent: string): string {
   const app = hashBlob(repo, appContent);

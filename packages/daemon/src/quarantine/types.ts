@@ -51,14 +51,22 @@ export const DEFAULT_BUDGETS: Budgets = Object.freeze({
  * The effective tree-size budget for one intake: each field is the STRICTER of
  * the default and any per-issue override (review r1 finding 7). A contract can
  * only TIGHTEN the cap, never widen it — so a supplied `maxBlobBytes` of 10 MB
- * cannot loosen the 1 MB default. (Widening was possible before this clamp,
- * contradicting the "stricter-only" documentation.)
+ * cannot loosen the 1 MB default.
+ *
+ * A non-finite or non-positive override (`NaN`, `Infinity`, `0`, negative, a
+ * non-number) is IGNORED — the default stands. Without this, `Math.min(default,
+ * NaN)` is `NaN` and every `size > NaN` comparison is false, silently disabling
+ * the size checks (review r2 finding 5).
  */
 export function effectiveBudgets(overrides?: Partial<Budgets>): Budgets {
+  const tighten = (dflt: number, override: unknown): number =>
+    typeof override === "number" && Number.isFinite(override) && override > 0
+      ? Math.min(dflt, override)
+      : dflt;
   return {
-    maxTreeBytes: Math.min(DEFAULT_BUDGETS.maxTreeBytes, overrides?.maxTreeBytes ?? Infinity),
-    maxBlobBytes: Math.min(DEFAULT_BUDGETS.maxBlobBytes, overrides?.maxBlobBytes ?? Infinity),
-    maxEntries: Math.min(DEFAULT_BUDGETS.maxEntries, overrides?.maxEntries ?? Infinity),
+    maxTreeBytes: tighten(DEFAULT_BUDGETS.maxTreeBytes, overrides?.maxTreeBytes),
+    maxBlobBytes: tighten(DEFAULT_BUDGETS.maxBlobBytes, overrides?.maxBlobBytes),
+    maxEntries: tighten(DEFAULT_BUDGETS.maxEntries, overrides?.maxEntries),
   };
 }
 
@@ -70,6 +78,18 @@ export function effectiveBudgets(overrides?: Partial<Budgets>): Budgets {
  * (POSIX PATH_MAX territory) and well under the schema's 8192-code-unit cap.
  */
 export const MAX_STORED_PATH_LENGTH = 4096;
+
+/**
+ * A worker commit OBJECT larger than this is rejected before its metadata is
+ * read (review r2 finding 6): the commit message is worker-controlled and
+ * otherwise unbounded, and copying a huge one through argv/a fixed buffer would
+ * throw (E2BIG/ENOBUFS) instead of failing as a clean rejection. 1 MiB is far
+ * beyond any real commit message.
+ */
+export const MAX_COMMIT_OBJECT_BYTES = 1 << 20;
+
+/** The candidate subject is the worker's, clipped to this many code units. */
+export const MAX_CANDIDATE_SUBJECT_LENGTH = 1000;
 
 /**
  * The registry-item-11 FETCH budget (PRD §5 item 11: "fetch ≤5,000 objects /
@@ -123,6 +143,7 @@ export type RejectionCode =
   | "tree-size-budget"
   | "entry-budget"
   | "path-too-long"
+  | "commit-metadata-budget"
   // Registry-item-11 FETCH-budget breaches (product additions over the spike):
   | "fetch-object-budget"
   | "fetch-size-budget";

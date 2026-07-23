@@ -230,18 +230,23 @@ export function checkSubmodules(
       path: e.path,
       detail: `submodule/gitlink introduced at "${e.path}" (${e.sha})`,
     }));
-  if (changed.has(".gitmodules")) {
-    out.push({
-      code: "submodule-gitlink",
-      path: ".gitmodules",
-      detail: "worker changed .gitmodules — submodule routing metadata may not be worker-edited",
-    });
+  // Match `.gitmodules` by its CANONICAL fold, not exact string, so a
+  // case/normalization alias a target FS resolves to `.gitmodules` (`.GitModules`
+  // on APFS) cannot slip the retarget guard (review r2 finding 4).
+  for (const p of changed) {
+    if (foldKey(p) === ".gitmodules") {
+      out.push({
+        code: "submodule-gitlink",
+        path: p,
+        detail: `worker changed .gitmodules (as "${p}") — submodule routing metadata may not be worker-edited`,
+      });
+    }
   }
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// path length
+// path length + changed-path validity
 // ---------------------------------------------------------------------------
 
 /**
@@ -259,6 +264,35 @@ export function checkPathLength(entries: readonly TreeEntry[]): Rejection[] {
         code: "path-too-long",
         path: e.path.slice(0, 80) + "…",
         detail: `stored path is ${e.path.length} code units (budget ${MAX_STORED_PATH_LENGTH})`,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Validate the CHANGED-path set (base↔head), which — unlike the final-tree
+ * `entries` — includes DELETED paths. A deleted path with a non-UTF-8 name (git
+ * decodes it to U+FFFD, so two distinct raw names can collapse) or over the
+ * length cap otherwise never reaches the entry-level checks and would surface
+ * only as a thrown or corrupted emitted diff (review r2 finding 7). Reject it
+ * here as a policy result instead.
+ */
+export function checkChangedPathValidity(changed: readonly string[]): Rejection[] {
+  const out: Rejection[] = [];
+  for (const path of changed) {
+    if (path.includes("�")) {
+      out.push({
+        code: "windows-alias",
+        path,
+        detail: `changed path "${path}" is not valid UTF-8 (non-portable, ambiguous identity)`,
+      });
+    }
+    if (path.length > MAX_STORED_PATH_LENGTH) {
+      out.push({
+        code: "path-too-long",
+        path: path.slice(0, 80) + "…",
+        detail: `changed path is ${path.length} code units (budget ${MAX_STORED_PATH_LENGTH})`,
       });
     }
   }
@@ -490,15 +524,18 @@ export function matchesAnyGlob(path: string, globs: readonly string[]): boolean 
  * scope-governed, not protected.
  */
 export function isProtectedPath(path: string): boolean {
-  // Case-insensitive: a case-insensitive host (macOS/Windows) resolves
-  // `.GITATTRIBUTES` / `.GitHub/Workflows` / `.Camino` to the protected path,
-  // and git even applies a `.GITATTRIBUTES` on such a host (WP-003 r1).
-  const p = path.toLowerCase();
-  const base = p.slice(p.lastIndexOf("/") + 1);
+  // Compare on the CANONICAL fold of each segment, not a plain lowercase: a
+  // case-insensitive / normalizing host resolves `.GITATTRIBUTES`, `.GitHub/
+  // Workflows`, `.Camino`, and — the round-2 finding — `.gitattributeſ` (long-s
+  // ⇄ s under NFKC) to the protected identity, and git even applies a
+  // `.GITATTRIBUTES` on such a host. Folding both sides catches the alias a
+  // literal match missed (review r2 finding 1); the fold's own residual is the
+  // named boundary in checkPathCollisions.
+  const segs = path.split("/").map((s) => foldKey(s));
+  const base = segs[segs.length - 1];
   if (base === ".gitattributes") return true;
-  if (p === ".github/workflows" || p.startsWith(".github/workflows/")) return true;
-  if (p === ".github/actions" || p.startsWith(".github/actions/")) return true;
-  if (p === ".camino" || p.startsWith(".camino/")) return true;
+  if (segs[0] === ".github" && (segs[1] === "workflows" || segs[1] === "actions")) return true;
+  if (segs[0] === ".camino") return true;
   return false;
 }
 

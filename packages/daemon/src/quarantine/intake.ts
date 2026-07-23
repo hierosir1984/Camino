@@ -19,12 +19,12 @@ import {
   changedPaths,
   changedPathsWithStatus,
   commitCandidate,
-  distinctBlobBytes,
   distinctObjectCount,
-  fetchedObjectCount,
+  fetchFootprint,
   fetchOid,
   fsckTree,
   initPristineRepo,
+  objectSize,
   parentShas,
   QuarantineGitError,
   subjectOf,
@@ -35,6 +35,7 @@ import {
 } from "./git.js";
 import {
   checkBudgets,
+  checkChangedPathValidity,
   checkDotGitPaths,
   checkFetchBudget,
   checkNameAliases,
@@ -47,6 +48,8 @@ import {
 } from "./policy.js";
 import {
   effectiveBudgets,
+  MAX_CANDIDATE_SUBJECT_LENGTH,
+  MAX_COMMIT_OBJECT_BYTES,
   type QuarantineAssignment,
   type QuarantineResult,
   type Rejection,
@@ -116,9 +119,24 @@ export function runIntake(
 
   const rejections: Rejection[] = [];
 
+  // Bound worker-controlled commit METADATA before reading it: an unbounded
+  // commit message would blow the argv/buffer path in merge-detection and
+  // candidate authoring (review r2 finding 6). A commit object over the cap is
+  // rejected, and the full-object reads below are then bounded to ≤ the cap.
+  const commitBytes = objectSize(pristineDir, workerHead);
+  const oversizeCommit = commitBytes > MAX_COMMIT_OBJECT_BYTES;
+  if (oversizeCommit) {
+    rejections.push({
+      code: "commit-metadata-budget",
+      detail: `worker head commit object is ${commitBytes} bytes (budget ${MAX_COMMIT_OBJECT_BYTES}) — unbounded metadata`,
+    });
+  }
+
   // Worker merge commits are rejected outright (design §5.1). Read from the RAW
-  // commit object so the shallow graft does not hide a second parent.
-  if (parentShas(pristineDir, workerHead).length > 1) {
+  // commit object so the shallow graft does not hide a second parent. Skipped
+  // when the commit is over-cap (it is rejected regardless, and reading it could
+  // overrun the buffer).
+  if (!oversizeCommit && parentShas(pristineDir, workerHead).length > 1) {
     rejections.push({
       code: "worker-merge-commit",
       detail: `worker head ${workerHead.slice(0, 12)} is a merge commit`,
@@ -131,11 +149,11 @@ export function runIntake(
   // so they cannot be silently deduped/collapsed (WP-003 r2).
   const entries = treeLeaves(pristineDir, treeSha);
   // Registry-item-11 FETCH budget consults the DISTINCT transfer footprint —
-  // distinct objects (incl. the commit) and distinct blob bytes (review r1
-  // finding 8). The per-issue tree POLICY budget consults the materialized
-  // entry count (with repetition), a distinct measure.
-  const fetchObjects = fetchedObjectCount(pristineDir, workerHead, treeSha);
-  const fetchBytes = distinctBlobBytes(entries);
+  // distinct objects (incl. the commit) and their total bytes (blobs + trees +
+  // commit), measured in one pass (review r1 finding 8 / r2 finding 6). The
+  // per-issue tree POLICY budget consults the materialized entry count (with
+  // repetition), a distinct measure.
+  const footprint = fetchFootprint(pristineDir, workerHead, treeSha);
   const entryCount = treeEntryCount(pristineDir, treeSha);
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, assignment.base, workerHead);
@@ -155,8 +173,9 @@ export function runIntake(
   rejections.push(
     // Registry-item-11 fetch budget: a HARD outer cap on the DISTINCT shallow-
     // fetch footprint, independent of the per-issue tree-size policy budget below.
-    ...checkFetchBudget(fetchObjects, fetchBytes),
+    ...checkFetchBudget(footprint.objects, footprint.bytes),
     ...checkScopeAndProtected(changed, assignment.allowedPaths),
+    ...checkChangedPathValidity(changed),
     ...checkPathCollisions(entries),
     ...checkNameAliases(entries),
     ...checkPathLength(entries),
@@ -170,7 +189,10 @@ export function runIntake(
   let rebuilt: QuarantineResult["rebuilt"] = null;
   let diff: QuarantinedDiff | null = null;
   if (accepted) {
-    const subject = subjectOf(pristineDir, workerHead);
+    // The candidate subject is the worker's, but BOUNDED: accept implies the
+    // commit object was ≤ the metadata cap, and we further clip the subject to a
+    // display length so the authored message can never be pathological.
+    const subject = subjectOf(pristineDir, workerHead).slice(0, MAX_CANDIDATE_SUBJECT_LENGTH);
     const attributionTrailer = workerAttributionTrailer(workerHead);
     const message = `${subject}\n\n${attributionTrailer}\n`;
     const candidateSha = commitCandidate(pristineDir, treeSha, assignment.base, message);

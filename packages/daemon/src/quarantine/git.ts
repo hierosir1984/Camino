@@ -13,7 +13,7 @@
 // the README boundary note on the residual serving-side config-exec surface,
 // which is structural, not an exhaustive denylist).
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { ChangedPath, ChangedPathKind } from "@camino/shared";
@@ -43,12 +43,17 @@ const GIT_ENV_BASE = {
   LC_ALL: "C",
 } as const;
 
-function runGit(cwd: string | null, args: string[], maxBuffer: number): Buffer {
-  const env: Record<string, string> = { ...GIT_ENV_BASE };
+/** The credential-free env (+ the ambient PATH so `git` resolves, nothing else). */
+function gitEnv(extra: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = { ...GIT_ENV_BASE, ...extra };
   const path = process.env["PATH"];
   if (typeof path === "string") env["PATH"] = path;
+  return env;
+}
+
+function runGit(cwd: string | null, args: string[], maxBuffer: number): Buffer {
   return execFileSync("git", cwd === null ? args : ["-C", cwd, ...args], {
-    env,
+    env: gitEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer,
   });
@@ -129,6 +134,26 @@ export function removePristineRepo(dir: string): void {
  * layouts.
  */
 export function assertSelfContainedObjectStore(repo: string): void {
+  // A GITFILE `.git` (a FILE, or a symlink, not a directory) redirects to a
+  // `commondir` whose object store — and its alternates — live elsewhere, so a
+  // linked-worktree worker repo could hide a borrowing store the direct file
+  // check below never sees (review r2 finding 3). Refuse it outright: a WP-107
+  // worker clone is a full clone with a REAL `.git` directory (its
+  // `gitIsRealDirectory` attestation), or a bare repo (no `.git` at all). This
+  // is an lstat, not a follow — no TOCTOU on the target.
+  const dotGit = join(repo, ".git");
+  let dotGitStat;
+  try {
+    dotGitStat = lstatSync(dotGit);
+  } catch {
+    dotGitStat = null; // absent ⇒ bare layout, checked below
+  }
+  if (dotGitStat !== null && !dotGitStat.isDirectory()) {
+    throw new QuarantineGitError(
+      "fetch source `.git` is a gitfile/symlink (linked worktree) — refused; a worker clone must " +
+        "have a real `.git` directory so its object store cannot borrow via commondir (CAM-EXEC-02 / review r2 finding 3)",
+    );
+  }
   const candidates = [
     join(repo, ".git", "objects", "info", "alternates"),
     join(repo, ".git", "objects", "info", "http-alternates"),
@@ -241,41 +266,57 @@ export function treeLeaves(dir: string, treeSha: string): TreeEntry[] {
   return parseTree(gitBuf(dir, "ls-tree", "-r", "-l", "-z", treeSha).toString("utf8"));
 }
 
-/**
- * The count of DISTINCT git objects the shallow fetch of `commit` transfers:
- * every distinct subtree + every distinct blob/leaf reachable from its tree,
- * plus the commit object itself. `-t` includes intermediate trees, so a
- * pathologically DEEP tree (one leaf, many trees) is counted honestly; DISTINCT
- * shas are counted, so a blob referenced at 5,000 paths is ONE object, not
- * 5,000 — and the fetched commit is included, closing the off-by-one a worker
- * used to sit exactly on the 5,000 cap (review r1 finding 8). This is the
- * object count the registry-item-11 fetch budget consults.
- */
-export function fetchedObjectCount(dir: string, commit: string, treeSha: string): number {
-  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
-  const shas = new Set<string>();
-  for (const e of parseTree(raw)) shas.add(e.sha);
-  shas.add(treeSha); // the root tree ls-tree omits
-  shas.add(commit); // the fetched commit object itself
-  return shas.size;
+/** The DISTINCT-object transfer footprint of the shallow fetch of `commit`. */
+export interface FetchFootprint {
+  /** Distinct objects: every subtree + leaf + the root tree + the commit. */
+  objects: number;
+  /** Summed size of ALL those distinct objects — blobs, trees, AND the commit. */
+  bytes: number;
 }
 
 /**
- * The total byte size of the DISTINCT blobs reachable from the tree — the
- * transfer's payload footprint, deduplicated by object id so a blob referenced
- * at many paths counts once (review r1 finding 8). Symlink and gitlink leaves
- * are blobs/commit-refs; only real blob content contributes bytes.
+ * Measure the shallow-fetch footprint of `commit`: the count AND total byte size
+ * of the DISTINCT objects reachable from its tree, plus the root tree and the
+ * commit object itself. `-t` includes intermediate trees (a deep tree is counted
+ * honestly); DISTINCT ids are counted, so a blob at 5,000 paths is one object,
+ * not 5,000 (review r1 finding 8). Bytes are the sizes of ALL distinct objects —
+ * blobs, trees, and the commit — not just blob payload (review r2 finding 6),
+ * read in ONE `cat-file --batch-check` pass so a worker's object metadata cannot
+ * hide from the transfer budget.
  */
-export function distinctBlobBytes(entries: readonly TreeEntry[]): number {
-  const seen = new Set<string>();
-  let total = 0;
-  for (const e of entries) {
-    if (e.size == null) continue; // gitlink — no blob payload
-    if (seen.has(e.sha)) continue;
-    seen.add(e.sha);
-    total += e.size;
+export function fetchFootprint(dir: string, commit: string, treeSha: string): FetchFootprint {
+  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
+  const ids = new Set<string>();
+  for (const e of parseTree(raw)) ids.add(e.sha);
+  ids.add(treeSha); // the root tree ls-tree omits
+  ids.add(commit); // the fetched commit object itself
+  let out: string;
+  try {
+    out = execFileSync("git", ["-C", dir, "cat-file", "--batch-check=%(objectsize)"], {
+      env: gitEnv(),
+      input: [...ids].join("\n") + "\n",
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    }).toString();
+  } catch (err) {
+    throw new QuarantineGitError(`fetch-footprint measurement failed: ${describe(err)}`);
   }
-  return total;
+  let bytes = 0;
+  for (const line of out.split("\n")) {
+    const n = Number.parseInt(line.trim(), 10);
+    if (Number.isFinite(n)) bytes += n;
+  }
+  return { objects: ids.size, bytes };
+}
+
+/** Byte size of one object (`cat-file -s`); 0 if unreadable. */
+export function objectSize(dir: string, oid: string): number {
+  try {
+    const n = Number.parseInt(git(dir, "cat-file", "-s", oid), 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -393,21 +434,22 @@ export function commitCandidate(
   base: string,
   message: string,
 ): string {
-  const env: Record<string, string> = {
-    ...GIT_ENV_BASE,
+  const env = gitEnv({
     GIT_AUTHOR_NAME: "Camino",
     GIT_AUTHOR_EMAIL: "camino@camino.invalid",
     GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
     GIT_COMMITTER_NAME: "Camino",
     GIT_COMMITTER_EMAIL: "camino@camino.invalid",
     GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
-  };
-  const path = process.env["PATH"];
-  if (typeof path === "string") env["PATH"] = path;
+  });
   try {
-    return execFileSync("git", ["-C", dir, "commit-tree", treeSha, "-p", base, "-m", message], {
+    // Message on STDIN, never `-m <message>`: a long worker-derived subject as an
+    // argv element blows the argv limit (E2BIG). commit-tree reads the message
+    // from stdin when `-m` is omitted (review r2 finding 6).
+    return execFileSync("git", ["-C", dir, "commit-tree", treeSha, "-p", base], {
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      input: message,
+      stdio: ["pipe", "pipe", "pipe"],
       maxBuffer: 1 << 20,
     })
       .toString()

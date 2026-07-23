@@ -57,6 +57,33 @@ describe("quarantinedDiffProblems", () => {
     expect(quarantinedDiffProblems(d).length).toBeGreaterThan(0);
   });
 
+  it("rejects an inherited attributionTrailer or contractRef (own-property only) — r2", () => {
+    const inhTrailer = validDiff();
+    delete inhTrailer["attributionTrailer"];
+    Object.setPrototypeOf(inhTrailer, { attributionTrailer: workerAttributionTrailer(SHA1_D) });
+    expect(quarantinedDiffProblems(inhTrailer).join(" ")).toMatch(/attributionTrailer/);
+
+    const inhRef = validDiff();
+    inhRef["contractRef"] = Object.create({
+      issueId: "M1.1",
+      contractVersion: 1,
+      contractHash: "a".repeat(64),
+    });
+    expect(quarantinedDiffProblems(inhRef).length).toBeGreaterThan(0);
+  });
+
+  it("rejects an impossible candidate==tree id, and non-canonical paths — r2", () => {
+    const sameTree = validDiff();
+    sameTree["treeSha"] = SHA1_A; // == candidateSha
+    expect(quarantinedDiffProblems(sameTree).join(" ")).toMatch(/cannot equal its tree/);
+
+    for (const bad of ["a\\b", "a/./b", "a//b", "a/", "a/../b"]) {
+      const d = validDiff();
+      d["changedPaths"] = [{ path: bad, change: "added" }];
+      expect(quarantinedDiffProblems(d).join(" ")).toMatch(/canonical repo-root-relative/);
+    }
+  });
+
   it("still rejects the controls it rejected before (sparse holes, unsorted, bad trailer)", () => {
     const sparse = validDiff();
     const holed: unknown[] = [{ path: "a", change: "added" }];

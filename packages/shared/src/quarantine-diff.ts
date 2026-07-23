@@ -129,8 +129,14 @@ export function quarantinedDiffProblems(value: unknown): string[] {
   };
   const candidateSha = sha("candidateSha");
   const baseSha = sha("baseSha");
-  sha("treeSha");
+  const treeSha = sha("treeSha");
   const workerHeadSha = sha("workerHeadSha");
+  // A commit object id and its tree object id are different objects — they can
+  // never share an id. Equal candidate/tree is an impossible, forged record
+  // (review r2 finding 9).
+  if (candidateSha !== null && treeSha !== null && candidateSha === treeSha) {
+    problems.push("candidateSha equals treeSha — a commit id cannot equal its tree id");
+  }
   // One repository has ONE object format; mixing 40-hex (sha-1) and 64-hex
   // (sha-256) identities in one record is impossible and forged (review r1 #9).
   if (shaLengths.size > 1) {
@@ -150,9 +156,9 @@ export function quarantinedDiffProblems(value: unknown): string[] {
     problems.push("candidateSha equals baseSha — the candidate must be a distinct commit");
   }
 
-  const trailer = record["attributionTrailer"];
+  const trailer = get("attributionTrailer");
   if (typeof trailer !== "string") {
-    problems.push("attributionTrailer must be a string");
+    problems.push("attributionTrailer must be an own string");
   } else if (workerHeadSha !== null && trailer !== workerAttributionTrailer(workerHeadSha)) {
     problems.push(
       `attributionTrailer must be "${WORKER_ATTRIBUTION_TRAILER_KEY}: <workerHeadSha>" naming workerHeadSha`,
@@ -163,7 +169,19 @@ export function quarantinedDiffProblems(value: unknown): string[] {
   if (!Object.hasOwn(record, "contractRef")) {
     problems.push("contractRef is required (null when the caller supplied none)");
   } else if (contractRef !== null) {
-    for (const p of contractRefProblems(contractRef)) problems.push(`contractRef ${p}`);
+    // Validate the ContractRef over its OWN properties only: contractRefProblems
+    // reads fields directly, so a ref whose fields live on the prototype would
+    // pass while serializing to `{}` (review r2 finding 9). Snapshot own enumerable
+    // props first; a non-object contractRef is caught by the snapshot guard.
+    if (typeof contractRef !== "object" || Array.isArray(contractRef)) {
+      problems.push("contractRef must be a plain object or null");
+    } else {
+      const ownRef: Record<string, unknown> = {};
+      for (const k of Object.keys(contractRef as Record<string, unknown>)) {
+        ownRef[k] = (contractRef as Record<string, unknown>)[k];
+      }
+      for (const p of contractRefProblems(ownRef)) problems.push(`contractRef ${p}`);
+    }
   }
 
   const changedPaths = get("changedPaths");
@@ -195,12 +213,14 @@ export function quarantinedDiffProblems(value: unknown): string[] {
           problems.push(`changedPaths[${i}].path exceeds ${MAX_PATH_LENGTH} code units`);
         }
         if (path.includes("\u0000")) problems.push(`changedPaths[${i}].path contains U+0000`);
-        // Repo-root-relative POSIX only: an absolute path or a `..` traversal
-        // component would resolve OUTSIDE the tree the diff describes (review r1
-        // finding 9). Reject a leading `/`, a leading `./`, and any `..` segment.
-        if (path.startsWith("/") || path.startsWith("./") || path.split("/").includes("..")) {
+        // Repo-root-relative POSIX, canonical form only (review r1 finding 9,
+        // r2 finding 9): reject a Windows separator (`\\`), and any empty,
+        // `.`, or `..` segment — which also rejects a leading `/`, a trailing
+        // `/`, a `//` run, and a `./`/`a/./b` component.
+        const segs = path.split("/");
+        if (path.includes("\\") || segs.some((s) => s === "" || s === "." || s === "..")) {
           problems.push(
-            `changedPaths[${i}].path must be repo-root-relative (no leading / or .. segment)`,
+            `changedPaths[${i}].path must be a canonical repo-root-relative POSIX path`,
           );
         }
         if (previous !== undefined && !(previous < path)) {
