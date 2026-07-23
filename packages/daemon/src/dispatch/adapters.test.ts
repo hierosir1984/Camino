@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { grokAdapter } from "./adapters/grok.js";
-import { classifyByQuotaSignal, classifyErrorTextForQuota } from "./quota.js";
+import { classifyByQuotaSignal, classifyErrorTextForQuota, sumUsageTokens } from "./quota.js";
 import { committedSince, headSha, makeWorkspace } from "./workspace.js";
 
 // Per-provider quota classification (CAM-EXEC-06), provoked without spending
@@ -128,6 +128,71 @@ describe("per-provider quota classification", () => {
     );
     expect(errorResult?.kind).toBe("error");
     expect(errorResult?.quotaSignal).toBe(true); // trusted in the error result
+  });
+});
+
+// WP-107 CAM-EXEC-03 "tokens where reportable" (round-1 finding 6): the token
+// figure a budget checks must count EVERY consumed-token variant, or a run
+// riding cache-read tokens evades a small budget.
+describe("sumUsageTokens (token-budget accounting)", () => {
+  it("sums input + output + cache_creation + cache_read (Anthropic total)", () => {
+    expect(
+      sumUsageTokens({
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 2000,
+        cache_creation_input_tokens: 500,
+      }),
+    ).toBe(2502);
+  });
+
+  it("does not let cache-read tokens evade the count (the finding-6 receipt)", () => {
+    // 2000 cache-read tokens + a 1000 budget must be over budget, not under.
+    const total = sumUsageTokens({
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_input_tokens: 2000,
+      cache_creation_input_tokens: 0,
+    });
+    expect(total).toBe(2002);
+    expect(total).toBeGreaterThan(1000);
+  });
+
+  it("is undefined only when NO recognized field is present, never a throw", () => {
+    expect(sumUsageTokens(undefined)).toBeUndefined();
+    expect(sumUsageTokens(null)).toBeUndefined();
+    expect(sumUsageTokens("nope")).toBeUndefined();
+    expect(sumUsageTokens({})).toBeUndefined();
+    expect(sumUsageTokens({ other: 5 })).toBeUndefined();
+  });
+
+  it("fails CLOSED on a hostile field: a present non-finite/negative field caps at MAX_SAFE_INTEGER (round-3 finding 10)", () => {
+    // A PRESENT numeric field that is non-finite or negative must NOT be
+    // silently dropped (that let the other fields sum small and evade the
+    // budget). Any bad field caps the whole figure so it trips any budget.
+    expect(sumUsageTokens({ input_tokens: Infinity, output_tokens: 1 })).toBe(
+      Number.MAX_SAFE_INTEGER,
+    ); // JSON `1e309` parses to Infinity
+    expect(sumUsageTokens({ input_tokens: 10, output_tokens: -1 })).toBe(Number.MAX_SAFE_INTEGER);
+    expect(sumUsageTokens({ input_tokens: 10, cache_read_input_tokens: NaN })).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
+  });
+
+  it("fails CLOSED on an overflowing sum — clamps to MAX_SAFE_INTEGER, never discards (round-2 finding 9)", () => {
+    // Two finite fields whose SUM leaves the finite range.
+    const total = sumUsageTokens({ input_tokens: 1e308, output_tokens: 1e308 });
+    expect(total).toBe(Number.MAX_SAFE_INTEGER);
+    expect(Number.isFinite(total)).toBe(true);
+  });
+
+  it("the claude result parser reports the cumulative total incl. cache tokens", () => {
+    const ev = claudeAdapter().parseLine(
+      '{"type":"result","result":"done","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}',
+      "stdout",
+    );
+    expect(ev?.terminalSuccess).toBe(true);
+    expect(ev?.tokensTotal).toBe(135);
   });
 });
 

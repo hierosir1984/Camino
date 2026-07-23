@@ -80,3 +80,53 @@ export function classifyByQuotaSignal(text: string): boolean {
 export function classifyErrorTextForQuota(text: string): boolean {
   return classifyByQuotaSignal(text) || EXHAUSTION_PHRASE_MARKERS.some((re) => re.test(text));
 }
+
+/**
+ * ALL token-count fields of a vendor usage object that count toward what the
+ * run processed. A per-attempt token BUDGET is a runaway guard, so it must sum
+ * EVERY consumed-token variant — Anthropic's total input is
+ * `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, plus
+ * `output_tokens` (prompt-caching docs). Excluding the cache fields let a run
+ * that consumed thousands of cache-read tokens slip a small budget (round-1
+ * finding 6). Cheaper-per-token ≠ not-consumed; a hard cap counts them all.
+ */
+const USAGE_TOKEN_FIELDS = [
+  "input_tokens",
+  "output_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+] as const;
+
+/**
+ * Sum a vendor usage object's token counts (WP-107, CAM-EXEC-03 "tokens where
+ * reportable"). Total over hostile/absent shapes: any non-record usage yields
+ * undefined ("not reportable"). A PRESENT NUMERIC field that is non-finite or
+ * negative FAILS CLOSED — the whole figure caps at MAX_SAFE_INTEGER so it trips any
+ * finite budget (never silently dropped, never a throw). A NON-NUMERIC field (a
+ * string, null, object) is treated as ABSENT — so a provider that reported a count
+ * as a STRING would UNDER-count that one field (round-18 finding 4); no current
+ * official provider does this (Claude/Codex report numeric usage), and per "tokens
+ * where reportable" an unparseable field is simply not-reported. Returns undefined
+ * only when NO recognized numeric token field is present.
+ */
+export function sumUsageTokens(usage: unknown): number | undefined {
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
+  const rec = usage as Record<string, unknown>;
+  let total = 0;
+  let sawAny = false;
+  for (const field of USAGE_TOKEN_FIELDS) {
+    const v = rec[field];
+    if (typeof v !== "number") continue; // absent / non-numeric → not that field
+    sawAny = true;
+    // Fail-CLOSED on a hostile field (round-3 finding 10): a PRESENT numeric
+    // field that is non-finite (Infinity from JSON `1e309`) or negative must
+    // not be silently DROPPED — that let the other fields sum small and evade
+    // the budget. Any bad field caps the whole figure at MAX_SAFE_INTEGER so
+    // it trips any finite budget.
+    if (!Number.isFinite(v) || v < 0) return Number.MAX_SAFE_INTEGER;
+    total += v;
+  }
+  if (!sawAny) return undefined;
+  // Fail-CLOSED on overflow of the SUM too (round-2 finding 9).
+  return Number.isFinite(total) ? total : Number.MAX_SAFE_INTEGER;
+}

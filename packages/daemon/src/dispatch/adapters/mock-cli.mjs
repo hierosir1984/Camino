@@ -16,10 +16,23 @@
 //   linger-descendant   — leader exits 0 SUCCESSFULLY leaving a background
 //                         descendant running → proves the post-exit group
 //                         sweep (a finished dispatch must not leak workers).
+//   budget-descendant   — leader exits 0 SUCCESSFULLY leaving an in-group
+//                         descendant that IGNORES SIGTERM and runs far past the
+//                         wall-clock budget → the budget must still breach
+//                         (group alive at the deadline), classify killed-budget,
+//                         and SIGKILL the survivor (WP-107, CAM-EXEC-03,
+//                         round-8 finding 1: the budget covers the GROUP, not
+//                         just the leader).
 //   graceful-cancel     — on SIGTERM, stop cleanly within the grace window.
 //   quota               — emit a rate-limit event and exit nonzero.
 //   quota-raw           — rate-limit signal on a non-JSON line only.
 //   flood               — emit MOCK_FLOOD events (bounded-retention test).
+//   tokens-stream       — stream rising CUMULATIVE token usage forever
+//                         (SIGTERM-cooperative) → a token budget must kill
+//                         mid-flight (WP-107, CAM-EXEC-03).
+//   tokens-final        — report a large cumulative usage figure on the final
+//                         result and exit 0 → an over-budget run must
+//                         classify killed-budget even at natural exit 0.
 //
 // Every mode writes its pid to `.mock-pid` in the workspace at startup: the
 // leader is the group leader (detached spawn), so tests can probe
@@ -108,6 +121,64 @@ if (mode === "hang") {
     emitSync("result", "finished while leaving a lingering descendant");
     process.exit(0);
   }, 10);
+} else if (mode === "budget-descendant") {
+  // Round-8 finding 1: the LEADER exits 0 (emits a success result) while an
+  // in-group descendant IGNORES SIGTERM and runs far past the wall-clock
+  // budget. The budget must still breach — the tracked GROUP is alive at the
+  // deadline — and the descendant is reaped by SIGKILL. Readiness marker (as in
+  // `orphan`): the descendant writes it only AFTER its TERM-ignoring trap is
+  // active, and the leader exits only after seeing it, so the post-exit SIGTERM
+  // cannot beat the trap into place. The shell (not `exec sleep`) stays the trap
+  // holder so the ignore actually applies.
+  const marker = join(process.cwd(), ".budget-descendant-ready");
+  spawn("sh", ["-c", `trap "" TERM; : > "${marker}"; while :; do sleep 1; done`], {
+    stdio: "ignore",
+  });
+  const gateStart = Date.now();
+  const gate = setInterval(() => {
+    if (!existsSync(marker) && Date.now() - gateStart < 10_000) return;
+    clearInterval(gate);
+    emitSync(
+      "assistant",
+      "leader done; an in-group descendant ignores TERM and outlives the budget",
+    );
+    emitSync("result", "RAN_AND_EXITED_BEFORE_BUDGET");
+    process.exit(0);
+  }, 10);
+} else if (mode === "budget-starve-descendant") {
+  // Round-10 finding 9 (corrects round-9 finding 4): the leader leaves an
+  // in-group descendant that IGNORES TERM and runs FOREVER (needs SIGKILL), then
+  // emits a STARVE marker and exits. The paired starving adapter busy-waits on
+  // STARVE, blocking the daemon loop past the budget deadline — so the in-process
+  // TIMER cannot fire in time. When the loop frees, the descendant is STILL ALIVE,
+  // so the exit-handling kill(pid,0) sees the group alive PAST the deadline:
+  // POSITIVE evidence → killed-budget. (The old self-exiting descendant died
+  // during the stall — an uncatchable, named-boundary case, not this one.)
+  const marker = join(process.cwd(), ".budget-starve-ready");
+  spawn("sh", ["-c", `trap "" TERM; : > "${marker}"; while :; do sleep 1; done`], {
+    stdio: "ignore",
+  });
+  const gateStart = Date.now();
+  const gate = setInterval(() => {
+    if (!existsSync(marker) && Date.now() - gateStart < 10_000) return;
+    clearInterval(gate);
+    emitSync("assistant", "STARVE"); // the line the adapter busy-waits on
+    emitSync(
+      "result",
+      "leader exit; an in-group descendant outlives the budget (immortal, needs SIGKILL)",
+    );
+    process.exit(0);
+  }, 10);
+} else if (mode === "budget-inreach-stall") {
+  // Round-10 finding 9 FALSE-POSITIVE discriminator: the leader and its whole
+  // group finish FAST (well under budget) — NO lingering descendant — then the
+  // adapter busy-waits on STARVE, stalling the loop past the budget. The group
+  // was never observed alive past the deadline (it died in time; the delay is
+  // pure daemon observation lag), so the run MUST classify `succeeded`, never
+  // killed-budget. The old observation-time backstop wrongly failed this.
+  emitSync("assistant", "STARVE");
+  emitSync("result", "in-time-then-stall");
+  process.exit(0);
 } else if (mode === "escaped-stdout-holder") {
   // A descendant that ESCAPES the process group (its own new session) AND
   // inherits stdout, holding the pipe's write end open after the leader exits
@@ -161,6 +232,23 @@ if (mode === "hang") {
     process.exit(0);
   };
   void loop();
+} else if (mode === "tokens-stream") {
+  // Rising cumulative usage, forever: a token budget must kill mid-flight.
+  // Cooperative on SIGTERM so kill-confirm succeeds without escalation.
+  process.on("SIGTERM", () => process.exit(0));
+  emit("assistant", "starting token-metered task");
+  let total = 0;
+  setInterval(() => {
+    total += 500;
+    process.stdout.write(JSON.stringify({ type: "other", text: "usage", tokens: total }) + "\n");
+  }, 50);
+} else if (mode === "tokens-final") {
+  // The usage figure arrives ONLY on the final result (the claude shape) and
+  // the process exits 0 — an over-budget figure must still classify
+  // killed-budget, never succeeded.
+  emitSync("assistant", "doing metered work");
+  writeSync(1, JSON.stringify({ type: "result", text: "done", tokens: 999_999 }) + "\n");
+  process.exit(0);
 } else if (mode === "quota") {
   emit("assistant", "attempting");
   emit("error", "429 rate_limit_exceeded: usage limit reached, retry later");
@@ -172,6 +260,28 @@ if (mode === "hang") {
   // the parsers' error channels).
   process.stdout.write("provider error: 429 rate_limit_exceeded, retry later\n");
   process.exit(4);
+} else if (mode === "bigline") {
+  // Emit ONE enormous line with NO newline (MOCK_BIGLINE bytes, default 8 MiB),
+  // then a normal result — exercises the bounded pre-parser line reader
+  // (WP-107 round-4 finding 1): the daemon must not buffer the whole line.
+  const n = Number(process.env.MOCK_BIGLINE ?? String(8 * 1024 * 1024));
+  const chunk = "A".repeat(64 * 1024);
+  let written = 0;
+  while (written < n) {
+    const take = Math.min(chunk.length, n - written);
+    writeSync(1, take === chunk.length ? chunk : chunk.slice(0, take));
+    written += take;
+  }
+  writeSync(1, "\n"); // terminate the giant line
+  emitSync("result", "done after a giant line");
+  process.exit(0);
+} else if (mode === "crlf") {
+  // Three result events terminated by CR, CRLF, and LF respectively — proves
+  // the bounded reader's CR/CRLF delimiter parity (WP-107 round-5 finding 3).
+  writeSync(1, JSON.stringify({ type: "result", text: "cr-line" }) + "\r");
+  writeSync(1, JSON.stringify({ type: "result", text: "crlf-line" }) + "\r\n");
+  writeSync(1, JSON.stringify({ type: "result", text: "lf-line" }) + "\n");
+  process.exit(0);
 } else if (mode === "flood") {
   // Emit many events to exercise the bounded retention cap. Synchronous writes
   // so process.exit() below can't truncate the stream (deterministic count

@@ -67,6 +67,10 @@ export type {
   GitHubQueryTransport,
 } from "./external-ops.js";
 
+// WP-107: PRD §5 registry item 11 quota values (CAM-EXEC-04/05, CAM-SEC-08).
+export { REGISTRY_ITEM_11_QUOTAS } from "./worker-quotas.js";
+export type { RegistryItem11Quotas } from "./worker-quotas.js";
+
 // WP-105: the worker-adapter dispatch contract (CAM-EXEC-01/06, CAM-SEC-06).
 export {
   GITHUB_CREDENTIAL_MARKERS,
@@ -87,6 +91,8 @@ export type { OfficialAdapterName } from "./adapter.js";
 export type {
   StreamEvent,
   DispatchOutcome,
+  AttemptBudget,
+  BudgetBreachRecord,
   SpawnPlan,
   AdapterContext,
   AdapterSpec,

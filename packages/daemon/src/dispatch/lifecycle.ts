@@ -16,10 +16,11 @@
 // (approved 2026-07-20, PR #50): this layer delivers group-gone; WP-107's
 // container completes full-tree containment.
 import { spawn, type ChildProcess } from "node:child_process";
-import { createInterface } from "node:readline";
 import type {
   AdapterContext,
   AdapterSpec,
+  AttemptBudget,
+  BudgetBreachRecord,
   DispatchRecord,
   KillConfirmRecord,
   LeaseDisposition,
@@ -79,8 +80,43 @@ export interface DispatchOptions {
    * `signal`.
    */
   cancelAfterFirstEventMs?: number;
-  /** Hard cap so a real dispatch can never run away. Classified `killed`, never `cancelled`. */
+  /**
+   * In-process cap that classifies `killed` (never `cancelled`) if a dispatch runs
+   * long. Like the wall-clock budget it is a best-effort in-process timer, not an
+   * out-of-process guarantee; the authoritative runaway bound is the container /
+   * WP-114 supervisor.
+   */
   timeoutMs?: number;
+  /**
+   * Per-attempt budget (CAM-EXEC-03, WP-107): a wall-clock budget is REQUIRED and
+   * enforced within the event loop's scheduling latency. BOUNDARY, stated honestly
+   * (round-14 findings 1/2, round-15 findings 2/3): the in-process timer is
+   * BEST-EFFORT to within the daemon loop's worst-case stall — a worker that
+   * overruns by LESS than that stall may be classified `succeeded`. This IS
+   * worker-influenceable: a single Node event loop that both runs the timer AND does
+   * a worker's own archival/attestation work can be delayed by that work — N
+   * concurrent archival hashes, a 200k-entry credential scan, or a large fsync each
+   * push the max gap into the tens-to-hundreds of ms. We shrink Camino's own
+   * contribution where cheap (tar/hash/delete/walk via spawn + yielding chunks and
+   * off-loop fsync — archive.ts; capped candidate reads — clone.ts; a per-line CPU
+   * cap — below), but we do NOT claim to bound it: making the in-process timer
+   * immune to concurrent same-process CPU is not achievable without moving that work
+   * off the loop entirely. The AUTHORITATIVE wall-clock bound is therefore the
+   * OUT-OF-PROCESS container timeout / WP-114 supervisor, not this timer; this timer
+   * is a fast-path best-effort kill, not the guarantee. Tokens enforced
+   * where the vendor stream reports usage (StreamEvent.tokensTotal). A breach runs
+   * kill-confirm and classifies `killed-budget` — distinct from `cancelled` (user
+   * decision) and `killed` (harness runaway cap) so the state machine's
+   * kill-and-escalate row (A.2#10/A.3#5) fires on exactly the budget case, never
+   * an auto-retry. Classification stays HERE, centralized, per the WP-105 principle.
+   *
+   * By design (round-2 finding 5): a CANCEL already terminates the worker
+   * within the bounded kill-confirm window, so a wall-clock deadline that
+   * passes DURING a cancel's grace does not separately breach — the worker is
+   * not running unbounded, and `cancelled` is the authoritative trigger. The
+   * budget fires when nothing else is stopping the worker.
+   */
+  budget?: AttemptBudget;
   killConfirm?: KillConfirmTimings;
   /** Sink for live transcript lines (raw). Guarded: a throwing sink cannot crash the dispatch. */
   onLine?: (channel: "stdout" | "stderr", line: string) => void;
@@ -110,6 +146,33 @@ function groupAlive(pgid: number): boolean {
 // context and the trailing result run that finalText needs.
 const EVENT_HEAD_CAP = 200;
 const EVENT_TAIL_CAP = 200;
+
+// Per-line char ceiling BEFORE the parser sees a line (round-4 finding 1): a
+// worker emitting one enormous line (no newline) would otherwise grow the
+// daemon's line buffer to that line's full size. A line past this cap is
+// truncated (prefix kept + a mark) and the remainder discarded to the next
+// newline. Kept SMALL (round-12 finding 1): an adapter's parseLine JSON.parses
+// this line and can String()-EXPAND a value, so a large line is not just memory
+// but per-line CPU that could STALL the loop past the budget's on-time window —
+// a WORKER-induced stall, which the budget's boundary must not permit. 64 KiB is
+// ~160× a legitimate JSON event line (parsers truncate to ~400 chars) yet keeps
+// per-line parse work to a few ms, well under STALL_GRACE_MS.
+const MAX_LINE_CHARS = 64 * 1024;
+const LINE_TRUNCATED_MARK = "…[camino:line-truncated]";
+
+// Cap on the parsed TEXT retained per event (round-12 finding 1): bounds daemon
+// RSS across retained events regardless of whether the adapter truncated.
+const MAX_EVENT_TEXT_CHARS = 8 * 1024;
+
+// A budget timer that fires more than this far past its deadline was delayed by a
+// daemon event-loop STALL. Within it (normal timer jitter), the breach fires
+// SYNCHRONOUSLY so it keeps precedence over a same-boundary timeout (round-1
+// finding 7). Past it, the timer does NOTHING and the stall case is decided by the
+// reliable post-reap exit-handling check below — because a leader that exited IN
+// TIME but is not yet reaped is a zombie that a late groupAlive() would misread
+// (round-10 finding 9, round-11 finding 5). Kept small so a load-delayed zombie
+// (tens–hundreds of ms) falls to the reliable path rather than the synchronous one.
+const STALL_GRACE_MS = 50;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -427,20 +490,31 @@ export async function dispatch(
   // State the whole body shares.
   let child: ChildProcess | undefined;
   let exited = false;
-  let killReason: "cancel" | "timeout" | null = null;
+  let killReason: "cancel" | "timeout" | "budget" | null = null;
   let killRecord: KillConfirmRecord | undefined;
   let killPromise: Promise<void> | null = null;
   let cancelTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
+  let budgetTimer: NodeJS.Timeout | undefined;
+  // Set exactly once, by whichever budget check trips first; consulted only
+  // when killReason === "budget" (evidence for the escalation record).
+  let budgetBreach: BudgetBreachRecord | undefined;
+  // Hoisted so the exception path can enforce the wall-clock budget too
+  // (round-2 finding 5): a plan() that overruns the budget then THROWS still
+  // records the breach and classifies killed-budget, not requirement-failed.
+  let budgetWallClockMs: number | undefined;
   // Abort may fire during the plan()/spawn window, before a child exists
   // (round-1 review finding 3): remember it and apply it the instant we can.
   let pendingCancel = false;
 
-  const requestKill = (reason: "cancel" | "timeout") => {
+  const requestKill = (reason: "cancel" | "timeout" | "budget") => {
     if (killReason) return;
     if (!child || exited) {
       // No live child yet (or already exited): remember a cancel so the
-      // post-spawn check applies it; a timeout with no child is moot.
+      // post-spawn check applies it; a timeout/budget kill with no child is
+      // moot (a budget breach with no live process has nothing to kill; the
+      // classification below still fires off budgetBreach if it was set
+      // before natural exit — see the outcome ordering note there).
       if (reason === "cancel") pendingCancel = true;
       return;
     }
@@ -470,6 +544,24 @@ export async function dispatch(
     cancelAfterMs = typeof rawCancel === "number" ? rawCancel : undefined;
     const rawTimeout = opts.timeoutMs; // one read
     timeoutMs = typeof rawTimeout === "number" ? rawTimeout : undefined;
+    // Budget snapshot (one read each, validated plain numbers — same
+    // discipline as every other option). Fail-closed coercion: a budget
+    // object whose wallClockMs is corrupt clamps to 0 (immediate breach),
+    // never to "unenforced" — wall-clock is always ARMED when a budget is
+    // supplied (CAM-EXEC-03; its enforcement is best-effort in-process and
+    // authoritative out-of-process — see the DispatchOptions.budget boundary). A
+    // corrupt tokens value likewise becomes 0
+    // (breach on the first usage report) rather than silently absent.
+    const rawBudget = opts.budget; // one read
+    let budgetTokens: number | undefined;
+    if (rawBudget !== undefined && rawBudget !== null) {
+      budgetWallClockMs = clampMs(rawBudget.wallClockMs, 0);
+      const rawTokens = rawBudget.tokens; // one read
+      if (rawTokens !== undefined) {
+        const n = typeof rawTokens === "number" ? rawTokens : Number(rawTokens);
+        budgetTokens = Number.isFinite(n) && n >= 0 ? n : 0;
+      }
+    }
     onLine = opts.onLine; // snapshot the sink once (round-5 finding 1)
     posture = composeWorkerEnv(process.env, {}, { officialCli }).posture;
 
@@ -507,6 +599,10 @@ export async function dispatch(
     const tailRing: StreamEvent[] = [];
     let totalEvents = 0;
     let anyEventQuota = false;
+    // Highest run-cumulative token figure any event reported (CAM-EXEC-03
+    // "tokens where reportable"). Streams that report nothing leave it 0 and
+    // the token budget is simply not exercisable — wall-clock still is.
+    let tokensObserved = 0;
     // A quota failure is "pending" (unrecovered) until a genuine SUCCESS
     // terminal clears it. A later NON-quota event (a generic error / footer
     // like codex turn.failed) is NOT recovery — only a success `result` clears
@@ -535,7 +631,23 @@ export async function dispatch(
       let text = "";
       try {
         const t = ev.text;
-        if (typeof t === "string") text = t;
+        // CAP the retained text per event (round-12 finding 1): an adapter that
+        // does not truncate (e.g. String()-expands a large JSON value) must not
+        // let a worker grow daemon RSS through retained events. Bounded here
+        // regardless of the adapter; assembleFinalText/parsers use ≤400 anyway.
+        if (typeof t === "string") {
+          const capped = t.length > MAX_EVENT_TEXT_CHARS ? t.slice(0, MAX_EVENT_TEXT_CHARS) : t;
+          // DETACH from any V8 sliced-string backing (round-13 finding 2): an
+          // adapter's `String(big).slice(0,400)` keeps the LARGE backing alive
+          // behind a small visible slice, so a bounded visible length can still
+          // hold megabytes. Copy the ≤8 KiB through a Buffer into a fresh FLAT
+          // string, so retained memory is the visible length, not the backing.
+          // utf16le, not utf8 (round-14 finding 9): utf16le round-trips EVERY JS
+          // string exactly (2 bytes per code unit), so a lone/unpaired surrogate in
+          // worker output is preserved verbatim rather than replaced with U+FFFD as
+          // a utf8 round-trip would; the copy is still flat and backing-detached.
+          text = Buffer.from(capped, "utf16le").toString("utf16le");
+        }
       } catch {
         text = "";
       }
@@ -551,12 +663,32 @@ export async function dispatch(
       } catch {
         terminalOk = false;
       }
+      let tokens: number | undefined;
+      try {
+        const t = ev.tokensTotal;
+        if (typeof t === "number" && Number.isFinite(t) && t >= 0) tokens = t;
+      } catch {
+        tokens = undefined;
+      }
       const snap: StreamEvent = {
         kind,
         text,
         ...(sig ? { quotaSignal: true } : {}),
         ...(terminalOk ? { terminalSuccess: true } : {}),
+        ...(tokens !== undefined ? { tokensTotal: tokens } : {}),
       };
+      if (tokens !== undefined && tokens > tokensObserved) tokensObserved = tokens;
+      // Token-budget check rides event recording so a mid-stream cumulative
+      // report kills the dispatch in flight. Exhaustion IS breach (>=): a
+      // budget of N is spent at N. Deliberately NOT gated on `exited`: a
+      // usage report parsed during the post-exit drain that exceeds the
+      // budget still classifies `killed-budget` below — an over-budget
+      // attempt is NEVER silently accepted as succeeded (kill-and-escalate,
+      // CAM-EXEC-03); with the process already gone, the kill itself is moot.
+      if (budgetTokens !== undefined && tokens !== undefined && tokensObserved >= budgetTokens) {
+        budgetBreach ??= { kind: "tokens", limit: budgetTokens, observed: tokensObserved };
+        requestKill("budget");
+      }
       if (sig) {
         anyEventQuota = true;
         pendingQuota = true;
@@ -593,7 +725,21 @@ export async function dispatch(
     });
 
     if (spawnFailed) {
-      const record = noProcessRecord(adapterName, "requirement-failed", posture, started);
+      // Wall-clock enforced on this early return too (round-3 finding 7): a
+      // plan() that overran the budget then returned an un-spawnable file
+      // reaches here before any timer or the catch path. Charge the elapsed
+      // time; over budget → killed-budget, else requirement-failed.
+      const elapsed = Date.now() - started;
+      if (budgetWallClockMs !== undefined && elapsed >= budgetWallClockMs) {
+        budgetBreach ??= { kind: "wall-clock", limit: budgetWallClockMs, observed: elapsed };
+      }
+      const record = noProcessRecord(
+        adapterName,
+        budgetBreach ? "killed-budget" : "requirement-failed",
+        posture,
+        started,
+        budgetBreach ? { budgetBreach } : {},
+      );
       await settleFor(record); // no process → group trivially gone → released
       return record;
     }
@@ -619,63 +765,200 @@ export async function dispatch(
     // descendant still holding the pipe), we can forcibly tear them down —
     // otherwise the readline keeps parsing lines AFTER the record is
     // snapshotted and the inherited pipe pins the process (round-9 finding 3).
-    const consumers: Array<{
-      rl: ReturnType<typeof createInterface>;
-      stream: NodeJS.ReadableStream;
-    }> = [];
+    const consumers: Array<{ close: () => void; stream: NodeJS.ReadableStream }> = [];
+    const handleLine = (channel: "stdout" | "stderr", line: string) => {
+      // The transcript sink is caller code — a throwing sink must not crash
+      // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
+      // an ASYNC sink (declared void but returning a promise) could reject
+      // and become an unhandledRejection crash — swallow that too (round-2
+      // review finding 3).
+      try {
+        const maybePromise = onLine?.(channel, line) as unknown;
+        if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
+          void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
+        }
+      } catch {
+        /* a broken sink is not the worker's fault */
+      }
+      // Quota is decided by the PARSER (structured signatures + provider
+      // exhaustion phrases in an ERROR context), NOT by a raw-line prose scan
+      // — a raw scan over assistant prose manufactured false positives
+      // ("issues 428, 429, 430", "too many requests for new features") and
+      // was removed (round-3 finding 2). A buggy parser must never crash the
+      // harness (bypassing cleanup).
+      let ev: StreamEvent | null = null;
+      try {
+        ev = adapter.parseLine(line, channel);
+      } catch {
+        ev = null;
+      }
+      if (!ev) return;
+      recordEvent(ev);
+      if (!sawFirstEvent) {
+        sawFirstEvent = true;
+        if (cancelAfterMs != null) {
+          cancelTimer = setTimeout(() => requestKill("cancel"), cancelAfterMs);
+        }
+      }
+    };
+    // BOUNDED line reader (round-4 finding 1). readline buffers a WHOLE line
+    // before emitting, so a worker that emits one enormous line (no newline)
+    // grows daemon memory to that line's size before any adapter truncation.
+    // This caps the per-line buffer: a line past MAX_LINE_CHARS is truncated
+    // (its prefix emitted, marked) and the rest discarded until the next
+    // newline — memory per line is bounded regardless of worker output. The
+    // parser truncates to ~400 chars anyway; this only bounds the transient
+    // pre-parse buffer.
     const consume = (channel: "stdout" | "stderr", stream: NodeJS.ReadableStream) => {
-      const rl = createInterface({ input: stream });
-      consumers.push({ rl, stream });
+      stream.setEncoding("utf8");
+      // Line-terminator parity with readline (round-5 finding 3, round-6
+      // finding 2): LF, CR, and CRLF all terminate a line. A CR terminates the
+      // line IMMEDIATELY (so a CR-terminated record is parsed at once, not held
+      // until later output or EOF — the readline behavior); a following LF (a
+      // CRLF, possibly split across chunks) is then SWALLOWED via swallowNextLF
+      // so it does not emit a spurious empty line. `partial` accumulates line
+      // CONTENT only (never a terminator), so the cap counts content, not
+      // delimiters (an exactly-MAX line with CRLF is not falsely truncated).
+      let partial = "";
+      let skipping = false; // discarding the tail of an over-long line
+      let swallowNextLF = false; // consume a LF immediately after a CR (CRLF)
+      let closed = false;
+      const accumulate = (s: string) => {
+        if (skipping || s.length === 0) return;
+        const room = MAX_LINE_CHARS - partial.length;
+        if (s.length <= room) {
+          partial += s;
+        } else {
+          if (!closed)
+            handleLine(channel, partial + s.slice(0, Math.max(0, room)) + LINE_TRUNCATED_MARK);
+          partial = "";
+          skipping = true; // discard until the next terminator
+          // BOUNDARY, stated (round-17 findings 2/3, reverting the round-15/16
+          // fail-closed): truncating an over-cap line makes any usage the adapter
+          // bundled in it UNREPORTABLE — it cannot be parsed. Token budgets bind
+          // "where the vendor stream reports usage" (adapter.ts); usage a worker
+          // hides in an oversized line is, like a harness that reports nothing,
+          // outside token accounting — bound by the WALL-CLOCK budget (always
+          // required) and the out-of-process container / WP-114 timeout, not the token
+          // budget. Failing closed HERE proved WORSE than the boundary: a truncated
+          // line is indistinguishable usage-bearing vs diagnostic, so it either
+          // suppressed a genuine overrun during a concurrent cancel/timeout (finding
+          // 2) or manufactured a false breach from a diagnostic-only line (finding 3).
+          // So the truncation records NO budget verdict; the parsed sub-cap usage
+          // (below) and the wall-clock budget remain the guards.
+        }
+      };
+      const emitLine = () => {
+        if (skipping) {
+          skipping = false; // this terminator ends the over-long line
+          return;
+        }
+        const line = partial;
+        partial = "";
+        if (!closed) handleLine(channel, line);
+      };
+      const onData = (data: string) => {
+        if (closed) return;
+        let start = 0;
+        // A LF at the very start of a chunk that continues a CR from the prior
+        // chunk (CRLF split across chunks) is swallowed.
+        if (swallowNextLF && data.charCodeAt(0) === 10) {
+          start = 1;
+        }
+        swallowNextLF = false;
+        while (start < data.length) {
+          let nl = -1;
+          for (let i = start; i < data.length; i++) {
+            const ch = data.charCodeAt(i);
+            if (ch === 10 || ch === 13) {
+              nl = i;
+              break;
+            }
+          }
+          if (nl === -1) {
+            accumulate(data.slice(start));
+            return;
+          }
+          accumulate(data.slice(start, nl));
+          if (data.charCodeAt(nl) === 13) {
+            // CR terminates the line NOW (readline parity). If a LF follows —
+            // in this chunk or the next — swallow it (CRLF).
+            emitLine();
+            if (nl === data.length - 1) {
+              swallowNextLF = true; // resolve against the next chunk's first char
+              return;
+            }
+            start = data.charCodeAt(nl + 1) === 10 ? nl + 2 : nl + 1;
+          } else {
+            emitLine(); // LF
+            start = nl + 1;
+          }
+        }
+      };
+      stream.on("data", onData);
       streamsClosed.push(
         new Promise<void>((resolve) => {
-          rl.once("close", () => resolve());
-          // A stream 'error' also ends the readline; never leave the drain
-          // await pending on a broken pipe.
+          const done = () => {
+            // A final line without a trailing terminator (readline parity): emit
+            // it once at end. A trailing CR already emitted its line inline.
+            if (!closed && !skipping && partial.length > 0) emitLine();
+            resolve();
+          };
+          stream.once("end", done);
+          stream.once("close", done);
           stream.once("error", () => resolve());
         }),
       );
-      rl.on("line", (line) => {
-        // The transcript sink is caller code — a throwing sink must not crash
-        // the dispatch (round-1 review finding 2). A SYNC throw is caught here;
-        // an ASYNC sink (declared void but returning a promise) could reject
-        // and become an unhandledRejection crash — swallow that too (round-2
-        // review finding 3).
-        try {
-          const maybePromise = onLine?.(channel, line) as unknown;
-          if (maybePromise && typeof (maybePromise as { then?: unknown }).then === "function") {
-            void (maybePromise as Promise<unknown>).then(undefined, () => {}).catch(() => {});
+      consumers.push({
+        close: () => {
+          closed = true;
+          try {
+            stream.removeListener("data", onData);
+          } catch {
+            /* best-effort */
           }
-        } catch {
-          /* a broken sink is not the worker's fault */
-        }
-        // Quota is decided by the PARSER (structured signatures + provider
-        // exhaustion phrases in an ERROR context), NOT by a raw-line prose scan
-        // — a raw scan over assistant prose manufactured false positives
-        // ("issues 428, 429, 430", "too many requests for new features") and
-        // was removed (round-3 finding 2). A buggy parser must never crash the
-        // harness (bypassing cleanup).
-        let ev: StreamEvent | null = null;
-        try {
-          ev = adapter.parseLine(line, channel);
-        } catch {
-          ev = null;
-        }
-        if (!ev) return;
-        recordEvent(ev);
-        if (!sawFirstEvent) {
-          sawFirstEvent = true;
-          // Use the snapshotted plain number, never re-read opts inside this
-          // async callback (the lexical try can't catch a throw here) — round-4
-          // finding 1.
-          if (cancelAfterMs != null) {
-            cancelTimer = setTimeout(() => requestKill("cancel"), cancelAfterMs);
-          }
-        }
+        },
+        stream,
       });
     };
     if (child.stdout) consume("stdout", child.stdout);
     if (child.stderr) consume("stderr", child.stderr);
 
+    // Arm the BUDGET timer BEFORE the generic timeout timer (round-1 finding
+    // 7): at an equal deadline, timers fire in insertion order, so the budget
+    // callback runs first and sets killReason="budget" — a budget breach at
+    // the same boundary as a runaway timeout is classified `killed-budget`
+    // (kill-and-escalate), never a generic `killed`.
+    if (budgetWallClockMs !== undefined) {
+      // Wall-clock is measured from dispatch START (round-1 finding 5): the
+      // budget covers plan()/spawn time too, so arm for the REMAINING budget,
+      // clamped to 0 (an already-over-budget dispatch breaches immediately).
+      const limit = budgetWallClockMs;
+      const remaining = Math.max(0, limit - (Date.now() - started));
+      budgetTimer = setTimeout(() => {
+        if (killReason || budgetBreach) return;
+        const pid = child?.pid;
+        if (pid == null || !groupAlive(pid)) return;
+        // ON-TIME path only. When the loop is healthy the timer fires within
+        // ~jitter of the deadline while the group is genuinely alive (the leader is
+        // still running, or a real descendant is), so groupAlive() is trustworthy
+        // and we breach SYNCHRONOUSLY — the budget takes precedence over a
+        // same-boundary timeout (round-1 finding 7), which fires right after this.
+        // The window is kept SMALL (STALL_GRACE_MS) precisely so a load-delayed
+        // zombie leader cannot linger inside it and be misread as alive.
+        //
+        // If the timer fired LATE (a daemon event-loop STALL delayed it past
+        // limit+STALL_GRACE_MS), we do NOTHING here: a leader that exited IN TIME
+        // but is not yet reaped is a ZOMBIE that still answers kill(-pgid,0), so a
+        // late groupAlive() cannot be trusted (round-10 finding 9). The stall case
+        // is decided reliably at exit-handling below, where `exited` is already
+        // true (the leader is reaped) so groupAlive() reflects only real members.
+        if (Date.now() - started <= limit + STALL_GRACE_MS) {
+          budgetBreach ??= { kind: "wall-clock", limit, observed: Date.now() - started };
+          requestKill("budget");
+        }
+      }, remaining);
+    }
     if (timeoutMs != null) {
       timeoutTimer = setTimeout(() => requestKill("timeout"), timeoutMs);
     }
@@ -701,6 +984,30 @@ export async function dispatch(
     // boundary at the top of this file.)
     let postExitCleanup: KillConfirmRecord | undefined;
     const pid = child.pid;
+    // Wall-clock BACKSTOP, reliable path (round-10 finding 9). We are here only
+    // AFTER the leader's 'exit' event, so `exited` is true and the leader is REAPED
+    // — a groupAlive() now cannot be fooled by a not-yet-reaped zombie leader; a
+    // true reading means a REAL in-group descendant survives. If such a descendant
+    // is alive AND we are already past the wall-clock deadline (the daemon loop was
+    // stalled so the on-time timer above did not fire), that descendant demonstrably
+    // outran the budget → breach. This uses only post-reap facts, so it does not
+    // false-positive on an in-time worker whose end was merely observed late.
+    if (
+      !budgetBreach &&
+      killReason == null &&
+      budgetWallClockMs !== undefined &&
+      pid != null &&
+      groupAlive(pid) &&
+      Date.now() - started > budgetWallClockMs
+    ) {
+      budgetBreach = {
+        kind: "wall-clock",
+        limit: budgetWallClockMs,
+        observed: Date.now() - started,
+      };
+      // The sweep just below reaps the over-budget descendant; budgetBreach set
+      // here classifies killed-budget (kill-and-escalate).
+    }
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child, timings); // never throws; fail-closed
     }
@@ -730,9 +1037,9 @@ export async function dispatch(
       // the consumers down so no line is parsed after this snapshot and the
       // inherited pipe stops pinning the process (round-9 finding 3). The
       // residual descendant is the named WP-107 container boundary.
-      for (const { rl, stream } of consumers) {
+      for (const { close, stream } of consumers) {
         try {
-          rl.close();
+          close();
         } catch {
           /* already closed */
         }
@@ -770,8 +1077,20 @@ export async function dispatch(
     // cancel-requested and exited as separate events and reconciles them rather
     // than forcing a synchronous label; WP-105 keeps the conservative
     // synchronous label at the seam.
+    // (The wall-clock backstop is applied above at exit-handling time, by POSITIVE
+    // EVIDENCE — a kill(pid,0) that saw the group alive at/after the deadline —
+    // rather than an observation-time estimate that a daemon stall could inflate.)
+
     let outcome: DispatchOutcome;
-    if (killReason === "timeout") {
+    if (budgetBreach) {
+      // A budget breach outranks every other classification (CAM-EXEC-03:
+      // kill-and-escalate, never a retry, never silent acceptance). This
+      // covers both the in-flight kill (killReason === "budget") and a
+      // breach detected from a usage report parsed after natural exit —
+      // exit code 0 with an over-budget usage figure is `killed-budget`,
+      // not `succeeded`.
+      outcome = "killed-budget";
+    } else if (killReason === "timeout") {
       outcome = "killed";
     } else if (killReason === "cancel") {
       outcome = "cancelled";
@@ -803,6 +1122,7 @@ export async function dispatch(
       durationMs: Date.now() - started,
       events,
       quotaSignalSeen: anyEventQuota,
+      ...(budgetBreach ? { budgetBreach } : {}),
     };
 
     // Lease settlement is LAST, strictly after the group-gone determination
@@ -821,9 +1141,28 @@ export async function dispatch(
     if (!killRecord && pid != null && groupAlive(pid)) {
       postExitCleanup = await sweepGroupSafe(child!, timings);
     }
+    // Wall-clock is enforced even here (round-2 finding 5): a plan()/env getter
+    // that BLOCKS past the deadline then THROWS never armed the async timer
+    // (it fires only after spawn). Charge the elapsed time now — if it exceeds
+    // the wall-clock budget, this is a killed-budget breach, not a plain
+    // requirement-failed, so kill-and-escalate still fires.
+    const elapsedAtCatch = Date.now() - started;
+    if (
+      budgetWallClockMs !== undefined &&
+      elapsedAtCatch >= budgetWallClockMs &&
+      killReason !== "cancel"
+    ) {
+      budgetBreach ??= {
+        kind: "wall-clock",
+        limit: budgetWallClockMs,
+        observed: elapsedAtCatch,
+      };
+    }
     const record: DispatchRecord = {
       adapter: adapterName,
-      outcome: "requirement-failed",
+      // A budget breach outranks requirement-failed (kill-and-escalate,
+      // CAM-EXEC-03); otherwise the exception path makes no stream claims.
+      outcome: budgetBreach ? "killed-budget" : "requirement-failed",
       spawned: child != null,
       streamedEvents: 0,
       finalText: "",
@@ -835,6 +1174,7 @@ export async function dispatch(
       durationMs: Date.now() - started,
       events: [],
       quotaSignalSeen: false, // exception path makes no stream claims (events: [])
+      ...(budgetBreach ? { budgetBreach } : {}),
       unexpectedError: safeStringify(err),
     };
     await settleFor(record);
@@ -842,6 +1182,7 @@ export async function dispatch(
   } finally {
     if (cancelTimer) clearTimeout(cancelTimer);
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (budgetTimer) clearTimeout(budgetTimer);
     // Even removeEventListener can throw on a hostile duck-typed signal
     // (round-2 finding 11) — the finally must never replace the returned record
     // with a throw.

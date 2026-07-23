@@ -35,9 +35,27 @@ function anyGroupAlive(pgid: number): boolean {
   }
 }
 
-/** The mock CLI writes its pid (== the group id under detached spawn) here. */
+/**
+ * The mock CLI writes its pid (== the group id under detached spawn) here at
+ * startup. A dispatch that cancels/times out in the spawn window can return
+ * BEFORE the mock's synchronous write lands under heavy machine load (observed
+ * as an ENOENT flake when many suites run in parallel). Poll briefly; if the
+ * file never appears, the mock never established a group, so return NaN —
+ * anyGroupAlive(NaN) is false, i.e. "group gone", the correct semantics.
+ */
 function mockPid(ws: string): number {
-  return Number(readFileSync(join(ws, ".mock-pid"), "utf8"));
+  const path = join(ws, ".mock-pid");
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 80; attempt++) {
+    try {
+      const raw = readFileSync(path, "utf8").trim();
+      if (raw.length > 0) return Number(raw);
+    } catch {
+      /* not written yet */
+    }
+    Atomics.wait(sleeper, 0, 0, 25); // 25ms, up to ~2s total
+  }
+  return Number.NaN;
 }
 
 describe("dispatch lifecycle (mock adapter, no quota)", () => {
@@ -892,6 +910,106 @@ describe("dispatch lifecycle (mock adapter, no quota)", () => {
       rmSync(ws, { recursive: true, force: true });
     }
   });
+
+  it("bounds a single ENORMOUS line pre-parser — DISCRIMINATING via onLine (WP-107 round-4/5)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // The mock emits one 8 MiB line (no newline) then a normal result. Capture
+      // the RAW line the reader hands to onLine — whole-line buffering (the old
+      // readline impl) would pass the full 8 MiB here; the bounded reader passes
+      // a truncated ~1 M-char line. This DIRECTLY tests the reader, not the
+      // parser (round-5 finding 4: the parser returns null for the giant line,
+      // so an events-only assertion did not discriminate).
+      let maxRawLine = 0;
+      const rec = await dispatch(
+        mockAdapter("bigline"),
+        { workdir: ws, prompt: "bigline" },
+        { onLine: (_ch, line) => (maxRawLine = Math.max(maxRawLine, line.length)) },
+      );
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.finalText).toContain("done after a giant line");
+      // The reader truncated the 8 MiB line to the cap (+ the mark), far below
+      // the emitted size — proof memory is bounded pre-parser. The cap is 64 KiB
+      // (round-12 finding 1: small enough that per-line parse work can't stall).
+      expect(maxRawLine).toBeLessThanOrEqual(64 * 1024 + 64);
+      expect(maxRawLine).toBeGreaterThan(0);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("caps RETAINED event text so an EXPANDING adapter cannot grow daemon memory (round-12 finding 1)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // The worker emits a TINY line carrying a count; the adapter EXPANDS it into
+      // a large text (mirrors grok's String()-of-a-large-value). The line cap does
+      // NOT catch this (the line is small); the lifecycle's retained-text cap must.
+      const emit = `process.stdout.write(JSON.stringify({type:"result",n:500000})+"\\n")`;
+      const adapter = {
+        name: "expanding",
+        enabled: true,
+        plan: () => ({ file: process.execPath, args: ["-e", emit], env: {} }),
+        parseLine: (line: string) => {
+          try {
+            const o = JSON.parse(line) as { n?: number };
+            return {
+              kind: "result" as const,
+              text: "X".repeat(o.n ?? 0),
+              terminalSuccess: true as const,
+            };
+          } catch {
+            return null;
+          }
+        },
+      };
+      const rec = await dispatch(adapter, { workdir: ws, prompt: "expand" }, {});
+      // Every retained event's text is bounded regardless of the adapter (8 KiB).
+      for (const e of rec.events) expect(e.text.length).toBeLessThanOrEqual(8 * 1024);
+      expect(rec.finalText.length).toBeLessThanOrEqual(8 * 1024);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("retained event text preserves a lone surrogate exactly (utf16le detach — round-14 finding 9)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // The backing-detach copy must round-trip EVERY JS string verbatim. A utf8
+      // round-trip replaces an unpaired surrogate with U+FFFD; utf16le preserves it.
+      const lone = `A${String.fromCharCode(0xd800)}B`; // unpaired high surrogate
+      const adapter = {
+        name: "surrogate",
+        enabled: true,
+        plan: () => ({
+          file: process.execPath,
+          args: ["-e", `process.stdout.write("x\\n")`],
+          env: {},
+        }),
+        parseLine: () => ({ kind: "result" as const, text: lone, terminalSuccess: true as const }),
+      };
+      const rec = await dispatch(adapter, { workdir: ws, prompt: "s" }, {});
+      const ev = rec.events.find((e) => e.text.length > 0);
+      expect(ev?.text).toBe(lone); // exact code units, NOT the U+FFFD a utf8 copy yields
+      expect(ev?.text.charCodeAt(1)).toBe(0xd800);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("splits CR, LF, and CRLF records (readline parity — round-5 finding 3)", async () => {
+    const ws = makeWorkspace();
+    try {
+      // CR-only and CRLF-delimited JSON events must each parse as separate
+      // events, not be concatenated. The mock's crlf mode emits three result
+      // events terminated by \r, \r\n, and \n respectively.
+      const rec = await dispatch(mockAdapter("crlf"), { workdir: ws, prompt: "crlf" });
+      expect(rec.outcome).toBe("succeeded");
+      expect(rec.streamedEvents).toBe(3); // CR, CRLF, LF each a distinct record
+      expect(rec.finalText).toContain("lf-line");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("spawn failure of a missing binary is reported, not thrown — and the lease is releasable", async () => {
     const ws = makeWorkspace();
