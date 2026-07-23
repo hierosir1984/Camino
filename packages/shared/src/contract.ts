@@ -192,8 +192,12 @@ export function contractProblems(value: unknown): string[] {
     problems.push("issueId must be namespaced under missionId (`<missionId>.<planIssueId>`)");
   }
   const version = record["version"];
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    problems.push("version must be an integer >= 1");
+  // SAFE integer, matching contractRefProblems (review r7 finding 8): a contract
+  // minted with an unstable version (2^53, 1.8e308, a JSON literal past 2^53
+  // that lost precision on parse) could otherwise pass here yet its ContractRef
+  // be rejected — the record and its reference must agree on what a version is.
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    problems.push("version must be a safe integer >= 1");
   }
   const template = record["template"];
   if (
@@ -319,6 +323,14 @@ export interface ContractRef {
 export function contractRefProblems(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return ["contractRef must be a plain object"];
+  }
+  // OWN properties only (review r7 finding 11): a value whose fields live on the
+  // PROTOTYPE (`Object.create(validRef)`) reads as populated here but serializes
+  // to `{}` on a store round-trip — the adoption threat. Require a plain object
+  // (own fields), so the fields the validator sees are the fields that persist.
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    return ["contractRef must be a plain object (own properties only, no forged prototype)"];
   }
   const record = value as Record<string, unknown>;
   const problems: string[] = [];

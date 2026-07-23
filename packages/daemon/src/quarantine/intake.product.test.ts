@@ -744,16 +744,20 @@ describe("round-5 falsification fixes", () => {
     expect(() => assertSelfContainedObjectStore(a)).toThrow(/non-local/);
   });
 
-  it("does NOT refuse a hardlinked pack file (normal after git clone --local/gc) — r6 #5", () => {
-    // A hardlink (nlink>1) proves another directory entry, NOT external borrowing:
-    // `git clone --local` and `gc` legitimately hardlink packs. Refusing it was a
-    // false positive; the object store is still ordinary local files.
+  it("refuses a hardlinked object file (nlink>1 — external mutation channel) — r7 #3", () => {
+    // A hardlinked pack shares its inode with another directory entry, so a write
+    // through the OTHER link mutates this store's object (the concrete r7 attack:
+    // a donor-side write corrupting the worker's admitted object). WP-107
+    // provisions worker clones WITHOUT such links; mirror that authoritative
+    // refusal. (My r6 "hardlinks are normal" carve-out was a regression.)
+    const donor = mkdtempTestDir();
+    mkdirSync(join(donor, "shared.pack.d"), { recursive: true });
+    const real = join(donor, "real.pack");
+    writeFileSync(real, "PACK");
     const b = mkdtempTestDir();
     mkdirSync(join(b, ".git", "objects", "pack"), { recursive: true });
-    const real = join(b, ".git", "objects", "pack", "pack-real.pack");
-    writeFileSync(real, "PACK");
-    linkSync(real, join(b, ".git", "objects", "pack", "pack-hardlink.pack")); // nlink=2, same store
-    expect(() => assertSelfContainedObjectStore(b)).not.toThrow();
+    linkSync(real, join(b, ".git", "objects", "pack", "pack-shared.pack")); // nlink=2, shared with donor
+    expect(() => assertSelfContainedObjectStore(b)).toThrow(/non-local\/unexpected/);
   });
 
   it("refuses a FIFO (or other non-file/dir node) in the object store — r6 #5", () => {
@@ -936,6 +940,61 @@ describe("round-6 falsification fixes", () => {
     const codes = r.rejections.map((x) => x.code);
     expect(codes).toContain("fsck-violation");
     expect(codes).not.toContain("path-too-long");
+  });
+});
+
+describe("round-7 falsification fixes", () => {
+  it("does NOT flag non-ASCII or spaced tilde names as 8.3 aliases (café~1, foo ~1) — r7 #10", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const b1 = hashBlob(repo, "1\n");
+    const b2 = hashBlob(repo, "2\n");
+    // An 8.3 name is ASCII below 0x80 with no space, so neither of these can be
+    // an 8.3 alias — they must not be over-rejected.
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: b1, path: "docs/café~1.md" },
+        { mode: "100644", sha: b2, path: "docs/foo ~1.txt" },
+      ]),
+      [base],
+      "legit tilde names",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(true);
+    expect(r.rejections).toEqual([]);
+  });
+
+  it("deep-snapshots contractRef: the emitted diff holds stable plain data, not a live getter — r7 #7", () => {
+    const fx = acceptedFixture();
+    let vReads = 0;
+    const liveRef = {
+      issueId: "m1.I1",
+      get contractVersion(): number {
+        vReads += 1;
+        return vReads <= 4 ? 1 : 9007199254740992; // valid during validation, unsafe afterward
+      },
+      contractHash: "a".repeat(64),
+    };
+    const assignment = { ...fx.assignment, contractRef: liveRef as unknown as ContractRef };
+    const r = runIntake(fx.repo, fx.head, assignment);
+    expect(r.accepted).toBe(true);
+    const ref = r.diff!.contractRef!;
+    // Captured as plain data (version 1), not the live getter.
+    expect(ref.contractVersion).toBe(1);
+    expect(Object.getOwnPropertyDescriptor(ref, "contractVersion")?.get).toBeUndefined();
+    // The returned artifact re-validates cleanly and cannot mutate to malformed.
+    expect(quarantinedDiffProblems(r.diff)).toEqual([]);
+    void liveRef.contractVersion;
+    void liveRef.contractVersion;
+    expect(r.diff!.contractRef!.contractVersion).toBe(1);
   });
 });
 

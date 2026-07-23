@@ -102,6 +102,9 @@ describe("contractProblems", () => {
   it("refuses malformed requirement ids, versions, templates, and instants", () => {
     expect(contractProblems(contract({ requirementIds: ["not-an-id"] }))).not.toEqual([]);
     expect(contractProblems(contract({ version: 0 }))).not.toEqual([]);
+    // An unsafe integer version is refused HERE too (not just in the ref), so a
+    // contract cannot mint a version its own ContractRef would reject — r7.
+    expect(contractProblems(contract({ version: 9007199254740992 }))).not.toEqual([]);
     expect(contractProblems({ ...contract(), template: "refactor" })).not.toEqual([]);
     expect(contractProblems(contract({ frozenAt: "2026-02-30T00:00:00.000Z" }))).not.toEqual([]);
     expect(contractProblems(contract({ frozenAt: "2026-07-22 10:00" }))).not.toEqual([]);
@@ -194,6 +197,17 @@ describe("contractRefProblems", () => {
       '{"issueId":"m1.I1","contractVersion":9007199254740993,"contractHash":"0000000000000000000000000000000000000000000000000000000000000000"}',
     );
     expect(contractRefProblems(parsed)).not.toEqual([]);
+  });
+
+  it("refuses an inherited-only reference (fields on the prototype vanish on storage) — r7", () => {
+    const valid = { issueId: "m1.I1", contractVersion: 1, contractHash: contractHash(terms()) };
+    const inherited = Object.create(valid) as Record<string, unknown>;
+    // Every field is on the prototype; it serializes to "{}".
+    expect(JSON.stringify(inherited)).toBe("{}");
+    expect(contractRefProblems(inherited)).not.toEqual([]);
+    // A null-prototype record with the same OWN fields is still accepted.
+    const ownNull = Object.assign(Object.create(null), valid);
+    expect(contractRefProblems(ownNull)).toEqual([]);
   });
 });
 

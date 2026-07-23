@@ -264,6 +264,16 @@ export function quarantinedDiffProblems(value: unknown): string[] {
           problems.push(`changedPaths[${i}].path exceeds ${MAX_PATH_LENGTH} code units`);
         }
         if (path.includes("\u0000")) problems.push(`changedPaths[${i}].path contains U+0000`);
+        // A path with U+FFFD (git's substitution for a non-UTF-8 name) or a LONE
+        // surrogate cannot be a faithful stored git path — the intake rejects
+        // U+FFFD, so a diff carrying either is a forged artifact a WP-111/WP-116
+        // consumer must refuse (review r7 finding 9).
+        if (path.includes("�")) {
+          problems.push(`changedPaths[${i}].path contains U+FFFD (non-UTF-8 substitution)`);
+        }
+        if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(path)) {
+          problems.push(`changedPaths[${i}].path contains an unpaired surrogate`);
+        }
         // Repo-root-relative POSIX, canonical form only (review r1 finding 9,
         // r2 finding 9): reject a Windows separator (`\\`), and any empty,
         // `.`, or `..` segment — which also rejects a leading `/`, a trailing

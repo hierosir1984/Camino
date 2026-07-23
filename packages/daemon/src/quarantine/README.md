@@ -81,13 +81,20 @@ not scope.
   git-config exec surface is unbounded in principle — the structural bound is
   that the fetch env carries no credential and no host `HOME`, the same boundary
   WP-107's `clone.ts` names. The `git` **binary itself** is resolved to an
-  absolute path ONCE at module load (from the startup PATH) and every call
+  absolute path ONCE at module load (scanning the startup PATH), and every call
   invokes that pinned path — so a PATH entry that becomes worker-writable mid-run
-  cannot swap it. **Named boundary / flagged for David (review r6 finding 10):**
-  the daemon's PATH at startup is a trusted deployment input (the control plane
-  owns its process env; a WP-107 worker cannot write the daemon host's PATH
+  cannot swap it. Two fail-closed properties (review r7 finding 5): only
+  **ABSOLUTE** PATH entries are considered (a relative `relbin`/`.` would resolve
+  against the exec-time cwd, so it is skipped, never pinned), and if NO absolute
+  git is found at load the module **throws on first call** rather than falling
+  back to a bare `"git"` re-resolved from a possibly-attacker-extended ambient
+  PATH. **Named boundary / flagged for David (review r6 finding 10):** the
+  daemon's PATH at startup is a trusted deployment input (the control plane owns
+  its process env; a WP-107 worker cannot write the daemon host's PATH
   directories), the same trusted-PATH residual WP-107 states. Every git call also
-  carries a wall-clock timeout, so a planted FIFO/device node cannot hang intake.
+  carries a wall-clock timeout bounding the DIRECT process; a serving-side
+  `upload-pack` descendant can briefly orphan (review r7 finding 4) but holds no
+  credential and is reaped by the daemon/container lifecycle.
 - **The worker head and base are fetched BY EXACT OBJECT ID, never a ref
   string.** A ref string is a refspec surface: `git fetch <repo> <src>:<dst>`
   writes `<dst>` (e.g. a `refs/replace/<oid>` that would substitute the assigned
@@ -98,26 +105,30 @@ not scope.
   validated oid), never an attacker-chosen destination ref (review r1 findings
   1, 2). Replacement refs are additionally disabled in the pristine store
   (`core.useReplaceRefs=false`).
-- **The worker object store must be self-contained (custody-bounded).** Before
-  fetching, the intake requires a full non-bare clone (a real `.git` directory),
-  refuses a `commondir` redirect, and walks the WHOLE `objects` subtree no-follow
-  (STREAMED, bounded by a scan cap) — refusing a symlink anywhere, an unexpected
-  node type (FIFO/socket/device — which both fell through as "safe" and would
-  hang the reader; review r6 finding 5), and any `alternates` file. Each is a
-  borrowing/serving hazard whose `upload-pack` would serve foreign objects into
-  the candidate (review r1 finding 4, r2/r3/r5 finding 2/3). A hardlinked object
-  file (`nlink>1`) is **not** refused — it is normal after a `git clone
---local`/`gc` and does not prove borrowing (review r6 finding 5). It is a
-  filesystem check (no git in the worker dir), re-attesting WP-107's
-  `assertWorkerCloneIsolation` — the authoritative walk — as defense in depth.
-  **Named boundary / flagged for David (review r6 finding 1):** the attestation
-  and the fetch that follows are separate operations, so this is not proof
-  against an adversary who plants an `alternates` file in the WINDOW between them
-  (a TOCTOU). What discharges the AC is the production **custody** model — by
-  intake time the WP-107 worker container has exited and its git dir is quiescent
-  under control-plane ownership, so nothing writes it concurrently. The intake
-  re-attests AFTER the fetch as cheap defense in depth; a fully atomic fix (fetch
-  from an immutable snapshot the control plane takes custody of) is future work.
+- **The worker object store must be self-contained — under a stopped-worker
+  CUSTODY PRECONDITION.** Before fetching, the intake requires a full non-bare
+  clone (a real `.git` directory), refuses a `commondir` redirect, and walks the
+  WHOLE `objects` subtree no-follow (STREAMED, bounded by a scan cap) — refusing a
+  symlink anywhere, an unexpected node (FIFO/socket/device — which fell through as
+  "safe" and would hang the reader; review r6 finding 5), a HARDLINKED object file
+  (`nlink>1` — it shares its inode with a donor a write can corrupt; review r7
+  finding 3), and any `alternates` file. Each is a borrowing/serving/mutation
+  hazard (review r1 finding 4, r2/r3/r5 finding 2/3, r7 #3). It **mirrors WP-107's
+  authoritative `assertWorkerCloneIsolation`** exactly (my r6 "hardlinks are
+  normal" carve-out was a regression — WP-107 provisions clones without them). It
+  is a filesystem check (no git in the worker dir). **Named boundary / SCOPE
+  DECISION flagged for David (review r6 finding 1, r7 findings 1/4):** no pair of
+  filesystem scans can be proof against a source mutated DURING the fetch — a
+  transient `alternates` (upload-pack serves a borrowed object) or a swapped-in
+  FIFO (a serving-side `upload-pack` orphan hangs) planted only while `git fetch`
+  runs and removed before either scan. This is fundamental — WP-108 is a LIBRARY
+  that receives a repo PATH and cannot lock another process's directory. The
+  guarantee is therefore a PRECONDITION the caller owns: **WP-107** provisions the
+  clone self-contained, and **WP-114** invokes `runIntake` only against a STOPPED,
+  quiescent worker. WP-108's pre-/post-fetch scans are best-effort defense in
+  depth. My recommendation: keep the precondition (owned by WP-107 + WP-114)
+  rather than build a WP-108-internal custody/snapshot mechanism (which still
+  cannot be TOCTOU-free against a live-mutated source).
 - **The registry-item-11 fetch budget is a DISTINCT-footprint ADMISSION check.**
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
@@ -126,10 +137,15 @@ not scope.
   counts are read PATH-FREE (`--format=%(objectname)`) and checked BEFORE the
   leaves are read, so a pathological tree (huge count or very-long paths) is
   rejected on its count rather than overrunning a path-bearing read buffer
-  (review r4 finding 3). Bytes are the on-disk STORE-FOOTPRINT delta of the
-  worker fetch — the compressed pack (a conservative proxy for the wire
-  transfer, never the uncompressed content that under-counts an incompressible
-  pack; review r3 finding 4, r4 finding 6). Worker-controlled
+  (review r4 finding 3). Bytes are the EXACT on-disk STORE-FOOTPRINT delta of the
+  worker fetch — the summed `lstat` size of every file under `.git/objects`
+  (pack + `.idx` + `.rev` + loose). This is measured by a filesystem walk, NOT
+  `count-objects -v`: that rounds pack size DOWN to KiB and omits `.rev`, and
+  because the intake subtracts a before-measurement the fixed overhead cancels,
+  leaving a real ~KiB UNDERcount that could let a fetch a hair over 500 MB measure
+  at/under the cap (review r7 finding 6). Summing actual byte sizes never
+  under-bounds the pack (the safe direction for an admission cap), and the walk
+  fails closed (returns MAX_SAFE_INTEGER) past the scan cap. Worker-controlled
   commit metadata is separately bounded: a commit object over 1 MiB is rejected
   (`commit-metadata-budget`) before it is read, and the authored candidate
   message is passed on stdin (never argv) and clipped — so an unbounded worker
@@ -188,34 +204,52 @@ not scope.
   fixtures; production passes a SEPARATE trusted `baseRepo` (review r2 finding
   10).
 - **The assignment is snapshotted once; integrity failures keep truthful
-  evidence.** Every worker-influenced field (`base`, `allowedPaths`,
-  `contractRef`, `budgets`) is read into an immutable local at entry, so a
-  malformed/stateful assignment (a side-effecting getter) cannot return a
-  different `base` between the diff and the rebuild and admit protected content
-  under an empty-looking diff (review r6 finding 6). `git fsck` runs BEFORE any
-  path-bearing read, so a type-confused object (a `120000` "symlink" whose object
-  is a tree) is reported as the truthful `fsck-violation`, not mislabeled
-  `path-too-long` by the read-overflow backstop (review r6 finding 7).
+  evidence.** Every worker-influenced field (`base`, `allowedPaths`, `budgets`,
+  and `contractRef` — the last DEEP-copied field-by-field, so a getter-backed ref
+  cannot pass validation at emit yet read as malformed afterward; review r7
+  finding 7) is read into an immutable local at entry, so a malformed/stateful
+  assignment (a side-effecting getter) cannot return a different `base` between
+  the diff and the rebuild and admit protected content under an empty-looking diff
+  (review r6 finding 6). `git fsck` runs BEFORE any path-bearing read, so a
+  type-confused object (a `120000` "symlink" whose object is a tree) is reported
+  as the truthful `fsck-violation`, not mislabeled `path-too-long` by the
+  read-overflow backstop (review r6 finding 7); the rejection is worded as an
+  integrity error in the pristine STORE (fsck also checks the shared trusted base,
+  so the worker is not provably the culprit; review r7 finding 12).
 - **Canonical path identity is over-reject-safe but NOT a complete fold; David
   RULED (2026-07-23): residual ACCEPTED for v1.** The fold (HFS-ignorable strip +
   NFKC + ICU upper/lower + `ß→ss`) catches the common aliases and the review
   examples, but ICU's case MAPPING is not full versioned case FOLDING, so
-  recent-Unicode case pairs (e.g. the U+A7CE class) that a case-insensitive
-  volume still aliases may under-detect. Making this complete means bundling a
-  versioned Unicode `CaseFolding.txt` table; David accepted the disclosed
+  recent-Unicode case pairs (e.g. the U+A7CE class) OR Apple's own HFS+
+  collation (e.g. Georgian U+10A0 `Ⴀ` ⇄ U+10D0 `ა`, which a case-insensitive HFS+
+  volume collapses to one inode; review r7 finding 2) that these mappings miss may
+  under-detect. Making this complete means bundling a versioned Unicode
+  `CaseFolding.txt` AND Apple's HFS+ case table; David accepted the disclosed
   over-reject-safe residual for a personal-tool v1 (the WP-003 precedent accepted
-  a weaker residual). Deferred follow-up (not burial): bundle the fold table if
+  a weaker residual; git's own docs note its HFS helper is incomplete outside its
+  `.git` purpose). Deferred follow-up (not burial): bundle the fold tables if
   Camino goes multi-user / hostile-Unicode.
 - **Windows name aliases match git's own rules, not a hand list.** Reserved
   device names cover the `RtlIsDosDeviceName_U` set — CON/PRN/AUX/NUL, COM/LPT¹⁻⁹
   (incl. superscripts), and the console devices CONIN$/CONOUT$ (review r6 finding
   4). The 8.3 short-name rule refuses any `NAME~<digits>` whose base (tilde +
-  digits included) is ≤8 chars — matching MS-FSCC's 8-char base limit, so it
-  catches git's zero-prefix/hash fallback forms (`~1000000`, `GI7D29~1`) yet does
-  not over-reject an impossible-as-8.3 long name like `report~2024` (review r6
-  findings 3, 9). The exact NTFS/HFS checkout algorithm is git's own
+  digits included) is ≤8 **ASCII-non-space** chars — matching MS-FSCC's 8-char
+  ASCII-no-space base limit, so it catches git's zero-prefix/hash fallback forms
+  (`~1000000`, `GI7D29~1`) yet does not over-reject an impossible-as-8.3 long
+  name — an 11-char base like `report~2024` (review r6 findings 3, 9), or a
+  non-ASCII/spaced base like `café~1` / `foo ~1` that MS-FSCC forbids in an 8.3
+  name (review r7 finding 10). The exact NTFS/HFS checkout algorithm is git's own
   (`core.protectNTFS`/`protectHFS`); these are the intake's bounded shape rules
   over the tree's raw bytes.
+- **The durable diff validator refuses what a store round-trip cannot represent.**
+  Beyond the r1–r6 checks, a changed path carrying U+FFFD (git's non-UTF-8
+  substitution) or an unpaired surrogate is rejected — the intake never emits such
+  a path, so a forged WP-111/WP-116 artifact bearing one is refused at adoption
+  (review r7 finding 9). Contract identity is consistent end to end: both the
+  `IssueContract` validator and its `ContractRef` require a `Number.isSafeInteger`
+  version (review r7 finding 8), and `contractRefProblems` requires a plain object
+  (own fields, no forged prototype) so an inherited-only ref that serializes to
+  `{}` cannot license adoption (review r7 finding 11).
 
 ## Running the suites
 

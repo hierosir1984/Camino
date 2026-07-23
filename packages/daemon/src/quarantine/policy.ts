@@ -239,10 +239,12 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
  * The COMPLETE, over-reject-safe rule is MS-FSCC's own bound: an 8.3 name is
  * NAME(≤8).EXT(≤3), and the `~<digits>` tilde tail lives INSIDE the ≤8 NAME. So
  * a segment aliases iff its base (up to an optional `.ext`, tilde + digits
- * included) is ≤8 chars, contains `~<digits>`, and any extension is ≤3 dot-free
- * chars. That catches every zero-prefix/hash/index form AND stops over-rejecting
- * an impossible-as-8.3 long name like `report~2024` (11-char base; review r6
- * finding 9). NAMED BOUNDARY: the exact NTFS short-name ALGORITHM is git's own
+ * included) is ≤8 ASCII-non-space chars, contains `~<digits>`, and any extension
+ * is ≤3 dot-free ASCII chars. That catches every zero-prefix/hash/index form AND
+ * stops over-rejecting an impossible-as-8.3 long name — an 11-char base like
+ * `report~2024` (review r6 finding 9), or a non-ASCII/space base like `café~1`
+ * or `foo ~1` that MS-FSCC forbids in an 8.3 name (review r7 finding 10). NAMED
+ * BOUNDARY: the exact NTFS short-name ALGORITHM is git's own
  * (`core.protectNTFS`) applied at a Windows checkout — this is the intake's
  * bounded shape rule for the tree's raw bytes, matching git's ≤8-base limit.
  */
@@ -251,8 +253,13 @@ function is83ShortName(seg: string): boolean {
   const dot = s.indexOf(".");
   const base = dot >= 0 ? s.slice(0, dot) : s;
   const ext = dot >= 0 ? s.slice(dot + 1) : "";
-  if (base.length > 8 || ext.length > 3 || ext.includes(".")) return false;
-  return /^[^.]*~[0-9]+$/.test(base);
+  if (base.length > 8 || ext.length > 3) return false;
+  // MS-FSCC: an 8.3 name is ASCII below 0x80 and contains NO space. So a base
+  // with a non-ASCII char (`café~1`) or a space (`foo ~1`) CANNOT be an 8.3 alias
+  // — do not over-reject it (review r7 finding 10). `[\x21-\x7e]` is printable
+  // ASCII excluding both space (0x20) and every codepoint >= 0x80.
+  if (!/^[\x21-\x7e]*$/.test(ext)) return false;
+  return /^[\x21-\x7e]*~[0-9]+$/.test(base);
 }
 
 // ---------------------------------------------------------------------------

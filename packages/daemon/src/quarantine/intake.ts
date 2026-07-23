@@ -88,6 +88,14 @@ function symlinkTargets(dir: string, entries: readonly TreeEntry[]): Map<string,
 /**
  * Run the quarantine intake for one worker head.
  *
+ * PRECONDITION (custody, owned by the caller — review r7 findings 1/4): the
+ * caller invokes this ONLY against a STOPPED worker whose `workerRepo` git dir is
+ * quiescent (the WP-107 container has exited; nothing writes it concurrently),
+ * and WP-107 has provisioned that clone self-contained. No pair of filesystem
+ * scans WP-108 runs can be proof against a source mutated DURING the fetch, so
+ * this quiescence is the guarantee; the pre-/post-fetch attestations here are
+ * best-effort defense in depth. See git.ts `assertSelfContainedObjectStore`.
+ *
  * @param workerRepo path to the worker's (untrusted) repo — a fetch source only
  * @param workerHeadOid EXACT object id (40/64-hex) of the worker's final head —
  *   never a ref string (refspec-injection guard; see fetchOid)
@@ -109,7 +117,20 @@ export function runIntake(
   // these locals, never `assignment.*` again.
   const base = assignment.base;
   const allowedPaths: readonly string[] = Object.freeze([...assignment.allowedPaths]);
-  const contractRef: ContractRef | null = assignment.contractRef ?? null;
+  // DEEP-snapshot the contractRef too (review r7 finding 7): capturing the
+  // reference alone would let a getter-backed ref pass validation at emit yet
+  // read as MALFORMED afterward (the emitted diff would fail the same validator
+  // that accepted it). Copy its own fields into a plain object ONCE, each read a
+  // single time, so the emitted artifact is stable plain data.
+  const rawRef = assignment.contractRef ?? null;
+  const contractRef: ContractRef | null =
+    rawRef == null
+      ? null
+      : {
+          issueId: rawRef.issueId,
+          contractVersion: rawRef.contractVersion,
+          contractHash: rawRef.contractHash,
+        };
   // Overrides may only TIGHTEN the default tree-size budget, never widen it
   // (review r1 finding 7) — a per-issue contract cannot loosen the policy cap.
   const budgets = effectiveBudgets(assignment.budgets);
@@ -229,9 +250,14 @@ export function runIntake(
   // HFS-ignorable chars, mode/type mismatches, broken links.)
   const fsckErr = fsckTree(pristineDir, treeSha);
   if (fsckErr) {
+    // `git fsck <tree>` sanity-checks other objects in the pristine store too, so
+    // the violation is not PROVABLY the worker's (the trusted base shares the
+    // store); report it honestly as an integrity error in the pristine store
+    // reachable while validating the worker tree (review r7 finding 12). Still
+    // fail-closed — a corrupt store never yields an accepted candidate.
     rejections.push({
       code: "fsck-violation",
-      detail: `git fsck rejected the worker tree: ${fsckErr}`,
+      detail: `git fsck reported an object-integrity violation in the pristine store while validating the worker tree: ${fsckErr}`,
     });
   }
 

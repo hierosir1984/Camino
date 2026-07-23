@@ -23,7 +23,7 @@ import {
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import type { ChangedPath, ChangedPathKind } from "@camino/shared";
 import type { TreeEntry } from "./types.js";
 
@@ -53,20 +53,29 @@ const GIT_ENV_BASE = {
 
 /**
  * The git executable, resolved to an ABSOLUTE path ONCE at module load by
- * scanning the startup PATH for an executable `git` (review r6 finding 10). Every
- * quarantine call invokes THIS pinned binary, not a bare `"git"` re-resolved
- * through the ambient PATH on each exec — so a PATH entry that becomes
- * worker-writable mid-run cannot swap the binary out. NAMED BOUNDARY: the
- * daemon's PATH AT STARTUP is a trusted deployment input (the control plane owns
- * its own process env; a WP-107 worker runs in a separate mount namespace and
- * cannot write the daemon host's PATH directories). If no executable is found at
- * load, we fall back to `"git"` (a broken deployment fails closed at first call).
+ * scanning the startup PATH for an executable `git` (review r6 finding 10, r7
+ * finding 5). Every quarantine call invokes THIS pinned absolute binary, not a
+ * bare `"git"` re-resolved through the ambient PATH on each exec — so a PATH
+ * entry that becomes worker-writable mid-run cannot swap the binary out.
+ *
+ * Two fail-closed properties (review r7 finding 5):
+ *  - Only ABSOLUTE PATH entries are considered. A relative entry (`relbin`, `.`)
+ *    would resolve `join(dir, "git")` against the process cwd AT EXEC time, which
+ *    varies and can be steered — so it is skipped, never pinned.
+ *  - If NO absolute git is found at load, GIT_BIN is null and every call THROWS
+ *    (`gitBin()`), rather than falling back to a bare `"git"` re-resolved from a
+ *    possibly-attacker-extended ambient PATH later.
+ *
+ * NAMED BOUNDARY: the daemon's PATH AT STARTUP is a trusted deployment input (the
+ * control plane owns its own process env; a WP-107 worker runs in a separate
+ * mount namespace and cannot write the daemon host's PATH directories) — flagged
+ * for David alongside the object-store custody precondition.
  */
-function resolveGitBinary(): string {
+function resolveGitBinary(): string | null {
   const raw = process.env["PATH"];
   if (typeof raw === "string") {
     for (const dir of raw.split(":")) {
-      if (dir.length === 0) continue;
+      if (dir.length === 0 || !isAbsolute(dir)) continue;
       const candidate = join(dir, "git");
       try {
         accessSync(candidate, constants.X_OK);
@@ -76,10 +85,21 @@ function resolveGitBinary(): string {
       }
     }
   }
-  return "git";
+  return null;
 }
 
 const GIT_BIN = resolveGitBinary();
+
+/** The pinned absolute git path, or fail closed if none was resolved at load. */
+function gitBin(): string {
+  if (GIT_BIN === null) {
+    throw new QuarantineGitError(
+      "no absolute `git` executable resolved on PATH at startup — refused; the daemon PATH must " +
+        "contain an absolute directory holding git (review r7 finding 5; fail-closed, never bare `git`)",
+    );
+  }
+  return GIT_BIN;
+}
 
 /**
  * Wall-clock ceiling on any single quarantine git invocation. Bounds a read that
@@ -87,6 +107,15 @@ const GIT_BIN = resolveGitBinary();
  * device node planted in the source object store (review r6 finding 5). On expiry
  * execFileSync throws (SIGKILL), which every caller turns into a fail-closed
  * QuarantineGitError. Generous so a legitimate large-but-bounded fetch completes.
+ *
+ * BOUNDARY (review r7 finding 4): the sync child-process timeout kills only the
+ * DIRECT git process. A serving-side descendant (`git upload-pack`, spawned in a
+ * local fetch) can briefly outlive it as an orphan — normally it exits at once on
+ * its broken pipe, but a FIFO planted in the source AFTER the pre-scan can wedge
+ * it. That planting requires a concurrently-mutated source, which the stopped-
+ * worker custody precondition (see assertSelfContainedObjectStore) excludes; the
+ * lingering orphan holds no credential, cannot affect the already-rejected
+ * intake, and is reaped by the daemon/container lifecycle (WP-107 teardable).
  */
 const GIT_TIMEOUT_MS = 120_000;
 
@@ -99,7 +128,7 @@ function gitEnv(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 function runGit(cwd: string | null, args: string[], maxBuffer: number): Buffer {
-  return execFileSync(GIT_BIN, cwd === null ? args : ["-C", cwd, ...args], {
+  return execFileSync(gitBin(), cwd === null ? args : ["-C", cwd, ...args], {
     env: gitEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer,
@@ -181,21 +210,32 @@ export function removePristineRepo(dir: string): void {
  * complete object-store isolation check); this is the intake's own bounded
  * re-attestation, a filesystem check only, no git executed in the worker-touched
  * directory. It requires a full non-bare clone (real `.git` dir) and refuses a
- * commondir redirect, a symlink or unexpected node anywhere in the object-store
- * tree, and an alternates file (review r2/r3/r5/r6).
+ * commondir redirect, a symlink, an unexpected node, or a hardlinked object file
+ * anywhere in the object-store tree, and an alternates file (review r2/r3/r5/r6/r7).
  *
- * NAMED BOUNDARY — custody, not a live-attacker proof (review r6 finding 1):
- * this attestation and the fetch that follows it (intake.ts) are separate
- * operations on the source directory, so it is NOT proof against an adversary
- * who plants `objects/info/alternates` in the WINDOW between the scan and the
- * fetch (a TOCTOU). What discharges the AC is the production CUSTODY model: by
- * the time the intake runs, the WP-107 worker container has EXITED and its git
- * dir is quiescent under control-plane ownership — nothing is concurrently
- * writing it. The intake re-attests AFTER the fetch as well (a cheap second
- * check that catches a non-adversarial/persistent alternate), but the custody
- * precondition — not a within-process lock the intake cannot hold over another
- * process's directory — is the guarantee. A future hardening (fetch from an
- * immutable snapshot the control plane takes custody of) is out of scope here.
+ * NAMED BOUNDARY — a stopped-worker CUSTODY PRECONDITION, not a live-attacker
+ * proof (review r6 finding 1, r7 findings 1/4). This scan and the fetch that
+ * follows it (intake.ts) are separate operations on the source directory, so no
+ * pair of filesystem scans can be proof against an adversary who mutates the
+ * source DURING the fetch — planting a transient `objects/info/alternates` (so
+ * upload-pack serves a borrowed object) or swapping the requested object for a
+ * FIFO (so a serving-side `upload-pack` orphan hangs) only while `git fetch`
+ * runs, removing it before either scan sees it. This is fundamental: WP-108 is a
+ * LIBRARY that receives a repo PATH and cannot hold a lock over another process's
+ * directory. What discharges the AC is therefore a PRECONDITION the CALLER owns:
+ *   - WP-107 provisions the worker clone self-contained (its authoritative
+ *     `assertWorkerCloneIsolation` — alternate-free, no hardlinks), and
+ *   - the caller (WP-114 dispatch) invokes `runIntake` ONLY against a STOPPED
+ *     worker whose git dir is quiescent — the container has exited, nothing
+ *     writes it concurrently.
+ * WP-108's pre- AND post-fetch scans are best-effort defense in depth (they
+ * catch a persistent/non-adversarial borrowing store), and every git call has a
+ * wall-clock timeout that bounds the DIRECT process; a serving-side descendant
+ * is bounded by the daemon/container lifecycle (WP-107 teardown). Whether WP-108
+ * must instead implement its OWN custody (snapshot the objects into a
+ * Camino-owned dir before fetching — which still cannot be TOCTOU-free against a
+ * live-mutated source) is a SCOPE DECISION flagged for David; the recommendation
+ * is to keep the precondition, owned by WP-107 + WP-114.
  */
 /** Entry cap for the object-store walk — a hostile store over it is itself refused. */
 const OBJECT_STORE_SCAN_CAP = 300_000;
@@ -211,14 +251,19 @@ const OBJECT_STORE_SCAN_CAP = 300_000;
  *    (review r5 finding 2);
  *  - any node that is NOT a regular file or directory — a FIFO, socket, or device
  *    node is not a git object, and reading THROUGH it would hang the intake; it
- *    must be refused, not fall through as "safe" (review r6 finding 5).
+ *    must be refused, not fall through as "safe" (review r6 finding 5);
+ *  - a HARDLINKED object file (`nlink>1`) — it shares its inode with another
+ *    directory entry, so an external write through the OTHER link mutates THIS
+ *    store's object (a `git clone --local` hardlinks packs; the concrete attack
+ *    is a donor-side write corrupting the worker's admitted object; review r7
+ *    finding 3). This MIRRORS WP-107's authoritative `hasHardlinkedObject` — a
+ *    WP-107 worker clone is provisioned WITHOUT such links, so refusing them is
+ *    the correct re-attestation (the r6 "hardlinks are normal" reasoning applied
+ *    to a `clone --local` layout WP-107 does not use).
  *
- * Does NOT treat a hardlink (`nlink>1`) as borrowing: a `git clone --local`/`gc`
- * legitimately hardlinks packs, so `nlink>1` proves another directory entry, not
- * an external store (review r6 finding 5) — the earlier nlink check both
- * false-rejected normal clones and did not actually prove borrowing. Directory
- * entries are STREAMED (`opendirSync`) so a hostile directory of millions of
- * names is bounded by the scan cap as it is walked, never materialized whole.
+ * Directory entries are STREAMED (`opendirSync`) so a hostile directory of
+ * millions of names is bounded by the scan cap as it is walked, never
+ * materialized whole.
  */
 function findBorrowedObjectPath(objectsDir: string): string | null {
   let seen = 0;
@@ -250,7 +295,13 @@ function findBorrowedObjectPath(objectsDir: string): string | null {
       }
       return null;
     }
-    if (st.isFile()) return null; // an ordinary object file (hardlinks are normal after a local clone/gc)
+    if (st.isFile()) {
+      // A hardlinked object file shares its inode with another tree, so a write
+      // through the other link mutates this store's object (review r7 finding 3).
+      // WP-107 provisions worker clones without such links; mirror that check.
+      if (st.nlink > 1) return `${rel} (hardlink nlink=${st.nlink})`;
+      return null;
+    }
     // FIFO, socket, block/char device: not a git object node — fail closed.
     return `${rel} (unexpected node type)`;
   };
@@ -295,21 +346,22 @@ export function assertSelfContainedObjectStore(repo: string): void {
     );
   }
 
-  // A SYMLINK anywhere in the object-store tree, or an UNEXPECTED node (FIFO,
-  // socket, device), makes (part of) the store non-local or non-serving — a
-  // nested `objects/pack/pack-xxx.pack` symlink was the round-5 escape past the
-  // top-level check (review r5 finding 2), and a FIFO both fell through as "safe"
-  // and hung the reader (review r6 finding 5). Walk the WHOLE `objects` subtree,
-  // no-follow and STREAMED, and refuse either. Bounded by an entry cap so a
-  // hostile store cannot drive an unbounded walk (fail-closed: over-cap is itself
-  // a refusal). A hardlinked object file is NOT refused — it is normal after a
-  // `git clone --local`/`gc` and proves nothing about borrowing (review r6 #5).
+  // A SYMLINK, an UNEXPECTED node (FIFO/socket/device), or a HARDLINKED object
+  // file (`nlink>1`) anywhere in the object-store tree makes (part of) the store
+  // non-local, non-serving, or externally mutable — a nested `objects/pack/*.pack`
+  // symlink was the r5 escape (review r5 finding 2), a FIFO both fell through as
+  // "safe" and hung the reader (review r6 finding 5), and a hardlinked pack
+  // shares its inode with a donor a write can corrupt (review r7 finding 3).
+  // Walk the WHOLE `objects` subtree, no-follow and STREAMED, and refuse any.
+  // Bounded by an entry cap so a hostile store cannot drive an unbounded walk
+  // (fail-closed: over-cap is itself a refusal). Mirrors WP-107's authoritative
+  // `assertWorkerCloneIsolation` walk.
   const objectsDir = join(gitDir, "objects");
   const offender = findBorrowedObjectPath(objectsDir);
   if (offender !== null) {
     throw new QuarantineGitError(
       `fetch source object store is non-local/unexpected at "${offender}" — ` +
-        "refused; the store must be ordinary local files (CAM-EXEC-02 / review r3/r5 #2, r6 #5)",
+        "refused; the store must be ordinary local files (CAM-EXEC-02 / review r3/r5 #2, r6 #5, r7 #3)",
     );
   }
 
@@ -453,24 +505,54 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
 }
 
 /**
- * The on-disk byte size of `dir`'s object store, from `count-objects -v`
- * (`size` loose + `size-pack`, reported in KiB → bytes). The intake takes this
- * BEFORE and AFTER the worker-head fetch; the delta bounds the fetch's transfer
- * by its on-disk store footprint — the COMPRESSED pack (plus its index and KiB
- * rounding), not the summed UNCOMPRESSED object content, which under-counts an
- * incompressible pack at the 500 MB edge (review r3 finding 4). It is a
- * conservative proxy for the wire transfer, not the exact wire byte count
- * (review r4 finding 6): it includes index/rounding overhead, so it never
- * under-bounds the pack, which is the safe direction for an admission cap.
+ * The EXACT on-disk byte size of `dir`'s object store — the summed `lstat` size
+ * of every file under `.git/objects` (pack + `.idx` + `.rev` + loose). The intake
+ * takes this BEFORE and AFTER the worker-head fetch; the delta bounds the fetch
+ * by its on-disk footprint.
+ *
+ * Measured by a filesystem walk, NOT `count-objects -v`: that reports pack size
+ * in KiB (rounds DOWN) and omits `.rev`, and because the intake SUBTRACTS a
+ * before-measurement the fixed overhead cancels, leaving a real ~KiB UNDERcount
+ * — so a fetch a hair over 500 MB could measure at/under the cap (review r7
+ * finding 6). Summing actual byte sizes never under-bounds the pack (it counts
+ * the `.idx`/`.rev` overhead too, the safe direction for an admission cap). The
+ * walk is bounded by the same scan cap; an object store with more files than the
+ * cap returns MAX_SAFE_INTEGER so the byte budget fails closed.
  */
 export function storeSizeBytes(dir: string): number {
-  const raw = git(dir, "count-objects", "-v");
-  let kib = 0;
-  for (const line of raw.split("\n")) {
-    const m = /^(size|size-pack):\s*(\d+)/.exec(line.trim());
-    if (m) kib += Number.parseInt(m[2]!, 10);
-  }
-  return kib * 1024;
+  const objectsDir = join(dir, ".git", "objects");
+  let total = 0;
+  let seen = 0;
+  const walk = (abs: string): boolean => {
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch {
+      return true; // absent path contributes nothing
+    }
+    if (st.isDirectory()) {
+      let d;
+      try {
+        d = opendirSync(abs);
+      } catch {
+        return true;
+      }
+      try {
+        let ent = d.readSync();
+        while (ent !== null) {
+          if (++seen > OBJECT_STORE_SCAN_CAP) return false; // too many files — fail closed
+          if (!walk(join(abs, ent.name))) return false;
+          ent = d.readSync();
+        }
+      } finally {
+        d.closeSync();
+      }
+      return true;
+    }
+    if (st.isFile()) total += st.size;
+    return true;
+  };
+  return walk(objectsDir) ? total : Number.MAX_SAFE_INTEGER;
 }
 
 /** Byte size of one object (`cat-file -s`); 0 if unreadable. */
@@ -616,7 +698,7 @@ export function commitCandidate(
     // Message on STDIN, never `-m <message>`: a long worker-derived subject as an
     // argv element blows the argv limit (E2BIG). commit-tree reads the message
     // from stdin when `-m` is omitted (review r2 finding 6).
-    return execFileSync(GIT_BIN, ["-C", dir, "commit-tree", treeSha, "-p", base], {
+    return execFileSync(gitBin(), ["-C", dir, "commit-tree", treeSha, "-p", base], {
       env,
       input: message,
       stdio: ["pipe", "pipe", "pipe"],

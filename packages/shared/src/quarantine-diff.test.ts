@@ -120,6 +120,20 @@ describe("quarantinedDiffProblems", () => {
     expect(quarantinedDiffProblems(big).join(" ")).toMatch(/not JSON-serializable|git object name/);
   });
 
+  it("rejects a changed path with U+FFFD or an unpaired surrogate (non-UTF-8 forgery) — r7", () => {
+    const fffd = validDiff();
+    fffd["changedPaths"] = [
+      { path: "src/" + String.fromCharCode(0xfffd) + ".js", change: "added" },
+    ];
+    expect(quarantinedDiffProblems(fffd).join(" ")).toMatch(/U\+FFFD/);
+
+    const surrogate = validDiff();
+    surrogate["changedPaths"] = [
+      { path: "src/" + String.fromCharCode(0xd800) + ".js", change: "added" },
+    ];
+    expect(quarantinedDiffProblems(surrogate).join(" ")).toMatch(/unpaired surrogate/);
+  });
+
   it("rejects a non-plain (Date / class) changed-path entry — r4", () => {
     const d = validDiff();
     const dateEntry = Object.assign(new Date("2026-01-01T00:00:00Z"), {
