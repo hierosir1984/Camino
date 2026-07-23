@@ -60,6 +60,8 @@ import {
   ATTEMPT_SUMMARY_SCHEMA_VERSION,
   HARNESS_FAMILY,
   LEASE_HEARTBEAT_MS,
+  LEASE_TTL_MS,
+  leaseLapsed,
   PROVIDER_FAMILIES,
   QUOTA_PAUSE_THRESHOLD,
   harnessFamily,
@@ -105,6 +107,8 @@ export interface WindowStateReader {
       at?: Date;
     },
   ): unknown;
+  /** Does a recorded observation exist for this dispatch id? (round-4 finding 5) */
+  hasObservation?(family: ProviderFamily, dispatchId: string): boolean;
 }
 
 /** Why dispatch is quota-paused for a family (CAM-ROUTE-06). */
@@ -794,6 +798,16 @@ export class AttemptScheduler {
    * reaped — WP-107; or the process group was confirmed gone). Settles the
    * lease (re-grant now lawful) and records the A.3#5 terminal.
    */
+  /**
+   * ISSUE DISPOSITION, per the appendix's own text (round-4 finding 2):
+   * the issue REMAINS `blocked` with its cleanup-failed cause. A.2#24's
+   * cell is "janitor + escalation" — blocked-with-cause IS this path's
+   * escalation surface, parked on David exactly like `escalated`, and his
+   * A.2#23 resolution is the escalation answer. There is deliberately no
+   * automatic route out (kill-and-escalate, never auto-retry); moving the
+   * issue anywhere without David's act would need an appendix row that
+   * does not exist.
+   */
   confirmKillAndSettle(plan: AttemptDispatchPlan, source: KillConfirmSource): OutcomeRouting {
     if (source === "never-spawned") {
       // A budget breach implies a worker RAN (round-1 finding 3): the
@@ -839,10 +853,18 @@ export class AttemptScheduler {
     // below; settling here would race that classification.)
     for (const lease of this.#leases.listCurrent()) {
       if (lease.state !== "held") continue;
-      // A JANITOR holder is a live reconciliation pass, not an orphaned
-      // dispatch (round-3 finding 2): it has no attempt entity by design
-      // and settles its own lease on completion.
-      if (lease.holderAttemptId.startsWith("janitor.")) continue;
+      // A JANITOR holder with a FRESH heartbeat is a live reconciliation
+      // pass (round-3 finding 2): no attempt entity by design; it settles
+      // its own lease. A LAPSED janitor lease is a pass whose daemon died
+      // (round-4 finding 3) — janitors never spawn anything, so the
+      // trivial confirm is honestly attestable and unfences the
+      // environment.
+      if (lease.holderAttemptId.startsWith("janitor.")) {
+        if (leaseLapsed(lease, this.#now().getTime(), LEASE_TTL_MS)) {
+          this.#leases.recordKillConfirm(lease.environmentId, lease.generation, "never-spawned");
+        }
+        continue;
+      }
       if (this.#recorder.currentState("attempt", lease.holderAttemptId) !== undefined) continue;
       const issueId = holderIssueId(lease.holderAttemptId);
       const issueState =
@@ -928,7 +950,8 @@ export class AttemptScheduler {
       // observation unwritten — finish those substeps idempotently instead
       // of skipping outright (round-3 finding 6), then report nothing.
       if (attemptState !== "running") {
-        this.#resumeIssueRouting(issueId, attemptId, attemptState);
+        const gapLease = this.#leases.at(environmentId, leaseGeneration);
+        this.#resumeIssueRouting(issueId, attemptId, attemptState, gapLease?.releasedOutcome);
         continue;
       }
       const leaseRow = this.#leases.at(environmentId, leaseGeneration);
@@ -1052,7 +1075,12 @@ export class AttemptScheduler {
    * terminal is durable but whose downstream substeps a crash cut short.
    * Every branch is guarded by current state — repeated passes are no-ops.
    */
-  #resumeIssueRouting(issueId: string, attemptId: string, attemptState: string | undefined): void {
+  #resumeIssueRouting(
+    issueId: string,
+    attemptId: string,
+    attemptState: string | undefined,
+    releasedOutcome?: DispatchRecord["outcome"],
+  ): void {
     const missionId = issueId.includes(".") ? issueId.slice(0, issueId.lastIndexOf(".")) : issueId;
     const ref: InterruptedAttempt = {
       missionId,
@@ -1081,8 +1109,41 @@ export class AttemptScheduler {
         });
         this.#backfillWindowObservation(ref, "killed-budget");
         return;
+      case "cancelled":
+        // A crash between the attempt cancel and the issue row (round-4
+        // finding 1): the cancel summary is durable (A.3#4 required it);
+        // finish the non-counting issue row and the window observation.
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-cancelled", {
+          reason: "pause",
+          summaryWritten: this.#summaries.get(attemptId) !== undefined,
+          attemptId,
+        });
+        this.#backfillWindowObservation(ref, "cancelled");
+        return;
+      case "submitted": {
+        // `submitted` is normally quarantine's parked state — EXCEPT when
+        // the dispatch's own lease says the run FAILED (round-4 finding 1:
+        // a crash between worker-completed and the fail verdict). The
+        // durable released outcome disambiguates; a succeeded or unknown
+        // outcome is left for the quarantine/validation owners.
+        if (releasedOutcome === "requirement-failed" || releasedOutcome === "killed") {
+          this.#recordAttemptIfActive(
+            this.#recorder.currentState("attempt", attemptId),
+            attemptId,
+            "verdict-recorded",
+            {
+              quarantineAndValidationComplete: true,
+              verdict: "fail",
+              failureClass: `recovered:${releasedOutcome}`,
+            },
+          );
+          this.#recordIssueIfIn(ref, ["implementing"], "attempt-failed", { attemptId });
+          this.#backfillWindowObservation(ref, releasedOutcome);
+        }
+        return;
+      }
       default:
-        return; // submitted/succeeded/cancelled/archived: downstream owners take over
+        return; // succeeded/archived: downstream owners take over
     }
   }
 
@@ -1103,10 +1164,12 @@ export class AttemptScheduler {
         quotaSignalSeen: outcome === "quota-blocked",
       });
     } catch (error) {
-      // ONLY a replay conflict is tolerable (the original, richer row
-      // stands); any other failure is a broken durable store and must
-      // surface (round-3 finding 6).
-      if (!/different content|already recorded/.test(String(error))) throw error;
+      // A throw is tolerable ONLY when the observation provably EXISTS
+      // (the original, richer row stands — a replay conflict); message
+      // text proves nothing (round-4 finding 5). Any store without an
+      // existence check, or a missing row, surfaces the failure.
+      const has = this.#windows.hasObservation?.(family, ref.attemptId);
+      if (has !== true) throw error;
     }
   }
 
@@ -1386,15 +1449,15 @@ export class AttemptScheduler {
       if (match !== null) maxOrdinal = Math.max(maxOrdinal, Number(match[1]));
     }
     let ordinal = maxOrdinal + 1;
-    while (existing.has(`${issueId}.a${ordinal}`)) {
-      ordinal++;
-      // Ordinals are bounded to 9 digits (round-3 finding 9): a store
-      // carrying a larger-than-bound forged id cannot walk this loop into
-      // float territory — an issue with a billion attempts is not a state
-      // this daemon reasons about; refuse loudly instead.
+    for (;;) {
+      // Bound checked BEFORE returning (round-4 finding 6): the first
+      // candidate can already be past nine digits when the max legal
+      // ordinal exists; a ten-digit id must never mint.
       if (ordinal > 999_999_999) {
         throw new Error(`attempt ordinal space for ${issueId} is exhausted or forged — refusing`);
       }
+      if (!existing.has(`${issueId}.a${ordinal}`)) break;
+      ordinal++;
     }
     return `${issueId}.a${ordinal}`;
   }
@@ -1435,7 +1498,11 @@ export class AttemptScheduler {
       });
     } else if (issueState === "implementing") {
       // A.2#12's guard requires the summary to exist; write the minimal
-      // recovery summary first (nothing ran — durations are honest zeros).
+      // recovery summary first (nothing ran — durations are honest zeros)
+      // and attest ONLY what provably exists (round-4 finding 4): if the
+      // summary store refused, the issue stays implementing with the
+      // attempt expired, and the next recovery pass routes it as a
+      // failure — lossier but never a false attestation.
       const missionId = issueId.includes(".")
         ? issueId.slice(0, issueId.lastIndexOf("."))
         : issueId;
@@ -1452,6 +1519,7 @@ export class AttemptScheduler {
         "cancelled:mid-protocol-pause",
         "cancelled",
       );
+      if (this.#summaries.get(attemptId) === undefined) return;
       this.#recordIssueIfIn({ issueId }, ["implementing"], "attempt-cancelled", {
         reason: "pause",
         summaryWritten: true,
