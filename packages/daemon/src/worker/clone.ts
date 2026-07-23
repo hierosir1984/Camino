@@ -26,6 +26,15 @@ import {
   lstatSync,
 } from "node:fs";
 import { join } from "node:path";
+import { resolveTrustedTool } from "../scheduler/image-provenance.js";
+
+// git resolves from the trusted directory list, never the ambient PATH
+// (the WP-107 trusted-toolchain handoff; falsification round 1, finding 8).
+let trustedGitPath: string | null = null;
+function trustedGit(): string {
+  trustedGitPath ??= resolveTrustedTool("git");
+  return trustedGitPath;
+}
 
 /** A provisioning or isolation-attestation failure. Always fail-closed. */
 export class WorkerCloneError extends Error {
@@ -84,7 +93,7 @@ function gitRaw(cwd: string | null, args: string[]): string {
   const env: Record<string, string> = { ...CLONE_ENV_BASE };
   const path = process.env["PATH"];
   if (typeof path === "string") env["PATH"] = path;
-  return execFileSync("git", cwd === null ? args : ["-C", cwd, ...args], {
+  return execFileSync(trustedGit(), cwd === null ? args : ["-C", cwd, ...args], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 16 * 1024 * 1024,
