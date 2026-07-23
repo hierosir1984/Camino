@@ -107,8 +107,8 @@ export interface WindowStateReader {
       at?: Date;
     },
   ): unknown;
-  /** Does a recorded observation exist for this dispatch id? (round-4 finding 5) */
-  hasObservation?(family: ProviderFamily, dispatchId: string): boolean;
+  /** The recorded observation's outcome for this dispatch id, if any (round-5 finding 3). */
+  observationOutcome?(family: ProviderFamily, dispatchId: string): string | undefined;
 }
 
 /** Why dispatch is quota-paused for a family (CAM-ROUTE-06). */
@@ -802,11 +802,13 @@ export class AttemptScheduler {
    * ISSUE DISPOSITION, per the appendix's own text (round-4 finding 2):
    * the issue REMAINS `blocked` with its cleanup-failed cause. A.2#24's
    * cell is "janitor + escalation" — blocked-with-cause IS this path's
-   * escalation surface, parked on David exactly like `escalated`, and his
-   * A.2#23 resolution is the escalation answer. There is deliberately no
-   * automatic route out (kill-and-escalate, never auto-retry); moving the
-   * issue anywhere without David's act would need an appendix row that
-   * does not exist.
+   * escalation surface, and there is deliberately no automatic route out
+   * (kill-and-escalate, never auto-retry): moving the issue anywhere would
+   * need an appendix row that does not exist. PRECISION (round-5 finding
+   * 4): unlike A.2#21, the appendix's A.2#23 `block-resolved` row carries
+   * no David actor guard — resolution AUTHORITY for a blocked issue is
+   * daemon policy, and no production caller records it yet; the surface
+   * that will (the WP-115/119 janitor/runner glue) owes that policy.
    */
   confirmKillAndSettle(plan: AttemptDispatchPlan, source: KillConfirmSource): OutcomeRouting {
     if (source === "never-spawned") {
@@ -861,7 +863,23 @@ export class AttemptScheduler {
       // environment.
       if (lease.holderAttemptId.startsWith("janitor.")) {
         if (leaseLapsed(lease, this.#now().getTime(), LEASE_TTL_MS)) {
-          this.#leases.recordKillConfirm(lease.environmentId, lease.generation, "never-spawned");
+          // A dead janitor pass may have left a LIVE archival child (tar —
+          // round-5 finding 1): never-spawned is NOT attestable for it.
+          // Reported for a REAL process-group kill-confirm like any
+          // interrupted attempt; the environment stays fenced meanwhile.
+          const embedded = lease.holderAttemptId.slice("janitor.".length);
+          const issueId = holderIssueId(embedded) ?? embedded;
+          const missionId = issueId.includes(".")
+            ? issueId.slice(0, issueId.lastIndexOf("."))
+            : issueId;
+          requiresKillConfirm.push({
+            missionId,
+            issueId,
+            attemptId: lease.holderAttemptId,
+            environmentId: lease.environmentId,
+            leaseGeneration: lease.generation,
+            issueState: "implementing",
+          });
         }
         continue;
       }
@@ -951,6 +969,22 @@ export class AttemptScheduler {
       // of skipping outright (round-3 finding 6), then report nothing.
       if (attemptState !== "running") {
         const gapLease = this.#leases.at(environmentId, leaseGeneration);
+        if (gapLease?.state === "held") {
+          // The dispatch lifecycle could not settle the lease (a
+          // release-threw disposition): the worker group is UNCONFIRMED
+          // even though the attempt advanced — report for a real
+          // kill-confirm instead of resuming past a fenced, possibly-live
+          // worker (round-5 finding 2).
+          requiresKillConfirm.push({
+            missionId,
+            issueId,
+            attemptId,
+            environmentId,
+            leaseGeneration,
+            issueState: "implementing",
+          });
+          continue;
+        }
         this.#resumeIssueRouting(issueId, attemptId, attemptState, gapLease?.releasedOutcome);
         continue;
       }
@@ -1168,8 +1202,11 @@ export class AttemptScheduler {
       // (the original, richer row stands — a replay conflict); message
       // text proves nothing (round-4 finding 5). Any store without an
       // existence check, or a missing row, surfaces the failure.
-      const has = this.#windows.hasObservation?.(family, ref.attemptId);
-      if (has !== true) throw error;
+      const existing = this.#windows.observationOutcome?.(family, ref.attemptId);
+      // Swallow ONLY a genuine replay: the row exists AND records the same
+      // outcome (richer original stands). A contradictory recorded outcome
+      // is conflicting durable evidence and must surface (round-5 finding 3).
+      if (existing === undefined || existing !== outcome) throw error;
     }
   }
 

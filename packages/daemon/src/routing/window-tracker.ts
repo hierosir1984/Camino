@@ -467,12 +467,12 @@ export class QuotaWindowTracker {
     }
   }
 
-  /** Does a recorded observation exist for this dispatch id? */
-  hasObservation(family: ProviderFamily, dispatchId: string): boolean {
+  /** The recorded observation's outcome for this dispatch id, if any. */
+  observationOutcome(family: ProviderFamily, dispatchId: string): string | undefined {
     const row = this.#db
-      .prepare("SELECT 1 FROM window_observations WHERE family = ? AND dispatch_id = ?")
-      .get(validFamily(family), dispatchId);
-    return row !== undefined;
+      .prepare("SELECT outcome FROM window_observations WHERE family = ? AND dispatch_id = ?")
+      .get(validFamily(family), dispatchId) as { outcome: string } | undefined;
+    return row?.outcome;
   }
 
   /** All observations for a family, in insertion order (seq). */
