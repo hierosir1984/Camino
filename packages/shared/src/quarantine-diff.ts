@@ -129,10 +129,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * hand a live object rather than a parsed record own that trust.
  */
 export function quarantinedDiffProblems(value: unknown): string[] {
-  if (!isPlainObject(value)) {
-    return ["quarantinedDiff must be a plain object (no class instance or forged prototype)"];
+  // Validate a JSON ROUND-TRIP snapshot, so acceptance is INVARIANT under the
+  // store round-trip an adopted artifact takes (review r5 findings 5, 7): a
+  // non-enumerable own property, a side-effecting getter, a Symbol-keyed field,
+  // and a cross-realm prototype all vanish or normalize through JSON — closing
+  // the classes a direct property read would accept but that would not survive
+  // serialization. A value that is not JSON-serializable is refused outright.
+  let snapshot: unknown;
+  try {
+    snapshot = JSON.parse(JSON.stringify(value));
+  } catch (err) {
+    return [`quarantinedDiff is not JSON-serializable: ${(err as Error).message}`];
   }
-  const record = value as Record<string, unknown>;
+  if (!isPlainObject(snapshot)) {
+    return ["quarantinedDiff must be a JSON object (no class instance, array, or scalar)"];
+  }
+  const record = snapshot as Record<string, unknown>;
   const problems: string[] = [];
 
   // OWN properties only: a record whose fields live on the PROTOTYPE would read

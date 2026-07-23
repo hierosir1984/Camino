@@ -89,11 +89,15 @@ not scope.
   1, 2). Replacement refs are additionally disabled in the pristine store
   (`core.useReplaceRefs=false`).
 - **The worker object store must be self-contained.** Before fetching, the
-  intake refuses a worker repo carrying an `objects/info/alternates` (or
-  `http-alternates`) file — a borrowing store whose `upload-pack` would serve
-  objects from an external/shared store into the candidate (review r1 finding 4).
-  This is a filesystem check (no git run in the worker dir) that re-attests
-  WP-107's `noAlternates` provisioning guarantee.
+  intake requires a full non-bare clone (a real `.git` directory), refuses a
+  `commondir` redirect, and walks the WHOLE `objects` subtree no-follow —
+  refusing a symlink anywhere OR a hardlinked object file (`nlink>1`, incl. a
+  nested `objects/pack/*.pack`) — plus any `alternates` file. Each is a borrowing
+  form whose `upload-pack` would serve objects from an external/shared store into
+  the candidate (review r1 finding 4, r2/r3/r4/r5 finding 2/3). It is a
+  filesystem check (no git run in the worker dir), bounded by a scan cap
+  (fail-closed), that re-attests WP-107's `assertWorkerCloneIsolation` — the
+  authoritative isolation walk — as defense in depth.
 - **The registry-item-11 fetch budget is a DISTINCT-footprint ADMISSION check.**
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
@@ -141,13 +145,18 @@ foo`) or via a SYMLINK whose target the worker edits — closing that requires
   running these checks at repo onboarding and gating on them — is WP-118
   (CAM-SEC-03); a truly complete symbolic glob∩namespace / GitHub-Actions
   analyzer is that onboarding check. This module's intake does not gate on it.
-- **The caller owns the pristine-repo lifecycle; checks are collect-all.** The
-  intake runs every policy check and reports ALL violations (not fail-fast), so a
-  rejected result may carry several codes. It does not auto-delete the pristine
-  store: `runIntake` returns `pristineDir` on both accept and reject (so a caller
-  can prove a carried-in object is structurally absent, and inspect a rejection),
-  and the caller reclaims it with `removePristineRepo` / `cleanupPristineRepos`.
-  A pristine dir created before a thrown refusal is tracked for
+- **The caller owns the pristine-repo lifecycle; checks are collect-all above
+  the processing bound.** For a tree within the processing bound the intake runs
+  every policy check and reports ALL violations (not fail-fast), so a rejected
+  result may carry several codes. A tree that exceeds a PROCESSING bound first —
+  over the object-count cap, or a path-bearing read that overruns its buffer — is
+  refused EARLY on the count-only findings, WITHOUT running the leaf/path checks
+  (their reads are unbounded on such a tree); that refusal is fail-closed but not
+  collect-all (review r5 finding 6). It does not auto-delete the pristine store:
+  `runIntake` returns `pristineDir` on both accept and reject (so a caller can
+  prove a carried-in object is structurally absent, and inspect a rejection), and
+  the caller reclaims it with `removePristineRepo` / `cleanupPristineRepos`. A
+  pristine dir created before a thrown refusal is tracked for
   `cleanupPristineRepos` (review r2 finding 11).
 - **The OID identifies WHICH object was fetched, not that it is the observed
   head.** `fetchOid` verifies the fetched object is exactly the requested OID and

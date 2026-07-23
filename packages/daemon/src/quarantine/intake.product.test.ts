@@ -4,6 +4,7 @@
 // boundary, and a production-shape smoke test of the real intake entry.
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -705,6 +706,49 @@ describe("round-4 falsification fixes", () => {
     expect(r.accepted).toBe(false);
     expect(r.rejections.map((x) => x.code)).toContain("fetch-object-budget");
     expect(r.diff).toBeNull();
+  });
+});
+
+describe("round-5 falsification fixes", () => {
+  it("rejects Git's HASH-based 8.3 fallback alias of a protected path (GI7D29~1) — r5 #1", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    // `.gitattributes` real NTFS short name is GI7D29~1 (hash-based, not GITATT~1).
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "GI7D29~1" },
+      ]),
+      [base],
+      "add git hash 8.3 alias",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("windows-alias");
+  });
+
+  it("refuses a NESTED symlinked or hardlinked pack file — r5 #2", () => {
+    // symlinked objects/pack/*.pack (two levels deep — below the r4 checks)
+    const a = mkdtempTestDir();
+    mkdirSync(join(a, ".git", "objects", "pack"), { recursive: true });
+    symlinkSync("/elsewhere/pack-x.pack", join(a, ".git", "objects", "pack", "pack-x.pack"));
+    expect(() => assertSelfContainedObjectStore(a)).toThrow(/non-local/);
+
+    // hardlinked pack file (nlink>1 — shared with another tree)
+    const b = mkdtempTestDir();
+    mkdirSync(join(b, ".git", "objects", "pack"), { recursive: true });
+    const real = join(b, "external.pack");
+    writeFileSync(real, "PACK");
+    linkSync(real, join(b, ".git", "objects", "pack", "pack-y.pack")); // nlink=2
+    expect(() => assertSelfContainedObjectStore(b)).toThrow(/non-local/);
   });
 });
 

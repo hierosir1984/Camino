@@ -58,12 +58,12 @@ describe("quarantinedDiffProblems", () => {
   });
 
   it("rejects an inherited attributionTrailer or contractRef (own-property only) — r2", () => {
-    // A record with a forged prototype (fields on the prototype) is rejected by
-    // the plain-object guard before field checks — the stronger r3 behaviour.
+    // Inherited (prototype) fields drop out of the JSON round-trip the validator
+    // snapshots, so the field reads as missing and the record is rejected.
     const inhTrailer = validDiff();
     delete inhTrailer["attributionTrailer"];
     Object.setPrototypeOf(inhTrailer, { attributionTrailer: workerAttributionTrailer(SHA1_D) });
-    expect(quarantinedDiffProblems(inhTrailer).join(" ")).toMatch(/plain object/);
+    expect(quarantinedDiffProblems(inhTrailer).length).toBeGreaterThan(0);
 
     const inhRef = validDiff();
     inhRef["contractRef"] = Object.create({
@@ -86,16 +86,38 @@ describe("quarantinedDiffProblems", () => {
     }
   });
 
-  it("rejects a JSON __proto__ contractRef bypass and a class-instance record — r3", () => {
+  it("rejects a JSON __proto__ contractRef bypass; a valid-serializing class instance round-trips — r3/r5", () => {
     const protoRef = validDiff();
     protoRef["contractRef"] = JSON.parse(
       `{"__proto__":{"issueId":"M1.1","contractVersion":1,"contractHash":"${"e".repeat(64)}"}}`,
     );
     expect(quarantinedDiffProblems(protoRef).length).toBeGreaterThan(0);
 
+    // A class instance whose OWN enumerable fields form a valid diff serializes
+    // to a valid JSON record — which is exactly what a consumer adopts — so it is
+    // ACCEPTED under the round-trip model (the adopted form is well-formed).
     class Forged {}
     const inst = Object.assign(new Forged(), validDiff());
-    expect(quarantinedDiffProblems(inst).join(" ")).toMatch(/plain object/);
+    expect(quarantinedDiffProblems(inst)).toEqual([]);
+  });
+
+  it("rejects a record with a non-enumerable own field (vanishes on JSON round-trip) — r5", () => {
+    const d = validDiff();
+    const trailer = d["attributionTrailer"];
+    Object.defineProperty(d, "attributionTrailer", {
+      value: trailer,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+    expect(JSON.stringify(d).includes("attributionTrailer")).toBe(false); // it vanishes
+    expect(quarantinedDiffProblems(d).length).toBeGreaterThan(0);
+  });
+
+  it("rejects a non-JSON-serializable record (BigInt / circular) — r5", () => {
+    const big = validDiff();
+    (big as Record<string, unknown>)["candidateSha"] = 1n as unknown as string;
+    expect(quarantinedDiffProblems(big).join(" ")).toMatch(/not JSON-serializable|git object name/);
   });
 
   it("rejects a non-plain (Date / class) changed-path entry — r4", () => {
@@ -117,11 +139,13 @@ describe("quarantinedDiffProblems", () => {
   });
 
   it("still rejects the controls it rejected before (sparse holes, unsorted, bad trailer)", () => {
+    // A sparse-array hole becomes `null` in the JSON round-trip, so it is caught
+    // as a non-plain-object entry (still rejected — the record does not survive).
     const sparse = validDiff();
     const holed: unknown[] = [{ path: "a", change: "added" }];
-    holed[2] = { path: "c", change: "added" }; // index 1 is a hole
+    holed[2] = { path: "c", change: "added" }; // index 1 is a hole → null on round-trip
     sparse["changedPaths"] = holed;
-    expect(quarantinedDiffProblems(sparse).join(" ")).toMatch(/sparse-array hole/);
+    expect(quarantinedDiffProblems(sparse).join(" ")).toMatch(/plain object/);
 
     const unsorted = validDiff();
     unsorted["changedPaths"] = [

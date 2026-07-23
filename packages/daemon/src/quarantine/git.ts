@@ -135,6 +135,46 @@ export function removePristineRepo(dir: string): void {
  * commondir redirect, a symlink anywhere in the object-store tree, and an
  * alternates file (review r2/r3/r4).
  */
+/** Entry cap for the object-store walk — a hostile store over it is itself refused. */
+const OBJECT_STORE_SCAN_CAP = 300_000;
+
+/**
+ * Walk the `objects` subtree NO-FOLLOW; return the first borrowed/non-local path
+ * (a symlink, a hardlinked file `nlink>1`, an unreadable dir, or a scan-cap
+ * breach), or null if the whole store is local. Bounded so a hostile store
+ * cannot drive an unbounded walk.
+ */
+function findBorrowedObjectPath(objectsDir: string): string | null {
+  let seen = 0;
+  const walk = (abs: string, rel: string): string | null => {
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch {
+      return null; // absent (e.g. no objects dir on a just-init'd repo)
+    }
+    if (st.isSymbolicLink()) return rel;
+    if (st.isDirectory()) {
+      let names: string[];
+      try {
+        names = readdirSync(abs);
+      } catch {
+        return `${rel} (unreadable)`;
+      }
+      for (const name of names) {
+        if (++seen > OBJECT_STORE_SCAN_CAP) return `${rel} (scan cap exceeded)`;
+        const found = walk(join(abs, name), rel.length > 0 ? `${rel}/${name}` : name);
+        if (found !== null) return found;
+      }
+      return null;
+    }
+    // A regular object FILE hardlinked into another tree (nlink>1) is shared.
+    if (st.isFile() && st.nlink > 1) return `${rel} (hardlink nlink=${st.nlink})`;
+    return null;
+  };
+  return walk(objectsDir, "objects");
+}
+
 export function assertSelfContainedObjectStore(repo: string): void {
   // A GITFILE `.git` (a FILE, or a symlink, not a directory) redirects to a
   // `commondir` whose object store — and its alternates — live elsewhere, so a
@@ -173,33 +213,20 @@ export function assertSelfContainedObjectStore(repo: string): void {
     );
   }
 
-  // A SYMLINK anywhere in the object-store tree points (part of) the store — and
-  // any alternates within it — outside the repo. Refuse a symlink at `objects`
-  // itself OR at ANY immediate child of it (`info`, `pack`, and every loose
-  // fan-out dir) — the `objects/pack` symlink was the round-4 escape (r3/r4
-  // finding 2). One readdir; a fresh clone's objects dir is small.
+  // A SYMLINK anywhere in the object-store tree, or a HARDLINKED object FILE
+  // (nlink>1, shared with another tree), makes (part of) the store non-local — a
+  // nested `objects/pack/pack-xxx.pack` symlink or hardlink was the round-5
+  // escape past the top-level check (review r5 finding 2). Walk the WHOLE
+  // `objects` subtree, no-follow, and refuse either. Bounded by an entry cap so a
+  // hostile store cannot drive an unbounded walk (fail-closed: over-cap is itself
+  // a refusal). Mirrors WP-107 clone.ts `hasHardlinkedObject`, the authoritative
+  // isolation walk, which we already ran green on a worker clone.
   const objectsDir = join(gitDir, "objects");
-  const symlinkOffenders: string[] = [];
-  try {
-    if (lstatSync(objectsDir).isSymbolicLink()) symlinkOffenders.push("objects");
-    else {
-      for (const name of readdirSync(objectsDir)) {
-        try {
-          if (lstatSync(join(objectsDir, name)).isSymbolicLink()) {
-            symlinkOffenders.push(`objects/${name}`);
-          }
-        } catch {
-          /* raced/removed — ignore */
-        }
-      }
-    }
-  } catch {
-    /* objects dir absent on a just-init'd repo — nothing to borrow through */
-  }
-  if (symlinkOffenders.length > 0) {
+  const offender = findBorrowedObjectPath(objectsDir);
+  if (offender !== null) {
     throw new QuarantineGitError(
-      `fetch source object-store path(s) are symlinks (${symlinkOffenders.join(", ")}) — refused; ` +
-        "the store must be local (CAM-EXEC-02 / review r3 finding 2, r4 finding 2)",
+      `fetch source object store is non-local at "${offender}" (symlink, hardlink, or over-scan) — ` +
+        "refused; the store must be local (CAM-EXEC-02 / review r3/r4/r5 finding 2)",
     );
   }
 
@@ -325,8 +352,13 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
   // Read OBJECT NAMES only (`--format=%(objectname)`), never paths: a
   // pathological tree of many very-long paths would overrun a path-bearing read
   // buffer BEFORE the budget check could reject it (review r4 finding 3). A
-  // sha-only line is ~41 bytes, so even a 65,000-object tree is a few MB.
-  const raw = git(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha);
+  // sha-only line is ~41 bytes; the 256 MiB buffer (gitBuf) holds millions of
+  // entries so even a 420k-repetition tree counts cleanly rather than throwing
+  // and reporting a misleading code (review r5 finding 6). An absurdly larger
+  // count overruns even this and is caught + rejected by the intake.
+  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha).toString(
+    "utf8",
+  );
   const ids = new Set<string>();
   for (const line of raw.split("\n")) {
     const s = line.trim();
@@ -375,9 +407,12 @@ export function objectSize(dir: string, oid: string): number {
  * count above (which deduplicates and adds the commit).
  */
 export function treeEntryCount(dir: string, treeSha: string): number {
-  // PATH-FREE (`--format=%(objectname)`) so a very-long-path tree cannot overrun
-  // this count's buffer before the budget rejects it (review r4 finding 3).
-  const raw = git(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha);
+  // PATH-FREE (`--format=%(objectname)`) with the large buffer so a very-long-
+  // path or high-repetition tree cannot overrun this count before the budget
+  // rejects it (review r4 finding 3, r5 finding 6).
+  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha).toString(
+    "utf8",
+  );
   const lines = raw.split("\n").filter((l) => l.trim().length > 0);
   return lines.length + 1;
 }

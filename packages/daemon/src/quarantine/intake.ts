@@ -204,12 +204,38 @@ export function runIntake(
     };
   }
 
-  // Within the processing cap (≤5,000 objects): reading the leaves — with paths,
-  // for the path/content checks — is now bounded. Paths that are not valid UTF-8
-  // decode to U+FFFD and are rejected by checkNameAliases (WP-003 r2).
-  const entries = treeLeaves(pristineDir, treeSha);
-  const targets = symlinkTargets(pristineDir, entries);
-  const changed = changedPaths(pristineDir, assignment.base, workerHead);
+  // Within the object-count cap the leaves are read WITH paths for the path/
+  // content checks. The object count bounds the NUMBER of paths but not a single
+  // ENORMOUS entry NAME (or an enormous DELETED base path in the diff), which
+  // would overrun the read buffer (review r5 findings 3, 4). Wrap the path-
+  // bearing reads: any overflow/malformed-output failure becomes a clean
+  // `path-too-long` rejection, never a thrown ENOBUFS. Paths that are not valid
+  // UTF-8 decode to U+FFFD and are rejected by checkNameAliases (WP-003 r2).
+  let entries: TreeEntry[];
+  let targets: Map<string, string>;
+  let changed: string[];
+  try {
+    entries = treeLeaves(pristineDir, treeSha);
+    targets = symlinkTargets(pristineDir, entries);
+    changed = changedPaths(pristineDir, assignment.base, workerHead);
+  } catch {
+    return {
+      accepted: false,
+      rejections: [
+        ...rejections,
+        {
+          code: "path-too-long",
+          detail:
+            "a tree/diff path-bearing read exceeded processing bounds (an over-long path/name)",
+        },
+      ],
+      rebuilt: null,
+      workerHead,
+      diff: null,
+      fetchedObjectCount: distinctObjectCount(pristineDir),
+      pristineDir,
+    };
+  }
   const changedSet = new Set(changed);
 
   // Delegate the malformed-object/path class to git's own hardened fsck first
