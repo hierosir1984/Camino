@@ -42,9 +42,12 @@ not scope.
 ## Boundaries (stated, not hidden)
 
 - **Canonical path identity uses ICU for the case fold; the residual is named.**
-  Each path prefix is reduced to a fold KEY — `\`→`/`, NFKC, an ICU
-  `toUpperCase().toLowerCase()` round trip, then `ß`→`ss` — and distinct paths
-  whose keys are equal are a collision (grouped by exact key equality, a Map).
+  Each path prefix is reduced to a fold KEY — `\`→`/`, strip git's HFS+
+  IGNORABLE codepoints (zero-width/bidi/BOM controls a case-insensitive HFS+
+  volume ignores in comparison, so `.git<U+200C>attributes` is `.gitattributes`
+  there; review r6 finding 2), NFKC, an ICU `toUpperCase().toLowerCase()` round
+  trip, then `ß`→`ss` — and distinct paths whose keys are equal are a collision
+  (grouped by exact key equality, a Map).
   The upper/lower round trip is what makes it a case FOLD rather than a mere
   lowercase: it collapses same-script pairs a plain `toLowerCase()` (and the
   WP-003 spike's hand-rolled residual list) **missed** yet a case-insensitive
@@ -77,7 +80,14 @@ not scope.
   config), so a worker cannot use it to run code during the fetch. The residual
   git-config exec surface is unbounded in principle — the structural bound is
   that the fetch env carries no credential and no host `HOME`, the same boundary
-  WP-107's `clone.ts` names.
+  WP-107's `clone.ts` names. The `git` **binary itself** is resolved to an
+  absolute path ONCE at module load (from the startup PATH) and every call
+  invokes that pinned path — so a PATH entry that becomes worker-writable mid-run
+  cannot swap it. **Named boundary / flagged for David (review r6 finding 10):**
+  the daemon's PATH at startup is a trusted deployment input (the control plane
+  owns its process env; a WP-107 worker cannot write the daemon host's PATH
+  directories), the same trusted-PATH residual WP-107 states. Every git call also
+  carries a wall-clock timeout, so a planted FIFO/device node cannot hang intake.
 - **The worker head and base are fetched BY EXACT OBJECT ID, never a ref
   string.** A ref string is a refspec surface: `git fetch <repo> <src>:<dst>`
   writes `<dst>` (e.g. a `refs/replace/<oid>` that would substitute the assigned
@@ -88,16 +98,26 @@ not scope.
   validated oid), never an attacker-chosen destination ref (review r1 findings
   1, 2). Replacement refs are additionally disabled in the pristine store
   (`core.useReplaceRefs=false`).
-- **The worker object store must be self-contained.** Before fetching, the
-  intake requires a full non-bare clone (a real `.git` directory), refuses a
-  `commondir` redirect, and walks the WHOLE `objects` subtree no-follow —
-  refusing a symlink anywhere OR a hardlinked object file (`nlink>1`, incl. a
-  nested `objects/pack/*.pack`) — plus any `alternates` file. Each is a borrowing
-  form whose `upload-pack` would serve objects from an external/shared store into
-  the candidate (review r1 finding 4, r2/r3/r4/r5 finding 2/3). It is a
-  filesystem check (no git run in the worker dir), bounded by a scan cap
-  (fail-closed), that re-attests WP-107's `assertWorkerCloneIsolation` — the
-  authoritative isolation walk — as defense in depth.
+- **The worker object store must be self-contained (custody-bounded).** Before
+  fetching, the intake requires a full non-bare clone (a real `.git` directory),
+  refuses a `commondir` redirect, and walks the WHOLE `objects` subtree no-follow
+  (STREAMED, bounded by a scan cap) — refusing a symlink anywhere, an unexpected
+  node type (FIFO/socket/device — which both fell through as "safe" and would
+  hang the reader; review r6 finding 5), and any `alternates` file. Each is a
+  borrowing/serving hazard whose `upload-pack` would serve foreign objects into
+  the candidate (review r1 finding 4, r2/r3/r5 finding 2/3). A hardlinked object
+  file (`nlink>1`) is **not** refused — it is normal after a `git clone
+--local`/`gc` and does not prove borrowing (review r6 finding 5). It is a
+  filesystem check (no git in the worker dir), re-attesting WP-107's
+  `assertWorkerCloneIsolation` — the authoritative walk — as defense in depth.
+  **Named boundary / flagged for David (review r6 finding 1):** the attestation
+  and the fetch that follows are separate operations, so this is not proof
+  against an adversary who plants an `alternates` file in the WINDOW between them
+  (a TOCTOU). What discharges the AC is the production **custody** model — by
+  intake time the WP-107 worker container has exited and its git dir is quiescent
+  under control-plane ownership, so nothing writes it concurrently. The intake
+  re-attests AFTER the fetch as cheap defense in depth; a fully atomic fix (fetch
+  from an immutable snapshot the control plane takes custody of) is future work.
 - **The registry-item-11 fetch budget is a DISTINCT-footprint ADMISSION check.**
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
@@ -131,13 +151,13 @@ not scope.
   repo). Both are compared under the same per-segment case-fold as the collision
   check, so an alias a target FS resolves to the protected identity —
   `.gitattributeſ`, `.GitModules` — is caught, not just the exact spelling
-  (review r1 findings 3, 5; r2 findings 1, 4). **Named boundary / escalation:** a
-  workflow may reference a local action at an ARBITRARY path (`uses: ./scripts/
-foo`) or via a SYMLINK whose target the worker edits — closing that requires
-  parsing each workflow's `uses: ./…` targets, which is the WP-118 onboarding
-  analyzer (CAM-SEC-03). Whether WP-108 should ship a minimal `uses:`-parser or
-  defer the complete local-action closure to WP-118 is a scope decision flagged
-  for David.
+  (review r1 findings 3, 5; r2 findings 1, 4). **Named boundary — David RULED
+  (2026-07-23): DEFERRED to WP-118.** A workflow may reference a local action at
+  an ARBITRARY path (`uses: ./scripts/foo`) or via a SYMLINK whose target the
+  worker edits; closing that requires parsing each workflow's `uses: ./…`
+  targets, which is the WP-118 onboarding analyzer (CAM-SEC-03). WP-108 protects
+  the conventional `.github/actions/**` location; the complete local-action
+  closure is WP-118's.
 - **The workflow-posture analyzer is heuristic and its home is WP-118.** Its
   behaviour is the WP-003 spike's analyzer (3 falsification rounds) carried
   forward — the only edits are `readonly` parameters and a frozen
@@ -167,15 +187,35 @@ foo`) or via a SYMLINK whose target the worker edits — closing that requires
   Likewise, the assigned `base` defaults to the worker repo only for the corpus
   fixtures; production passes a SEPARATE trusted `baseRepo` (review r2 finding
   10).
-- **Canonical path identity is over-reject-safe but NOT a complete fold; a
-  scope decision is flagged for David.** The fold (NFKC + ICU upper/lower +
-  `ß→ss`) catches the common aliases and the round-1/round-2 examples, but ICU's
-  case MAPPING is not full versioned case FOLDING, so recent-Unicode case pairs
-  (e.g. the U+A7CE class) that a case-insensitive volume still aliases may slip
-  (they over-reject-safely nowhere, but under-detect). Making this complete means
-  bundling a versioned Unicode `CaseFolding.txt` table. Whether to fund that in
-  WP-108 or accept the disclosed residual for a personal-tool v1 (the WP-003
-  precedent accepted a weaker residual) is flagged for David.
+- **The assignment is snapshotted once; integrity failures keep truthful
+  evidence.** Every worker-influenced field (`base`, `allowedPaths`,
+  `contractRef`, `budgets`) is read into an immutable local at entry, so a
+  malformed/stateful assignment (a side-effecting getter) cannot return a
+  different `base` between the diff and the rebuild and admit protected content
+  under an empty-looking diff (review r6 finding 6). `git fsck` runs BEFORE any
+  path-bearing read, so a type-confused object (a `120000` "symlink" whose object
+  is a tree) is reported as the truthful `fsck-violation`, not mislabeled
+  `path-too-long` by the read-overflow backstop (review r6 finding 7).
+- **Canonical path identity is over-reject-safe but NOT a complete fold; David
+  RULED (2026-07-23): residual ACCEPTED for v1.** The fold (HFS-ignorable strip +
+  NFKC + ICU upper/lower + `ß→ss`) catches the common aliases and the review
+  examples, but ICU's case MAPPING is not full versioned case FOLDING, so
+  recent-Unicode case pairs (e.g. the U+A7CE class) that a case-insensitive
+  volume still aliases may under-detect. Making this complete means bundling a
+  versioned Unicode `CaseFolding.txt` table; David accepted the disclosed
+  over-reject-safe residual for a personal-tool v1 (the WP-003 precedent accepted
+  a weaker residual). Deferred follow-up (not burial): bundle the fold table if
+  Camino goes multi-user / hostile-Unicode.
+- **Windows name aliases match git's own rules, not a hand list.** Reserved
+  device names cover the `RtlIsDosDeviceName_U` set — CON/PRN/AUX/NUL, COM/LPT¹⁻⁹
+  (incl. superscripts), and the console devices CONIN$/CONOUT$ (review r6 finding
+  4). The 8.3 short-name rule refuses any `NAME~<digits>` whose base (tilde +
+  digits included) is ≤8 chars — matching MS-FSCC's 8-char base limit, so it
+  catches git's zero-prefix/hash fallback forms (`~1000000`, `GI7D29~1`) yet does
+  not over-reject an impossible-as-8.3 long name like `report~2024` (review r6
+  findings 3, 9). The exact NTFS/HFS checkout algorithm is git's own
+  (`core.protectNTFS`/`protectHFS`); these are the intake's bounded shape rules
+  over the tree's raw bytes.
 
 ## Running the suites
 

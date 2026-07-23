@@ -35,18 +35,41 @@ import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
  *   - `ß`→`ss` closes the one case-fold the round trip still leaves: `ẞ`→`ß` (a
  *     lowercase, not `ss`), so applying it last folds `ẞ`, `ß`, and `SS` alike.
  *
+ * HFS+ IGNORABLE codepoints are stripped FIRST: a case-insensitive HFS+ volume
+ * ignores a fixed set of formatting codepoints (zero-width joiners, bidi
+ * controls, the BOM) when it compares names, so `.gitattributes` with a
+ * U+200C spliced in is the SAME file as `.gitattributes` on that volume, and
+ * git's own `is_hfs_dotgit` strips exactly this set (review r6 finding 2). NFKC
+ * does NOT remove these (they are valid format controls), so without the strip a
+ * spliced protected name folds to itself and slips both the collision and the
+ * protected-identity check. The set is git's (utf8.c) — a bounded, authoritative
+ * list, the delegate-to-git lesson applied to the fold.
+ *
  * BOUNDARY, stated (the WP-003 "name the boundary" lesson): JavaScript exposes
- * no `u_strFoldCase`, so this is NFKC + an ICU upper/lower round trip + the `ß`
- * residual — a strong approximation of Unicode default case folding, NOT the
- * complete CaseFolding.txt table. Same- or cross-script case-fold pairs beyond
- * what NFKC and ICU's upper/lower casing collapse may still slip; the design
- * bias is to ERR TOWARD COLLAPSING (a false collision over-rejects — the safe
- * direction, e.g. the locale-dependent `I`⇄`ı`; a MISS would be a missed
- * collision, never an accept of something worse). The complete target-filesystem
- * identity oracle is deferred (a bundled fold table / WP-118 onboarding).
+ * no `u_strFoldCase`, so this is the HFS-ignorable strip + NFKC + an ICU
+ * upper/lower round trip + the `ß` residual — a strong approximation of Unicode
+ * default case folding, NOT the complete CaseFolding.txt table. Same- or
+ * cross-script case-fold pairs beyond what NFKC and ICU's upper/lower casing
+ * collapse may still slip; the design bias is to ERR TOWARD COLLAPSING (a false
+ * collision over-rejects — the safe direction, e.g. the locale-dependent
+ * `I`⇄`ı`; a MISS would be a missed collision, never an accept of something
+ * worse). The complete target-filesystem identity oracle is deferred (a bundled
+ * fold table / WP-118 onboarding).
  */
+// Git's HFS+ ignorable set (utf8.c `is_hfs_dotgit`): zero-width (non-)joiners and
+// LRM/RLM, the bidi embedding/override controls, the Arabic/national digit-shape
+// controls, and the BOM (U+FEFF). A case-insensitive HFS+ volume ignores these in
+// name comparison, so they cannot distinguish two paths.
+const HFS_IGNORABLE_RE = /[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g;
+
 function foldKey(path: string): string {
-  return path.replace(/\\/g, "/").normalize("NFKC").toUpperCase().toLowerCase().replace(/ß/g, "ss");
+  return path
+    .replace(/\\/g, "/")
+    .replace(HFS_IGNORABLE_RE, "")
+    .normalize("NFKC")
+    .toUpperCase()
+    .toLowerCase()
+    .replace(/ß/g, "ss");
 }
 
 /**
@@ -128,8 +151,13 @@ export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] 
 // ---------------------------------------------------------------------------
 
 // COM/LPT digits include the superscript forms ¹²³ (U+00B9/B2/B3), which
-// Windows also reserves — COM² etc. (WP-003 r1).
-const RESERVED = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
+// Windows also reserves — COM² etc. (WP-003 r1). CONIN$ / CONOUT$ are the console
+// input/output DOS devices in Microsoft's `RtlIsDosDeviceName_U` set, absent from
+// the earlier list (review r6 finding 4); a name that resolves to a device is a
+// non-faithful materialization on Windows. NAMED BOUNDARY: the authoritative set
+// is the Windows kernel's `RtlIsDosDeviceName_U`; this enumerates its documented
+// members (CON/PRN/AUX/NUL, COM/LPT¹⁻⁹ incl. superscripts, CONIN$/CONOUT$).
+const RESERVED = /^(con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i;
 
 /**
  * Strip the aliases Windows applies before it resolves a name: an NTFS alternate
@@ -199,21 +227,32 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
 
 /**
  * Does a segment look like ANY NTFS 8.3 SHORT NAME (`GITATT~1`, `GI7D29~1`,
- * `FOO~12.TXT`)? Windows can create such an alias for a long name and it resolves
- * to that long name on access — so it can alias a PROTECTED path the long-name
- * check never sees (review r4 finding 1). Git's REAL fallback short name is
- * HASH-based (`.gitattributes`→`GI7D29~1`, not `GITATT~1`; path.c), so a name-
- * prefix allowlist cannot enumerate the aliases (review r5 finding 1). We
- * therefore reject the general 8.3 SHAPE — a base of ≤8 non-dot chars, a
- * `~<digits>` tail, an optional ≤3-char extension — which is COMPLETE: it catches
- * every fallback/index/hash form. A worker has no legitimate reason to commit a
- * literal 8.3-shaped name; a genuine `report~2024.txt` is over-rejected, the safe
- * direction. NAMED BOUNDARY: the exact NTFS short-name algorithm is git's own
- * (`core.protectNTFS`), applied at a Windows checkout — this shape rule is the
- * intake's bounded, over-reject-safe approximation.
+ * `FOO~12.TXT`, `~1000000`)? Windows can create such an alias for a long name and
+ * it resolves to that long name on access — so it can alias a PROTECTED path the
+ * long-name check never sees (review r4 finding 1). Git's REAL fallback short
+ * name is HASH-based (`.gitattributes`→`GI7D29~1`, not `GITATT~1`; path.c), and
+ * git tests a ZERO-length prefix with up to seven digits (`~1000000`,
+ * `~9999999`) as an alias of `.gitmodules` (review r6 finding 3), so a name-
+ * prefix allowlist — or a `{1,8}~{1,6}` shape that requires ≥1 leading char and
+ * ≤6 digits — cannot enumerate them.
+ *
+ * The COMPLETE, over-reject-safe rule is MS-FSCC's own bound: an 8.3 name is
+ * NAME(≤8).EXT(≤3), and the `~<digits>` tilde tail lives INSIDE the ≤8 NAME. So
+ * a segment aliases iff its base (up to an optional `.ext`, tilde + digits
+ * included) is ≤8 chars, contains `~<digits>`, and any extension is ≤3 dot-free
+ * chars. That catches every zero-prefix/hash/index form AND stops over-rejecting
+ * an impossible-as-8.3 long name like `report~2024` (11-char base; review r6
+ * finding 9). NAMED BOUNDARY: the exact NTFS short-name ALGORITHM is git's own
+ * (`core.protectNTFS`) applied at a Windows checkout — this is the intake's
+ * bounded shape rule for the tree's raw bytes, matching git's ≤8-base limit.
  */
 function is83ShortName(seg: string): boolean {
-  return /^[^/.]{1,8}~[0-9]{1,6}(\.[^/.]{1,3})?$/.test(stripWindowsAlias(seg));
+  const s = stripWindowsAlias(seg);
+  const dot = s.indexOf(".");
+  const base = dot >= 0 ? s.slice(0, dot) : s;
+  const ext = dot >= 0 ? s.slice(dot + 1) : "";
+  if (base.length > 8 || ext.length > 3 || ext.includes(".")) return false;
+  return /^[^.]*~[0-9]+$/.test(base);
 }
 
 // ---------------------------------------------------------------------------

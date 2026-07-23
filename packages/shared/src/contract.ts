@@ -324,8 +324,12 @@ export function contractRefProblems(value: unknown): string[] {
   const problems: string[] = [];
   boundedText("contractRef.issueId", record["issueId"], problems);
   const version = record["contractVersion"];
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    problems.push("contractRef.contractVersion must be an integer >= 1");
+  // SAFE integer, not merely integer (review r6 finding 8): 2^53, 1.8e308, and a
+  // JSON literal like 9007199254740993 are all `Number.isInteger` yet lose
+  // precision on parse — an identity-bearing version that silently CHANGES across
+  // a store round-trip. Number.isSafeInteger also excludes ±Infinity and NaN.
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    problems.push("contractRef.contractVersion must be a safe integer >= 1");
   }
   const hash = record["contractHash"];
   if (typeof hash !== "string" || !isSha256Hex(hash)) {

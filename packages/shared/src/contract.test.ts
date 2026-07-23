@@ -178,6 +178,23 @@ describe("contractRefProblems", () => {
       }),
     ).not.toEqual([]);
   });
+
+  it("refuses a contractVersion that is an integer but not SAFE (loses precision) — r6", () => {
+    for (const bad of [9007199254740992, Number.MAX_VALUE, 1.7976931348623157e308]) {
+      expect(
+        contractRefProblems({
+          issueId: "m1.I1",
+          contractVersion: bad,
+          contractHash: "0".repeat(64),
+        }),
+      ).not.toEqual([]);
+    }
+    // A JSON literal beyond 2^53 already lost precision on parse; still refused.
+    const parsed = JSON.parse(
+      '{"issueId":"m1.I1","contractVersion":9007199254740993,"contractHash":"0000000000000000000000000000000000000000000000000000000000000000"}',
+    );
+    expect(contractRefProblems(parsed)).not.toEqual([]);
+  });
 });
 
 describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {

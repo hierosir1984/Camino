@@ -19,7 +19,6 @@ import {
   changedPaths,
   changedPathsWithStatus,
   commitCandidate,
-  distinctObjectCount,
   fetchedObjectCount,
   fetchOid,
   fsckTree,
@@ -101,6 +100,16 @@ export function runIntake(
   assignment: QuarantineAssignment,
   options: IntakeOptions = {},
 ): QuarantineResult {
+  // SNAPSHOT the assignment ONCE at entry (review r6 finding 6): capture every
+  // worker-influenced field into an immutable local up front. A malformed or
+  // STATEFUL assignment (a side-effecting getter, a Proxy) that returned a
+  // DIFFERENT base on a later read could otherwise split the DIFF (computed vs
+  // one base) from the REBUILD (parented on another) — admitting protected
+  // content while reporting an empty base-relative diff. Every use below reads
+  // these locals, never `assignment.*` again.
+  const base = assignment.base;
+  const allowedPaths: readonly string[] = Object.freeze([...assignment.allowedPaths]);
+  const contractRef: ContractRef | null = assignment.contractRef ?? null;
   // Overrides may only TIGHTEN the default tree-size budget, never widen it
   // (review r1 finding 7) — a per-issue contract cannot loosen the policy cap.
   const budgets = effectiveBudgets(assignment.budgets);
@@ -116,7 +125,7 @@ export function runIntake(
   // head shallow. Both are fetched BY EXACT OID (no refspec/wildcard surface),
   // so nothing but those two commits' trees crosses the boundary.
   const pristineDir = initPristineRepo();
-  fetchOid(pristineDir, baseRepo, assignment.base, true);
+  fetchOid(pristineDir, baseRepo, base, true);
   // Store size AFTER the base fetch, BEFORE the worker fetch: the delta after the
   // worker fetch bounds the fetch by its on-disk store footprint — the compressed
   // pack (a conservative proxy for the wire transfer, not exact wire bytes;
@@ -124,6 +133,12 @@ export function runIntake(
   const bytesBeforeWorker = storeSizeBytes(pristineDir);
   const workerHead = fetchOid(pristineDir, workerRepo, workerHeadOid, true);
   const fetchBytes = storeSizeBytes(pristineDir) - bytesBeforeWorker;
+  // Re-attest the source AFTER the fetch (review r6 finding 1): cheap defence in
+  // depth against an alternates/borrowing store that appeared or persisted around
+  // the fetch window. The custody model (the worker dir is quiescent by intake
+  // time — see git.ts boundary note) is the guarantee; this narrows the residual
+  // TOCTOU window. A borrowed store now throws → fail-closed, before any policy.
+  assertSelfContainedObjectStore(workerRepo);
 
   const rejections: Rejection[] = [];
 
@@ -199,48 +214,19 @@ export function runIntake(
       rebuilt: null,
       workerHead,
       diff: null,
-      fetchedObjectCount: distinctObjectCount(pristineDir),
+      fetchedObjectCount: fetchObjects,
       pristineDir,
     };
   }
 
-  // Within the object-count cap the leaves are read WITH paths for the path/
-  // content checks. The object count bounds the NUMBER of paths but not a single
-  // ENORMOUS entry NAME (or an enormous DELETED base path in the diff), which
-  // would overrun the read buffer (review r5 findings 3, 4). Wrap the path-
-  // bearing reads: any overflow/malformed-output failure becomes a clean
-  // `path-too-long` rejection, never a thrown ENOBUFS. Paths that are not valid
-  // UTF-8 decode to U+FFFD and are rejected by checkNameAliases (WP-003 r2).
-  let entries: TreeEntry[];
-  let targets: Map<string, string>;
-  let changed: string[];
-  try {
-    entries = treeLeaves(pristineDir, treeSha);
-    targets = symlinkTargets(pristineDir, entries);
-    changed = changedPaths(pristineDir, assignment.base, workerHead);
-  } catch {
-    return {
-      accepted: false,
-      rejections: [
-        ...rejections,
-        {
-          code: "path-too-long",
-          detail:
-            "a tree/diff path-bearing read exceeded processing bounds (an over-long path/name)",
-        },
-      ],
-      rebuilt: null,
-      workerHead,
-      diff: null,
-      fetchedObjectCount: distinctObjectCount(pristineDir),
-      pristineDir,
-    };
-  }
-  const changedSet = new Set(changed);
-
-  // Delegate the malformed-object/path class to git's own hardened fsck first
-  // (WP-003 r3); our hand-rolled checks then add the cross-platform aliases git
-  // PERMITS (GIT~1, case-spelled protected paths, etc.).
+  // Delegate the malformed-object/path class to git's own hardened fsck FIRST —
+  // BEFORE any path-bearing read (review r6 finding 7). A type-confused entry (a
+  // `120000` "symlink" whose object is actually a tree) makes the symlink-target
+  // read throw, and the broad catch below would otherwise MISLABEL that integrity
+  // violation as `path-too-long`. Running fsck first records the TRUTHFUL
+  // `fsck-violation`; the catch then attributes an overflow only when fsck found
+  // the tree clean. (WP-003 r3: fsck also covers `.git` equivalents incl.
+  // HFS-ignorable chars, mode/type mismatches, broken links.)
   const fsckErr = fsckTree(pristineDir, treeSha);
   if (fsckErr) {
     rejections.push({
@@ -249,8 +235,45 @@ export function runIntake(
     });
   }
 
+  // Within the object-count cap the leaves are read WITH paths for the path/
+  // content checks. The object count bounds the NUMBER of paths but not a single
+  // ENORMOUS entry NAME (or an enormous DELETED base path in the diff), which
+  // would overrun the read buffer (review r5 findings 3, 4). Wrap the path-
+  // bearing reads: any overflow/malformed-output failure becomes a clean
+  // rejection, never a thrown ENOBUFS. Paths that are not valid UTF-8 decode to
+  // U+FFFD and are rejected by checkNameAliases (WP-003 r2).
+  let entries: TreeEntry[];
+  let targets: Map<string, string>;
+  let changed: string[];
+  try {
+    entries = treeLeaves(pristineDir, treeSha);
+    targets = symlinkTargets(pristineDir, entries);
+    changed = changedPaths(pristineDir, base, workerHead);
+  } catch {
+    // If fsck already explained the tree is malformed, THAT is the truthful
+    // rejection — do not also relabel a read that failed on the corruption as a
+    // path overflow (review r6 finding 7). Attribute path-too-long only when the
+    // tree fscks clean (⇒ the failure really is an over-long path/name).
+    if (!fsckErr) {
+      rejections.push({
+        code: "path-too-long",
+        detail: "a tree/diff path-bearing read exceeded processing bounds (an over-long path/name)",
+      });
+    }
+    return {
+      accepted: false,
+      rejections,
+      rebuilt: null,
+      workerHead,
+      diff: null,
+      fetchedObjectCount: fetchObjects,
+      pristineDir,
+    };
+  }
+  const changedSet = new Set(changed);
+
   rejections.push(
-    ...checkScopeAndProtected(changed, assignment.allowedPaths),
+    ...checkScopeAndProtected(changed, allowedPaths),
     ...checkChangedPathValidity(changed),
     ...checkPathCollisions(entries),
     ...checkNameAliases(entries),
@@ -271,22 +294,21 @@ export function runIntake(
     const subject = subjectOf(pristineDir, workerHead).slice(0, MAX_CANDIDATE_SUBJECT_LENGTH);
     const attributionTrailer = workerAttributionTrailer(workerHead);
     const message = `${subject}\n\n${attributionTrailer}\n`;
-    const candidateSha = commitCandidate(pristineDir, treeSha, assignment.base, message);
+    const candidateSha = commitCandidate(pristineDir, treeSha, base, message);
     rebuilt = {
       sha: candidateSha,
       parents: parentShas(pristineDir, candidateSha),
       treeSha,
       attributionTrailer,
     };
-    const contractRef: ContractRef | null = assignment.contractRef ?? null;
     const candidate: QuarantinedDiff = {
       candidateSha,
-      baseSha: assignment.base,
+      baseSha: base,
       treeSha,
       workerHeadSha: workerHead,
       attributionTrailer,
       contractRef,
-      changedPaths: changedPathsWithStatus(pristineDir, assignment.base, candidateSha),
+      changedPaths: changedPathsWithStatus(pristineDir, base, candidateSha),
     };
     // Emit only a well-formed artifact: an internal inconsistency (a bad
     // contractRef the caller supplied, a mis-keyed sha) fails closed rather than
@@ -306,7 +328,7 @@ export function runIntake(
     rebuilt,
     workerHead,
     diff,
-    fetchedObjectCount: distinctObjectCount(pristineDir),
+    fetchedObjectCount: fetchObjects,
     pristineDir,
   };
 }

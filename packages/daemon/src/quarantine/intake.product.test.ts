@@ -2,6 +2,7 @@
 // (CAM-EXEC-04): the emitted quarantined diff, WP-110 contract binding, the
 // registry-item-11 fetch budget, the credentialed-git / worker-touched-dir
 // boundary, and a production-shape smoke test of the real intake entry.
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   linkSync,
@@ -735,20 +736,206 @@ describe("round-5 falsification fixes", () => {
     expect(r.rejections.map((x) => x.code)).toContain("windows-alias");
   });
 
-  it("refuses a NESTED symlinked or hardlinked pack file — r5 #2", () => {
+  it("refuses a NESTED symlinked pack file — r5 #2", () => {
     // symlinked objects/pack/*.pack (two levels deep — below the r4 checks)
     const a = mkdtempTestDir();
     mkdirSync(join(a, ".git", "objects", "pack"), { recursive: true });
     symlinkSync("/elsewhere/pack-x.pack", join(a, ".git", "objects", "pack", "pack-x.pack"));
     expect(() => assertSelfContainedObjectStore(a)).toThrow(/non-local/);
+  });
 
-    // hardlinked pack file (nlink>1 — shared with another tree)
+  it("does NOT refuse a hardlinked pack file (normal after git clone --local/gc) — r6 #5", () => {
+    // A hardlink (nlink>1) proves another directory entry, NOT external borrowing:
+    // `git clone --local` and `gc` legitimately hardlink packs. Refusing it was a
+    // false positive; the object store is still ordinary local files.
     const b = mkdtempTestDir();
     mkdirSync(join(b, ".git", "objects", "pack"), { recursive: true });
-    const real = join(b, "external.pack");
+    const real = join(b, ".git", "objects", "pack", "pack-real.pack");
     writeFileSync(real, "PACK");
-    linkSync(real, join(b, ".git", "objects", "pack", "pack-y.pack")); // nlink=2
-    expect(() => assertSelfContainedObjectStore(b)).toThrow(/non-local/);
+    linkSync(real, join(b, ".git", "objects", "pack", "pack-hardlink.pack")); // nlink=2, same store
+    expect(() => assertSelfContainedObjectStore(b)).not.toThrow();
+  });
+
+  it("refuses a FIFO (or other non-file/dir node) in the object store — r6 #5", () => {
+    // A FIFO is neither symlink, dir, nor regular file: it must fail closed, not
+    // fall through as "safe" (and reading through it would hang the intake).
+    const c = mkdtempTestDir();
+    mkdirSync(join(c, ".git", "objects", "pack"), { recursive: true });
+    const fifo = join(c, ".git", "objects", "pack", "pack-fifo.pack");
+    execFileSync("mkfifo", [fifo]);
+    expect(() => assertSelfContainedObjectStore(c)).toThrow(/non-local\/unexpected/);
+  });
+});
+
+describe("round-6 falsification fixes", () => {
+  it("rejects an HFS-ignorable-char alias of a protected path (.git<U+200C>attributes) — r6 #2", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    // HFS+ ignores U+200C in name comparison, so this is `.gitattributes` there.
+    const alias = ".git" + String.fromCodePoint(0x200c) + "attributes";
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: alias },
+      ]),
+      [base],
+      "add hfs-ignorable alias",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("protected-path");
+  });
+
+  it("rejects a zero-prefix 8.3 fallback alias (~1000000) — r6 #3", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    // Git tests `~1000000`/`~9999999` (0-char prefix, 7 digits) as NTFS aliases.
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "~1000000" },
+      ]),
+      [base],
+      "add zero-prefix 8.3 alias",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("windows-alias");
+  });
+
+  it("does NOT flag an impossible-as-8.3 long name (report~2024.txt, 11-char base) — r6 #9", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "y\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "reports/report~2024.txt" }, // 11-char base — not 8.3
+      ]),
+      [base],
+      "add legit tilde name",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(true);
+    expect(r.rejections).toEqual([]);
+  });
+
+  it("rejects a Windows console device name (CONIN$) — r6 #4", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "z\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "CONIN$" },
+      ]),
+      [base],
+      "add console device name",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("reserved-name");
+  });
+
+  it("snapshots the assignment: a stateful base getter cannot split diff from rebuild — r6 #6", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base1 = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base1",
+    );
+    const other = hashBlob(repo, "other\n");
+    const base2 = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: other, path: "src/other.js" }]),
+      [],
+      "base2",
+    );
+    const app2 = hashBlob(repo, "console.log('app v2');\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app2, path: "src/app.js" }]),
+      [base1],
+      "feat",
+    );
+    // A getter that returns base1 first, then base2 on every later read.
+    let reads = 0;
+    const assignment = { allowedPaths: ["**"] } as unknown as QuarantineAssignment;
+    Object.defineProperty(assignment, "base", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? base1 : base2;
+      },
+    });
+    const r = runIntake(repo, head, assignment);
+    // The snapshot fixes base = base1 for EVERY use — the diff and the rebuild
+    // parent are consistent, matching a plain base1 assignment.
+    const plain = runIntake(repo, head, { base: base1, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(plain.accepted);
+    expect(r.diff?.baseSha).toBe(base1);
+    expect(r.rebuilt?.parents).toEqual([base1]);
+    expect(r.diff?.changedPaths).toEqual(plain.diff?.changedPaths);
+  });
+
+  it("reports a type-confused symlink (mode 120000 → tree) as fsck-violation, not path-too-long — r6 #7", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    // A subtree object id used as a 120000 (symlink) entry's target — a broken
+    // link git fsck flags ("is a tree, not a blob").
+    const someTree = buildTree(repo, [{ mode: "100644", sha: app, path: "inner.js" }]);
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "120000", sha: someTree, path: "badlink" },
+      ]),
+      [base],
+      "type-confused symlink",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    const codes = r.rejections.map((x) => x.code);
+    expect(codes).toContain("fsck-violation");
+    expect(codes).not.toContain("path-too-long");
   });
 });
 

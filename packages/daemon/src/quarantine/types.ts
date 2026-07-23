@@ -179,7 +179,13 @@ export interface QuarantineResult {
    * WP-116 evidence; carries candidate identity (sha, base_sha) + changed paths.
    */
   diff: import("@camino/shared").QuarantinedDiff | null;
-  /** Distinct object shas the shallow-fetch pulled into the pristine store. */
+  /**
+   * Distinct git objects the WORKER shallow-fetch transferred (the worker commit
+   * + every distinct tree/blob reachable from its final tree) — the registry-
+   * item-11 fetch footprint, NOT the whole pristine store (which also holds the
+   * trusted base and the authored candidate; review r6 finding 11). 0 when the
+   * object count could not be read (a fetch far over the processing cap).
+   */
   fetchedObjectCount: number;
   /**
    * The pristine, hooks-disabled repo the shallow-fetch landed in. Exposed so a

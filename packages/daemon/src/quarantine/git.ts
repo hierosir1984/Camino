@@ -13,7 +13,15 @@
 // the README boundary note on the residual serving-side config-exec surface,
 // which is structural, not an exhaustive denylist).
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  opendirSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { ChangedPath, ChangedPathKind } from "@camino/shared";
@@ -43,6 +51,45 @@ const GIT_ENV_BASE = {
   LC_ALL: "C",
 } as const;
 
+/**
+ * The git executable, resolved to an ABSOLUTE path ONCE at module load by
+ * scanning the startup PATH for an executable `git` (review r6 finding 10). Every
+ * quarantine call invokes THIS pinned binary, not a bare `"git"` re-resolved
+ * through the ambient PATH on each exec — so a PATH entry that becomes
+ * worker-writable mid-run cannot swap the binary out. NAMED BOUNDARY: the
+ * daemon's PATH AT STARTUP is a trusted deployment input (the control plane owns
+ * its own process env; a WP-107 worker runs in a separate mount namespace and
+ * cannot write the daemon host's PATH directories). If no executable is found at
+ * load, we fall back to `"git"` (a broken deployment fails closed at first call).
+ */
+function resolveGitBinary(): string {
+  const raw = process.env["PATH"];
+  if (typeof raw === "string") {
+    for (const dir of raw.split(":")) {
+      if (dir.length === 0) continue;
+      const candidate = join(dir, "git");
+      try {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // not here; try the next PATH entry
+      }
+    }
+  }
+  return "git";
+}
+
+const GIT_BIN = resolveGitBinary();
+
+/**
+ * Wall-clock ceiling on any single quarantine git invocation. Bounds a read that
+ * would otherwise hang forever — e.g. a `cat-file`/`fetch` that touches a FIFO or
+ * device node planted in the source object store (review r6 finding 5). On expiry
+ * execFileSync throws (SIGKILL), which every caller turns into a fail-closed
+ * QuarantineGitError. Generous so a legitimate large-but-bounded fetch completes.
+ */
+const GIT_TIMEOUT_MS = 120_000;
+
 /** The credential-free env (+ the ambient PATH so `git` resolves, nothing else). */
 function gitEnv(extra: Record<string, string> = {}): Record<string, string> {
   const env: Record<string, string> = { ...GIT_ENV_BASE, ...extra };
@@ -52,10 +99,12 @@ function gitEnv(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 function runGit(cwd: string | null, args: string[], maxBuffer: number): Buffer {
-  return execFileSync("git", cwd === null ? args : ["-C", cwd, ...args], {
+  return execFileSync(GIT_BIN, cwd === null ? args : ["-C", cwd, ...args], {
     env: gitEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer,
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
 }
 
@@ -132,17 +181,44 @@ export function removePristineRepo(dir: string): void {
  * complete object-store isolation check); this is the intake's own bounded
  * re-attestation, a filesystem check only, no git executed in the worker-touched
  * directory. It requires a full non-bare clone (real `.git` dir) and refuses a
- * commondir redirect, a symlink anywhere in the object-store tree, and an
- * alternates file (review r2/r3/r4).
+ * commondir redirect, a symlink or unexpected node anywhere in the object-store
+ * tree, and an alternates file (review r2/r3/r5/r6).
+ *
+ * NAMED BOUNDARY — custody, not a live-attacker proof (review r6 finding 1):
+ * this attestation and the fetch that follows it (intake.ts) are separate
+ * operations on the source directory, so it is NOT proof against an adversary
+ * who plants `objects/info/alternates` in the WINDOW between the scan and the
+ * fetch (a TOCTOU). What discharges the AC is the production CUSTODY model: by
+ * the time the intake runs, the WP-107 worker container has EXITED and its git
+ * dir is quiescent under control-plane ownership — nothing is concurrently
+ * writing it. The intake re-attests AFTER the fetch as well (a cheap second
+ * check that catches a non-adversarial/persistent alternate), but the custody
+ * precondition — not a within-process lock the intake cannot hold over another
+ * process's directory — is the guarantee. A future hardening (fetch from an
+ * immutable snapshot the control plane takes custody of) is out of scope here.
  */
 /** Entry cap for the object-store walk — a hostile store over it is itself refused. */
 const OBJECT_STORE_SCAN_CAP = 300_000;
 
 /**
- * Walk the `objects` subtree NO-FOLLOW; return the first borrowed/non-local path
- * (a symlink, a hardlinked file `nlink>1`, an unreadable dir, or a scan-cap
- * breach), or null if the whole store is local. Bounded so a hostile store
- * cannot drive an unbounded walk.
+ * Walk the `objects` subtree NO-FOLLOW; return the first NON-LOCAL/unexpected
+ * path, or null if the whole store is ordinary local files + directories.
+ * Bounded so a hostile store cannot drive an unbounded walk.
+ *
+ * Refuses (fail-closed):
+ *  - a SYMLINK anywhere — the genuine borrowing channel: a `pack` (or a fanout
+ *    dir) symlinked at a shared store makes upload-pack serve foreign objects
+ *    (review r5 finding 2);
+ *  - any node that is NOT a regular file or directory — a FIFO, socket, or device
+ *    node is not a git object, and reading THROUGH it would hang the intake; it
+ *    must be refused, not fall through as "safe" (review r6 finding 5).
+ *
+ * Does NOT treat a hardlink (`nlink>1`) as borrowing: a `git clone --local`/`gc`
+ * legitimately hardlinks packs, so `nlink>1` proves another directory entry, not
+ * an external store (review r6 finding 5) — the earlier nlink check both
+ * false-rejected normal clones and did not actually prove borrowing. Directory
+ * entries are STREAMED (`opendirSync`) so a hostile directory of millions of
+ * names is bounded by the scan cap as it is walked, never materialized whole.
  */
 function findBorrowedObjectPath(objectsDir: string): string | null {
   let seen = 0;
@@ -153,24 +229,30 @@ function findBorrowedObjectPath(objectsDir: string): string | null {
     } catch {
       return null; // absent (e.g. no objects dir on a just-init'd repo)
     }
-    if (st.isSymbolicLink()) return rel;
+    if (st.isSymbolicLink()) return `${rel} (symlink)`;
     if (st.isDirectory()) {
-      let names: string[];
+      let dir;
       try {
-        names = readdirSync(abs);
+        dir = opendirSync(abs);
       } catch {
         return `${rel} (unreadable)`;
       }
-      for (const name of names) {
-        if (++seen > OBJECT_STORE_SCAN_CAP) return `${rel} (scan cap exceeded)`;
-        const found = walk(join(abs, name), rel.length > 0 ? `${rel}/${name}` : name);
-        if (found !== null) return found;
+      try {
+        let ent = dir.readSync();
+        while (ent !== null) {
+          if (++seen > OBJECT_STORE_SCAN_CAP) return `${rel} (scan cap exceeded)`;
+          const found = walk(join(abs, ent.name), rel.length > 0 ? `${rel}/${ent.name}` : ent.name);
+          if (found !== null) return found;
+          ent = dir.readSync();
+        }
+      } finally {
+        dir.closeSync();
       }
       return null;
     }
-    // A regular object FILE hardlinked into another tree (nlink>1) is shared.
-    if (st.isFile() && st.nlink > 1) return `${rel} (hardlink nlink=${st.nlink})`;
-    return null;
+    if (st.isFile()) return null; // an ordinary object file (hardlinks are normal after a local clone/gc)
+    // FIFO, socket, block/char device: not a git object node — fail closed.
+    return `${rel} (unexpected node type)`;
   };
   return walk(objectsDir, "objects");
 }
@@ -213,20 +295,21 @@ export function assertSelfContainedObjectStore(repo: string): void {
     );
   }
 
-  // A SYMLINK anywhere in the object-store tree, or a HARDLINKED object FILE
-  // (nlink>1, shared with another tree), makes (part of) the store non-local — a
-  // nested `objects/pack/pack-xxx.pack` symlink or hardlink was the round-5
-  // escape past the top-level check (review r5 finding 2). Walk the WHOLE
-  // `objects` subtree, no-follow, and refuse either. Bounded by an entry cap so a
+  // A SYMLINK anywhere in the object-store tree, or an UNEXPECTED node (FIFO,
+  // socket, device), makes (part of) the store non-local or non-serving — a
+  // nested `objects/pack/pack-xxx.pack` symlink was the round-5 escape past the
+  // top-level check (review r5 finding 2), and a FIFO both fell through as "safe"
+  // and hung the reader (review r6 finding 5). Walk the WHOLE `objects` subtree,
+  // no-follow and STREAMED, and refuse either. Bounded by an entry cap so a
   // hostile store cannot drive an unbounded walk (fail-closed: over-cap is itself
-  // a refusal). Mirrors WP-107 clone.ts `hasHardlinkedObject`, the authoritative
-  // isolation walk, which we already ran green on a worker clone.
+  // a refusal). A hardlinked object file is NOT refused — it is normal after a
+  // `git clone --local`/`gc` and proves nothing about borrowing (review r6 #5).
   const objectsDir = join(gitDir, "objects");
   const offender = findBorrowedObjectPath(objectsDir);
   if (offender !== null) {
     throw new QuarantineGitError(
-      `fetch source object store is non-local at "${offender}" (symlink, hardlink, or over-scan) — ` +
-        "refused; the store must be local (CAM-EXEC-02 / review r3/r4/r5 finding 2)",
+      `fetch source object store is non-local/unexpected at "${offender}" — ` +
+        "refused; the store must be ordinary local files (CAM-EXEC-02 / review r3/r5 #2, r6 #5)",
     );
   }
 
@@ -533,11 +616,13 @@ export function commitCandidate(
     // Message on STDIN, never `-m <message>`: a long worker-derived subject as an
     // argv element blows the argv limit (E2BIG). commit-tree reads the message
     // from stdin when `-m` is omitted (review r2 finding 6).
-    return execFileSync("git", ["-C", dir, "commit-tree", treeSha, "-p", base], {
+    return execFileSync(GIT_BIN, ["-C", dir, "commit-tree", treeSha, "-p", base], {
       env,
       input: message,
       stdio: ["pipe", "pipe", "pipe"],
       maxBuffer: 1 << 20,
+      timeout: GIT_TIMEOUT_MS,
+      killSignal: "SIGKILL",
     })
       .toString()
       .trim();
