@@ -33,7 +33,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import type { AttemptBudget } from "@camino/shared";
 import {
   TOKEN_LITERAL_PATTERN_SOURCE,
@@ -219,10 +219,21 @@ export function composeContainerRun(options: ComposeContainerRunOptions): Compos
   // let the caller answer its own attestation. This is the cheap
   // accidental-bypass fence (the WP-105 provenance lesson); an in-process
   // caller who can forge the whole object is the named in-process boundary.
-  if (!TRUSTED_TOOL_DIRS.some((dir) => image.dockerPath.startsWith(`${dir}/`))) {
+  // LEXICALLY canonicalize before the prefix check (round-3 finding 5):
+  // `..` segments must not let a textual prefix attest through a foreign
+  // executable. Symlink TARGETS are deliberately not chased: a symlink
+  // INSIDE a trusted directory (Docker Desktop's own /usr/local/bin/docker
+  // → /Applications/… shim is the canonical benign case) was planted by a
+  // trusted-directory writer — the same actor the trusted-dir model
+  // already names; the entry itself must simply BE in a trusted dir and
+  // not world-writable (checked below via lstat semantics of statSync on
+  // the entry's own trusted parent).
+  const lexicalDockerPath = resolvePath(image.dockerPath);
+  if (!TRUSTED_TOOL_DIRS.some((dir) => lexicalDockerPath.startsWith(`${dir}/`))) {
     throw new ContainerInputError(
-      `provenance docker path ${JSON.stringify(image.dockerPath)} is outside the trusted ` +
-        "directories — a composition must not attest through a caller-selected executable",
+      `provenance docker path ${JSON.stringify(image.dockerPath)} normalizes to ` +
+        `${JSON.stringify(lexicalDockerPath)}, outside the trusted directories — a composition ` +
+        "must not attest through a caller-selected executable",
     );
   }
   // IMAGE + NETWORK: RE-attested at composition time (provenance and

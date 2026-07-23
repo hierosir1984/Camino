@@ -24,7 +24,7 @@
 // toolchain to run.
 //
 // argv: <containerName> <deadlineEpochMs> <dockerPath>
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const RETRY_MS = 2000;
 const CONFIRM_WINDOW_MS = 10 * 60_000;
@@ -49,20 +49,37 @@ if (
 // authoritative deadline.
 const TOOL_CALL_TIMEOUT_MS = 60_000;
 
+// The bound resolves on 'exit' OR the timer — NEVER on stream close
+// (round-3 finding 4: a docker descendant inheriting the pipes kept an
+// execFile callback pending past its own timeout). The tool runs in its
+// own detached process group so the timer can kill the whole tree.
 function run(args) {
   return new Promise((resolve) => {
-    execFile(
-      dockerPath,
-      args,
-      { timeout: TOOL_CALL_TIMEOUT_MS, killSignal: "SIGKILL" },
-      (error, stdout, stderr) => {
-        resolve({
-          code: error ? 1 : 0,
-          stdout: String(stdout ?? ""),
-          stderr: String(stderr ?? ""),
-        });
-      },
-    );
+    const child = spawn(dockerPath, args, {
+      detached: true,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 8192) stderr += String(chunk);
+    });
+    let settled = false;
+    const settle = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stderr });
+    };
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      settle(1);
+    }, TOOL_CALL_TIMEOUT_MS);
+    child.on("error", () => settle(1));
+    child.on("exit", (code) => settle(code === 0 ? 0 : 1));
   });
 }
 

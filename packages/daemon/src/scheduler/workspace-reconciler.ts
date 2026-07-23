@@ -107,14 +107,18 @@ export async function reconcileRetainedWorkspace(
   if (!janitorGrant.ok) {
     return { kind: "deferred-lease-held", holderAttemptId: janitorGrant.holder.holderAttemptId };
   }
+  // The released lease's outcome is TRUTHFUL evidence of the pass
+  // (round-3 finding 10): `succeeded` only when reconciliation actually
+  // archived; every other exit — deferral, escalation, throw — releases as
+  // `requirement-failed` (the pass did not complete the reconciliation).
+  let result: ReconciliationOutcome | undefined;
   try {
-    return await reconcileHoldingJanitorLease(ref, deps);
+    result = await reconcileHoldingJanitorLease(ref, deps);
+    return result;
   } finally {
-    // groupGone is literally true: a janitor lease never spawns anything.
-    // The settled lease is the durable record that a janitor pass ran.
     deps.leases.release(ref.environmentId, janitorGrant.lease.generation, {
       groupGone: true,
-      outcome: "succeeded",
+      outcome: result?.kind === "archived" ? "succeeded" : "requirement-failed",
     });
   }
 }

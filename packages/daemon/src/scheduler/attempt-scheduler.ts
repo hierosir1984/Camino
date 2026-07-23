@@ -462,6 +462,7 @@ export class AttemptScheduler {
         payload: { leaseValid: fence.ok === true, attemptId },
       });
       this.#hook("scheduler-after-worker-started");
+      assertStillExecuting();
     } catch (error) {
       // Nothing was spawned (spawn happens strictly after step 4): settle
       // the lease honestly. A mid-protocol PAUSE additionally unwinds the
@@ -838,6 +839,10 @@ export class AttemptScheduler {
     // below; settling here would race that classification.)
     for (const lease of this.#leases.listCurrent()) {
       if (lease.state !== "held") continue;
+      // A JANITOR holder is a live reconciliation pass, not an orphaned
+      // dispatch (round-3 finding 2): it has no attempt entity by design
+      // and settles its own lease on completion.
+      if (lease.holderAttemptId.startsWith("janitor.")) continue;
       if (this.#recorder.currentState("attempt", lease.holderAttemptId) !== undefined) continue;
       const issueId = holderIssueId(lease.holderAttemptId);
       const issueState =
@@ -846,6 +851,37 @@ export class AttemptScheduler {
       this.#leases.recordKillConfirm(lease.environmentId, lease.generation, "never-spawned");
     }
     for (const [issueId, snapshot] of view.issues) {
+      // `blocked` joins the scan for exactly one case (round-3 finding 7):
+      // an unconfirmed budget kill routed to cleanup-failed, whose
+      // kill-confirm was then durably recorded but the daemon died before
+      // the A.3#5 terminal — the attempt must not stay `running` forever.
+      if (snapshot.state === "blocked") {
+        const blockedDispatch = this.#latestDispatchRecord(issueId);
+        if (blockedDispatch !== undefined) {
+          const {
+            attemptId: bAttempt,
+            environmentId: bEnv,
+            leaseGeneration: bGen,
+          } = blockedDispatch;
+          if (
+            this.#recorder.currentState("attempt", bAttempt) === "running" &&
+            this.#leases.at(bEnv, bGen)?.state === "kill-confirmed"
+          ) {
+            this.#recordAttemptIfActive(
+              this.#recorder.currentState("attempt", bAttempt),
+              bAttempt,
+              "attempt-budget-breached",
+              { killConfirmed: true },
+            );
+            settledFromDurableOutcome.push({
+              issueId,
+              attemptId: bAttempt,
+              outcome: "killed-budget",
+            });
+          }
+        }
+        continue;
+      }
       if (snapshot.state !== "claimed" && snapshot.state !== "implementing") continue;
       const dispatchRecord = this.#latestDispatchRecord(issueId);
       if (dispatchRecord === undefined) continue; // pre-WP-114 state shapes: nothing to settle
@@ -887,10 +923,14 @@ export class AttemptScheduler {
       // group-gone) and the outcome is durably recorded. Recovery routes
       // that outcome; it never re-classifies a durably-settled dispatch as
       // a kill-confirm case (which would count a success as a failure).
-      // An attempt already past `running` (submitted, terminal) needs no
-      // settlement — and must not be re-reported on every recovery pass
-      // (round-2 finding 5's replay case).
-      if (attemptState !== "running") continue;
+      // An attempt already past `running`: the ATTEMPT needs no settlement,
+      // but a crash may still have left the ISSUE row or the window
+      // observation unwritten — finish those substeps idempotently instead
+      // of skipping outright (round-3 finding 6), then report nothing.
+      if (attemptState !== "running") {
+        this.#resumeIssueRouting(issueId, attemptId, attemptState);
+        continue;
+      }
       const leaseRow = this.#leases.at(environmentId, leaseGeneration);
       const ref: InterruptedAttempt = {
         missionId,
@@ -915,13 +955,16 @@ export class AttemptScheduler {
       }
       if (leaseRow?.state === "kill-confirmed") {
         // The kill was already confirmed (a prior recovery, or the budget
-        // path): settle directly instead of demanding a second external
-        // confirmation (round-2 finding 5).
+        // path): settle directly with FULL evidence — summary and window
+        // row included, outcome reported truthfully as the kill it was
+        // (round-3 finding 7).
         this.#recordAttemptIfActive(attemptState, attemptId, "heartbeat-lapsed", {
           killConfirmed: true,
         });
+        this.#writeRecoverySummary(ref, "expired", "recovered:kill-confirmed", "killed");
+        this.#backfillWindowObservation(ref, "killed");
         this.#recordIssueIfIn({ issueId }, ["implementing"], "attempt-failed", { attemptId });
-        settledFromDurableOutcome.push({ issueId, attemptId, outcome: "kill-confirmed" });
+        settledFromDurableOutcome.push({ issueId, attemptId, outcome: "killed" });
         continue;
       }
       // Held (worker may still be alive — kill -9 killed the daemon, not
@@ -1005,6 +1048,45 @@ export class AttemptScheduler {
   }
 
   /**
+   * Finish the ISSUE-side routing (and window row) for an attempt whose
+   * terminal is durable but whose downstream substeps a crash cut short.
+   * Every branch is guarded by current state — repeated passes are no-ops.
+   */
+  #resumeIssueRouting(issueId: string, attemptId: string, attemptState: string | undefined): void {
+    const missionId = issueId.includes(".") ? issueId.slice(0, issueId.lastIndexOf(".")) : issueId;
+    const ref: InterruptedAttempt = {
+      missionId,
+      issueId,
+      attemptId,
+      environmentId: "",
+      leaseGeneration: 1,
+      issueState: "implementing",
+    };
+    switch (attemptState) {
+      case "quota-blocked":
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-quota-blocked", { attemptId });
+        this.#backfillWindowObservation(ref, "quota-blocked");
+        return;
+      case "failed":
+      case "expired":
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-failed", { attemptId });
+        this.#backfillWindowObservation(
+          ref,
+          attemptState === "failed" ? "requirement-failed" : "killed",
+        );
+        return;
+      case "killed-budget":
+        this.#recordIssueIfIn(ref, ["implementing", "claimed"], "attempt-budget-breached", {
+          killConfirmed: true,
+        });
+        this.#backfillWindowObservation(ref, "killed-budget");
+        return;
+      default:
+        return; // submitted/succeeded/cancelled/archived: downstream owners take over
+    }
+  }
+
+  /**
    * Backfill the WP-106 window ledger for a recovered dispatch: idempotent
    * on the attempt id, and a row the ORIGINAL recording already wrote (with
    * richer content) wins — the conflict refusal is caught, never propagated
@@ -1020,8 +1102,11 @@ export class AttemptScheduler {
         durationMs: 0,
         quotaSignalSeen: outcome === "quota-blocked",
       });
-    } catch {
-      // The original, richer row exists — better evidence stands.
+    } catch (error) {
+      // ONLY a replay conflict is tolerable (the original, richer row
+      // stands); any other failure is a broken durable store and must
+      // surface (round-3 finding 6).
+      if (!/different content|already recorded/.test(String(error))) throw error;
     }
   }
 
@@ -1292,7 +1377,7 @@ export class AttemptScheduler {
     // ordinal among ids of exactly this issue's grammar, then walk forward
     // past any existing entity — a foreign id sharing the prefix can skew
     // a COUNT but never the max-ordinal/existence pair.
-    const exact = new RegExp(`^${escapeForRegExp(issueId)}\\.a([1-9]\\d*)$`);
+    const exact = new RegExp(`^${escapeForRegExp(issueId)}\\.a([1-9]\\d{0,8})$`);
     const existing = new Set<string>();
     let maxOrdinal = 0;
     for (const id of attemptIds) {
@@ -1301,20 +1386,34 @@ export class AttemptScheduler {
       if (match !== null) maxOrdinal = Math.max(maxOrdinal, Number(match[1]));
     }
     let ordinal = maxOrdinal + 1;
-    while (existing.has(`${issueId}.a${ordinal}`)) ordinal++;
+    while (existing.has(`${issueId}.a${ordinal}`)) {
+      ordinal++;
+      // Ordinals are bounded to 9 digits (round-3 finding 9): a store
+      // carrying a larger-than-bound forged id cannot walk this loop into
+      // float territory — an issue with a billion attempts is not a state
+      // this daemon reasons about; refuse loudly instead.
+      if (ordinal > 999_999_999) {
+        throw new Error(`attempt ordinal space for ${issueId} is exhausted or forged — refusing`);
+      }
+    }
     return `${issueId}.a${ordinal}`;
   }
 
-  /** The issueId the durable A.3#1 record names for an attempt, if any. */
+  /** The issueId the durable A.3#1 record names for an attempt, if any —
+   * read from the GUARD-REQUIRED contractRef (round-3 finding 3: the
+   * sibling `issueId` field is unguarded and could disagree). */
   #attemptOwner(attemptId: string): string | undefined {
     const rows = this.#events.read({ entityKind: "attempt", entityId: attemptId });
     const created = rows.find((r) => r.event === "attempt-dispatched" && r.outcome === "applied");
-    const issueId = created?.payload["issueId"];
+    const ref = created?.payload["contractRef"] as { issueId?: unknown } | undefined;
+    const issueId = ref?.issueId;
     return typeof issueId === "string" && issueId.length > 0 ? issueId : undefined;
   }
 
   /** Unwind a mid-protocol pause: attempt (if recorded) expires with the
-   * never-spawned confirm; a claimed issue re-queues via A.2#7a. */
+   * never-spawned confirm; the issue re-queues from claimed (A.2#7a) or
+   * implementing (A.2#12 — round-3 finding 8: the pause can land after the
+   * worker-started record too; nothing was spawned either way). */
   #unwindNeverSpawned(issueId: string, attemptId: string): void {
     if (this.#recorder.currentState("attempt", attemptId) === "running") {
       this.#record({
@@ -1325,13 +1424,38 @@ export class AttemptScheduler {
         payload: { killConfirmed: true },
       });
     }
-    if (this.#recorder.currentState("issue", issueId) === "claimed") {
+    const issueState = this.#recorder.currentState("issue", issueId);
+    if (issueState === "claimed") {
       this.#record({
         entityKind: "issue",
         entityId: issueId,
         event: "attempt-pre-start-terminal",
         cause: "mission left executing mid-protocol; issue re-queued (A.2#7a)",
         payload: { attemptTerminal: "expired", recorded: true },
+      });
+    } else if (issueState === "implementing") {
+      // A.2#12's guard requires the summary to exist; write the minimal
+      // recovery summary first (nothing ran — durations are honest zeros).
+      const missionId = issueId.includes(".")
+        ? issueId.slice(0, issueId.lastIndexOf("."))
+        : issueId;
+      this.#writeRecoverySummary(
+        {
+          missionId,
+          issueId,
+          attemptId,
+          environmentId: "",
+          leaseGeneration: 1,
+          issueState: "implementing",
+        },
+        "expired",
+        "cancelled:mid-protocol-pause",
+        "cancelled",
+      );
+      this.#recordIssueIfIn({ issueId }, ["implementing"], "attempt-cancelled", {
+        reason: "pause",
+        summaryWritten: true,
+        attemptId,
       });
     }
   }

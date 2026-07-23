@@ -137,7 +137,11 @@ async function runDocker(
     );
   }
   try {
-    const { stdout, stderr } = await execFileP(dockerPath, args, { maxBuffer: 16 * 1024 * 1024 });
+    const { stdout, stderr } = await execFileP(dockerPath, args, {
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+    });
     return { code: 0, stdout, stderr };
   } catch (err) {
     const e = err as { code?: number | string; stdout?: string; stderr?: string };

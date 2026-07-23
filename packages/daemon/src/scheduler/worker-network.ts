@@ -84,6 +84,13 @@ export function attestWorkerNetwork(
   if (id === undefined || name === undefined || driver === undefined) {
     throw new WorkerNetworkError(`network inspect returned an unreadable record for ${networkId}`);
   }
+  // The returned id must be a FULL 64-hex network id (round-3 finding 5):
+  // everything downstream (the run argument) relies on its uniqueness.
+  if (!/^[0-9a-f]{64}$/.test(id)) {
+    throw new WorkerNetworkError(
+      `network inspect returned a non-canonical id ${JSON.stringify(id)} — refusing`,
+    );
+  }
   // The record must be ABOUT the requested id (a full id, or the full id
   // the requested unique prefix resolves to) — an answer describing some
   // other network attests nothing about this one.

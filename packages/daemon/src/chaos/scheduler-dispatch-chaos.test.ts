@@ -122,19 +122,40 @@ function recover(world: { stateDir: string; github: FakeGitHub }): RecoveredWorl
   return { state, scheduler, windows, missionId };
 }
 
-/** Zero duplicate external effects: each attempt appended at most once. */
-function assertEffectsAtMostOnce(dir: string): void {
+/**
+ * The external-effect oracle (round-3 finding 11): asserts the EXACT
+ * expected number of effect lines for the phase the kill landed in — zero
+ * when the child died before the simulated call, exactly one after — plus
+ * at-most-once per attempt id in every case. An absent log is only legal
+ * when zero effects are expected.
+ */
+function assertEffects(dir: string, expectedTotal: number): void {
   const path = join(dir, "worker-effects.log");
-  if (!existsSync(path)) return;
-  const lines = readFileSync(path, "utf8")
-    .split("\n")
-    .filter((l) => l.length > 0);
+  const lines = existsSync(path)
+    ? readFileSync(path, "utf8")
+        .split("\n")
+        .filter((l) => l.length > 0)
+    : [];
+  expect(lines.length, `expected ${expectedTotal} external effect(s), saw ${lines.length}`).toBe(
+    expectedTotal,
+  );
   const seen = new Map<string, number>();
   for (const line of lines) seen.set(line, (seen.get(line) ?? 0) + 1);
   for (const [attemptId, count] of seen) {
     expect(count, `external effect for ${attemptId} applied ${count} times`).toBeLessThanOrEqual(1);
   }
 }
+
+/** Effects expected per kill point: the append sits after dispatchNext returns. */
+const EFFECTS_BY_POINT: Readonly<Record<string, number>> = {
+  "scheduler-after-plan-approval-recorded": 0,
+  "scheduler-after-lease-granted": 0,
+  "scheduler-after-issue-claimed": 0,
+  "scheduler-after-attempt-recorded": 0,
+  "scheduler-after-worker-started": 0,
+  "scheduler-before-outcome-recorded": 1,
+  "scheduler-after-outcome-recorded": 1,
+};
 
 function assertUniversalInvariants(r: RecoveredWorld): void {
   // The log replays and verifies (CAM-STATE-05 co-recovery).
@@ -180,7 +201,7 @@ describe("scheduler dispatch protocol under kill -9 (deterministic matrix)", () 
     expect(result.completed).toBe(true);
     const r = recover(world);
     assertUniversalInvariants(r);
-    assertEffectsAtMostOnce(world.dir);
+    assertEffects(world.dir, 1);
     // The child's requirement-failed outcome routed fully: issue ready
     // with one counted failure and a structured summary on record.
     const issue1 = `${r.missionId}.I1`;
@@ -239,7 +260,7 @@ describe("scheduler dispatch protocol under kill -9 (deterministic matrix)", () 
       }
 
       assertUniversalInvariants(r);
-      assertEffectsAtMostOnce(world.dir);
+      assertEffects(world.dir, EFFECTS_BY_POINT[point] ?? 0);
 
       // NOTHING IS LOST: the mission proceeds — a follow-up dispatch grants
       // the NEXT monotonic generation and claims the issue again.
