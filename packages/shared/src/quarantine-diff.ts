@@ -129,6 +129,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * or carries non-JSON fields (`Symbol` keys) — such an object never survives
  * serialization to the store, so it is outside the adoption model. Callers that
  * hand a live object rather than a parsed record own that trust.
+ *
+ * AUTHENTICITY BOUNDARY (review r12 finding 2): this validates the record's
+ * STRUCTURE and internal consistency — NOT that `changedPaths` semantically
+ * equals the real base↔candidate diff. It holds no git repo and cannot re-derive
+ * the diff from the shas, so a FORGED persisted artifact carrying real shas but a
+ * lying `changedPaths` (e.g. `[]`) passes shape validation. The intake EMITTER
+ * computes the true paths (intake.ts), so no worker admission is affected; a
+ * consumer that ADOPTS a persisted artifact relies on emitter integrity + the
+ * store's authenticity — WP-116 evidence binding / tamper-evidence — not this
+ * shape validator. Flagged for David: a future WP-111/WP-116 consumer must verify
+ * the artifact's authenticity (a candidate-bound hash/signature), not treat an
+ * empty `quarantinedDiffProblems` as proof the diff is faithful.
  */
 export function quarantinedDiffProblems(value: unknown): string[] {
   // Validate a JSON ROUND-TRIP snapshot, so acceptance is INVARIANT under the

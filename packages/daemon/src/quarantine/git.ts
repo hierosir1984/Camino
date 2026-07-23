@@ -510,19 +510,24 @@ export function assertSelfContainedObjectStore(repo: string): void {
       );
     }
     // Refuse ANY `include`-family section header — `[include]`, `[includeIf ...]`,
-    // and every subsectioned/escaped variant. NAMED BOUNDARY: rather than hand-
-    // parse git's include grammar (three rounds of edge cases — a differently-
-    // named `[include.custom]`, a subsection-less `[includeIf]`, an escaped-quote
-    // condition `[includeIf "…\"…"]`; review r9 #7, r10 #6, r11 #1), we make a
-    // BLANKET rule — a `git clone`-provisioned worker config carries NO include of
-    // any form, so refusing every `[include…]` section over-rejects nothing real
-    // while closing the whole surface (an include `path` could be a FIFO the
-    // serving `upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1).
-    if (/^[ \t]*\[[ \t]*include/im.test(configText)) {
+    // and every subsectioned/escaped/BOM-prefixed variant. NAMED BOUNDARY: rather
+    // than hand-parse git's include grammar (four rounds of edge cases — a
+    // differently-named `[include.custom]`, a subsection-less `[includeIf]`, an
+    // escaped-quote condition, a leading BOM; review r9 #7, r10 #6, r11 #1, r12
+    // #1), we make a BLANKET rule. A WP-107-provisioned worker clone carries NO
+    // include (WP-107 does not pass `git clone --config include.path=…`), so this
+    // over-rejects only a config that DELIBERATELY added one — not the controlled
+    // provisioner — while closing the whole surface (an include `path` could be a
+    // FIFO the serving `upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1).
+    // `[^\S\r\n]` = any whitespace EXCEPT a line break — it also matches the
+    // U+FEFF BOM (JS `\s` includes it) and git's `\f`/`\v`, so a header preceded
+    // by a leading BOM or exotic whitespace git still honors as an include is
+    // caught (review r12 finding 1); `[ \t]` alone missed the BOM.
+    if (/^[^\S\r\n]*\[[^\S\r\n]*include/im.test(configText)) {
       throw new QuarantineGitError(
         "fetch source `.git/config` contains an `[include]`/`[includeIf]`-family section — refused; " +
           "a worker clone must not indirect its config (an include path could be a FIFO the serving " +
-          "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1, r11 finding 1)",
+          "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1, r11 finding 1, r12 finding 1)",
       );
     }
   }

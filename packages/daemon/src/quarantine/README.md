@@ -89,11 +89,14 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   ALSO refuses a worker `.git/config` that is a FIFO/special node, is over a size
   cap (bounded read, review r9 finding 2), or uses git's `[include]` /
   `[includeIf "…"]`-family section — a BLANKET rule refusing ANY `[include…]`
-  section header (a `git clone`-provisioned worker config has none), rather than
-  hand-parse git's include grammar, which cost three rounds of edge cases (a
-  differently-named `[include.custom]`, a subsection-less `[includeIf]`, an
-  escaped-quote condition; review r9 finding 7, r10 finding 6, r11 finding 1): an
-  include `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
+  section header (matched BOM/whitespace-tolerantly), rather than hand-parse git's
+  include grammar, which cost four rounds of edge cases (a differently-named
+  `[include.custom]`, a subsection-less `[includeIf]`, an escaped-quote condition,
+  a leading BOM; review r9 finding 7, r10 finding 6, r11 finding 1, r12 finding 1).
+  A WP-107-provisioned clone carries no include (WP-107 does not pass `git clone
+--config include.path`), so this over-rejects only a config that deliberately
+  added one, not the controlled provisioner: an include `path` pointing at a FIFO
+  makes the serving `upload-pack` BLOCK,
   orphaning a descendant even for a fully stopped worker (review r8 finding 1).
   The remaining repo-config exec/indirection surface
   (e.g. an include pointing OUTSIDE `.git`) is bounded by the fetch env carrying
@@ -295,6 +298,15 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   (review r8 finding 9). A cross-platform materialization guard belongs to a
   portability-lint layer, not this admission check; flagged as a low-severity
   scope note.
+- **The durable diff validator checks SHAPE, not diff AUTHENTICITY (a WP-116
+  boundary flagged for David).** It validates a persisted artifact's structure and
+  internal consistency, but holds no git repo and cannot re-derive the diff from
+  the shas — so a FORGED artifact with real shas but a lying `changedPaths` (e.g.
+  `[]`) passes shape validation (review r12 finding 2). No worker admission is
+  affected (the trusted intake EMITTER computes the true paths); but a future
+  WP-111/WP-116 consumer that ADOPTS a stored artifact must verify its authenticity
+  (a candidate-bound hash/signature, i.e. WP-116 evidence/tamper-evidence), NOT
+  treat an empty validator result as proof the diff is faithful.
 - **The durable diff validator refuses what a store round-trip cannot represent.**
   Beyond the r1–r6 checks, a changed path carrying U+FFFD (git's non-UTF-8
   substitution) or an unpaired surrogate is rejected — the intake never emits such

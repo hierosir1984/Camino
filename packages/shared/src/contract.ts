@@ -221,6 +221,19 @@ function safeErrorMessage(err: unknown): string {
  * adoption (a store row that fails this is refused, never repaired).
  */
 export function contractProblems(value: unknown): string[] {
+  // UNCONDITIONALLY total (review r12 finding 3): even input whose serialization
+  // POISONS realm intrinsics — a `toJSON` that replaces `JSON.stringify` /
+  // `Number.isSafeInteger` during the snapshot, i.e. in-process compromise, the
+  // named live-object boundary — returns a problem rather than throwing. The
+  // static-string return in the catch cannot itself throw.
+  try {
+    return contractProblemsImpl(value);
+  } catch {
+    return ["contract validation failed unexpectedly (unserializable/hostile input)"];
+  }
+}
+
+function contractProblemsImpl(value: unknown): string[] {
   // TOTAL — never throw, even on a revoked Proxy (whose `Array.isArray` throws):
   // do the serializable-shape checks on the SNAPSHOT, inside the catch (review
   // r10 finding 3). `typeof` on the original is safe (it does not trap).
@@ -384,6 +397,16 @@ export interface ContractRef {
 
 /** Total validator for a ContractRef; empty result licenses the cast. */
 export function contractRefProblems(value: unknown): string[] {
+  // UNCONDITIONALLY total (review r12 finding 3): an outer guard so even
+  // intrinsic-poisoning input returns a problem, never throws. See contractProblems.
+  try {
+    return contractRefProblemsImpl(value);
+  } catch {
+    return ["contractRef validation failed unexpectedly (unserializable/hostile input)"];
+  }
+}
+
+function contractRefProblemsImpl(value: unknown): string[] {
   // TOTAL and OWN-DATA-ONLY (review r7 finding 11, r8 finding 5, r9 finding 5,
   // r10 finding 3): validate a recursive null-proto JSON snapshot — the exact
   // plain data a store persists — so an inherited-only ref, a non-enumerable

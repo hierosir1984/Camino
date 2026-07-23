@@ -302,6 +302,26 @@ describe("contractRefProblems", () => {
     expect(() => contractProblems(hostile)).not.toThrow();
   });
 
+  it("stays total even when input POISONS a realm intrinsic during serialization — r12 #2", () => {
+    // A `toJSON` that replaces `Number.isSafeInteger` while it serializes would
+    // make a later check throw — an outer guard must still return problems.
+    const saved = Number.isSafeInteger;
+    const poison = {
+      toJSON(): Record<string, unknown> {
+        (Number as unknown as { isSafeInteger: unknown }).isSafeInteger = (): never => {
+          throw new Error("poisoned");
+        };
+        return { issueId: "x", contractVersion: 1, contractHash: "a".repeat(64) };
+      },
+    };
+    try {
+      expect(() => contractProblems(poison)).not.toThrow();
+      expect(() => contractRefProblems(poison)).not.toThrow();
+    } finally {
+      (Number as unknown as { isSafeInteger: typeof Number.isSafeInteger }).isSafeInteger = saved;
+    }
+  });
+
   it("rejects a NESTED inherited interface and a stateful Proxy ref (JSON snapshot) — r9", () => {
     // A nested interface whose fields are inherited serializes to {} — the
     // top-level own-copy missed it; the JSON snapshot catches it.

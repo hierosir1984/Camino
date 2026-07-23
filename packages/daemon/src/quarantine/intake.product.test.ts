@@ -1120,6 +1120,8 @@ describe("round-9 falsification fixes", () => {
       "[includeIf.custom]",
       "[includeIf]",
       '[includeIf "onbranch:main\\"x"]', // escaped quote in condition — git honors
+      String.fromCodePoint(0xfeff) + "[include]", // leading BOM — git honors (r12 #1)
+      "\f[include]", // form-feed lead-in — git's isspace (r12 #1)
     ]) {
       const bad = mkdtempTestDir();
       mkdirSync(join(bad, ".git", "objects"), { recursive: true });
