@@ -37,9 +37,51 @@ export const ATTEMPT_STATES = deepFreeze([
   ATTEMPT_ARCHIVED_STATE,
 ] as const);
 
+/**
+ * The contract reference an attempt record carries (CAM-PLAN-04 attempt
+ * half; WP-110 amendment on issue #21). Structural twin of
+ * @camino/shared's ContractRef — duplicated because core stays
+ * dependency-free; the shapes are pinned against each other by test.
+ */
+export interface AttemptContractRef {
+  readonly issueId: string;
+  readonly contractVersion: number;
+  readonly contractHash: string;
+}
+
+/** Well-formed contract reference: the A.3#1 guard's structural check. */
+export function isAttemptContractRef(value: unknown): value is AttemptContractRef {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  // CLOSED shape (round-2 finding 11): exactly the three fields, a
+  // non-blank bounded issueId — matching the shared validator's strictness
+  // so the guard cannot admit what contractRefProblems would refuse.
+  if (keys.length !== 3) return false;
+  const issueId = record["issueId"];
+  return (
+    typeof issueId === "string" &&
+    issueId.trim().length > 0 &&
+    issueId.length <= 300 &&
+    !issueId.includes("\u0000") &&
+    typeof record["contractVersion"] === "number" &&
+    Number.isInteger(record["contractVersion"]) &&
+    record["contractVersion"] >= 1 &&
+    typeof record["contractHash"] === "string" &&
+    /^[0-9a-f]{64}$/.test(record["contractHash"])
+  );
+}
+
 export type AttemptEvent =
-  // A.3#1 — dispatch | lease granted (generation g)
-  | { type: "attempt-dispatched"; leaseGranted: boolean; leaseGeneration: number }
+  // A.3#1 — dispatch | lease granted (generation g); the record carries the
+  // ContractRef it executes (CAM-PLAN-04 attempt half — guard-required, so
+  // an attempt without its contract reference cannot exist)
+  | {
+      type: "attempt-dispatched";
+      leaseGranted: boolean;
+      leaseGeneration: number;
+      contractRef: AttemptContractRef;
+    }
   // A.3#2 — heartbeat lapse > TTL | kill-confirm executed
   | { type: "heartbeat-lapsed"; killConfirmed: boolean }
   // A.3#3 — worker completes | final head fetched
@@ -111,12 +153,15 @@ const attemptRows: readonly AttemptRow[] = [
     from: null,
     event: "attempt-dispatched",
     guard: {
-      name: "lease-granted-with-generation",
+      name: "lease-granted-with-generation-and-contract-ref",
       check: (e) =>
-        attested(e.leaseGranted) && Number.isInteger(e.leaseGeneration) && e.leaseGeneration >= 1,
+        attested(e.leaseGranted) &&
+        Number.isInteger(e.leaseGeneration) &&
+        e.leaseGeneration >= 1 &&
+        isAttemptContractRef(e.contractRef),
     },
     to: "running",
-    note: "Lease generations are monotonic per environment (registry item 5, CAM-STATE-04); monotonicity is enforced by the lease store (WP-114), the machine records the granted generation.",
+    note: "Lease generations are monotonic per environment (registry item 5, CAM-STATE-04); monotonicity is enforced by the lease store (WP-114), the machine records the granted generation. The ContractRef is guard-required (CAM-PLAN-04 attempt half, WP-110 amendment): an attempt record without its contract reference is refused, not merely discouraged.",
   }),
   // A.3#2 — running | heartbeat lapse > TTL | kill-confirm executed | expired
   row({

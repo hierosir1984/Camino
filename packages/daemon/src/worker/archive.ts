@@ -34,6 +34,7 @@
 // AND outside the issue's newest 10.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { resolveTrustedTool } from "../scheduler/image-provenance.js";
 import {
   createReadStream,
   createWriteStream,
@@ -628,7 +629,7 @@ function runTarToFile(tmpPath: string, workspaceReal: string, maxBytes: number):
     let written = 0;
     let settled = false;
     let out: ReturnType<typeof createWriteStream> | undefined;
-    const child = spawn("tar", ["-cz", "-C", workspaceReal, "."], {
+    const child = spawn(resolveTrustedTool("tar"), ["-cz", "-C", workspaceReal, "."], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settle = (fn: () => void): void => {

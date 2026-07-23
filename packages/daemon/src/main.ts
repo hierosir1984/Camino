@@ -4,30 +4,67 @@
  * prints the precise reason and exits non-zero; it is never downgraded to
  * a warning.
  *
- * WP-122 wires the gap-register surface: the canon-side stores (intent
- * ledger, canon facts, gap dispositions) open under the writer lock and
- * back /api/register. This is deliberately NOT the full recovery
- * composition (openRecoveredState) — reconciliation needs the GitHub
- * query transports, which production startup does not construct yet; the
- * WP that wires real external operations replaces this block with the
- * full path. Until repo-head polling lands, the register's context source
- * reports "unavailable" and the GUI shows the honest empty state.
+ * WP-114 wires the FULL recovery composition into production boot:
+ * openRecoveredState opens every durable store under the writer lock, runs
+ * intent reconciliation, PlanningService.resumePendingWork(), and lease
+ * inspection; the scheduler recovery pass then settles what the dispatch
+ * protocol proves never spawned and reports the rest. Two boundaries are
+ * wired fail-closed rather than papered over:
+ *
+ *   - EXTERNAL QUERY TRANSPORTS (GitHub reads) land with WP-119/120. Until
+ *     then the transport below REFUSES with the precise reason. With no
+ *     external operation ever recorded this is vacuous (reconciliation
+ *     consults transports only for intents in the ambiguity window); the
+ *     moment a pre-transport store contains one, boot fails loudly instead
+ *     of guessing about the outside world.
+ *   - Attempts recovery reports as needing a container/group kill-confirm
+ *     are LOGGED and left fenced (stale generations rejected; re-grant
+ *     refused) — the runner glue that executes real kill-confirms arrives
+ *     with the worker-run loop (WP-119); fencing does not wait for it.
  */
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { CanonFactsStore } from "./canon-facts.js";
-import { CanonLedgerStore } from "./canon-ledger.js";
 import { caminoHome, ConfigError, daemonPort, guiDistPath } from "./config.js";
-import { GapDispositionsStore } from "./gap-dispositions.js";
-import { closeAll, STATE_FILES } from "./recovery.js";
+import { openRecoveredState, STATE_FILES } from "./recovery.js";
+import type { QueryTransports, RecoveredState } from "./recovery.js";
+import { QuotaWindowTracker } from "./routing/window-tracker.js";
+import { AttemptScheduler } from "./scheduler/attempt-scheduler.js";
 import { RegisterService } from "./register-service.js";
 import { startDaemonServer } from "./server.js";
 import { loadOrCreateToken, TokenError } from "./token.js";
-import { WriterLock, WriterLockHeldError } from "./writer-lock.js";
+import { WriterLockHeldError } from "./writer-lock.js";
+import { DEFAULT_POLICY_TABLE } from "@camino/shared";
 
 /** Longest a stop signal waits for a graceful close before force-exiting. */
 const SHUTDOWN_GRACE_MS = 10000;
+
+/** GitHub reads land with WP-119/120; until then queries refuse loudly. */
+const NO_TRANSPORT_MESSAGE =
+  "no external-operation query transport is wired yet (lands with WP-119/120) — an intent " +
+  "requiring external facts cannot be reconciled; refusing to guess";
+const REFUSING_QUERIES: QueryTransports = {
+  github: {
+    getRef: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+    observeRef: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+    findPullRequestsByHead: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+    isLabelPresent: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+    findCommentsByMarker: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+    findWorkflowRunsByCorrelation: () => {
+      throw new Error(NO_TRANSPORT_MESSAGE);
+    },
+  },
+};
 
 export async function main(): Promise<void> {
   let port: number;
@@ -48,49 +85,93 @@ export async function main(): Promise<void> {
   }
 
   const stateDir = caminoHome();
-  let lock: WriterLock;
+  // The one production path that opens Camino's durable state: writer lock,
+  // fail-closed replay verification, intent reconciliation, planning
+  // resume, lease inspection (WP-104 + WP-110 + WP-114 composition).
+  let state: RecoveredState;
+  let windows: QuotaWindowTracker | undefined;
   try {
-    lock = WriterLock.acquire(join(stateDir, STATE_FILES.writerLock));
+    state = openRecoveredState(stateDir, REFUSING_QUERIES);
   } catch (error) {
     if (error instanceof WriterLockHeldError) {
       console.error(`Refusing to start: ${error.message}`);
       process.exit(1);
     }
-    throw error;
+    console.error(`Refusing to start: ${(error as Error).message}`);
+    process.exit(1);
   }
-  let canonLedger: CanonLedgerStore | undefined;
-  let canonFacts: CanonFactsStore | undefined;
-  let gapDispositions: GapDispositionsStore | undefined;
-  // Best-effort teardown with deterministic precedence, mirroring
-  // openRecoveredState (round 1, finding 13: a sequential close left later
-  // stores and the writer lock open if an earlier close threw). Every closer
-  // runs; the FIRST failure surfaces after cleanup finished. The lock release
-  // is last and always attempted.
+
   let closed = false;
   let teardownFailures: unknown[] = [];
-  // Returns the failures (does not throw): the caller decides what an unclean
-  // teardown means. The onClose hook records them so a stop signal can exit
-  // NON-ZERO (round 3, finding 5: the hook wrapper swallows a throw, so a
-  // resolved close() must still surface teardown failure through this record).
   const closeStores = (): unknown[] => {
-    if (closed) return teardownFailures; // the onClose hook and a refusal path can both fire
+    if (closed) return teardownFailures;
     closed = true;
-    teardownFailures = closeAll([
-      () => gapDispositions?.close(),
-      () => canonFacts?.close(),
-      () => canonLedger?.close(),
-      () => lock.release(),
-    ]);
+    teardownFailures = [];
+    try {
+      windows?.close();
+    } catch (error) {
+      teardownFailures.push(error);
+    }
+    try {
+      state.close();
+    } catch (error) {
+      teardownFailures.push(error);
+    }
     return teardownFailures;
   };
+
   try {
-    canonLedger = new CanonLedgerStore(join(stateDir, STATE_FILES.canonLedger), {
-      writerLock: lock,
+    windows = new QuotaWindowTracker(join(stateDir, STATE_FILES.windows), {
+      writerLock: state.lock,
     });
-    canonFacts = new CanonFactsStore(join(stateDir, STATE_FILES.canonFacts), { writerLock: lock });
-    gapDispositions = new GapDispositionsStore(join(stateDir, STATE_FILES.gapDispositions), {
-      writerLock: lock,
+    const scheduler = new AttemptScheduler({
+      recorder: state.recorder,
+      events: state.eventStore,
+      domain: state.domain,
+      contracts: (missionId) => state.planStore.contractsForMission(missionId),
+      leases: state.leases,
+      windows,
+      policyTable: () => DEFAULT_POLICY_TABLE,
+      summaries: state.summaries,
     });
+    // The scheduler recovery pass: settle what the protocol PROVES never
+    // spawned; everything else stays fenced and is reported here. The
+    // kill-confirm executor arrives with the worker-run loop (WP-119).
+    const recovered = scheduler.recoverInterrupted();
+    if (recovered.settledNeverSpawned.length > 0) {
+      console.log(
+        `Recovery re-queued ${recovered.settledNeverSpawned.length} interrupted dispatch(es): ` +
+          recovered.settledNeverSpawned.join(", "),
+      );
+    }
+    for (const interrupted of recovered.requiresKillConfirm) {
+      console.warn(
+        `Attempt ${interrupted.attemptId} needs a container/group kill-confirm before its ` +
+          `environment (${interrupted.environmentId} g${interrupted.leaseGeneration}) can be ` +
+          "re-granted; it stays fenced until the worker-run loop (WP-119) settles it.",
+      );
+    }
+    for (const settled of recovered.settledFromDurableOutcome) {
+      console.log(
+        `Recovery routed attempt ${settled.attemptId} by its durable lease outcome (${settled.outcome}).`,
+      );
+    }
+    for (const awaiting of recovered.succeededAwaitingSubmission) {
+      console.warn(
+        `Attempt ${awaiting.attemptId} completed successfully before the interruption; its ` +
+          "submission resumes when the final head is re-fetched (workspace intact).",
+      );
+    }
+    if (state.planningResume.completedApprovals.length > 0) {
+      console.log(
+        `Recovery completed ${state.planningResume.completedApprovals.length} interrupted plan approval(s).`,
+      );
+    }
+    if (state.leaseRecovery.lapsed.length > 0) {
+      console.warn(
+        `${state.leaseRecovery.lapsed.length} lease(s) lapsed past the TTL — fenced pending kill-confirm.`,
+      );
+    }
   } catch (error) {
     const message = (error as Error).message;
     closeStores();
@@ -99,32 +180,20 @@ export async function main(): Promise<void> {
   }
 
   const register = new RegisterService({
-    canonLedger,
-    canonFacts,
-    gapDispositions,
-    // Honest until repo-head polling lands (see module header).
+    canonLedger: state.canonLedger,
+    canonFacts: state.canonFacts,
+    gapDispositions: state.gapDispositions,
+    // Honest until repo-head polling lands (WP-121 wires the production
+    // context source; issue #29 tracks it).
     contextSource: { current: () => null },
   });
 
   // Install the shutdown handlers BEFORE binding the listener (round 3, finding
   // 2): startDaemonServer awaits listen(), and a SIGTERM arriving after the
   // socket binds but before the handlers existed would take the default action
-  // and kill the daemon ungracefully. Registered here — before startDaemonServer
-  // — so every signal from THIS POINT (which precedes the listener) is handled.
-  // A brief earlier window remains (during token / lock / store setup above): a
-  // signal there still takes the default action, but nothing is listening yet
-  // and the kernel releases the writer lock on process exit, so a re-launch
-  // starts cleanly (round 4, finding 6 — this is a documented residual, not the
-  // listener race, which is closed). Until the server is listening, `daemon` is
-  // undefined and a stop just releases the stores + lock and exits; afterwards it
-  // closes the instance (whose onClose hook releases them).
-  //
-  // The forced-exit path (a hung close) exits NON-ZERO, and a resolved close
-  // whose store teardown FAILED also exits non-zero (round 3, finding 5) — an
-  // unclean shutdown must not report itself as clean. close() itself can hang
-  // waiting on a connection to drain, so the bounded timer guarantees a daemon
-  // told to stop always stops (relying on the loop draining after close is not
-  // portable — round 2, finding 1).
+  // and kill the daemon ungracefully. The forced-exit path (a hung close) exits
+  // NON-ZERO, and a resolved close whose store teardown FAILED also exits
+  // non-zero — an unclean shutdown must not report itself as clean.
   let daemon: Awaited<ReturnType<typeof startDaemonServer>> | undefined;
   let stopping = false;
   const stop = (): void => {
@@ -164,11 +233,10 @@ export async function main(): Promise<void> {
       port,
       register,
       // Stores close whenever the instance closes — signals, /api/shutdown, or
-      // a post-listen failure — via a hook registered BEFORE listen (round 1,
-      // finding 1). No post-listen addHook here; that crashed the daemon.
+      // a post-listen failure — via a hook registered BEFORE listen.
       onClose: () => void closeStores(),
-      // /api/shutdown shares the ONE stop path (round 4, finding 2): the same
-      // teardown-aware, force-guarded exit as a signal.
+      // /api/shutdown shares the ONE stop path: the same teardown-aware,
+      // force-guarded exit as a signal.
       onShutdownRequest: stop,
       logger: true,
     });

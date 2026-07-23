@@ -238,6 +238,80 @@ export type {
   RegisterSnapshot,
 } from "./register-service.js";
 
+// WP-114: the attempt scheduler — readiness, leases, quota-aware dispatch,
+// failure handoff (CAM-PLAN-09/-12, CAM-STATE-04/-06, CAM-ROUTE-06), plus
+// the WP-107 handoff surfaces (out-of-process budget supervision, image
+// provenance, network attestation, container-input composition, retained-
+// workspace reconciliation).
+export { SqliteLeaseStore } from "./scheduler/lease-store.js";
+export type { SqliteLeaseStoreOptions } from "./scheduler/lease-store.js";
+export { AttemptSummaryStore } from "./scheduler/summary-store.js";
+export type { AttemptSummaryStoreOptions } from "./scheduler/summary-store.js";
+export { ArchiveLedgerStore } from "./scheduler/archive-ledger.js";
+export type { ArchiveLedgerStoreOptions } from "./scheduler/archive-ledger.js";
+export {
+  dependencyOrder,
+  dependentsOf,
+  latestContracts,
+  selectNextDispatch,
+  unmetDependencies,
+} from "./scheduler/readiness.js";
+export type { DispatchHold, DispatchSelection, IssueStateSnapshot } from "./scheduler/readiness.js";
+export { AttemptScheduler, QUOTA_PROBE_BACKOFF_MS } from "./scheduler/attempt-scheduler.js";
+export type {
+  AttemptDispatchPlan,
+  AttemptSchedulerDeps,
+  DispatchDecision,
+  InterruptedAttempt,
+  OutcomeRouting,
+  QuotaPause,
+  RecordOutcomeOptions,
+  SchedulerRecoveryReport,
+  WindowStateReader,
+} from "./scheduler/attempt-scheduler.js";
+export {
+  SupervisorError,
+  armContainerSupervisor,
+  confirmContainerGone,
+  killContainerAndConfirm,
+} from "./scheduler/supervisor.js";
+export type { ArmedSupervisor, ArmSupervisorOptions } from "./scheduler/supervisor.js";
+export {
+  CAMINO_IMAGE_LABEL,
+  TRUSTED_TOOL_DIRS,
+  ToolchainError,
+  WORKER_PROFILE_DIR,
+  assertCaminoBuiltImage,
+  buildWorkerImage,
+  resolveTrustedTool,
+} from "./scheduler/image-provenance.js";
+export type {
+  BuildWorkerImageOptions,
+  WorkerImageProvenance,
+} from "./scheduler/image-provenance.js";
+export {
+  CAMINO_NETWORK_LABEL,
+  WorkerNetworkError,
+  attestWorkerNetwork,
+  createAttestedWorkerNetwork,
+  destroyWorkerNetwork,
+} from "./scheduler/worker-network.js";
+export type { AttestedWorkerNetwork } from "./scheduler/worker-network.js";
+export { ContainerInputError, composeContainerRun } from "./scheduler/container-inputs.js";
+export type {
+  ComposeContainerRunOptions,
+  ComposedContainerRun,
+} from "./scheduler/container-inputs.js";
+export {
+  recordArchivalEvent,
+  reconcileRetainedWorkspace,
+} from "./scheduler/workspace-reconciler.js";
+export type {
+  ReconcilerDeps,
+  ReconciliationOutcome,
+  RetainedWorkspaceRef,
+} from "./scheduler/workspace-reconciler.js";
+
 // WP-110: planning — the plan store, the planning service, and the contract
 // freeze (CAM-PLAN-01/-02/-04/-07/-11).
 export { PlanStore, PLAN_STREAM_KINDS, reviewArtifactProblems } from "./plan-store.js";

@@ -15,7 +15,15 @@
 //      structurally invalid record, which the runner must refuse by name
 //      without crashing.
 //   5. Exit 0.
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 
 const STREAM = "plan-stream.jsonl";
 const emit = (record) => appendFileSync(STREAM, JSON.stringify(record) + "\n");
@@ -69,8 +77,22 @@ if (process.env.MOCK_PLANNER_MODE === "malformed") {
 if (process.env.MOCK_PLANNER_MODE === "rewrite-history") {
   // Same-length in-place rewrite of already-consumed content (r2 finding
   // 11): the runner's consumed-prefix hash must refuse everything after.
-  const current = readFileSync(STREAM, "utf8");
-  writeFileSync(STREAM, current.replace('"I1"', '"I7"'));
+  // The rewrite is a positional write over the existing bytes, opened
+  // "r+" — NEVER writeFileSync, whose truncate-then-write leaves a
+  // zero-length window a concurrent tail poll can read as a shrink
+  // (post-merge CI flake on e7e3c0d: "shrank from consumed offset"
+  // fired instead of "rewritten in place"). '"I1"' and '"I7"' differ in
+  // exactly one byte, so every possible read observes either the intact
+  // old content or the completed rewrite — no third state exists.
+  const buf = readFileSync(STREAM);
+  const at = buf.indexOf('"I1"');
+  if (at === -1) {
+    console.error("I1 marker not found for rewrite");
+    process.exit(1);
+  }
+  const fd = openSync(STREAM, "r+");
+  writeSync(fd, '"I7"', at);
+  closeSync(fd);
 }
 
 const first = segments[0].segmentId;

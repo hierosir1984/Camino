@@ -146,6 +146,7 @@ describe("@camino/core public barrel immutability (deep)", () => {
       type: "attempt-dispatched",
       leaseGranted: false,
       leaseGeneration: 1,
+      contractRef: { issueId: "m1.I1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     expect(refused.ok).toBe(false);
   });
@@ -167,6 +168,7 @@ describe("@camino/core public barrel immutability (deep)", () => {
       type: "attempt-dispatched",
       leaseGranted: true,
       leaseGeneration: 1,
+      contractRef: { issueId: "m1.I1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     expect(result).toEqual({ ok: false, code: "illegal-transition" });
   });

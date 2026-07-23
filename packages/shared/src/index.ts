@@ -267,6 +267,44 @@ export {
 } from "./quarantine-diff.js";
 export type { ChangedPath, ChangedPathKind, QuarantinedDiff } from "./quarantine-diff.js";
 
+// WP-114: the attempt-lease / environment-fencing interface (CAM-STATE-04;
+// PRD §5 registry item 5). The NAMED durable seam WP-115's validation
+// runner and any future janitor (CAM-STATE-07) present generations through.
+export {
+  LEASE_HEARTBEAT_MS,
+  LEASE_TTL_MS,
+  LEASE_STATES,
+  KILL_CONFIRM_SOURCES,
+  leaseLapsed,
+  environmentIdProblems,
+  validationEnvironmentId,
+} from "./lease.js";
+export type {
+  LeaseState,
+  KillConfirmSource,
+  LeaseGrant,
+  EnvironmentLeaseView,
+  GrantResult,
+  FenceResult,
+  SettleResult,
+  LapsedLease,
+  LeaseRecoveryReport,
+  EnvironmentLeaseStore,
+} from "./lease.js";
+
+// WP-114: structured attempt-failure handoff (CAM-PLAN-09 — summaries,
+// never raw transcripts; the schema is closed so a transcript has no
+// field to ride in).
+export {
+  ATTEMPT_SUMMARY_SCHEMA_VERSION,
+  HEADLINE_MAX_CHARS,
+  SUMMARY_ATTEMPT_TERMINALS,
+  TOKEN_LITERAL_PATTERN_SOURCE,
+  attemptSummaryProblems,
+  summaryHeadline,
+} from "./attempt-summary.js";
+export type { AttemptSummary, SummaryAttemptTerminal } from "./attempt-summary.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,
