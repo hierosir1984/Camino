@@ -20,12 +20,19 @@ import {
   commitTree,
   git,
   hashBlob,
+  hashManyDistinctBlobs,
   initRepo,
   type CacheEntry,
 } from "./corpus-git.js";
 import { cleanupPristineRepos, runIntake } from "./intake.js";
-import { checkFetchBudget, REGISTRY_ITEM_11_FETCH_BUDGET } from "./policy.js";
-import type { QuarantineAssignment } from "./types.js";
+import {
+  checkFetchBudget,
+  checkPathCollisions,
+  isProtectedPath,
+  REGISTRY_ITEM_11_FETCH_BUDGET,
+} from "./policy.js";
+import { MAX_STORED_PATH_LENGTH } from "./types.js";
+import type { QuarantineAssignment, TreeEntry } from "./types.js";
 
 afterAll(() => {
   cleanupRepos();
@@ -162,11 +169,12 @@ describe("registry-item-11 fetch budget (CAM-EXEC-04)", () => {
     expect(checkFetchBudget(5_000, 500_000_000)).toEqual([]);
   });
 
-  it("rejects end-to-end when the shallow-fetch footprint exceeds 5,000 objects", () => {
-    // 5,001 leaves under one dir → object count > the hard fetch cap, even though
-    // the per-issue policy entry-budget is set high enough not to fire — so ONLY
-    // the registry-item-11 fetch-object-budget is exercised. All share one blob
-    // sha (distinct paths), generated in-script (no giant argv → no E2BIG).
+  it("counts DISTINCT objects: 5,001 paths sharing ONE blob do NOT trip the fetch-object budget", () => {
+    // The fetch budget measures the TRANSFER footprint — distinct objects — so a
+    // single blob referenced at 5,001 paths is one object, not 5,001 (review r1
+    // finding 8: the old measure counted repeated paths and would have tripped
+    // fetch-object-budget here). The tree is still huge by ENTRY count, so it is
+    // rejected — but by the policy entry-budget, NOT the distinct-object fetch cap.
     const repo = initRepo();
     const readme = hashBlob(repo, "# base\n");
     const base = commitTree(
@@ -181,17 +189,67 @@ describe("registry-item-11 fetch budget (CAM-EXEC-04)", () => {
       entries.push({ mode: "100644", sha: blob, path: `many/f${String(i).padStart(5, "0")}` });
     }
     const head = commitTree(repo, buildTreeBulk(repo, entries), [base], "many files");
-    const r = runIntake(repo, head, {
-      base,
-      allowedPaths: ["**"],
-      budgets: { maxEntries: 10_000, maxTreeBytes: 5_000_000_000, maxBlobBytes: 1_000_000 },
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    const codes = r.rejections.map((x) => x.code);
+    expect(codes).toContain("entry-budget"); // too many tree ENTRIES
+    expect(codes).not.toContain("fetch-object-budget"); // but only ONE distinct blob object
+  });
+
+  it("rejects end-to-end when the DISTINCT-object footprint exceeds 5,000", () => {
+    // 5,001 DISTINCT blobs in a flat directory → >5,000 distinct objects, a
+    // genuine over-budget transfer. Distinct objects must go WIDE, not deep: git's
+    // upload-pack refuses to serve a tree past its max depth, so a deep chain
+    // cannot even be fetched. Trips the registry-item-11 fetch-object budget (the
+    // entry-budget also fires — collect-all — which is fine).
+    const repo = initRepo();
+    const readme = hashBlob(repo, "# base\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: readme, path: "README.md" }]),
+      [],
+      "base",
+    );
+    const shas = hashManyDistinctBlobs(repo, 5001);
+    const entries: CacheEntry[] = [{ mode: "100644", sha: readme, path: "README.md" }];
+    shas.forEach((sha, i) => {
+      entries.push({ mode: "100644", sha, path: `many/f${String(i).padStart(5, "0")}` });
     });
+    const head = commitTree(repo, buildTreeBulk(repo, entries), [base], "many distinct");
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
     expect(r.accepted).toBe(false);
     expect(r.rejections.map((x) => x.code)).toContain("fetch-object-budget");
-    // The policy entry-budget was NOT the trigger (it was raised above the count).
-    expect(r.rejections.map((x) => x.code)).not.toContain("entry-budget");
-    expect(r.rebuilt).toBeNull();
-    expect(r.diff).toBeNull();
+  });
+
+  it("clamps a widened budget to stricter-only (a per-issue override cannot loosen the cap)", () => {
+    // review r1 finding 7: a contract override may only TIGHTEN the tree-size
+    // budget. A caller asking for a 10 MB per-blob cap does not get to admit a
+    // 2 MB blob that the 1 MB default rejects.
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const big = hashBlob(repo, "X".repeat(2 * 1024 * 1024)); // 2 MB > 1 MB default
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: big, path: "src/big.bin" },
+      ]),
+      [base],
+      "add big",
+    );
+    const widened = runIntake(repo, head, {
+      base,
+      allowedPaths: ["**"],
+      budgets: { maxBlobBytes: 10 * 1024 * 1024 }, // attempt to widen — must be ignored
+    });
+    expect(widened.accepted).toBe(false);
+    expect(widened.rejections.map((x) => x.code)).toContain("blob-size-budget");
   });
 });
 
@@ -277,6 +335,123 @@ describe("production-shape smoke: trusted base source distinct from the worker c
     const a = runIntake(fx.repo, fx.head, fx.assignment);
     const b = runIntake(fx.repo, fx.head, fx.assignment);
     expect(a.rebuilt!.sha).toBe(b.rebuilt!.sha);
+  });
+});
+
+describe("round-1 falsification fixes", () => {
+  const leaf = (path: string): TreeEntry => ({
+    mode: "100644",
+    type: "blob",
+    sha: "x",
+    size: 1,
+    path,
+  });
+
+  it("refuses a ref-string (refspec) as the worker head — only a bare OID is accepted", () => {
+    const fx = acceptedFixture();
+    // The refspec-injection vector: a `<src>:<dst>` string that git would write to
+    // refs/replace/*. isOid rejects it before any fetch (review r1 findings 1, 2).
+    expect(() => runIntake(fx.repo, `${fx.head}:refs/replace/${fx.base}`, fx.assignment)).toThrow(
+      /bare git object id/,
+    );
+    expect(() => runIntake(fx.repo, "refs/heads/*", fx.assignment)).toThrow(/bare git object id/);
+  });
+
+  it("strengthened fold catches same-script APFS aliases missed before (review r1 finding 6)", () => {
+    // ẞ (capital sharp S) ⇄ SS, and combining ypogegrammeni ⇄ iota: same-inode on
+    // a case-insensitive APFS/HFS+ volume, missed by the pre-fix fold.
+    expect(checkPathCollisions([leaf("ẞ.txt"), leaf("SS.txt")]).length).toBe(1);
+    expect(
+      checkPathCollisions([
+        leaf(String.fromCodePoint(0x0345) + ".txt"),
+        leaf(String.fromCodePoint(0x03b9) + ".txt"),
+      ]).length,
+    ).toBe(1);
+    // …while an accent difference is NOT a collision (no over-reject of café/cafe).
+    expect(
+      checkPathCollisions([leaf("caf" + String.fromCodePoint(0x00e9) + ".txt"), leaf("cafe.txt")]),
+    ).toEqual([]);
+  });
+
+  it("protects local actions and rejects a .gitmodules retarget (review r1 findings 3, 5)", () => {
+    expect(isProtectedPath(".github/actions/local/action.yml")).toBe(true);
+    expect(isProtectedPath(".github/workflows/ci.yml")).toBe(true);
+    expect(isProtectedPath(".github/CODEOWNERS")).toBe(false); // non-executing policy file
+
+    // A worker that leaves an existing gitlink OID untouched but retargets it via
+    // .gitmodules is rejected.
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const gm = hashBlob(
+      repo,
+      '[submodule "lib"]\n  path = lib\n  url = https://safe.example/lib\n',
+    );
+    const base = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: gm, path: ".gitmodules" },
+      ]),
+      [],
+      "base",
+    );
+    const gm2 = hashBlob(
+      repo,
+      '[submodule "lib"]\n  path = lib\n  url = https://attacker.example/lib\n',
+    );
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: gm2, path: ".gitmodules" },
+      ]),
+      [base],
+      "retarget submodule url",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("submodule-gitlink");
+  });
+
+  it("rejects an over-long path as a policy result, never a thrown emitter (review r1 finding 10)", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    // A single long FILENAME (one directory level) past MAX_STORED_PATH_LENGTH —
+    // shallow, so git's upload-pack serves it (a deep path would be refused by
+    // git before any policy runs); valid to git, over the policy cap.
+    const longPath = "many/" + "a".repeat(MAX_STORED_PATH_LENGTH + 200) + ".txt";
+    expect(longPath.length).toBeGreaterThan(MAX_STORED_PATH_LENGTH);
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: longPath },
+      ]),
+      [base],
+      "long path",
+    );
+    // No throw: a rejection result, not a QuarantineGitError from the emitter.
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("path-too-long");
+    expect(r.diff).toBeNull();
+  });
+
+  it("refuses a worker repo that borrows objects via alternates (review r1 finding 4)", () => {
+    const fx = acceptedFixture();
+    // Plant an alternates file: the worker store would borrow from an external
+    // store, letting its upload-pack serve objects it does not itself contain.
+    writeFileSync(join(fx.repo, ".git", "objects", "info", "alternates"), "/some/other/objects\n");
+    expect(() => runIntake(fx.repo, fx.head, fx.assignment)).toThrow(
+      /borrows from an external store/,
+    );
   });
 });
 

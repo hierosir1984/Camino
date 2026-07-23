@@ -15,19 +15,22 @@
 import { quarantinedDiffProblems, workerAttributionTrailer } from "@camino/shared";
 import type { ContractRef, QuarantinedDiff } from "@camino/shared";
 import {
+  assertSelfContainedObjectStore,
   changedPaths,
   changedPathsWithStatus,
   commitCandidate,
+  distinctBlobBytes,
   distinctObjectCount,
-  fetchTip,
+  fetchedObjectCount,
+  fetchOid,
   fsckTree,
   initPristineRepo,
   parentShas,
   QuarantineGitError,
   subjectOf,
   symlinkTargetBytes,
+  treeEntryCount,
   treeLeaves,
-  treeObjectCount,
   treeOf,
 } from "./git.js";
 import {
@@ -36,13 +39,14 @@ import {
   checkFetchBudget,
   checkNameAliases,
   checkPathCollisions,
+  checkPathLength,
   checkScopeAndProtected,
   checkSubmodules,
   checkSymlinks,
   SYMLINK_TARGET_MAX_BYTES,
 } from "./policy.js";
 import {
-  DEFAULT_BUDGETS,
+  effectiveBudgets,
   type QuarantineAssignment,
   type QuarantineResult,
   type Rejection,
@@ -77,36 +81,38 @@ function symlinkTargets(dir: string, entries: readonly TreeEntry[]): Map<string,
   return targets;
 }
 
-/** Sum of blob byte sizes across the final tree (gitlinks/oversized handled elsewhere). */
-function totalTreeBytes(entries: readonly TreeEntry[]): number {
-  let total = 0;
-  for (const e of entries) total += e.size ?? 0;
-  return total;
-}
-
 /**
  * Run the quarantine intake for one worker head.
  *
  * @param workerRepo path to the worker's (untrusted) repo — a fetch source only
- * @param workerRef  ref or sha of the worker's final head inside that repo
- * @param assignment assigned base + allowed-path scope + budgets + contract binding
+ * @param workerHeadOid EXACT object id (40/64-hex) of the worker's final head —
+ *   never a ref string (refspec-injection guard; see fetchOid)
+ * @param assignment assigned base OID + allowed-path scope + budgets + contract binding
  * @param options    trusted base source (defaults to workerRepo; see IntakeOptions)
  */
 export function runIntake(
   workerRepo: string,
-  workerRef: string,
+  workerHeadOid: string,
   assignment: QuarantineAssignment,
   options: IntakeOptions = {},
 ): QuarantineResult {
-  const budgets = { ...DEFAULT_BUDGETS, ...assignment.budgets };
+  // Overrides may only TIGHTEN the default tree-size budget, never widen it
+  // (review r1 finding 7) — a per-issue contract cannot loosen the policy cap.
+  const budgets = effectiveBudgets(assignment.budgets);
   const baseRepo = options.baseRepo ?? workerRepo;
+
+  // The worker repo must be self-contained: an alternates-borrowing store would
+  // let its upload-pack serve objects from an external store into the candidate
+  // (review r1 finding 4). Re-attested here (WP-107 also provisions it so).
+  assertSelfContainedObjectStore(workerRepo);
 
   // Pristine control-plane repo: trusted base first (shallow — only its tree is
   // needed for the diff and as the rebuild parent), then the worker's final
-  // head shallow. Nothing else crosses the boundary.
+  // head shallow. Both are fetched BY EXACT OID (no refspec/wildcard surface),
+  // so nothing but those two commits' trees crosses the boundary.
   const pristineDir = initPristineRepo();
-  fetchTip(pristineDir, baseRepo, assignment.base, true);
-  const workerHead = fetchTip(pristineDir, workerRepo, workerRef, true);
+  fetchOid(pristineDir, baseRepo, assignment.base, true);
+  const workerHead = fetchOid(pristineDir, workerRepo, workerHeadOid, true);
 
   const rejections: Rejection[] = [];
 
@@ -124,9 +130,13 @@ export function runIntake(
   // are not valid UTF-8 decode to U+FFFD and are rejected by checkNameAliases,
   // so they cannot be silently deduped/collapsed (WP-003 r2).
   const entries = treeLeaves(pristineDir, treeSha);
-  // …and ALL objects (subtrees + leaves + root) for the object-count budgets.
-  const objectCount = treeObjectCount(pristineDir, treeSha);
-  const totalBytes = totalTreeBytes(entries);
+  // Registry-item-11 FETCH budget consults the DISTINCT transfer footprint —
+  // distinct objects (incl. the commit) and distinct blob bytes (review r1
+  // finding 8). The per-issue tree POLICY budget consults the materialized
+  // entry count (with repetition), a distinct measure.
+  const fetchObjects = fetchedObjectCount(pristineDir, workerHead, treeSha);
+  const fetchBytes = distinctBlobBytes(entries);
+  const entryCount = treeEntryCount(pristineDir, treeSha);
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, assignment.base, workerHead);
   const changedSet = new Set(changed);
@@ -143,16 +153,17 @@ export function runIntake(
   }
 
   rejections.push(
-    // Registry-item-11 fetch budget: a HARD outer cap on the shallow-fetch
-    // footprint, independent of the per-issue tree-size policy budget below.
-    ...checkFetchBudget(objectCount, totalBytes),
+    // Registry-item-11 fetch budget: a HARD outer cap on the DISTINCT shallow-
+    // fetch footprint, independent of the per-issue tree-size policy budget below.
+    ...checkFetchBudget(fetchObjects, fetchBytes),
     ...checkScopeAndProtected(changed, assignment.allowedPaths),
     ...checkPathCollisions(entries),
     ...checkNameAliases(entries),
+    ...checkPathLength(entries),
     ...checkDotGitPaths(entries),
     ...checkSubmodules(entries, changedSet),
     ...checkSymlinks(entries, targets),
-    ...checkBudgets(entries, budgets, objectCount),
+    ...checkBudgets(entries, budgets, entryCount),
   );
 
   const accepted = rejections.length === 0;

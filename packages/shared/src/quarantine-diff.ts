@@ -109,18 +109,35 @@ export function quarantinedDiffProblems(value: unknown): string[] {
   const record = value as Record<string, unknown>;
   const problems: string[] = [];
 
+  // OWN properties only: a record whose fields live on the PROTOTYPE would read
+  // as present here but serialize to `{}` (review r1 finding 9). Reading through
+  // `get` makes an inherited field undefined, so it fails its type check.
+  const get = (field: string): unknown =>
+    Object.hasOwn(record, field) ? record[field] : undefined;
+
+  const shaLengths = new Set<number>();
   const sha = (field: string): string | null => {
-    const v = record[field];
+    const v = get(field);
     if (typeof v !== "string" || !isGitObjectName(v)) {
-      problems.push(`${field} must be a git object name (/${GIT_OBJECT_NAME_PATTERN_SOURCE}/)`);
+      problems.push(
+        `${field} must be an own git object name (/${GIT_OBJECT_NAME_PATTERN_SOURCE}/)`,
+      );
       return null;
     }
+    shaLengths.add(v.length);
     return v;
   };
   const candidateSha = sha("candidateSha");
   const baseSha = sha("baseSha");
   sha("treeSha");
   const workerHeadSha = sha("workerHeadSha");
+  // One repository has ONE object format; mixing 40-hex (sha-1) and 64-hex
+  // (sha-256) identities in one record is impossible and forged (review r1 #9).
+  if (shaLengths.size > 1) {
+    problems.push(
+      "object ids mix sha-1 and sha-256 lengths — one record cannot span object formats",
+    );
+  }
 
   // A squash-and-rebuild candidate is a NEW Camino-authored commit; if it
   // equals the worker head the rebuild did not happen (design §5.1).
@@ -142,14 +159,16 @@ export function quarantinedDiffProblems(value: unknown): string[] {
     );
   }
 
-  const contractRef = record["contractRef"];
-  if (contractRef !== null) {
+  const contractRef = get("contractRef");
+  if (!Object.hasOwn(record, "contractRef")) {
+    problems.push("contractRef is required (null when the caller supplied none)");
+  } else if (contractRef !== null) {
     for (const p of contractRefProblems(contractRef)) problems.push(`contractRef ${p}`);
   }
 
-  const changedPaths = record["changedPaths"];
+  const changedPaths = get("changedPaths");
   if (!Array.isArray(changedPaths)) {
-    problems.push("changedPaths must be an array");
+    problems.push("changedPaths must be an own array");
   } else {
     if (changedPaths.length > MAX_CHANGED_PATHS) {
       problems.push(`changedPaths exceeds ${MAX_CHANGED_PATHS} entries`);
@@ -168,14 +187,22 @@ export function quarantinedDiffProblems(value: unknown): string[] {
         return;
       }
       const cp = entry as Record<string, unknown>;
-      const path = cp["path"];
+      const path = Object.hasOwn(cp, "path") ? cp["path"] : undefined;
       if (typeof path !== "string" || path.length === 0) {
-        problems.push(`changedPaths[${i}].path must be a non-empty string`);
+        problems.push(`changedPaths[${i}].path must be a non-empty own string`);
       } else {
         if (path.length > MAX_PATH_LENGTH) {
           problems.push(`changedPaths[${i}].path exceeds ${MAX_PATH_LENGTH} code units`);
         }
         if (path.includes("\u0000")) problems.push(`changedPaths[${i}].path contains U+0000`);
+        // Repo-root-relative POSIX only: an absolute path or a `..` traversal
+        // component would resolve OUTSIDE the tree the diff describes (review r1
+        // finding 9). Reject a leading `/`, a leading `./`, and any `..` segment.
+        if (path.startsWith("/") || path.startsWith("./") || path.split("/").includes("..")) {
+          problems.push(
+            `changedPaths[${i}].path must be repo-root-relative (no leading / or .. segment)`,
+          );
+        }
         if (previous !== undefined && !(previous < path)) {
           problems.push(
             `changedPaths must be strictly sorted and duplicate-free (changedPaths[${i}])`,
@@ -183,9 +210,10 @@ export function quarantinedDiffProblems(value: unknown): string[] {
         }
         previous = path;
       }
+      const change = Object.hasOwn(cp, "change") ? cp["change"] : undefined;
       if (
-        typeof cp["change"] !== "string" ||
-        !(CHANGED_PATH_KINDS as readonly string[]).includes(cp["change"])
+        typeof change !== "string" ||
+        !(CHANGED_PATH_KINDS as readonly string[]).includes(change)
       ) {
         problems.push(`changedPaths[${i}].change must be one of ${CHANGED_PATH_KINDS.join(", ")}`);
       }

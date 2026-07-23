@@ -48,6 +48,30 @@ export const DEFAULT_BUDGETS: Budgets = Object.freeze({
 });
 
 /**
+ * The effective tree-size budget for one intake: each field is the STRICTER of
+ * the default and any per-issue override (review r1 finding 7). A contract can
+ * only TIGHTEN the cap, never widen it — so a supplied `maxBlobBytes` of 10 MB
+ * cannot loosen the 1 MB default. (Widening was possible before this clamp,
+ * contradicting the "stricter-only" documentation.)
+ */
+export function effectiveBudgets(overrides?: Partial<Budgets>): Budgets {
+  return {
+    maxTreeBytes: Math.min(DEFAULT_BUDGETS.maxTreeBytes, overrides?.maxTreeBytes ?? Infinity),
+    maxBlobBytes: Math.min(DEFAULT_BUDGETS.maxBlobBytes, overrides?.maxBlobBytes ?? Infinity),
+    maxEntries: Math.min(DEFAULT_BUDGETS.maxEntries, overrides?.maxEntries ?? Infinity),
+  };
+}
+
+/**
+ * A single stored path longer than this is rejected as `path-too-long` BEFORE
+ * the accept branch, so no policy-passing tree can carry a path the durable
+ * QuarantinedDiff schema would refuse (which would make the emitter throw rather
+ * than reject — review r1 finding 10). 4096 is a generous single-path bound
+ * (POSIX PATH_MAX territory) and well under the schema's 8192-code-unit cap.
+ */
+export const MAX_STORED_PATH_LENGTH = 4096;
+
+/**
  * The registry-item-11 FETCH budget (PRD §5 item 11: "fetch ≤5,000 objects /
  * 500 MB"). A HARD outer cap on the shallow-fetch footprint — the object count
  * and total byte size of the worker's final head — enforced by the intake and
@@ -98,6 +122,7 @@ export type RejectionCode =
   | "blob-size-budget"
   | "tree-size-budget"
   | "entry-budget"
+  | "path-too-long"
   // Registry-item-11 FETCH-budget breaches (product additions over the spike):
   | "fetch-object-budget"
   | "fetch-size-budget";

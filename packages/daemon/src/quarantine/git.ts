@@ -3,17 +3,19 @@
 // Every git invocation here runs with a CREDENTIAL-FREE, hooks-disabled env
 // (the WP-107 clone.ts pattern): no GitHub PAT, host global/system config
 // neutralized to /dev/null, no interactive credential prompt, LC_ALL=C for
-// stable parsing. The intake executes git ONLY in the Camino-owned pristine
-// repo and reads the worker's objects solely by FETCHING from the worker repo
-// (upload-pack) — it never runs a git command inside a worker-touched working
-// tree. Together these discharge the AC "credentialed git never executes in
-// worker-touched directories" (see the README boundary note on the residual
-// serving-side config-exec surface, which is structural, not an exhaustive
-// denylist).
+// stable parsing. The intake spawns git with cwd ONLY in the Camino-owned
+// pristine repo; it reads the worker's objects solely by FETCHING from the
+// worker repo, which spawns `git upload-pack` as a HOST process whose cwd is the
+// worker repo — but that server inherits the same credential-free, config-
+// neutralized env, and git does not honour a repo-local `uploadpack.
+// packObjectsHook` (read only from protected config). Together these discharge
+// the AC "credentialed git never executes in worker-touched directories" (see
+// the README boundary note on the residual serving-side config-exec surface,
+// which is structural, not an exhaustive denylist).
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ChangedPath, ChangedPathKind } from "@camino/shared";
 import type { TreeEntry } from "./types.js";
 
@@ -88,6 +90,12 @@ export function initPristineRepo(prefix = "camino-quarantine-pristine-"): string
   git(dir, "config", "commit.gpgsign", "false");
   git(dir, "config", "core.hooksPath", "/dev/null");
   git(dir, "config", "credential.helper", "");
+  // Replacement refs (refs/replace/<oid>) transparently substitute one object
+  // for another in EVERY later git command, so a fetched replace ref would let a
+  // worker swap the assigned base out from under the diff/rebuild. Disable them
+  // in the pristine store (defence in depth behind the OID validation in
+  // fetchOid, which is what stops such a ref being written in the first place).
+  git(dir, "config", "core.useReplaceRefs", "false");
   // Keep raw path bytes intact so the POLICY layer sees exactly what the tree
   // stores (macOS would otherwise precompose NFD names, hiding a Unicode
   // collision; HFS/NTFS guards could pre-reject trailing-dot / reserved names).
@@ -110,33 +118,96 @@ export function removePristineRepo(dir: string): void {
 }
 
 /**
- * Fetch a single ref/sha from `sourceRepo` into `pristineDir`. `shallow` uses
- * `--depth=1`, which for the worker head pulls ONLY its final tree (commit +
- * trees + blobs), never intermediate history — the structural basis of
- * reachable-history exclusion. Returns the fetched tip sha (from FETCH_HEAD),
- * so the intake never runs `rev-parse` inside the worker-touched source.
+ * Refuse a fetch source whose object store BORROWS from another via an
+ * `objects/info/alternates` (or `http-alternates`) file. Such a store makes its
+ * `upload-pack` serve objects it does not itself contain, so a worker could put
+ * an object from an external/shared store into its final tree and have it
+ * admitted into the candidate (review r1 finding 4). WP-107 provisions worker
+ * clones alternate-free (`assertWorkerCloneIsolation`'s `noAlternates`); this is
+ * the intake's own re-attestation — a filesystem check only, no git executed in
+ * the worker-touched directory. Covers non-bare (`.git/…`) and bare (`…`)
+ * layouts.
  */
-export function fetchTip(
+export function assertSelfContainedObjectStore(repo: string): void {
+  const candidates = [
+    join(repo, ".git", "objects", "info", "alternates"),
+    join(repo, ".git", "objects", "info", "http-alternates"),
+    join(repo, "objects", "info", "alternates"),
+    join(repo, "objects", "info", "http-alternates"),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) {
+      throw new QuarantineGitError(
+        `fetch source object store borrows from an external store (${basename(p)}) — refused; ` +
+          "a worker clone must be self-contained (CAM-EXEC-02 / review r1 finding 4)",
+      );
+    }
+  }
+}
+
+/** A git object name: 40-hex (sha-1) or 64-hex (sha-256), lower-case. */
+const OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/** Lower-case-hex git object name — the ONLY accepted fetch source (see fetchOid). */
+export function isOid(value: string): boolean {
+  return OID_RE.test(value);
+}
+
+/**
+ * Fetch a single commit BY EXACT OBJECT ID from `sourceRepo` into `pristineDir`.
+ *
+ * The source MUST be a bare 40/64-hex OID, never a ref string. A ref string is a
+ * refspec surface: `git fetch <repo> <src>:<dst>` writes `<dst>` (e.g. a
+ * `refs/replace/<oid>` that would substitute the assigned base), and `--` ends
+ * OPTION parsing but does NOT stop `src:dst` / wildcard interpretation. An OID
+ * cannot carry a `:` or `*`, so passing one closes refspec injection and the
+ * multi-head/over-budget wildcard fetch outright (review r1 findings 1, 2); the
+ * fetch writes only FETCH_HEAD. `--depth=1` pulls ONLY the commit's own tree
+ * (commit + trees + blobs), never intermediate history — the structural basis
+ * of reachable-history exclusion. Returns the fetched OID (verified to equal the
+ * requested one), so the intake never runs `rev-parse` inside the worker source.
+ */
+export function fetchOid(
   pristineDir: string,
   sourceRepo: string,
-  ref: string,
+  oid: string,
   shallow: boolean,
 ): string {
+  if (!isOid(oid)) {
+    throw new QuarantineGitError(
+      `fetch source must be a bare git object id, not a ref string (refspec injection guard): ${JSON.stringify(oid)}`,
+    );
+  }
   const args = ["fetch", "--no-tags", "--quiet"];
   if (shallow) args.push("--depth=1");
-  args.push("--", sourceRepo, ref);
+  // `oid` is validated hex — no option/refspec shape can survive isOid — so it
+  // reaches upload-pack as a single want with no destination. The default
+  // FETCH_HEAD write is harmless (it can only name the validated oid) and keeps
+  // the fetched object referenced.
+  args.push("--", sourceRepo, oid);
   try {
     git(pristineDir, ...args);
   } catch (err) {
     throw new QuarantineGitError(
-      `shallow-fetch of ${JSON.stringify(ref)} from source failed: ${describe(err)}`,
+      `shallow-fetch of ${oid.slice(0, 12)} from source failed: ${describe(err)}`,
     );
   }
+  // The requested OID is now an object in the pristine store; confirm it parses
+  // to itself as a commit (FETCH_HEAD can only point at the validated oid).
+  let resolved: string;
   try {
-    return git(pristineDir, "rev-parse", "FETCH_HEAD");
+    resolved = git(pristineDir, "rev-parse", "--verify", `${oid}^{commit}`);
   } catch (err) {
-    throw new QuarantineGitError(`could not resolve fetched tip: ${describe(err)}`);
+    throw new QuarantineGitError(
+      `fetched object ${oid.slice(0, 12)} is not a commit: ${describe(err)}`,
+    );
   }
+  if (resolved !== oid) {
+    throw new QuarantineGitError(
+      `fetched object id ${resolved.slice(0, 12)} does not match requested ${oid.slice(0, 12)}`,
+    );
+  }
+  return oid;
 }
 
 /** The tree sha of a commit present in `dir`. */
@@ -171,13 +242,49 @@ export function treeLeaves(dir: string, treeSha: string): TreeEntry[] {
 }
 
 /**
- * Count of ALL objects in `treeSha` — every subtree plus every leaf, plus 1 for
- * the queried root that ls-tree omits. `-t` includes intermediate trees, so a
- * pathologically DEEP tree (one leaf, many trees) is counted honestly. This is
- * the object-count both the registry-item-11 fetch budget and the final-tree
- * policy budget consult.
+ * The count of DISTINCT git objects the shallow fetch of `commit` transfers:
+ * every distinct subtree + every distinct blob/leaf reachable from its tree,
+ * plus the commit object itself. `-t` includes intermediate trees, so a
+ * pathologically DEEP tree (one leaf, many trees) is counted honestly; DISTINCT
+ * shas are counted, so a blob referenced at 5,000 paths is ONE object, not
+ * 5,000 — and the fetched commit is included, closing the off-by-one a worker
+ * used to sit exactly on the 5,000 cap (review r1 finding 8). This is the
+ * object count the registry-item-11 fetch budget consults.
  */
-export function treeObjectCount(dir: string, treeSha: string): number {
+export function fetchedObjectCount(dir: string, commit: string, treeSha: string): number {
+  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
+  const shas = new Set<string>();
+  for (const e of parseTree(raw)) shas.add(e.sha);
+  shas.add(treeSha); // the root tree ls-tree omits
+  shas.add(commit); // the fetched commit object itself
+  return shas.size;
+}
+
+/**
+ * The total byte size of the DISTINCT blobs reachable from the tree — the
+ * transfer's payload footprint, deduplicated by object id so a blob referenced
+ * at many paths counts once (review r1 finding 8). Symlink and gitlink leaves
+ * are blobs/commit-refs; only real blob content contributes bytes.
+ */
+export function distinctBlobBytes(entries: readonly TreeEntry[]): number {
+  const seen = new Set<string>();
+  let total = 0;
+  for (const e of entries) {
+    if (e.size == null) continue; // gitlink — no blob payload
+    if (seen.has(e.sha)) continue;
+    seen.add(e.sha);
+    total += e.size;
+  }
+  return total;
+}
+
+/**
+ * Count of ALL tree objects + leaves in `treeSha` (with repetition), plus 1 for
+ * the queried root. This is the per-issue tree-policy "entry-budget" measure — a
+ * deep-nesting resource proxy, distinct from the registry-item-11 fetch object
+ * count above (which deduplicates and adds the commit).
+ */
+export function treeEntryCount(dir: string, treeSha: string): number {
   const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
   return parseTree(raw).length + 1;
 }
@@ -322,10 +429,16 @@ export function distinctObjectCount(dir: string): number {
   return raw.length === 0 ? 0 : raw.split("\n").filter((l) => l.trim().length > 0).length;
 }
 
-/** True iff object `sha` exists in `dir`'s object store. */
+/**
+ * True iff object `sha` exists in `dir`'s object store. Runs through the same
+ * credential-free, config-neutralized env as every other quarantine git call
+ * (review r1 finding 11): the earlier raw `execFileSync` here inherited the
+ * ambient process env — a GITHUB_TOKEN, host HOME, and credential helper — which
+ * contradicted the module's credential-free guarantee for this exported helper.
+ */
 export function objectExists(dir: string, sha: string): boolean {
   try {
-    execFileSync("git", ["-C", dir, "cat-file", "-e", sha], { stdio: "ignore" });
+    runGit(dir, ["cat-file", "-e", sha], 1 << 20);
     return true;
   } catch {
     return false;

@@ -71,6 +71,36 @@ export function hashBlob(dir: string, content: string | Buffer): string {
   }
 }
 
+/**
+ * Hash `n` DISTINCT blobs in ONE git process (`hash-object --stdin-paths` over
+ * temp files whose content varies by index), returning their shas. Used to build
+ * a genuinely-many-DISTINCT-object tree (e.g. the registry-item-11 fetch-object
+ * budget) without one spawn per blob and without a deep tree (git's upload-pack
+ * refuses to serve trees past its max-depth, so distinct objects must go WIDE).
+ */
+export function hashManyDistinctBlobs(dir: string, n: number): string[] {
+  const scratch = mkdtempSync(join(tmpdir(), "camino-blobs-"));
+  try {
+    const paths: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const p = join(scratch, `b${i}`);
+      writeFileSync(p, `distinct-content-${i}\n`);
+      paths.push(p);
+    }
+    const out = execFileSync("git", ["-C", dir, "hash-object", "-w", "--stdin-paths"], {
+      input: paths.join("\n") + "\n",
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 64 * 1024 * 1024,
+    })
+      .toString()
+      .trim()
+      .split("\n");
+    return out;
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 /** One entry for {@link buildTree}: a git index cacheinfo triple. */
 export interface CacheEntry {
   /** "100644" | "100755" | "120000" (symlink) | "160000" (gitlink). */

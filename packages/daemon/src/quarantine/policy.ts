@@ -8,6 +8,7 @@
 // rather than the spike's hand-rolled residual list — the two hard-learned
 // lessons from that spike's r1–r3 review.
 import { REGISTRY_ITEM_11_QUOTAS } from "@camino/shared";
+import { MAX_STORED_PATH_LENGTH } from "./types.js";
 import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -15,35 +16,37 @@ import type { Budgets, FetchBudget, Rejection, TreeEntry } from "./types.js";
 // ---------------------------------------------------------------------------
 
 /**
- * ICU is the case-fold authority here. Two oracles compose the collision key,
- * matching the two collision classes real target filesystems produce:
+ * ICU is the case-fold authority here. Each path segment/prefix is reduced to a
+ * canonical fold KEY; two distinct stored paths whose keys are EQUAL would
+ * resolve to one file on a case-insensitive or Unicode-normalizing filesystem.
  *
- *   - NORMALIZATION + COMPATIBILITY: NFKC folds NFC⇄NFD, the Latin ligatures
- *     (ﬁ→fi …), the long s (ſ→s), superscripts, and the like into one form;
- *     a small residual (`ß`→`ss`, Greek final sigma `ς`→`σ`) closes the two
- *     compatibility-fold gaps NFKC leaves. This yields a per-path KEY.
- *   - CASE: the keys are grouped with an ICU `Intl.Collator` at
- *     `sensitivity: "accent"` — case-INsensitive, accent-PRESERVING. So
- *     `Config.txt`⇄`config.txt` and `straße`⇄`STRASSE` collide, while a
- *     legitimately distinct `café.txt` and `cafe.txt` do NOT (accents are kept,
- *     unlike a `sensitivity: "base"` fold, which would over-reject them).
+ * The fold, all ICU-backed: `\`→`/` (Windows separator equivalence), NFKC
+ * (composition + compatibility: NFC⇄NFD, ligatures ﬁ→fi, long s ſ→s,
+ * superscripts …), then an UPPERCASE→LOWERCASE round trip, then `ß`→`ss`.
  *
- * BOUNDARY, stated (the WP-003 "name the boundary" lesson): JavaScript does not
- * expose ICU's full `u_strFoldCase`, so this is NFKC + a documented residual
- * fold + ICU collation-case-folding, NOT a byte-exact model of every
- * filesystem's own fold table. It errs toward COLLAPSING (a false collision
- * over-rejects — the safe direction; a MISS would be a missed collision, never
- * an accept of something worse). Exotic cross-script confusables a complete
- * fold table would collapse may slip; that residual is accepted and named.
+ *   - The `toUpperCase().toLowerCase()` round trip is what makes this a case
+ *     FOLD rather than a mere lowercase: ICU's special casing maps the capital
+ *     sharp S `ẞ`, the combining ypogegrammeni `ͅ`→`ι`, and the like — pairs a
+ *     plain `toLowerCase()` (or the WP-003 spike's hand-rolled residual list)
+ *     MISSED, yet which a case-insensitive APFS/HFS+ volume collapses to one
+ *     inode (review r1 finding 6). Accents are PRESERVED across the round trip
+ *     (`café`⇄`CAFÉ`⇄`café`), so a legitimately distinct `café.txt`/`cafe.txt`
+ *     is NOT a false collision (unlike an accent-insensitive `base` collation).
+ *   - `ß`→`ss` closes the one case-fold the round trip still leaves: `ẞ`→`ß` (a
+ *     lowercase, not `ss`), so applying it last folds `ẞ`, `ß`, and `SS` alike.
+ *
+ * BOUNDARY, stated (the WP-003 "name the boundary" lesson): JavaScript exposes
+ * no `u_strFoldCase`, so this is NFKC + an ICU upper/lower round trip + the `ß`
+ * residual — a strong approximation of Unicode default case folding, NOT the
+ * complete CaseFolding.txt table. Same- or cross-script case-fold pairs beyond
+ * what NFKC and ICU's upper/lower casing collapse may still slip; the design
+ * bias is to ERR TOWARD COLLAPSING (a false collision over-rejects — the safe
+ * direction, e.g. the locale-dependent `I`⇄`ı`; a MISS would be a missed
+ * collision, never an accept of something worse). The complete target-filesystem
+ * identity oracle is deferred (a bundled fold table / WP-118 onboarding).
  */
-const CASE_FOLD_COLLATOR = new Intl.Collator("en", { sensitivity: "accent" });
-
-/** NFKC + the two compatibility folds NFKC omits. NO lowercasing — the collator folds case. */
-function normalizationKey(path: string): string {
-  // `\` ⇄ `/` (a Windows separator makes `docs\note` and `docs/note` one file);
-  // NFKC (composition + compatibility); then ß→ss and final-sigma ς→σ, the two
-  // full-fold residuals NFKC does not perform.
-  return path.replace(/\\/g, "/").normalize("NFKC").replace(/ß/g, "ss").replace(/ς/g, "σ");
+function foldKey(path: string): string {
+  return path.replace(/\\/g, "/").normalize("NFKC").toUpperCase().toLowerCase().replace(/ß/g, "ss");
 }
 
 /** Every prefix (each ancestor directory component + the full path) of a stored path. */
@@ -62,43 +65,38 @@ function pathPrefixes(path: string): string[] {
  *
  * EVERY path prefix is keyed, not just leaves: a root symlink `A` and a
  * directory `a/file` collide through the `A`⇄`a` component even though their
- * leaf paths differ (the WP-003 r3 ancestor-component finding).
+ * leaf paths differ (the WP-003 r3 ancestor-component finding). Grouping is by
+ * EXACT fold-key equality (a Map) — an unambiguous equivalence relation, no sort
+ * or collator ordering to reason about.
  */
 export function checkPathCollisions(entries: readonly TreeEntry[]): Rejection[] {
-  // De-duplicate prefixes (a shared ancestor appears under many leaves) and
-  // record each with its normalization key.
+  // De-duplicate prefixes (a shared ancestor appears under many leaves), then
+  // bucket by canonical fold key.
   const seen = new Set<string>();
-  const items: { prefix: string; key: string }[] = [];
+  const byKey = new Map<string, string[]>();
   for (const e of entries) {
     for (const prefix of pathPrefixes(e.path)) {
       if (seen.has(prefix)) continue;
       seen.add(prefix);
-      items.push({ prefix, key: normalizationKey(prefix) });
+      const key = foldKey(prefix);
+      const bucket = byKey.get(key);
+      if (bucket) bucket.push(prefix);
+      else byKey.set(key, [prefix]);
     }
   }
-  // Group by ICU collation equality of the keys. compare() === 0 is an
-  // equivalence relation (equal collation sort-keys), so a stable sort places
-  // every equivalence class in one contiguous run — no union-find needed.
-  items.sort((a, b) => CASE_FOLD_COLLATOR.compare(a.key, b.key));
   const out: Rejection[] = [];
-  let i = 0;
-  while (i < items.length) {
-    let j = i + 1;
-    while (j < items.length && CASE_FOLD_COLLATOR.compare(items[i]!.key, items[j]!.key) === 0) j++;
-    const group = items.slice(i, j).map((x) => x.prefix);
-    if (group.length >= 2) {
-      // Case-only iff lowercasing ALONE (no normalization) already collapses the
-      // whole group; if normalization/compatibility was needed to make them
-      // collide, the difference is Unicode composition (e.g. composed "é" vs
-      // "e"+combining-accent, or ß⇄SS).
-      const caseOnly = new Set(group.map((p) => p.toLowerCase())).size === 1;
-      out.push({
-        code: caseOnly ? "path-collision-case" : "path-collision-unicode",
-        path: group.join(" ⇄ "),
-        detail: `paths collide under ${caseOnly ? "case-folding" : "Unicode normalization"}: ${group.join(", ")}`,
-      });
-    }
-    i = j;
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    // Case-only iff lowercasing ALONE (no normalization/fold) already collapses
+    // the whole group; if NFKC or the case fold was needed to make them collide,
+    // the difference is Unicode composition/compatibility (composed "é" vs
+    // "e"+combining-accent, or `ẞ`⇄`SS`).
+    const caseOnly = new Set(group.map((p) => p.toLowerCase())).size === 1;
+    out.push({
+      code: caseOnly ? "path-collision-case" : "path-collision-unicode",
+      path: group.join(" ⇄ "),
+      detail: `paths collide under ${caseOnly ? "case-folding" : "Unicode normalization"}: ${group.join(", ")}`,
+    });
   }
   return out;
 }
@@ -213,18 +211,58 @@ export function checkDotGitPaths(entries: readonly TreeEntry[]): Rejection[] {
  * present and unchanged in the assigned base is not the worker's doing
  * (CAM-EXEC-04 blocks *introductions*; WP-003 r2). `changed` is the base↔head
  * path set.
+ *
+ * `.gitmodules` is the ROUTING metadata that maps a gitlink path to the URL git
+ * clones it from. The "unchanged gitlink is safe" exception is only sound while
+ * that routing is fixed: a worker that leaves the gitlink OID untouched but
+ * edits `.gitmodules` to retarget it at an attacker-controlled repository has
+ * changed where the submodule resolves. So ANY worker change to `.gitmodules`
+ * is rejected here too (review r1 finding 5), regardless of gitlink changes.
  */
 export function checkSubmodules(
   entries: readonly TreeEntry[],
   changed: ReadonlySet<string>,
 ): Rejection[] {
-  return entries
+  const out: Rejection[] = entries
     .filter((e) => (e.mode === "160000" || e.type === "commit") && changed.has(e.path))
     .map((e) => ({
       code: "submodule-gitlink" as const,
       path: e.path,
       detail: `submodule/gitlink introduced at "${e.path}" (${e.sha})`,
     }));
+  if (changed.has(".gitmodules")) {
+    out.push({
+      code: "submodule-gitlink",
+      path: ".gitmodules",
+      detail: "worker changed .gitmodules — submodule routing metadata may not be worker-edited",
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// path length
+// ---------------------------------------------------------------------------
+
+/**
+ * A stored path longer than MAX_STORED_PATH_LENGTH is rejected as a POLICY
+ * violation, not left to fail later at the durable-diff schema (which would make
+ * the emitter throw rather than return a rejection — review r1 finding 10). Such
+ * a path passes git fsck and every other check, so without this it would reach
+ * the accept branch and only then be refused by the schema's own cap.
+ */
+export function checkPathLength(entries: readonly TreeEntry[]): Rejection[] {
+  const out: Rejection[] = [];
+  for (const e of entries) {
+    if (e.path.length > MAX_STORED_PATH_LENGTH) {
+      out.push({
+        code: "path-too-long",
+        path: e.path.slice(0, 80) + "…",
+        detail: `stored path is ${e.path.length} code units (budget ${MAX_STORED_PATH_LENGTH})`,
+      });
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,10 +471,23 @@ export function matchesAnyGlob(path: string, globs: readonly string[]): boolean 
 
 /**
  * Protected paths may never be touched by a worker, regardless of scope:
- * `.gitattributes` (rewrites how blobs are interpreted), CI definitions
- * (`.github/workflows/**` — the token/secrets surface), and `.camino/**`
- * (Camino's own config). Match order is basename for `.gitattributes`, prefix
- * for the directory sets.
+ * `.gitattributes` (rewrites how blobs are interpreted), CI definitions — both
+ * workflow YAML (`.github/workflows/**`, the token/secrets surface) AND LOCAL
+ * ACTIONS (`.github/actions/**`) — and `.camino/**` (Camino's own config).
+ *
+ * A local composite/JS action runs with the same privilege as the workflow that
+ * references it (`uses: ./.github/actions/foo`), so a worker that edits an
+ * action's code changes CI/gating behaviour without touching any protected
+ * workflow YAML (review r1 finding 3). Match order is basename for
+ * `.gitattributes`, prefix for the directory sets.
+ *
+ * BOUNDARY, stated: a workflow may reference a local action by an ARBITRARY path
+ * (`uses: ./scripts/foo`), which this path list cannot enumerate. The complete
+ * defence — parsing each workflow's `uses: ./…` references and protecting those
+ * targets — is the WP-118 CI-posture onboarding analyzer (CAM-SEC-03). This list
+ * covers the conventional `.github/actions/**` location; other `.github/*`
+ * policy files that do not execute code (CODEOWNERS, dependabot.yml) are left
+ * scope-governed, not protected.
  */
 export function isProtectedPath(path: string): boolean {
   // Case-insensitive: a case-insensitive host (macOS/Windows) resolves
@@ -446,6 +497,7 @@ export function isProtectedPath(path: string): boolean {
   const base = p.slice(p.lastIndexOf("/") + 1);
   if (base === ".gitattributes") return true;
   if (p === ".github/workflows" || p.startsWith(".github/workflows/")) return true;
+  if (p === ".github/actions" || p.startsWith(".github/actions/")) return true;
   if (p === ".camino" || p.startsWith(".camino/")) return true;
   return false;
 }

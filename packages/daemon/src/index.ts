@@ -184,12 +184,13 @@ export {
   removePristineRepo,
 } from "./quarantine/intake.js";
 export type { IntakeOptions } from "./quarantine/intake.js";
-export { DEFAULT_BUDGETS } from "./quarantine/types.js";
+export { DEFAULT_BUDGETS, effectiveBudgets, MAX_STORED_PATH_LENGTH } from "./quarantine/types.js";
 export {
   checkFetchBudget,
   checkScopeAndProtected,
   checkPathCollisions,
   checkNameAliases,
+  checkPathLength,
   checkDotGitPaths,
   checkSubmodules,
   checkSymlinks,
