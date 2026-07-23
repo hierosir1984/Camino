@@ -36,7 +36,7 @@ import {
   initRepo,
   type CacheEntry,
 } from "./corpus-git.js";
-import { assertSelfContainedObjectStore } from "./git.js";
+import { assertSelfContainedObjectStore, objectFormatOfRepo } from "./git.js";
 import { cleanupPristineRepos, runIntake } from "./intake.js";
 import {
   checkFetchBudget,
@@ -1070,6 +1070,94 @@ describe("round-8 falsification fixes", () => {
     const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
     expect(r.accepted).toBe(true);
     expect(r.rejections).toEqual([]);
+  });
+});
+
+describe("round-9 falsification fixes", () => {
+  it("rejects a symlink whose target aliases `.git` via an HFS-ignorable char — r9 #1", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    // Symlink target `.g<U+200C>it/config` — an HFS+ volume opens it as .git/config.
+    const target = ".g" + String.fromCodePoint(0x200c) + "it/config";
+    const linkBlob = hashBlob(repo, target);
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "120000", sha: linkBlob, path: "link" },
+      ]),
+      [base],
+      "hfs-ignorable dotgit symlink",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("symlink-escape");
+  });
+
+  it("bounds an oversized `.git/config` before reading it — r9 #2", () => {
+    const a = mkdtempTestDir();
+    mkdirSync(join(a, ".git", "objects"), { recursive: true });
+    writeFileSync(join(a, ".git", "config"), "x".repeat((1 << 20) + 1)); // > 1 MiB
+    expect(() => assertSelfContainedObjectStore(a)).toThrow(/bytes/);
+  });
+
+  it("matches git's exact include grammar — accepts `[include.custom]`, refuses `[include]` — r9 #7", () => {
+    // A differently-named section git reads locally (no inclusion) must NOT be
+    // rejected as an include directive.
+    const ok = mkdtempTestDir();
+    mkdirSync(join(ok, ".git", "objects"), { recursive: true });
+    writeFileSync(join(ok, ".git", "config"), "[include.custom]\n\tkey = value\n[include-x]\n");
+    expect(() => assertSelfContainedObjectStore(ok)).not.toThrow();
+
+    const bad = mkdtempTestDir();
+    mkdirSync(join(bad, ".git", "objects"), { recursive: true });
+    writeFileSync(join(bad, ".git", "config"), "[include]\n\tpath = /etc/x\n");
+    expect(() => assertSelfContainedObjectStore(bad)).toThrow(/include/);
+  });
+
+  it("does NOT classify a multi-dot long name as an 8.3 alias (FOO~1.T.X) — r9 #8", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "docs/FOO~1.T.X" }, // two dots — not 8.3
+      ]),
+      [base],
+      "multi-dot tilde name",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(true);
+    expect(r.rejections).toEqual([]);
+  });
+
+  it("detects a repo's object format from its config file, no git-exec — r9 #4", () => {
+    const sha256 = mkdtempTestDir();
+    mkdirSync(join(sha256, ".git"), { recursive: true });
+    writeFileSync(
+      join(sha256, ".git", "config"),
+      "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n",
+    );
+    expect(objectFormatOfRepo(sha256)).toBe("sha256");
+
+    const sha1 = mkdtempTestDir();
+    mkdirSync(join(sha1, ".git"), { recursive: true });
+    writeFileSync(join(sha1, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    expect(objectFormatOfRepo(sha1)).toBe("sha1");
   });
 });
 

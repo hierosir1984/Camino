@@ -166,11 +166,22 @@ const pristineDirs: string[] = [];
  * fixture repo, it needs no upload-pack allow flags — the pristine repo is the
  * FETCHER, never a server for untrusted refs.
  */
-export function initPristineRepo(prefix = "camino-quarantine-pristine-"): string {
+export function initPristineRepo(
+  prefix = "camino-quarantine-pristine-",
+  objectFormat: "sha1" | "sha256" = "sha1",
+): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   pristineDirs.push(dir);
   try {
-    runGit(dir, ["init", "--quiet", "--initial-branch=main"], 1 << 20);
+    // Init with the SOURCE repo's object format (review r9 finding 4): a fetch of
+    // a sha-256 base/head into a default sha-1 store fails ("couldn't find remote
+    // ref"), so the sha-256 grammar isOid accepts was non-functional. The intake
+    // detects the format from the trusted base and passes it here.
+    runGit(
+      dir,
+      ["init", "--quiet", "--initial-branch=main", `--object-format=${objectFormat}`],
+      1 << 20,
+    );
   } catch (err) {
     throw new QuarantineGitError(`pristine repo init failed: ${describe(err)}`);
   }
@@ -214,6 +225,29 @@ export function removePristineRepo(dir: string): void {
   rmSync(dir, { recursive: true, force: true });
   const idx = pristineDirs.indexOf(dir);
   if (idx >= 0) pristineDirs.splice(idx, 1);
+}
+
+/**
+ * The object format ("sha1" | "sha256") of `repo`, read from its config FILE —
+ * NOT via `git rev-parse` (review r9 finding 4). Running git in the repo would
+ * honor the repo's own config (an alias, an include), the surface we guard for
+ * the worker; a bounded file read does not. A sha-256 repo carries
+ * `[extensions] objectformat = sha256`; anything else (or an unreadable/absent
+ * config) is treated as sha-1. Checks `.git/config` (non-bare) then `config`
+ * (bare).
+ */
+export function objectFormatOfRepo(repo: string): "sha1" | "sha256" {
+  for (const p of [join(repo, ".git", "config"), join(repo, "config")]) {
+    try {
+      const st = lstatSync(p);
+      if (!st.isFile() || st.size > MAX_CONFIG_BYTES) continue;
+      const text = readFileSync(p, "utf8");
+      return /^\s*objectformat\s*=\s*sha256\b/im.test(text) ? "sha256" : "sha1";
+    } catch {
+      // try the next candidate path
+    }
+  }
+  return "sha1";
 }
 
 /**
@@ -422,6 +456,15 @@ export function assertSelfContainedObjectStore(repo: string): void {
           "it could block or redirect the serving `upload-pack` (CAM-EXEC-02 / review r8 finding 1)",
       );
     }
+    // BOUND the read before it happens (review r9 finding 2): a worker-controlled
+    // 128 MiB `.git/config` would balloon RSS if slurped whole. A real config is a
+    // few KiB; refuse anything over the cap rather than read it.
+    if (configStat.size > MAX_CONFIG_BYTES) {
+      throw new QuarantineGitError(
+        `fetch source \`.git/config\` is ${configStat.size} bytes (> ${MAX_CONFIG_BYTES}) — refused; ` +
+          "an oversized config is not a normal clone (fail-closed; review r9 finding 2)",
+      );
+    }
     let configText = "";
     try {
       configText = readFileSync(configPath, "utf8");
@@ -430,15 +473,22 @@ export function assertSelfContainedObjectStore(repo: string): void {
         "fetch source `.git/config` is unreadable — refused (fail-closed; review r8 finding 1)",
       );
     }
-    if (/^\s*\[\s*include(if)?\b/im.test(configText) || /^\s*include(if)?\./im.test(configText)) {
+    // Match git's EXACT include grammar — the `[include]` section (no subsection)
+    // and `[includeIf "<cond>"]` — NOT a differently-named section like
+    // `[include.custom]` / `[include-custom]` / `[include "custom"]`, which git
+    // reads locally without inclusion (review r9 finding 7).
+    if (/^\s*\[\s*include\s*\]/im.test(configText) || /^\s*\[\s*includeif\b/im.test(configText)) {
       throw new QuarantineGitError(
-        "fetch source `.git/config` uses an `include`/`includeIf` directive — refused; a worker " +
+        "fetch source `.git/config` uses an `[include]`/`[includeIf]` directive — refused; a worker " +
           "clone must not indirect its config (an include path could be a FIFO the serving " +
           "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1)",
       );
     }
   }
 }
+
+/** Cap on a worker `.git/config` size — a real clone's config is a few KiB. */
+const MAX_CONFIG_BYTES = 1 << 20;
 
 /** A git object name: 40-hex (sha-1) or 64-hex (sha-256), lower-case. */
 const OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -582,16 +632,17 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
  * — so a fetch a hair over 500 MB could measure at/under the cap (review r7
  * finding 6). Summing actual byte sizes never under-bounds the pack (the safe
  * direction for an admission cap). The walk is bounded by the same scan cap;
- * more files than the cap, OR any read failure on an existing entry (an absent
- * objects dir alone is a legitimately empty 0-byte store), returns
- * MAX_SAFE_INTEGER so the byte budget fails CLOSED (review r8 finding 2).
+ * more files than the cap, OR any read failure on an existing entry, THROWS (an
+ * absent objects dir alone is a legitimately empty 0-byte store) — so the intake
+ * fails CLOSED rather than letting a sentinel value cancel under the before/after
+ * subtraction (review r8 finding 2, r9 finding 3).
  */
 export function storeSizeBytes(dir: string): number {
   const objectsDir = join(dir, ".git", "objects");
   // An entirely ABSENT objects dir is a legitimately empty store (0 bytes). Any
-  // OTHER read failure mid-walk fails CLOSED (review r8 finding 2): if the size
-  // cannot be attested, the byte budget must not silently pass — an unreadable
-  // store returns MAX_SAFE_INTEGER so the admission cap rejects it.
+  // OTHER read failure mid-walk THROWS (review r8 finding 2, r9 finding 3): if the
+  // size cannot be attested, the byte budget must not silently pass — and a
+  // sentinel return value would CANCEL under the intake's before/after delta.
   if (!existsSync(objectsDir)) return 0;
   let total = 0;
   let seen = 0;
@@ -624,7 +675,17 @@ export function storeSizeBytes(dir: string): number {
     if (st.isFile()) total += st.size;
     return true;
   };
-  return walk(objectsDir) ? total : Number.MAX_SAFE_INTEGER;
+  // THROW on any measurement failure rather than returning a sentinel: the intake
+  // takes a delta (after − before), and a MAX_SAFE_INTEGER sentinel in BOTH
+  // measurements cancels to 0 (or, in one, to a negative) and silently PASSES the
+  // 500 MB cap (review r9 finding 3). A thrown error fails the whole intake closed.
+  if (!walk(objectsDir)) {
+    throw new QuarantineGitError(
+      "object-store size could not be measured (an unreadable entry or scan-cap breach) — " +
+        "refused (fail-closed; review r9 finding 3)",
+    );
+  }
+  return total;
 }
 
 /** Byte size of one object (`cat-file -s`); 0 if unreadable. */

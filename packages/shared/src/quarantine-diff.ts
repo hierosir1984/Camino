@@ -115,8 +115,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * Total validator for a quarantined-diff record: an empty result means the
  * record is well-formed and internally consistent (the trailer names the
  * worker head; the candidate is neither the worker head nor the base nor its
- * own tree; changed paths are sorted, unique, canonical, non-empty and
- * NUL-free). Used at emit (before handing the artifact on) and at adoption (a
+ * own tree; each changed path is a non-empty, NUL-free, canonical, unique,
+ * sorted string — though the changed-paths LIST itself may be empty, e.g. a
+ * metadata-only candidate whose tree equals the base's; review r9 finding 9).
+ * Used at emit (before handing the artifact on) and at adoption (a
  * consumer refuses a record that fails this, never repairs it — the WP-110
  * contract-validator precedent).
  *

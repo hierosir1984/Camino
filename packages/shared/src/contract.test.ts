@@ -241,6 +241,23 @@ describe("contractRefProblems", () => {
       }
     }
   });
+
+  it("rejects a NESTED inherited interface and a stateful Proxy ref (JSON snapshot) — r9", () => {
+    // A nested interface whose fields are inherited serializes to {} — the
+    // top-level own-copy missed it; the JSON snapshot catches it.
+    const ifaceProto = { name: "x", kind: "api", description: "y" };
+    const inheritedIface = Object.create(ifaceProto);
+    expect(JSON.stringify(inheritedIface)).toBe("{}");
+    expect(contractProblems({ ...contract(), interfaces: [inheritedIface] })).not.toEqual([]);
+
+    // A Proxy that reads valid during validation but serializes to a malformed
+    // record must be rejected on its serialized (persisted) form.
+    const proxy = new Proxy(
+      { issueId: "", contractVersion: 9007199254740992, contractHash: "" },
+      { get: (t, p) => (t as Record<string, unknown>)[p as string] },
+    );
+    expect(contractRefProblems(proxy)).not.toEqual([]);
+  });
 });
 
 describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {
@@ -259,30 +276,26 @@ describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {
 });
 
 describe("total validation over sparse arrays (r1 finding 7)", () => {
-  it("names a sparse acceptanceCriteria hole instead of throwing", () => {
+  // The validator snapshots via a JSON round-trip (r9 finding 5), which is what a
+  // store does: a sparse-array HOLE becomes `null`. The guarantee is unchanged —
+  // the validator never THROWS and rejects the record (now as a null element, the
+  // exact form that would persist), matching quarantinedDiffProblems.
+  it("rejects a sparse acceptanceCriteria hole instead of throwing", () => {
     const holed = contract();
     const criteria: unknown[] = ["A criterion."];
     criteria[2] = "Another.";
     const candidate = { ...holed, acceptanceCriteria: criteria };
     const problems = contractProblems(candidate);
     expect(Array.isArray(problems)).toBe(true);
-    expect(problems.some((p) => p.includes("sparse-array hole"))).toBe(true);
+    expect(problems.length).toBeGreaterThan(0);
   });
 
-  it("names holes in requirementIds and interfaces too", () => {
+  it("rejects holes in requirementIds and interfaces too", () => {
     const ids: unknown[] = [];
     ids[1] = "CAM-APP-01";
-    expect(
-      contractProblems({ ...contract(), requirementIds: ids }).some((p) =>
-        p.includes("sparse-array hole"),
-      ),
-    ).toBe(true);
+    expect(contractProblems({ ...contract(), requirementIds: ids })).not.toEqual([]);
     const ifaces: unknown[] = [];
     ifaces[1] = { name: "x", kind: "api", description: "y" };
-    expect(
-      contractProblems({ ...contract(), interfaces: ifaces }).some((p) =>
-        p.includes("sparse-array hole"),
-      ),
-    ).toBe(true);
+    expect(contractProblems({ ...contract(), interfaces: ifaces })).not.toEqual([]);
   });
 });

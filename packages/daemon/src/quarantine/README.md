@@ -86,10 +86,13 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   credential-free, config-neutralized env. Git does **not** honour a repo-local
   `uploadpack.packObjectsHook` (that command is read only from protected system
   config), so a worker cannot use it to run code during the fetch. The intake
-  ALSO refuses a worker `.git/config` that is a FIFO/special node or that uses an
-  `[include]`/`[includeIf]` directive: an include `path` pointing at a FIFO makes
-  the serving `upload-pack` BLOCK, orphaning a descendant even for a fully stopped
-  worker (review r8 finding 1). The remaining repo-config exec/indirection surface
+  ALSO refuses a worker `.git/config` that is a FIFO/special node, is over a size
+  cap (bounded read, review r9 finding 2), or uses git's `[include]` /
+  `[includeIf "…"]` directive (matched by git's EXACT section grammar, not a
+  differently-named `[include.custom]` that git reads locally; review r9 finding
+  7): an include `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
+  orphaning a descendant even for a fully stopped worker (review r8 finding 1).
+  The remaining repo-config exec/indirection surface
   (e.g. an include pointing OUTSIDE `.git`) is bounded by the fetch env carrying
   no credential and no host `HOME`, and by the daemon/container process lifecycle
   (WP-107 teardown reaps descendants) — the same boundary WP-107's `clone.ts`
@@ -121,7 +124,10 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   fetch outright; the fetch writes only `FETCH_HEAD` (which can only name the
   validated oid), never an attacker-chosen destination ref (review r1 findings
   1, 2). Replacement refs are additionally disabled in the pristine store
-  (`core.useReplaceRefs=false`).
+  (`core.useReplaceRefs=false`). The OID grammar accepts 40-hex (sha-1) OR 64-hex
+  (sha-256), and the pristine store is initialized with the TRUSTED base's object
+  format — read from its config file, never via a git-exec that would honor the
+  repo's config — so a sha-256 intake actually fetches (review r9 finding 4).
 - **The worker object store must be self-contained — under a stopped-worker
   CUSTODY PRECONDITION.** Before fetching, the intake requires a full non-bare
   clone (a real `.git` directory), refuses a `commondir` redirect, and walks the
@@ -164,13 +170,15 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   which rounds pack size DOWN to KiB and omits `.rev` — a real ~KiB UNDERcount
   once the before-measurement is subtracted, review r7 finding 6). The pristine
   repo sets `fetch.unpackLimit=1`, so a fetch is KEPT AS A PACK (never unpacked to
-  loose objects): the delta is therefore the RECEIVED `.pack` — the transfer
-  boundary — not a post-unpack store that a pack a few bytes over 500 MB could
-  shrink under the cap (review r8 finding 2). Summing actual byte sizes never
-  under-bounds the pack (the safe direction), and the walk fails CLOSED (returns
-  MAX_SAFE_INTEGER) past the scan cap OR on any read failure of an existing entry
-  (an absent objects dir alone is a legitimately empty 0-byte store; review r8
-  finding 2). Worker-controlled
+  loose objects): the delta is therefore the received `.pack` plus its locally
+  generated `.idx`/`.rev` — a slight OVER-count of the wire transfer (the safe
+  direction: it can conservatively false-reject a pack a hair below the limit, but
+  never admit one over it), not a post-unpack store that a pack a few bytes over
+  500 MB could shrink under the cap (review r8 finding 2, r9 finding 3). The walk
+  **throws** (fails the intake CLOSED) past the scan cap OR on any read failure of
+  an existing entry — never returns a sentinel that could cancel under the
+  before/after subtraction (review r9 finding 3); an absent objects dir alone is a
+  legitimately empty 0-byte store. Worker-controlled
   commit metadata is separately bounded: a commit object over 1 MiB is rejected
   (`commit-metadata-budget`) before it is read, and the authored candidate
   message is passed on stdin (never argv) and clipped — so an unbounded worker

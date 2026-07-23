@@ -253,7 +253,10 @@ function is83ShortName(seg: string): boolean {
   const dot = s.indexOf(".");
   const base = dot >= 0 ? s.slice(0, dot) : s;
   const ext = dot >= 0 ? s.slice(dot + 1) : "";
-  if (base.length > 8 || ext.length > 3) return false;
+  // An 8.3 name has AT MOST ONE period (MS-FSCC), so a second dot in the ext
+  // (`FOO~1.T.X`, `FOO~1..X`) proves it is not a genuine short name (review r9
+  // finding 8). `dot` is the FIRST period, so `ext` holding another means >1.
+  if (base.length > 8 || ext.length > 3 || ext.includes(".")) return false;
   // MS-FSCC: an 8.3 name is ASCII below 0x80 and contains NO space. So a base
   // with a non-ASCII char (`café~1`) or a space (`foo ~1`) CANNOT be an 8.3 alias
   // — do not over-reject it (review r7 finding 10). `[\x21-\x7e]` is printable
@@ -271,10 +274,14 @@ function is83ShortName(seg: string): boolean {
 
 /** A path segment that resolves to a `.git` directory on some platform. */
 function isDotGitSegment(seg: string): boolean {
-  // Strip NTFS ADS + trailing dots/spaces first, then match `.git` (any case) or
-  // the 8.3 short-name alias `git~N` (WP-003 r1 + r2).
-  const s = stripWindowsAlias(seg);
-  return /^\.git$/i.test(s) || /^git~[0-9]+$/i.test(s);
+  // Canonicalize through the SAME fold as protected-path matching — Windows-alias
+  // strip + HFS-ignorable strip + NFKC + case fold — so `.git` aliases the fold
+  // recognizes elsewhere are recognized HERE too. Without the HFS-ignorable strip,
+  // a `.g<U+200C>it` segment (which a case-insensitive HFS+ volume opens as
+  // `.git`, and git's protectHFS rejects) slipped the `.git`/`git~N` check — most
+  // dangerously as a SYMLINK TARGET, which uses this predicate (review r9 #1).
+  const s = protectedSegment(seg);
+  return s === ".git" || /^git~[0-9]+$/.test(s);
 }
 
 /**
@@ -464,7 +471,14 @@ export function symlinkEscapes(linkPath: string, target: string): boolean {
 
 /** A symlink target is dangerous if it escapes the root OR dives into `.git`. */
 export function symlinkTargetDanger(linkPath: string, target: string): "escape" | "dotgit" | null {
-  if (target.split(/[/\\]/).some((seg) => isDotGitSegment(seg))) return "dotgit";
+  // `target` is the symlink blob decoded latin1 (raw bytes — so the escape/NUL
+  // check sees exactly what the OS stores). For the `.git`-ALIAS check, interpret
+  // those bytes as UTF-8, which is how a macOS/HFS+ volume resolves the target: an
+  // HFS-ignorable codepoint spliced into `.git` (`.g<U+200C>it`) is stored as its
+  // MULTI-BYTE UTF-8 form, which the codepoint-level fold in isDotGitSegment only
+  // recognizes after this re-decode (review r9 finding 1).
+  const utf8Target = Buffer.from(target, "latin1").toString("utf8");
+  if (utf8Target.split(/[/\\]/).some((seg) => isDotGitSegment(seg))) return "dotgit";
   if (symlinkEscapes(linkPath, target)) return "escape";
   return null;
 }

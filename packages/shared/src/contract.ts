@@ -175,16 +175,26 @@ export function contractProblems(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return ["contract must be a plain object"];
   }
-  // Validate OWN-ENUMERABLE fields only (review r8 finding 5): reading through
-  // `record[field]` would follow the prototype chain, so an inherited-only record
-  // (`Object.create(validContract)`) or a non-enumerable `Object.prototype`
-  // pollution would read as populated yet serialize to `{}`. Copy own-enumerable
-  // props into a NULL-proto record — the exact fields that persist on a store
-  // round-trip — and validate that.
-  const record: Record<string, unknown> = Object.create(null);
-  for (const k of Object.keys(value as Record<string, unknown>)) {
-    record[k] = (value as Record<string, unknown>)[k];
+  // Validate a JSON ROUND-TRIP SNAPSHOT (review r8 finding 5, r9 finding 5): a
+  // top-level own-copy still followed the prototype chain for NESTED records
+  // (an inherited `interfaces[]` entry) and could not normalize a stateful
+  // `Proxy`. The round-trip resolves every level to the exact own-enumerable
+  // plain data a store persists — inherited/polluted/Proxy fields vanish or
+  // normalize — and a non-serializable value is refused outright.
+  let record: Record<string, unknown>;
+  try {
+    record = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  } catch (err) {
+    return [`contract is not JSON-serializable: ${(err as Error).message}`];
   }
+  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+    return ["contract must be a plain object"];
+  }
+  // NULL the prototype of the snapshot: `JSON.parse` returns an object whose proto
+  // is `Object.prototype`, so a field-read like `record["issueId"]` would still
+  // follow the chain to a non-enumerable `Object.prototype` pollution (review r8
+  // finding 5). With a null proto, every read sees own data only.
+  Object.setPrototypeOf(record, null);
   const problems: string[] = [];
   if (record["schemaVersion"] !== CONTRACT_SCHEMA_VERSION) {
     problems.push(
@@ -333,16 +343,24 @@ export function contractRefProblems(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return ["contractRef must be a plain object"];
   }
-  // OWN-ENUMERABLE fields only (review r7 finding 11, r8 finding 5): reading
-  // through `record[field]` follows the prototype chain, so an inherited-only ref
-  // (`Object.create(validRef)`) OR a non-enumerable `Object.prototype` pollution
-  // (which makes even `{}` read as populated) would pass yet serialize to `{}`.
-  // Copy own-enumerable props into a NULL-proto record — the fields that persist
-  // on a store round-trip — and validate that.
-  const record: Record<string, unknown> = Object.create(null);
-  for (const k of Object.keys(value as Record<string, unknown>)) {
-    record[k] = (value as Record<string, unknown>)[k];
+  // Validate a JSON ROUND-TRIP SNAPSHOT (review r7 finding 11, r8 finding 5, r9
+  // finding 5): an inherited-only ref (`Object.create(validRef)`), a non-
+  // enumerable `Object.prototype` pollution (which makes even `{}` read as
+  // populated), and a stateful `Proxy` all pass a direct/own-copy read yet
+  // serialize to a DIFFERENT record. The round-trip validates exactly the plain
+  // data a store persists; a non-serializable value is refused.
+  let record: Record<string, unknown>;
+  try {
+    record = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+  } catch (err) {
+    return [`contractRef is not JSON-serializable: ${(err as Error).message}`];
   }
+  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+    return ["contractRef must be a plain object"];
+  }
+  // NULL the snapshot's prototype so a field-read cannot follow the chain to a
+  // non-enumerable `Object.prototype` pollution (review r8 finding 5).
+  Object.setPrototypeOf(record, null);
   const problems: string[] = [];
   boundedText("contractRef.issueId", record["issueId"], problems);
   const version = record["contractVersion"];

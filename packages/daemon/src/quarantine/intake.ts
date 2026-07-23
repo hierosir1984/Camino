@@ -23,6 +23,7 @@ import {
   fetchOid,
   fsckTree,
   initPristineRepo,
+  objectFormatOfRepo,
   objectSize,
   parentShas,
   QuarantineGitError,
@@ -72,11 +73,12 @@ export interface IntakeOptions {
   baseRepo?: string;
   /**
    * When true, a null/absent `contractRef` is REFUSED — the emitted diff must
-   * carry a WP-110 contract binding. Production dispatch (WP-114) sets this so
-   * every downstream artifact resolves the exact frozen contract (CAM-PLAN-04 /
-   * CONTRACT_REFERENCE_OBLIGATIONS); the WP-003 corpus fixtures, which have no
+   * carry a WP-110 contract binding. The production run-loop integration (WP-119,
+   * successor work) will set this so every downstream artifact resolves the exact
+   * frozen contract (CAM-PLAN-04 / CONTRACT_REFERENCE_OBLIGATIONS); no caller
+   * passes it yet on this branch. The WP-003 corpus fixtures, which have no
    * contract, leave it false and emit the null (no-binding) form (review r8
-   * finding 4). Default false.
+   * finding 4, r9 finding 6). Default false.
    */
   requireContractRef?: boolean;
 }
@@ -143,8 +145,9 @@ export function runIntake(
       );
     }
   }
-  // Production provenance: WP-114 sets requireContractRef so an unbound candidate
-  // is refused (review r8 finding 4). The corpus fixtures leave it false.
+  // Production provenance: the WP-119 run-loop will set requireContractRef so an
+  // unbound candidate is refused (review r8 finding 4, r9 finding 6 — no caller
+  // passes it yet). The corpus fixtures leave it false.
   if (options.requireContractRef === true && contractRef == null) {
     throw new QuarantineGitError(
       "a contract binding (contractRef) is required but the assignment supplied none — refused " +
@@ -165,7 +168,10 @@ export function runIntake(
   // needed for the diff and as the rebuild parent), then the worker's final
   // head shallow. Both are fetched BY EXACT OID (no refspec/wildcard surface),
   // so nothing but those two commits' trees crosses the boundary.
-  const pristineDir = initPristineRepo();
+  // Match the pristine store's object format to the trusted base's (sha-1 or
+  // sha-256), read from its config file — so a sha-256 intake actually fetches
+  // (review r9 finding 4).
+  const pristineDir = initPristineRepo(undefined, objectFormatOfRepo(baseRepo));
   fetchOid(pristineDir, baseRepo, base, true);
   // Store size AFTER the base fetch, BEFORE the worker fetch: the delta after the
   // worker fetch bounds the fetch by its on-disk store footprint — the compressed
