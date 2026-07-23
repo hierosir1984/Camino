@@ -13,7 +13,7 @@
 // the README boundary note on the residual serving-side config-exec surface,
 // which is structural, not an exhaustive denylist).
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { ChangedPath, ChangedPathKind } from "@camino/shared";
@@ -128,10 +128,12 @@ export function removePristineRepo(dir: string): void {
  * `upload-pack` serve objects it does not itself contain, so a worker could put
  * an object from an external/shared store into its final tree and have it
  * admitted into the candidate (review r1 finding 4). WP-107 provisions worker
- * clones alternate-free (`assertWorkerCloneIsolation`'s `noAlternates`); this is
- * the intake's own re-attestation — a filesystem check only, no git executed in
- * the worker-touched directory. Covers non-bare (`.git/…`) and bare (`…`)
- * layouts.
+ * clones alternate-free (`assertWorkerCloneIsolation` — the authoritative,
+ * complete object-store isolation check); this is the intake's own bounded
+ * re-attestation, a filesystem check only, no git executed in the worker-touched
+ * directory. It requires a full non-bare clone (real `.git` dir) and refuses a
+ * commondir redirect, a symlink anywhere in the object-store tree, and an
+ * alternates file (review r2/r3/r4).
  */
 export function assertSelfContainedObjectStore(repo: string): void {
   // A GITFILE `.git` (a FILE, or a symlink, not a directory) redirects to a
@@ -141,26 +143,29 @@ export function assertSelfContainedObjectStore(repo: string): void {
   // worker clone is a full clone with a REAL `.git` directory (its
   // `gitIsRealDirectory` attestation), or a bare repo (no `.git` at all). This
   // is an lstat, not a follow — no TOCTOU on the target.
-  const dotGit = join(repo, ".git");
+  // A WP-107 worker clone is a full clone with a REAL `.git` DIRECTORY. Require
+  // it: refuse a gitfile/symlink `.git` (a linked worktree redirecting to a
+  // `commondir`), and refuse a BARE repo (no `.git`) — a bare layout was the
+  // route a symlinked `objects/pack` slipped through (review r2/r4). This is an
+  // lstat, not a follow — no TOCTOU on the target.
+  const gitDir = join(repo, ".git");
   let dotGitStat;
   try {
-    dotGitStat = lstatSync(dotGit);
+    dotGitStat = lstatSync(gitDir);
   } catch {
-    dotGitStat = null; // absent ⇒ bare layout, checked below
+    dotGitStat = null;
   }
-  if (dotGitStat !== null && !dotGitStat.isDirectory()) {
+  if (dotGitStat === null || !dotGitStat.isDirectory()) {
     throw new QuarantineGitError(
-      "fetch source `.git` is a gitfile/symlink (linked worktree) — refused; a worker clone must " +
-        "have a real `.git` directory so its object store cannot borrow via commondir (CAM-EXEC-02 / review r2 finding 3)",
+      "fetch source has no real `.git` directory (bare, gitfile, or symlink) — refused; a worker " +
+        "clone must be a full clone with a real `.git` so its object store cannot borrow via a " +
+        "commondir or an external bare store (CAM-EXEC-02 / review r2 finding 3, r4 finding 2)",
     );
   }
-  // The git dir: `<repo>/.git` (non-bare) or `<repo>` itself (bare, no `.git`).
-  const gitDir = dotGitStat !== null ? dotGit : repo;
 
-  // A `commondir` file redirects the object store (and refs) to ANOTHER git dir,
-  // even with a real `.git` directory or a bare repo — git honours it and its
-  // upload-pack then serves objects from that external common store (review r3
-  // finding 2). Refuse its presence.
+  // A `commondir` file redirects the object store (and refs) to ANOTHER git dir;
+  // git honours it and upload-pack then serves objects from that external common
+  // store (review r3 finding 2). Refuse its presence.
   if (existsSync(join(gitDir, "commondir"))) {
     throw new QuarantineGitError(
       "fetch source has a `commondir` redirect — refused; its object store is external " +
@@ -168,23 +173,34 @@ export function assertSelfContainedObjectStore(repo: string): void {
     );
   }
 
-  // A SYMLINKED objects store (or its `info` dir) points the whole store — and
-  // thus any alternates within it — outside the repo, another borrowing form the
-  // direct alternates-file check would miss (review r3 finding 2). Refuse a
-  // symlink at `objects` or `objects/info`.
-  for (const rel of [["objects"], ["objects", "info"]]) {
-    const p = join(gitDir, ...rel);
-    try {
-      if (lstatSync(p).isSymbolicLink()) {
-        throw new QuarantineGitError(
-          `fetch source object store path "${rel.join("/")}" is a symlink — refused; the store must ` +
-            "be local (CAM-EXEC-02 / review r3 finding 2)",
-        );
+  // A SYMLINK anywhere in the object-store tree points (part of) the store — and
+  // any alternates within it — outside the repo. Refuse a symlink at `objects`
+  // itself OR at ANY immediate child of it (`info`, `pack`, and every loose
+  // fan-out dir) — the `objects/pack` symlink was the round-4 escape (r3/r4
+  // finding 2). One readdir; a fresh clone's objects dir is small.
+  const objectsDir = join(gitDir, "objects");
+  const symlinkOffenders: string[] = [];
+  try {
+    if (lstatSync(objectsDir).isSymbolicLink()) symlinkOffenders.push("objects");
+    else {
+      for (const name of readdirSync(objectsDir)) {
+        try {
+          if (lstatSync(join(objectsDir, name)).isSymbolicLink()) {
+            symlinkOffenders.push(`objects/${name}`);
+          }
+        } catch {
+          /* raced/removed — ignore */
+        }
       }
-    } catch (err) {
-      if (err instanceof QuarantineGitError) throw err;
-      // absent path ⇒ nothing to borrow through; continue.
     }
+  } catch {
+    /* objects dir absent on a just-init'd repo — nothing to borrow through */
+  }
+  if (symlinkOffenders.length > 0) {
+    throw new QuarantineGitError(
+      `fetch source object-store path(s) are symlinks (${symlinkOffenders.join(", ")}) — refused; ` +
+        "the store must be local (CAM-EXEC-02 / review r3 finding 2, r4 finding 2)",
+    );
   }
 
   const candidates = [
@@ -306,9 +322,16 @@ export function treeLeaves(dir: string, treeSha: string): TreeEntry[] {
  * the off-by-one (r2 finding 6).
  */
 export function fetchedObjectCount(dir: string, commit: string, treeSha: string): number {
-  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
+  // Read OBJECT NAMES only (`--format=%(objectname)`), never paths: a
+  // pathological tree of many very-long paths would overrun a path-bearing read
+  // buffer BEFORE the budget check could reject it (review r4 finding 3). A
+  // sha-only line is ~41 bytes, so even a 65,000-object tree is a few MB.
+  const raw = git(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha);
   const ids = new Set<string>();
-  for (const e of parseTree(raw)) ids.add(e.sha);
+  for (const line of raw.split("\n")) {
+    const s = line.trim();
+    if (s.length > 0) ids.add(s);
+  }
   ids.add(treeSha); // the root tree ls-tree omits
   ids.add(commit); // the fetched commit object itself
   return ids.size;
@@ -317,10 +340,13 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
 /**
  * The on-disk byte size of `dir`'s object store, from `count-objects -v`
  * (`size` loose + `size-pack`, reported in KiB → bytes). The intake takes this
- * BEFORE and AFTER the worker-head fetch; the delta is the ACTUAL packed bytes
- * the fetch transferred — the compressed pack, not the summed uncompressed
- * object content, which under-counts an incompressible pack at the 500 MB edge
- * (review r3 finding 4). KiB rounding is negligible against a 500 MB cap.
+ * BEFORE and AFTER the worker-head fetch; the delta bounds the fetch's transfer
+ * by its on-disk store footprint — the COMPRESSED pack (plus its index and KiB
+ * rounding), not the summed UNCOMPRESSED object content, which under-counts an
+ * incompressible pack at the 500 MB edge (review r3 finding 4). It is a
+ * conservative proxy for the wire transfer, not the exact wire byte count
+ * (review r4 finding 6): it includes index/rounding overhead, so it never
+ * under-bounds the pack, which is the safe direction for an admission cap.
  */
 export function storeSizeBytes(dir: string): number {
   const raw = git(dir, "count-objects", "-v");
@@ -349,8 +375,11 @@ export function objectSize(dir: string, oid: string): number {
  * count above (which deduplicates and adds the commit).
  */
 export function treeEntryCount(dir: string, treeSha: string): number {
-  const raw = gitBuf(dir, "ls-tree", "-r", "-t", "-l", "-z", treeSha).toString("utf8");
-  return parseTree(raw).length + 1;
+  // PATH-FREE (`--format=%(objectname)`) so a very-long-path tree cannot overrun
+  // this count's buffer before the budget rejects it (review r4 finding 3).
+  const raw = git(dir, "ls-tree", "-r", "-t", "--format=%(objectname)", treeSha);
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  return lines.length + 1;
 }
 
 /**

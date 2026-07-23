@@ -646,6 +646,68 @@ describe("round-3 falsification fixes", () => {
   });
 });
 
+describe("round-4 falsification fixes", () => {
+  it("rejects an added NTFS 8.3 short-name alias of a protected path (GITATT~1) — r4 #1", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "GITATT~1" }, // 8.3 alias of .gitattributes
+      ]),
+      [base],
+      "add 8.3 alias",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("windows-alias");
+  });
+
+  it("refuses a bare repo and a symlinked objects/pack store — r4 #2", () => {
+    // A bare repo (no .git) is refused outright.
+    const bare = mkdtempTestDir();
+    mkdirSync(join(bare, "objects", "pack"), { recursive: true });
+    expect(() => assertSelfContainedObjectStore(bare)).toThrow(/real `\.git` directory/);
+
+    // A symlinked objects/pack (below the previously-checked levels) is refused.
+    const c = mkdtempTestDir();
+    mkdirSync(join(c, ".git", "objects"), { recursive: true });
+    symlinkSync("/elsewhere/pack", join(c, ".git", "objects", "pack"));
+    expect(() => assertSelfContainedObjectStore(c)).toThrow(/symlink/);
+  });
+
+  it("rejects a huge-object-count tree on its count, without reading leaves or throwing — r4 #3", () => {
+    // >5,000 DISTINCT objects ⇒ rejected on the PATH-FREE count before the leaves
+    // are read (the ENOBUFS route). 5,001 distinct blobs suffices to exercise it.
+    const repo = initRepo();
+    const readme = hashBlob(repo, "# base\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: readme, path: "README.md" }]),
+      [],
+      "base",
+    );
+    const shas = hashManyDistinctBlobs(repo, 5001);
+    const entries: CacheEntry[] = [{ mode: "100644", sha: readme, path: "README.md" }];
+    shas.forEach((sha, i) => {
+      entries.push({ mode: "100644", sha, path: `many/f${String(i).padStart(5, "0")}` });
+    });
+    const head = commitTree(repo, buildTreeBulk(repo, entries), [base], "many distinct");
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(false);
+    expect(r.rejections.map((x) => x.code)).toContain("fetch-object-budget");
+    expect(r.diff).toBeNull();
+  });
+});
+
 // --- helpers ---
 
 function mkdtempTestDir(): string {

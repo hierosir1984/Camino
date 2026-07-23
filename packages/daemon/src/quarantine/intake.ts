@@ -45,6 +45,7 @@ import {
   checkScopeAndProtected,
   checkSubmodules,
   checkSymlinks,
+  REGISTRY_ITEM_11_FETCH_BUDGET,
   SYMLINK_TARGET_MAX_BYTES,
 } from "./policy.js";
 import {
@@ -117,7 +118,9 @@ export function runIntake(
   const pristineDir = initPristineRepo();
   fetchOid(pristineDir, baseRepo, assignment.base, true);
   // Store size AFTER the base fetch, BEFORE the worker fetch: the delta after the
-  // worker fetch is the ACTUAL packed bytes it transferred (review r3 finding 4).
+  // worker fetch bounds the fetch by its on-disk store footprint — the compressed
+  // pack (a conservative proxy for the wire transfer, not exact wire bytes;
+  // review r3 finding 4, r4 finding 6), never the uncompressed content.
   const bytesBeforeWorker = storeSizeBytes(pristineDir);
   const workerHead = fetchOid(pristineDir, workerRepo, workerHeadOid, true);
   const fetchBytes = storeSizeBytes(pristineDir) - bytesBeforeWorker;
@@ -149,18 +152,62 @@ export function runIntake(
   }
 
   const treeSha = treeOf(pristineDir, workerHead);
-  // Leaves (blobs, symlinks, gitlinks) for the path/content checks. Paths that
-  // are not valid UTF-8 decode to U+FFFD and are rejected by checkNameAliases,
-  // so they cannot be silently deduped/collapsed (WP-003 r2).
+
+  // OBJECT COUNTS FIRST, via PATH-FREE reads, so a pathological tree (huge
+  // object count or very-long paths) is rejected on its count BEFORE any
+  // path-bearing read overruns its buffer (review r4 finding 3). The
+  // registry-item-11 fetch object cap is also the PROCESSING cap: a tree over it
+  // is refused without materializing its leaves, which — for a tree within the
+  // cap — are bounded (≤5,000 objects ⇒ ≤5,000 path components ⇒ a few MB).
+  let fetchObjects: number;
+  let entryCount: number;
+  try {
+    fetchObjects = fetchedObjectCount(pristineDir, workerHead, treeSha);
+    entryCount = treeEntryCount(pristineDir, treeSha);
+  } catch {
+    // Even the path-free object-count read overran its buffer ⇒ an absurd object
+    // count, far over the fetch cap. Reject cleanly rather than throw.
+    rejections.push({
+      code: "fetch-object-budget",
+      detail: "worker tree object count exceeds processing bounds",
+    });
+    return {
+      accepted: false,
+      rejections,
+      rebuilt: null,
+      workerHead,
+      diff: null,
+      fetchedObjectCount: 0,
+      pristineDir,
+    };
+  }
+  rejections.push(...checkFetchBudget(fetchObjects, fetchBytes));
+  if (fetchObjects > REGISTRY_ITEM_11_FETCH_BUDGET.maxObjects) {
+    // Over the hard processing cap: do NOT read the leaves (their combined path
+    // bytes are unbounded — the ENOBUFS route). Report the count-only findings
+    // (fetch-object-budget already pushed; add entry-budget if it also applies)
+    // and stop. The per-issue entry-budget below handles the within-cap case.
+    if (entryCount > budgets.maxEntries) {
+      rejections.push({
+        code: "entry-budget",
+        detail: `final tree has ${entryCount} objects, trees + leaves (budget ${budgets.maxEntries})`,
+      });
+    }
+    return {
+      accepted: false,
+      rejections,
+      rebuilt: null,
+      workerHead,
+      diff: null,
+      fetchedObjectCount: distinctObjectCount(pristineDir),
+      pristineDir,
+    };
+  }
+
+  // Within the processing cap (≤5,000 objects): reading the leaves — with paths,
+  // for the path/content checks — is now bounded. Paths that are not valid UTF-8
+  // decode to U+FFFD and are rejected by checkNameAliases (WP-003 r2).
   const entries = treeLeaves(pristineDir, treeSha);
-  // Registry-item-11 FETCH budget consults the DISTINCT transfer footprint:
-  // distinct objects incl. the commit (r1 #8 / r2 #6), and the ACTUAL packed
-  // bytes the fetch added to the store (`fetchBytes`, measured above as the
-  // store-size delta — the real compressed transfer, r3 #4). The per-issue tree
-  // POLICY budget consults the materialized entry count (with repetition), a
-  // distinct measure.
-  const fetchObjects = fetchedObjectCount(pristineDir, workerHead, treeSha);
-  const entryCount = treeEntryCount(pristineDir, treeSha);
   const targets = symlinkTargets(pristineDir, entries);
   const changed = changedPaths(pristineDir, assignment.base, workerHead);
   const changedSet = new Set(changed);
@@ -177,9 +224,6 @@ export function runIntake(
   }
 
   rejections.push(
-    // Registry-item-11 fetch budget: a HARD outer cap on the DISTINCT shallow-
-    // fetch footprint, independent of the per-issue tree-size policy budget below.
-    ...checkFetchBudget(fetchObjects, fetchBytes),
     ...checkScopeAndProtected(changed, assignment.allowedPaths),
     ...checkChangedPathValidity(changed),
     ...checkPathCollisions(entries),

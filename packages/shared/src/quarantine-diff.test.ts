@@ -98,6 +98,16 @@ describe("quarantinedDiffProblems", () => {
     expect(quarantinedDiffProblems(inst).join(" ")).toMatch(/plain object/);
   });
 
+  it("rejects a non-plain (Date / class) changed-path entry — r4", () => {
+    const d = validDiff();
+    const dateEntry = Object.assign(new Date("2026-01-01T00:00:00Z"), {
+      path: "src/x",
+      change: "added",
+    });
+    d["changedPaths"] = [dateEntry];
+    expect(quarantinedDiffProblems(d).join(" ")).toMatch(/must be a plain object/);
+  });
+
   it("rejects base/worker head sha equal to the tree sha (impossible ids) — r3", () => {
     for (const field of ["baseSha", "workerHeadSha"]) {
       const d = validDiff();

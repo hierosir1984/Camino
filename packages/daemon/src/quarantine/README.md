@@ -98,9 +98,14 @@ not scope.
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
   id and **including** the fetched commit, closing the off-by-one and the
-  repeated-path inflation a worker could exploit (review r1 finding 8) — and the
-  summed bytes of ALL those objects (blobs, trees, AND the commit), so object
-  metadata cannot hide from the budget (review r2 finding 6). Worker-controlled
+  repeated-path inflation a worker could exploit (review r1 finding 8). Object
+  counts are read PATH-FREE (`--format=%(objectname)`) and checked BEFORE the
+  leaves are read, so a pathological tree (huge count or very-long paths) is
+  rejected on its count rather than overrunning a path-bearing read buffer
+  (review r4 finding 3). Bytes are the on-disk STORE-FOOTPRINT delta of the
+  worker fetch — the compressed pack (a conservative proxy for the wire
+  transfer, never the uncompressed content that under-counts an incompressible
+  pack; review r3 finding 4, r4 finding 6). Worker-controlled
   commit metadata is separately bounded: a commit object over 1 MiB is rejected
   (`commit-metadata-budget`) before it is read, and the authored candidate
   message is passed on stdin (never argv) and clipped — so an unbounded worker

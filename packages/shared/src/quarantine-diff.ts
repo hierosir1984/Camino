@@ -114,10 +114,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * Total validator for a quarantined-diff record: an empty result means the
  * record is well-formed and internally consistent (the trailer names the
- * worker head; the candidate is neither the worker head nor the base; changed
- * paths are sorted, unique, non-empty and NUL-free). Used at emit (before
- * handing the artifact on) and at adoption (a consumer refuses a record that
- * fails this, never repairs it — the WP-110 contract-validator precedent).
+ * worker head; the candidate is neither the worker head nor the base nor its
+ * own tree; changed paths are sorted, unique, canonical, non-empty and
+ * NUL-free). Used at emit (before handing the artifact on) and at adoption (a
+ * consumer refuses a record that fails this, never repairs it — the WP-110
+ * contract-validator precedent).
+ *
+ * SCOPE, stated (review r4 finding 4): this is total over PLAIN-DATA records —
+ * the JSON-serializable form an artifact actually takes on a store round-trip,
+ * which is the adoption threat. It is NOT hardened against a live in-memory
+ * object that lies BETWEEN reads (a stateful `Proxy`, a side-effecting getter)
+ * or carries non-JSON fields (`Symbol` keys) — such an object never survives
+ * serialization to the store, so it is outside the adoption model. Callers that
+ * hand a live object rather than a parsed record own that trust.
  */
 export function quarantinedDiffProblems(value: unknown): string[] {
   if (!isPlainObject(value)) {
@@ -227,8 +236,11 @@ export function quarantinedDiffProblems(value: unknown): string[] {
     }
     let previous: string | undefined;
     changedPaths.forEach((entry, i) => {
-      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-        problems.push(`changedPaths[${i}] must be an object`);
+      // Plain object only: a `Date` (or any class instance) with own `path` /
+      // `change` fields would validate here but serialize to a string, so the
+      // adopted diff would not round-trip (review r4 finding 4).
+      if (!isPlainObject(entry)) {
+        problems.push(`changedPaths[${i}] must be a plain object`);
         return;
       }
       const cp = entry as Record<string, unknown>;

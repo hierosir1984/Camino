@@ -148,7 +148,9 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
   for (const e of entries) {
     // A path git handed us that did not round-trip as UTF-8 decodes to U+FFFD:
     // its real bytes are non-portable and its identity is ambiguous. Reject
-    // rather than guess (WP-003 r2).
+    // rather than guess (WP-003 r2). A LITERAL U+FFFD filename is indistinguishable
+    // from a decode substitution here and is over-rejected — the safe direction,
+    // and such a name is non-portable anyway (review r4 finding 5).
     if (e.path.includes("�")) {
       out.push({
         code: "windows-alias",
@@ -183,9 +185,42 @@ export function checkNameAliases(entries: readonly TreeEntry[]): Rejection[] {
           detail: `path segment "${seg}" has a trailing dot or space (aliases to "${seg.replace(/[ .]+$/, "")}")`,
         });
       }
+      if (is83ProtectedAlias(seg)) {
+        out.push({
+          code: "windows-alias",
+          path: e.path,
+          detail: `path segment "${seg}" is an NTFS 8.3 short-name alias (may resolve to a different long name, incl. a protected path)`,
+        });
+      }
     }
   }
   return out;
+}
+
+/**
+ * The dotless 6-char (Windows drops leading dots) 8.3 prefixes of the protected
+ * / `.git` names: `.gitattributes`→GITATT, `.gitmodules`→GITMOD, `.github`→
+ * GITHUB, `.camino`→CAMINO, `.git`→GIT. A short name with one of these bases
+ * resolves to the protected long name on NTFS.
+ */
+const PROTECTED_83_BASES = new Set(["gitatt", "gitmod", "github", "camino", "git"]);
+
+/**
+ * Does a segment look like the NTFS 8.3 SHORT NAME of a PROTECTED / `.git`
+ * identity (`GITATT~1`→`.gitattributes`, `GITHUB~1`→`.github`, `GIT~1`→`.git`)?
+ * Windows can create such an alias and it resolves to that long name on access,
+ * so it aliases a protected path the long-name check never sees (review r4
+ * finding 1). Matched narrowly by the protected 8.3 BASES, so a legitimate
+ * `report~2024.txt` / `image~1.png` is NOT over-rejected — only names that
+ * resolve to a protected identity are. Over-rejects only a genuine dir whose
+ * own 8.3 base collides with one of these (e.g. a real `github-x`), the safe
+ * direction.
+ */
+function is83ProtectedAlias(seg: string): boolean {
+  const m = /^([a-z0-9]{1,8})~[0-9]{1,6}(\.[^/.]{1,3})?$/.exec(
+    stripWindowsAlias(seg).toLowerCase(),
+  );
+  return m !== null && PROTECTED_83_BASES.has(m[1]!);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +373,15 @@ export function checkChangedPathValidity(changed: readonly string[]): Rejection[
         code: "windows-alias",
         path,
         detail: `changed path "${path}" is not a canonical repo-root-relative POSIX path`,
+      });
+    }
+    // NTFS 8.3 short-name aliases in a DELETED path (`GITATT~1`) that
+    // checkNameAliases (final-tree entries only) never sees (review r4 finding 1).
+    if (segs.some((s) => is83ProtectedAlias(s))) {
+      out.push({
+        code: "windows-alias",
+        path,
+        detail: `changed path "${path}" contains an NTFS 8.3 short-name alias`,
       });
     }
   }
