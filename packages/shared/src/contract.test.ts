@@ -242,6 +242,38 @@ describe("contractRefProblems", () => {
     }
   });
 
+  it("is TOTAL over a revoked Proxy and defeats NESTED Object.prototype pollution — r10", () => {
+    // A revoked Proxy makes `Array.isArray`/serialization throw — the validator
+    // must return problems, never throw (its "total" guarantee, r10 finding 3).
+    const revocableRef = Proxy.revocable({}, {});
+    revocableRef.revoke();
+    expect(() => contractRefProblems(revocableRef.proxy)).not.toThrow();
+    expect(contractRefProblems(revocableRef.proxy).length).toBeGreaterThan(0);
+    const revocableContract = Proxy.revocable({}, {});
+    revocableContract.revoke();
+    expect(() => contractProblems(revocableContract.proxy)).not.toThrow();
+    expect(contractProblems(revocableContract.proxy).length).toBeGreaterThan(0);
+
+    // NESTED Object.prototype pollution: a `{}` interface must still be rejected —
+    // the recursive null-proto snapshot blocks the chain at every level (r10 #2).
+    const nested: Record<string, unknown> = { name: "x", kind: "api", description: "y" };
+    for (const [k, v] of Object.entries(nested)) {
+      Object.defineProperty(Object.prototype, k, {
+        value: v,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    try {
+      expect(contractProblems({ ...contract(), interfaces: [{}] })).not.toEqual([]);
+    } finally {
+      for (const k of Object.keys(nested)) {
+        delete (Object.prototype as Record<string, unknown>)[k];
+      }
+    }
+  });
+
   it("rejects a NESTED inherited interface and a stateful Proxy ref (JSON snapshot) — r9", () => {
     // A nested interface whose fields are inherited serializes to {} — the
     // top-level own-copy missed it; the JSON snapshot catches it.

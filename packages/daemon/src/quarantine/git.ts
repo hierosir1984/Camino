@@ -241,10 +241,37 @@ export function objectFormatOfRepo(repo: string): "sha1" | "sha256" {
     try {
       const st = lstatSync(p);
       if (!st.isFile() || st.size > MAX_CONFIG_BYTES) continue;
-      const text = readFileSync(p, "utf8");
-      return /^\s*objectformat\s*=\s*sha256\b/im.test(text) ? "sha256" : "sha1";
+      return objectFormatFromConfig(readFileSync(p, "utf8"));
     } catch {
       // try the next candidate path
+    }
+  }
+  return "sha1";
+}
+
+/**
+ * Parse `extensions.objectformat` from git config text — SECTION-AWARE and
+ * quote-tolerant (review r10 finding 5). A section-unaware regex would (a) match
+ * an unrelated `[user] objectformat = sha256`, mis-initializing the pristine
+ * store, and (b) miss git's valid QUOTED value `objectformat = "sha256"`. Only an
+ * `objectformat` key inside the `[extensions]` section (no subsection) counts.
+ */
+function objectFormatFromConfig(text: string): "sha1" | "sha256" {
+  let inExtensions = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/[;#].*$/, "").trim(); // strip inline comments
+    if (line.length === 0) continue;
+    const section = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]$/.exec(line);
+    if (section) {
+      inExtensions = section[1]!.toLowerCase() === "extensions";
+      continue;
+    }
+    if (!inExtensions) continue;
+    const kv = /^objectformat\s*=\s*(.*)$/i.exec(line);
+    if (kv) {
+      let v = kv[1]!.trim();
+      if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+      if (v.toLowerCase() === "sha256") return "sha256";
     }
   }
   return "sha1";
@@ -474,10 +501,14 @@ export function assertSelfContainedObjectStore(repo: string): void {
       );
     }
     // Match git's EXACT include grammar — the `[include]` section (no subsection)
-    // and `[includeIf "<cond>"]` — NOT a differently-named section like
-    // `[include.custom]` / `[include-custom]` / `[include "custom"]`, which git
-    // reads locally without inclusion (review r9 finding 7).
-    if (/^\s*\[\s*include\s*\]/im.test(configText) || /^\s*\[\s*includeif\b/im.test(configText)) {
+    // and `[includeIf "<cond>"]` (a QUOTED condition) — NOT a differently-named
+    // section like `[include.custom]` / `[include-custom]`, nor a subsection-less
+    // `[includeIf]` / `[includeIf.custom]`, none of which git honors as an include
+    // (review r9 finding 7, r10 finding 6).
+    if (
+      /^\s*\[\s*include\s*\]/im.test(configText) ||
+      /^\s*\[\s*includeif\s+"[^"]*"\s*\]/im.test(configText)
+    ) {
       throw new QuarantineGitError(
         "fetch source `.git/config` uses an `[include]`/`[includeIf]` directive — refused; a worker " +
           "clone must not indirect its config (an include path could be a FIFO the serving " +
@@ -639,11 +670,21 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
  */
 export function storeSizeBytes(dir: string): number {
   const objectsDir = join(dir, ".git", "objects");
-  // An entirely ABSENT objects dir is a legitimately empty store (0 bytes). Any
-  // OTHER read failure mid-walk THROWS (review r8 finding 2, r9 finding 3): if the
-  // size cannot be attested, the byte budget must not silently pass — and a
-  // sentinel return value would CANCEL under the intake's before/after delta.
-  if (!existsSync(objectsDir)) return 0;
+  // An ABSENT objects dir is a legitimately empty store (0 bytes) — but ONLY
+  // ENOENT. `existsSync` returns false on ANY error (incl. EACCES on an
+  // unreadable `.git`), which would fail OPEN as "empty" (review r10 finding 4).
+  // Distinguish ENOENT (→ 0) from an inaccessible root (→ throw). Any OTHER read
+  // failure mid-walk also throws (review r8 finding 2, r9 finding 3): if the size
+  // cannot be attested the byte budget must not silently pass, and a sentinel
+  // return value would CANCEL under the intake's before/after delta.
+  try {
+    lstatSync(objectsDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw new QuarantineGitError(
+      "object-store root is inaccessible — refused (fail-closed; review r10 finding 4)",
+    );
+  }
   let total = 0;
   let seen = 0;
   const walk = (abs: string): boolean => {

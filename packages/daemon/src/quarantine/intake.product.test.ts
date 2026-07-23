@@ -4,6 +4,7 @@
 // boundary, and a production-shape smoke test of the real intake entry.
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -36,7 +37,7 @@ import {
   initRepo,
   type CacheEntry,
 } from "./corpus-git.js";
-import { assertSelfContainedObjectStore, objectFormatOfRepo } from "./git.js";
+import { assertSelfContainedObjectStore, objectFormatOfRepo, storeSizeBytes } from "./git.js";
 import { cleanupPristineRepos, runIntake } from "./intake.js";
 import {
   checkFetchBudget,
@@ -1158,6 +1159,54 @@ describe("round-9 falsification fixes", () => {
     mkdirSync(join(sha1, ".git"), { recursive: true });
     writeFileSync(join(sha1, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
     expect(objectFormatOfRepo(sha1)).toBe("sha1");
+  });
+
+  it("parses object format section-aware and quote-tolerant — r10 #5", () => {
+    // A QUOTED value is honored...
+    const quoted = mkdtempTestDir();
+    mkdirSync(join(quoted, ".git"), { recursive: true });
+    writeFileSync(join(quoted, ".git", "config"), '[extensions]\n\tobjectformat = "sha256"\n');
+    expect(objectFormatOfRepo(quoted)).toBe("sha256");
+
+    // ...but an `objectformat` key in an UNRELATED section is NOT.
+    const unrelated = mkdtempTestDir();
+    mkdirSync(join(unrelated, ".git"), { recursive: true });
+    writeFileSync(join(unrelated, ".git", "config"), "[user]\n\tobjectformat = sha256\n");
+    expect(objectFormatOfRepo(unrelated)).toBe("sha1");
+  });
+
+  it("only refuses git's actual includeIf grammar (quoted condition) — r10 #6", () => {
+    // `[includeIf.custom]`, `[includeIf-custom]`, and subsection-less `[includeIf]`
+    // are NOT includes git honors — accept them.
+    for (const header of ["[includeIf.custom]", "[includeIf-custom]", "[includeIf]"]) {
+      const ok = mkdtempTestDir();
+      mkdirSync(join(ok, ".git", "objects"), { recursive: true });
+      writeFileSync(join(ok, ".git", "config"), `${header}\n\tkey = v\n`);
+      expect(() => assertSelfContainedObjectStore(ok)).not.toThrow();
+    }
+    // A real conditional include (quoted condition) IS refused.
+    const bad = mkdtempTestDir();
+    mkdirSync(join(bad, ".git", "objects"), { recursive: true });
+    writeFileSync(join(bad, ".git", "config"), '[includeIf "gitdir:/x"]\n\tpath = /etc/x\n');
+    expect(() => assertSelfContainedObjectStore(bad)).toThrow(/include/);
+  });
+
+  it("storeSizeBytes returns 0 for an absent store but THROWS on an inaccessible one — r10 #4", () => {
+    // ENOENT (no objects dir yet) is a legitimately empty 0-byte store.
+    const empty = mkdtempTestDir();
+    mkdirSync(join(empty, ".git"), { recursive: true });
+    expect(storeSizeBytes(empty)).toBe(0);
+
+    // An UNREADABLE `.git` must fail closed (throw), not read as empty.
+    const locked = mkdtempTestDir();
+    mkdirSync(join(locked, ".git", "objects", "pack"), { recursive: true });
+    writeFileSync(join(locked, ".git", "objects", "pack", "p.pack"), "PACK");
+    chmodSync(join(locked, ".git"), 0o000);
+    try {
+      expect(() => storeSizeBytes(locked)).toThrow(/inaccessible|fail-closed/);
+    } finally {
+      chmodSync(join(locked, ".git"), 0o755); // restore so afterAll cleanup can remove it
+    }
   });
 });
 

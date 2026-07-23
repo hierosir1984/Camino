@@ -166,35 +166,58 @@ function sortedStringList(
 }
 
 /**
+ * A RECURSIVE own-data snapshot of `value`: JSON round-trip (resolving getters/
+ * `toJSON`/Proxy to plain data, refusing non-serializable / circular / revoked-
+ * Proxy input by throwing) then a null prototype set on EVERY nested object. The
+ * validators check AND (for a contract) HASH this one snapshot, so:
+ *  - a NESTED inherited/polluted field is normalized at every level, not just the
+ *    top (review r10 finding 2);
+ *  - hashing reads the SAME snapshot that was validated, so a Proxy cannot expose
+ *    one terms shape to validation and another to the hash recompute (r10 #1);
+ *  - the snapshot is the canonical plain-data form a store persists.
+ * A live object that serializes DIFFERENTLY across calls (a stateful Proxy) is a
+ * caller-trust boundary: the validator validates ONE snapshot; a caller that then
+ * adopts the live object rather than a serialized record owns that risk (the same
+ * scope quarantinedDiffProblems states).
+ */
+function ownDataSnapshot(value: unknown): unknown {
+  const snapshot = JSON.parse(JSON.stringify(value)) as unknown;
+  const nullProtoDeep = (v: unknown): void => {
+    if (Array.isArray(v)) {
+      for (const item of v) nullProtoDeep(item);
+    } else if (v !== null && typeof v === "object") {
+      Object.setPrototypeOf(v, null);
+      for (const k of Object.keys(v as Record<string, unknown>)) {
+        nullProtoDeep((v as Record<string, unknown>)[k]);
+      }
+    }
+  };
+  nullProtoDeep(snapshot);
+  return snapshot;
+}
+
+/**
  * Total validator for a contract record, hash INCLUDED: an empty result
  * means the record is well-formed and its contractHash equals the
  * recomputed hash of its terms. Used at freeze (before insert) and at
  * adoption (a store row that fails this is refused, never repaired).
  */
 export function contractProblems(value: unknown): string[] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // TOTAL — never throw, even on a revoked Proxy (whose `Array.isArray` throws):
+  // do the serializable-shape checks on the SNAPSHOT, inside the catch (review
+  // r10 finding 3). `typeof` on the original is safe (it does not trap).
+  if (value === null || typeof value !== "object") {
     return ["contract must be a plain object"];
   }
-  // Validate a JSON ROUND-TRIP SNAPSHOT (review r8 finding 5, r9 finding 5): a
-  // top-level own-copy still followed the prototype chain for NESTED records
-  // (an inherited `interfaces[]` entry) and could not normalize a stateful
-  // `Proxy`. The round-trip resolves every level to the exact own-enumerable
-  // plain data a store persists — inherited/polluted/Proxy fields vanish or
-  // normalize — and a non-serializable value is refused outright.
   let record: Record<string, unknown>;
   try {
-    record = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+    record = ownDataSnapshot(value) as Record<string, unknown>;
   } catch (err) {
     return [`contract is not JSON-serializable: ${(err as Error).message}`];
   }
-  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
     return ["contract must be a plain object"];
   }
-  // NULL the prototype of the snapshot: `JSON.parse` returns an object whose proto
-  // is `Object.prototype`, so a field-read like `record["issueId"]` would still
-  // follow the chain to a non-enumerable `Object.prototype` pollution (review r8
-  // finding 5). With a null proto, every read sees own data only.
-  Object.setPrototypeOf(record, null);
   const problems: string[] = [];
   if (record["schemaVersion"] !== CONTRACT_SCHEMA_VERSION) {
     problems.push(
@@ -290,7 +313,10 @@ export function contractProblems(value: unknown): string[] {
     // canonicalizer refuses becomes a named problem, never a throw
     // (r1 finding 7).
     try {
-      const recomputed = contractHash(contractTermsOf(value as IssueContract));
+      // Hash the validated SNAPSHOT, not the original `value` (review r10 finding
+      // 1): a stateful Proxy could otherwise serialize terms T1 to validation but
+      // expose T2 to this recompute, passing while its persisted form fails.
+      const recomputed = contractHash(contractTermsOf(record as unknown as IssueContract));
       if (recomputed !== hash) {
         problems.push(
           `contractHash ${hash} does not match the recomputed terms hash ${recomputed} — ` +
@@ -340,27 +366,24 @@ export interface ContractRef {
 
 /** Total validator for a ContractRef; empty result licenses the cast. */
 export function contractRefProblems(value: unknown): string[] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // TOTAL and OWN-DATA-ONLY (review r7 finding 11, r8 finding 5, r9 finding 5,
+  // r10 finding 3): validate a recursive null-proto JSON snapshot — the exact
+  // plain data a store persists — so an inherited-only ref, a non-enumerable
+  // `Object.prototype` pollution (which makes even `{}` read as populated), and a
+  // stateful/revoked `Proxy` are all normalized or refused, never accepted and
+  // never thrown on.
+  if (value === null || typeof value !== "object") {
     return ["contractRef must be a plain object"];
   }
-  // Validate a JSON ROUND-TRIP SNAPSHOT (review r7 finding 11, r8 finding 5, r9
-  // finding 5): an inherited-only ref (`Object.create(validRef)`), a non-
-  // enumerable `Object.prototype` pollution (which makes even `{}` read as
-  // populated), and a stateful `Proxy` all pass a direct/own-copy read yet
-  // serialize to a DIFFERENT record. The round-trip validates exactly the plain
-  // data a store persists; a non-serializable value is refused.
   let record: Record<string, unknown>;
   try {
-    record = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+    record = ownDataSnapshot(value) as Record<string, unknown>;
   } catch (err) {
     return [`contractRef is not JSON-serializable: ${(err as Error).message}`];
   }
-  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
     return ["contractRef must be a plain object"];
   }
-  // NULL the snapshot's prototype so a field-read cannot follow the chain to a
-  // non-enumerable `Object.prototype` pollution (review r8 finding 5).
-  Object.setPrototypeOf(record, null);
   const problems: string[] = [];
   boundedText("contractRef.issueId", record["issueId"], problems);
   const version = record["contractVersion"];

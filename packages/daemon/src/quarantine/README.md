@@ -88,9 +88,11 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   config), so a worker cannot use it to run code during the fetch. The intake
   ALSO refuses a worker `.git/config` that is a FIFO/special node, is over a size
   cap (bounded read, review r9 finding 2), or uses git's `[include]` /
-  `[includeIf "…"]` directive (matched by git's EXACT section grammar, not a
-  differently-named `[include.custom]` that git reads locally; review r9 finding
-  7): an include `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
+  `[includeIf "…"]` directive (matched by git's EXACT section grammar — the bare
+  `[include]` and an `[includeIf "<quoted condition>"]` only, not a
+  differently-named `[include.custom]` nor a subsection-less `[includeIf]` git
+  reads locally without inclusion; review r9 finding 7, r10 finding 6): an include
+  `path` pointing at a FIFO makes the serving `upload-pack` BLOCK,
   orphaning a descendant even for a fully stopped worker (review r8 finding 1).
   The remaining repo-config exec/indirection surface
   (e.g. an include pointing OUTSIDE `.git`) is bounded by the fetch env carrying
@@ -126,8 +128,11 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   1, 2). Replacement refs are additionally disabled in the pristine store
   (`core.useReplaceRefs=false`). The OID grammar accepts 40-hex (sha-1) OR 64-hex
   (sha-256), and the pristine store is initialized with the TRUSTED base's object
-  format — read from its config file, never via a git-exec that would honor the
-  repo's config — so a sha-256 intake actually fetches (review r9 finding 4).
+  format — read from its config file (a section-aware, quote-tolerant parse of
+  `[extensions] objectformat`, so an unrelated section's key does not mis-init and
+  git's quoted value is honored; review r9 finding 4, r10 finding 5), never via a
+  git-exec that would honor the repo's config — so a sha-256 intake actually
+  fetches.
 - **The worker object store must be self-contained — under a stopped-worker
   CUSTODY PRECONDITION.** Before fetching, the intake requires a full non-bare
   clone (a real `.git` directory), refuses a `commondir` redirect, and walks the
@@ -177,8 +182,10 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   500 MB could shrink under the cap (review r8 finding 2, r9 finding 3). The walk
   **throws** (fails the intake CLOSED) past the scan cap OR on any read failure of
   an existing entry — never returns a sentinel that could cancel under the
-  before/after subtraction (review r9 finding 3); an absent objects dir alone is a
-  legitimately empty 0-byte store. Worker-controlled
+  before/after subtraction (review r9 finding 3). Only an **ENOENT** objects dir
+  is a legitimately empty 0-byte store; an inaccessible root (`EACCES`) throws
+  rather than reading as empty, distinguished by errno not `existsSync` (review
+  r10 finding 4). Worker-controlled
   commit metadata is separately bounded: a commit object over 1 MiB is rejected
   (`commit-metadata-budget`) before it is read, and the authored candidate
   message is passed on stdin (never argv) and clipped — so an unbounded worker
@@ -293,14 +300,19 @@ JSON round-trip so the emitted artifact holds owned primitives, never a live
   the same over-reject-safe direction the intake already takes). Contract identity
   is consistent end to end: both the `IssueContract` validator and its
   `ContractRef` require a `Number.isSafeInteger` version (review r7 finding 8),
-  and BOTH validators copy own-enumerable fields into a null-proto record before
-  checking, so an inherited-only record (`Object.create(valid)`) OR a
-  non-enumerable `Object.prototype` pollution (which makes even `{}` read as
-  populated) — either of which serializes to `{}` — cannot license adoption
-  (review r7 finding 11, r8 finding 5). The intake also snapshots a caller's
-  `contractRef` through a JSON round-trip, so a `toJSON`/getter-backed ref is
-  emitted as owned primitives that cannot mutate to malformed after return (review
-  r8 finding 3).
+  and BOTH validators are TOTAL over a **recursive null-prototype JSON snapshot** —
+  the exact plain data a store persists — which they also HASH (never the original
+  `value`). So an inherited-only record (`Object.create(valid)`), a non-enumerable
+  `Object.prototype` pollution at ANY nesting level (which makes even `{}` read as
+  populated), a stateful/revoked `Proxy`, and a non-serializable value are all
+  normalized or refused, never accepted and never thrown on (review r7 finding 11,
+  r8 finding 5, r9 finding 5, r10 findings 1–3). **Boundary:** a live object that
+  serializes DIFFERENTLY across calls is a caller-trust surface — the validator
+  validates ONE snapshot, and a caller that then adopts the live object rather
+  than a serialized record owns that risk (the scope `quarantinedDiffProblems`
+  states). The intake also snapshots a caller's `contractRef` through a JSON
+  round-trip, so a `toJSON`/getter-backed ref is emitted as owned primitives that
+  cannot mutate to malformed after return (review r8 finding 3).
 
 ## Running the suites
 
