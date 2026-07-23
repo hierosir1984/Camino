@@ -42,11 +42,20 @@ import { join } from "node:path";
 import { decideReconciliation, statusOnlyVerdict } from "@camino/core";
 import type { IntentSnapshot, ObservedFacts, ReconcileVerdict } from "@camino/core";
 import type { ExternalOperationSpec, GitHubQueryTransport } from "@camino/shared";
+import type { LeaseRecoveryReport } from "@camino/shared";
 import { CanonFactsStore } from "./canon-facts.js";
 import { CanonLedgerStore } from "./canon-ledger.js";
+import { SqliteDomainStore } from "./domain-store.js";
 import { SqliteEventStore } from "./event-store.js";
 import { GapDispositionsStore } from "./gap-dispositions.js";
 import { IntentJournal } from "./intent-journal.js";
+import { PlanStore } from "./plan-store.js";
+import { PlanningService } from "./planning.js";
+import type { ResumeReport } from "./planning.js";
+import { ArchiveLedgerStore } from "./scheduler/archive-ledger.js";
+import { AttemptSummaryStore } from "./scheduler/summary-store.js";
+import { SqliteLeaseStore } from "./scheduler/lease-store.js";
+import { SerializationScheduler } from "./serialization-scheduler.js";
 import { TransitionRecorder } from "./transition-recorder.js";
 import { WriterLock } from "./writer-lock.js";
 
@@ -82,7 +91,34 @@ export interface RecoveredState {
   readonly canonFacts: CanonFactsStore;
   /** WP-122: David's gap-register disposition events (CAM-CANON-05). */
   readonly gapDispositions: GapDispositionsStore;
+  /** WP-114: the domain store (missions/repos), opened under the same lock. */
+  readonly domain: SqliteDomainStore;
+  /** WP-114: the WP-110 plan store — planning state now runs in the daemon process. */
+  readonly planStore: PlanStore;
+  /** WP-114: the planning service, resume already run (see planningResume). */
+  readonly planning: PlanningService;
+  /** WP-114: the mission-lane scheduler over the recovered recorder (WP-103). */
+  readonly serialization: SerializationScheduler;
+  /** WP-114: the attempt-lease store (CAM-STATE-04). */
+  readonly leases: SqliteLeaseStore;
+  /** WP-114: structured failure-handoff summaries (CAM-PLAN-09). */
+  readonly summaries: AttemptSummaryStore;
+  /** WP-114: the archival ledger rows (A.4#5 step 2). */
+  readonly archiveLedger: ArchiveLedgerStore;
   readonly report: RecoveryReport;
+  /**
+   * WP-114 (decision-package item 7): PlanningService.resumePendingWork()
+   * runs as part of recovery — interrupted freezes/approvals complete or
+   * refuse loudly before anything else builds on the planning state.
+   */
+  readonly planningResume: ResumeReport;
+  /**
+   * WP-114 (CAM-STATE-06 lease clause): every held lease classified live
+   * vs lapsed at recovery. Lapsed leases are FENCED by the store's steady
+   * state (stale generations rejected; re-grant only after kill-confirm);
+   * this report is the inspection evidence plus the kill-confirm worklist.
+   */
+  readonly leaseRecovery: LeaseRecoveryReport;
   close(): void;
 }
 
@@ -114,6 +150,13 @@ export const STATE_FILES = Object.freeze({
   canonLedger: "canon-ledger.sqlite",
   canonFacts: "canon-facts.sqlite",
   gapDispositions: "gap-dispositions.sqlite",
+  // WP-114: planning state joins the daemon process (decision-package item
+  // 7) and the scheduler's durable stores land (CAM-STATE-04, CAM-PLAN-09).
+  domain: "domain.sqlite",
+  planStore: "plan-store.sqlite",
+  leases: "leases.sqlite",
+  attemptSummaries: "attempt-summaries.sqlite",
+  archiveLedger: "archive-ledger.sqlite",
 } as const);
 
 /**
@@ -140,6 +183,11 @@ export function openRecoveredState(
   let canonLedger: CanonLedgerStore | undefined;
   let canonFacts: CanonFactsStore | undefined;
   let gapDispositions: GapDispositionsStore | undefined;
+  let domain: SqliteDomainStore | undefined;
+  let planStore: PlanStore | undefined;
+  let leases: SqliteLeaseStore | undefined;
+  let summaries: AttemptSummaryStore | undefined;
+  let archiveLedger: ArchiveLedgerStore | undefined;
   try {
     eventStore = new SqliteEventStore(join(stateDir, STATE_FILES.events), {
       ...(options.now === undefined ? {} : { now: options.now }),
@@ -170,12 +218,57 @@ export function openRecoveredState(
       ...(options.now === undefined ? {} : { now: options.now }),
       writerLock: lock,
     });
+    // WP-114: the domain + plan stores open under the same lock — planning
+    // state now runs in the daemon process (decision-package item 7) —
+    // followed by the scheduler's durable stores.
+    domain = new SqliteDomainStore(join(stateDir, STATE_FILES.domain), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+    planStore = new PlanStore(join(stateDir, STATE_FILES.planStore), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
+    leases = new SqliteLeaseStore(join(stateDir, STATE_FILES.leases), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
+    summaries = new AttemptSummaryStore(join(stateDir, STATE_FILES.attemptSummaries), {
+      writerLock: lock,
+    });
+    archiveLedger = new ArchiveLedgerStore(join(stateDir, STATE_FILES.archiveLedger), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
     const report = reconcileIntents(journal, queries, options);
+    // WP-114: planning resume runs INSIDE recovery — interrupted freezes,
+    // approvals, and ledger pairs complete (or refuse loudly) here, so
+    // nothing downstream builds on half-finished planning state.
+    const serialization = new SerializationScheduler(domain, recorder, eventStore);
+    const planning = new PlanningService(
+      planStore,
+      domain,
+      recorder,
+      eventStore,
+      canonLedger,
+      serialization,
+      { ...(options.now === undefined ? {} : { now: options.now }) },
+    );
+    const planningResume = planning.resumePendingWork();
+    // WP-114 (CAM-STATE-06 lease clause): inspect every held lease. The
+    // FENCE is the store's steady state — a lapsed lease already refuses
+    // stale-generation writes and re-grant-without-kill-confirm whether or
+    // not this inspection ran; the report is evidence plus the worklist.
+    const leaseRecovery = leases.inspectRecovered(options.now?.());
     const openJournal = journal;
     const openStore = eventStore;
     const openCanonLedger = canonLedger;
     const openCanonFacts = canonFacts;
     const openGapDispositions = gapDispositions;
+    const openDomain = domain;
+    const openPlanStore = planStore;
+    const openLeases = leases;
+    const openSummaries = summaries;
+    const openArchiveLedger = archiveLedger;
     return {
       lock,
       eventStore,
@@ -184,7 +277,16 @@ export function openRecoveredState(
       canonLedger,
       canonFacts,
       gapDispositions,
+      domain,
+      planStore,
+      planning,
+      serialization,
+      leases,
+      summaries,
+      archiveLedger,
       report,
+      planningResume,
+      leaseRecovery,
       close(): void {
         // Exception-safe teardown (review round 1 finding 14; round 2
         // finding 11 folded the lock release into the guarded set; round
@@ -198,6 +300,11 @@ export function openRecoveredState(
         // failure. This is best-effort invocation with deterministic
         // precedence, not a proof that every underlying handle closed.
         const failures = closeAll([
+          () => openArchiveLedger.close(),
+          () => openSummaries.close(),
+          () => openLeases.close(),
+          () => openPlanStore.close(),
+          () => openDomain.close(),
           () => openGapDispositions.close(),
           () => openCanonFacts.close(),
           () => openCanonLedger.close(),
@@ -213,6 +320,11 @@ export function openRecoveredState(
     // of everything opened so far INCLUDING the lock release, and the
     // ORIGINAL refusal (not a secondary close/release failure) rethrown.
     closeAll([
+      () => archiveLedger?.close(),
+      () => summaries?.close(),
+      () => leases?.close(),
+      () => planStore?.close(),
+      () => domain?.close(),
       () => gapDispositions?.close(),
       () => canonFacts?.close(),
       () => canonLedger?.close(),

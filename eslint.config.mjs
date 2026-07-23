@@ -178,6 +178,10 @@ export default tseslint.config(
       "packages/daemon/src/dispatch/adapters/mock-cli.mjs",
       // The planner runner's fake worker (WP-110, same zero-quota pattern).
       "packages/daemon/src/plan-mock-planner-cli.mjs",
+      // The out-of-process budget supervisor child (WP-114): deliberately
+      // dependency-free plain ESM so the authoritative bound needs no
+      // toolchain to run.
+      "packages/daemon/src/scheduler/supervisor-child.mjs",
     ],
     languageOptions: {
       globals: {

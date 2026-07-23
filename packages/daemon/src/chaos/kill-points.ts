@@ -33,6 +33,22 @@ export const KILL_POINTS = [
   "recovery-after-resolution-append",
   /** Recovery: between the ambiguity row and its escalation row. */
   "recovery-between-ambiguity-and-escalation",
+  // WP-114 dispatch protocol (both sides of the worker external call —
+  // the attempt-scheduler module header names the step each gap follows).
+  /** Planning: approval act durable, freeze/completion not yet run (WP-110 resume seam). */
+  "scheduler-after-plan-approval-recorded",
+  /** Scheduler: lease durable, issue not yet claimed. */
+  "scheduler-after-lease-granted",
+  /** Scheduler: issue claimed (A.2#3), attempt not yet recorded. */
+  "scheduler-after-issue-claimed",
+  /** Scheduler: attempt recorded (A.3#1), worker-started not yet recorded. */
+  "scheduler-after-attempt-recorded",
+  /** Scheduler: worker-started durable (A.2#6), worker not yet spawned. */
+  "scheduler-after-worker-started",
+  /** Scheduler: worker exited (effect external), outcome not yet recorded. */
+  "scheduler-before-outcome-recorded",
+  /** Scheduler: outcome routing complete. */
+  "scheduler-after-outcome-recorded",
 ] as const;
 export type KillPointName = (typeof KILL_POINTS)[number];
 
