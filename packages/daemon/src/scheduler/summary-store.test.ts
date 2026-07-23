@@ -57,6 +57,17 @@ describe("AttemptSummaryStore", () => {
     );
   });
 
+  it("replay is TIMESTAMP-stable: a crash-replay at a later instant returns the original row", () => {
+    // Round-1 finding 6: recordedAt is the store's evidence of the FIRST
+    // write, excluded from the conflict comparison — a re-derived summary
+    // recorded after the crash must not strand the attempt on a refusal.
+    const { store } = newStore();
+    const first = store.record(summary(1, { recordedAt: "2026-07-23T10:01:00.000Z" }));
+    const replayed = store.record(summary(1, { recordedAt: "2026-07-23T11:59:59.000Z" }));
+    expect(replayed.recordedAt).toBe(first.recordedAt);
+    expect(store.forIssue("m1.I1")).toHaveLength(1);
+  });
+
   it("refuses an invalid summary on write (the closed-schema guarantee)", () => {
     const { store } = newStore();
     expect(() =>

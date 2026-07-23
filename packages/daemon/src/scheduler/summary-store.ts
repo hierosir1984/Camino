@@ -170,8 +170,15 @@ export class AttemptSummaryStore {
       .prepare("SELECT * FROM attempt_summaries WHERE attempt_id = ?")
       .get(snapshot.attemptId) as SummaryRow | undefined;
     if (existing !== undefined) {
-      if (existing.record === serialized) {
-        return JSON.parse(existing.record) as AttemptSummary;
+      // Replay compares CONTENT, not the clock (falsification round 1,
+      // finding 6): a crash-replay re-derives the same summary at a later
+      // instant, and `recordedAt` is the store's evidence of the FIRST
+      // write — so it is excluded from the conflict comparison and the
+      // original row always wins. Everything else differing is a conflict.
+      const stored = JSON.parse(existing.record) as AttemptSummary;
+      const withoutInstant = (s: AttemptSummary): string => canonicalJson({ ...s, recordedAt: "" });
+      if (withoutInstant(stored) === withoutInstant(snapshot)) {
+        return stored;
       }
       throw new Error(
         `attempt ${snapshot.attemptId} already has a recorded summary with different content — ` +

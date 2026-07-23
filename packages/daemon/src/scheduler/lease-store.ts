@@ -50,7 +50,15 @@ import {
 // Pre-release schema iterations BUMP this version rather than migrating
 // (the WP-106 window-tracker convention): no store ships before this work
 // package merges, so an older store is refused with the precise message.
-const SCHEMA_VERSION = 1;
+// Bumped 1 → 2 (falsification round 1, finding 4): the settlement triggers
+// now demand the settlement EVIDENCE in SQL (released ⇒ outcome recorded;
+// kill-confirmed ⇒ instant + source recorded), generation updates advance
+// by EXACTLY one, and heartbeats never regress — an in-band writer that
+// bypasses this class dies on the same guards the API enforces. NAMED
+// BOUNDARY, restated: this is tamper-EVIDENT depth, not proof — a
+// filesystem writer can still rebuild the whole file; that perimeter is
+// the 0700 state directory + the WP-104 writer lock, as for every store.
+const SCHEMA_VERSION = 2;
 
 const DISPATCH_OUTCOMES: readonly DispatchOutcome[] = [
   "succeeded",
@@ -82,9 +90,9 @@ CREATE TABLE IF NOT EXISTS leases (
 
 CREATE TRIGGER IF NOT EXISTS lease_env_monotonic
 BEFORE UPDATE ON lease_environments
-WHEN NEW.current_generation <= OLD.current_generation OR NEW.environment_id != OLD.environment_id
+WHEN NEW.current_generation != OLD.current_generation + 1 OR NEW.environment_id != OLD.environment_id
 BEGIN
-  SELECT RAISE(ABORT, 'lease generations are monotonic per environment: non-increasing update rejected');
+  SELECT RAISE(ABORT, 'lease generations advance by exactly one: any other update rejected');
 END;
 
 CREATE TRIGGER IF NOT EXISTS lease_env_no_delete
@@ -143,6 +151,27 @@ BEFORE UPDATE ON leases
 WHEN OLD.state != 'held'
 BEGIN
   SELECT RAISE(ABORT, 'a settled lease is absorbing: further updates rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS leases_release_carries_outcome
+BEFORE UPDATE ON leases
+WHEN NEW.state = 'released' AND NEW.released_outcome IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'a release must record its dispatch outcome: evidence-free release rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS leases_kill_confirm_carries_evidence
+BEFORE UPDATE ON leases
+WHEN NEW.state = 'kill-confirmed' AND (NEW.kill_confirmed_at IS NULL OR NEW.kill_confirm_source IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'a kill-confirm must record its instant and source: evidence-free confirm rejected');
+END;
+
+CREATE TRIGGER IF NOT EXISTS leases_heartbeat_never_regresses
+BEFORE UPDATE ON leases
+WHEN NEW.state = 'held' AND NEW.heartbeat_at < OLD.heartbeat_at
+BEGIN
+  SELECT RAISE(ABORT, 'heartbeats never regress: backdated heartbeat rejected');
 END;
 `;
 
@@ -408,6 +437,15 @@ export class SqliteLeaseStore implements EnvironmentLeaseStore {
   current(environmentId: string): EnvironmentLeaseView | undefined {
     assertKey("environmentId", environmentId);
     const row = this.#currentRow(environmentId);
+    return row === undefined ? undefined : this.#toView(row);
+  }
+
+  at(environmentId: string, generation: number): EnvironmentLeaseView | undefined {
+    assertKey("environmentId", environmentId);
+    this.#assertGeneration(generation);
+    const row = this.#db
+      .prepare("SELECT * FROM leases WHERE environment_id = ? AND generation = ?")
+      .get(environmentId, generation) as LeaseRow | undefined;
     return row === undefined ? undefined : this.#toView(row);
   }
 

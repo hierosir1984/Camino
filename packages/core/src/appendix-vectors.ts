@@ -1306,7 +1306,12 @@ export const ATTEMPT_LEGAL: readonly LegalVector<AttemptState, AttemptEvent>[] =
   {
     ref: "A.3#1",
     from: null,
-    event: { type: "attempt-dispatched", leaseGranted: true, leaseGeneration: 1 },
+    event: {
+      type: "attempt-dispatched",
+      leaseGranted: true,
+      leaseGeneration: 1,
+      contractRef: { issueId: "m1.I1", contractVersion: 1, contractHash: "a".repeat(64) },
+    },
     to: "running",
   },
   {
@@ -1506,7 +1511,24 @@ export const ATTEMPT_ILLEGAL: readonly IllegalVector<AttemptState, AttemptEvent>
   {
     name: "dispatch without a lease generation",
     from: null,
-    event: { type: "attempt-dispatched", leaseGranted: true, leaseGeneration: 0 },
+    event: {
+      type: "attempt-dispatched",
+      leaseGranted: true,
+      leaseGeneration: 0,
+      contractRef: { issueId: "m1.I1", contractVersion: 1, contractHash: "a".repeat(64) },
+    },
+    expect: "guard-rejected",
+  },
+  {
+    // CAM-PLAN-04 attempt half (WP-110 amendment): an attempt record
+    // without its ContractRef is guard-refused, not merely discouraged.
+    name: "dispatch without a contract reference",
+    from: null,
+    event: {
+      type: "attempt-dispatched",
+      leaseGranted: true,
+      leaseGeneration: 1,
+    } as unknown as AttemptEvent,
     expect: "guard-rejected",
   },
 ];

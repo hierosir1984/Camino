@@ -15,8 +15,12 @@
  *     and a killed container is gone with every namespaced pid.
  */
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireDockerDaemon } from "../worker/docker.js";
+import { composeContainerRun, provisionAndArm } from "./container-inputs.js";
 import {
   assertCaminoBuiltImage,
   buildWorkerImage,
@@ -169,6 +173,90 @@ describe("authoritative out-of-process budget bound (CAM-EXEC-03, the load-beari
       await new Promise((r) => setTimeout(r, 1500));
       expect(await confirmContainerGone(name, provenance.dockerPath)).toBe(false);
       docker(["rm", "-f", name]);
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    "closes the LATE-START race: a created container cannot start past its deadline (round-1 finding 2)",
+    async () => {
+      const name = `camino-sup-late-${Date.now().toString(36)}`;
+      containers.push(name);
+      // The race-free protocol's shape: the container EXISTS (created)
+      // before the supervisor arms; a start delayed past the deadline
+      // finds it removed — or is promptly killed if it slipped through.
+      docker([
+        "create",
+        "--rm",
+        "--name",
+        name,
+        "--entrypoint",
+        "/bin/sleep",
+        provenance.imageId,
+        "120",
+      ]);
+      const armed = armContainerSupervisor({
+        containerName: name,
+        wallClockMs: 1500,
+        dockerPath: provenance.dockerPath,
+      });
+      try {
+        await new Promise((r) => setTimeout(r, 5000)); // deadline passes; the child enforces
+        let startFailed = false;
+        try {
+          docker(["start", name]);
+        } catch {
+          startFailed = true;
+        }
+        if (!startFailed) {
+          // The start slipped into the enforcement loop's window: the next
+          // iteration removes the now-running container.
+          let gone = false;
+          for (let i = 0; i < 20 && !gone; i++) {
+            gone = await confirmContainerGone(name, provenance.dockerPath);
+            if (!gone) await new Promise((r) => setTimeout(r, 500));
+          }
+          expect(gone).toBe(true);
+        } else {
+          expect(startFailed).toBe(true);
+        }
+      } finally {
+        armed.disarm();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  it(
+    "provisionAndArm over the real daemon: create first, then arm (the composed protocol)",
+    async () => {
+      const workspace = mkdtempSync(join(tmpdir(), "camino-obligation-ws-"));
+      try {
+        const composed = composeContainerRun({
+          image: provenance,
+          network,
+          allowlist: [],
+          workspaceHostPath: workspace,
+          budget: { wallClockMs: 60_000 },
+          cmd: ["true"],
+        });
+        containers.push(composed.containerName);
+        const supervisor = await provisionAndArm(composed);
+        try {
+          const state = docker([
+            "inspect",
+            "--format",
+            "{{.State.Status}}",
+            composed.containerName,
+          ]).trim();
+          expect(state).toBe("created");
+        } finally {
+          supervisor.disarm();
+          docker(["rm", "-f", composed.containerName]);
+        }
+      } finally {
+        rmSync(workspace, { recursive: true, force: true });
+      }
     },
     TEST_TIMEOUT,
   );

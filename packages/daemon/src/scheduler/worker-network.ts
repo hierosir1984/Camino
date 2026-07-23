@@ -84,6 +84,15 @@ export function attestWorkerNetwork(
   if (id === undefined || name === undefined || driver === undefined) {
     throw new WorkerNetworkError(`network inspect returned an unreadable record for ${networkId}`);
   }
+  // The record must be ABOUT the requested id (a full id, or the full id
+  // the requested unique prefix resolves to) — an answer describing some
+  // other network attests nothing about this one.
+  if (!id.toLowerCase().startsWith(networkId.toLowerCase())) {
+    throw new WorkerNetworkError(
+      `network inspect answered for ${id}, not the requested ${networkId} — refusing a record ` +
+        "that does not describe the network being attested",
+    );
+  }
   if (RESERVED_NETWORK_NAMES.has(name)) {
     throw new WorkerNetworkError(
       `network ${networkId} is the built-in "${name}" network — workers run only on Camino-created bridges`,

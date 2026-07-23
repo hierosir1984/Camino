@@ -59,6 +59,7 @@ import type { ProviderWindowState, WindowConsumptionEstimate } from "../routing/
 import {
   ATTEMPT_SUMMARY_SCHEMA_VERSION,
   HARNESS_FAMILY,
+  LEASE_HEARTBEAT_MS,
   PROVIDER_FAMILIES,
   QUOTA_PAUSE_THRESHOLD,
   harnessFamily,
@@ -74,7 +75,12 @@ import { processGroupConfirmedGone } from "../dispatch/lifecycle.js";
 import type { RecordOutcome, TransitionRecorder } from "../transition-recorder.js";
 import { SCHEDULER_ACTOR } from "../serialization-scheduler.js";
 import type { AttemptSummaryStore } from "./summary-store.js";
-import { selectNextDispatch, type DispatchHold, type IssueStateSnapshot } from "./readiness.js";
+import {
+  latestContracts,
+  selectNextDispatch,
+  type DispatchHold,
+  type IssueStateSnapshot,
+} from "./readiness.js";
 
 /**
  * Resume policy for a provider with NO recorded window shape after an
@@ -199,6 +205,23 @@ export interface SchedulerRecoveryReport {
   readonly settledNeverSpawned: readonly string[];
   /** Attempts needing a REAL kill-confirm before settlement (worker may live). */
   readonly requiresKillConfirm: readonly InterruptedAttempt[];
+  /**
+   * Attempts whose lease was durably RELEASED with a non-success outcome:
+   * the dispatch completed before the crash, and recovery routed exactly
+   * that outcome (a quota block stays a quota block, a cancel stays a
+   * cancel — round-1 finding 5).
+   */
+  readonly settledFromDurableOutcome: ReadonlyArray<{
+    readonly issueId: string;
+    readonly attemptId: string;
+    readonly outcome: string;
+  }>;
+  /**
+   * Attempts whose lease says the dispatch SUCCEEDED: never auto-failed.
+   * The workspace is intact; completeSucceededInterrupted routes the
+   * submission once the final head is re-fetched.
+   */
+  readonly succeededAwaitingSubmission: readonly InterruptedAttempt[];
 }
 
 export interface AttemptSchedulerDeps {
@@ -263,7 +286,7 @@ export class AttemptScheduler {
    */
   dispatchNext(
     missionId: string,
-    opts: { features: TaskFeatures; budget: AttemptBudget; environmentId?: string },
+    opts: { features: TaskFeatures; budget: AttemptBudget },
   ): DispatchDecision {
     const mission = this.#requireMission(missionId);
     const missionState = this.#recorder.currentState("mission", missionId);
@@ -279,6 +302,19 @@ export class AttemptScheduler {
     const selection = selectNextDispatch(this.#contracts(missionId), stateOf);
     if (!selection.ok) return { kind: "held", hold: selection.hold };
     const { issueId, contract } = selection;
+
+    // Sequential slot, ATTEMPT grain (round-1 finding 10): issue states
+    // alone are not enough — a running/submitted attempt ENTITY belonging
+    // to any of this mission's issues holds the slot even if its issue's
+    // recorded state has moved (foreign or partially-recovered histories).
+    const missionIssueIds = new Set(this.#contracts(missionId).map((c) => c.issueId));
+    for (const [attemptId, snapshot] of view.attempts) {
+      if (snapshot.state !== "running" && snapshot.state !== "submitted") continue;
+      const owner = holderIssueId(attemptId);
+      if (owner !== undefined && missionIssueIds.has(owner)) {
+        return { kind: "held", hold: { kind: "attempt-active", issueId: owner } };
+      }
+    }
 
     // (harness, model, tier) from the WP-106 policy table; family switch
     // per CAM-PLAN-09 after 2 recorded failures (quota waits never reached
@@ -313,12 +349,31 @@ export class AttemptScheduler {
       return { kind: "quota-paused", issueId, family, pause };
     }
 
-    const environmentId = opts.environmentId ?? validationEnvironmentId(mission.repoId);
+    // The environment is DERIVED, never caller-selectable (round-1 finding
+    // 10): a chooseable environment id would bypass the per-repo lease
+    // serialization the fencing rests on. WP-115 binds real environments
+    // behind this same derivation.
+    const environmentId = validationEnvironmentId(mission.repoId);
     const attemptId = this.#mintAttemptId(issueId, view.attempts.keys());
     const granted = this.#leases.grant(environmentId, attemptId);
     if (!granted.ok) return { kind: "lease-unavailable", issueId, grant: granted };
     const lease = granted.lease;
     this.#hook("scheduler-after-lease-granted");
+
+    // RE-CHECK the mission state in the same synchronous frame as the
+    // records (round-1 finding 9, the WP-103 approvePlan discipline): the
+    // policy-table and window-state calls above are injected callbacks — a
+    // re-entrant callback could have parked the mission after the first
+    // check. From here to the records there are no foreign calls, so the
+    // fact recorded is the fact that held when it was recorded.
+    if (this.#recorder.currentState("mission", missionId) !== "executing") {
+      this.#leases.recordKillConfirm(environmentId, lease.generation, "never-spawned");
+      return {
+        kind: "idle",
+        reason: "mission-not-executing",
+        missionState: this.#recorder.currentState("mission", missionId),
+      };
+    }
 
     const contractRef: ContractRef = {
       issueId: contract.issueId,
@@ -362,6 +417,11 @@ export class AttemptScheduler {
             reasoningTier: assignment.reasoningTier,
           },
           family,
+          // CAM-PLAN-09 family-switch facts, DURABLE (round-1 finding 12):
+          // a due-but-unavailable switch (single-family allowlist) is
+          // recorded evidence, never only a return value.
+          familySwitched,
+          familySwitchUnavailable,
         },
       });
       this.#hook("scheduler-after-attempt-recorded");
@@ -421,6 +481,35 @@ export class AttemptScheduler {
   /** Refresh the attempt's lease heartbeat (every LEASE_HEARTBEAT_MS while running). */
   heartbeat(plan: AttemptDispatchPlan): ReturnType<EnvironmentLeaseStore["heartbeat"]> {
     return this.#leases.heartbeat(plan.environmentId, plan.lease.generation);
+  }
+
+  /**
+   * The production heartbeat DRIVER (round-1 finding 7: the 30-second
+   * cadence must exist as a scheduled loop, not only as a constant): an
+   * unref'd interval that heartbeats the plan's lease until stopped. The
+   * runner arms it when the worker spawns and stops it in its outcome
+   * finally-block; a heartbeat failure surfaces through the TTL (the lease
+   * lapses and fences), never as a crash of the driver.
+   */
+  armHeartbeat(
+    plan: AttemptDispatchPlan,
+    intervalMs: number = LEASE_HEARTBEAT_MS,
+  ): { stop(): void } {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new TypeError("heartbeat interval must be a finite positive number of milliseconds");
+    }
+    const timer = setInterval(() => {
+      try {
+        this.heartbeat(plan);
+      } catch {
+        // A broken store surfaces through the TTL lapse (fencing), not by
+        // crashing the daemon from a timer callback.
+      }
+    }, intervalMs);
+    timer.unref();
+    return {
+      stop: () => clearInterval(timer),
+    };
   }
 
   /**
@@ -666,6 +755,16 @@ export class AttemptScheduler {
    * lease (re-grant now lawful) and records the A.3#5 terminal.
    */
   confirmKillAndSettle(plan: AttemptDispatchPlan, source: KillConfirmSource): OutcomeRouting {
+    if (source === "never-spawned") {
+      // A budget breach implies a worker RAN (round-1 finding 3): the
+      // trivial confirm is attestable only for dispatches the protocol
+      // proves never spawned, which this is not. A caller cannot settle a
+      // possibly-live worker's environment with words.
+      throw new TypeError(
+        "confirmKillAndSettle requires a REAL kill-confirm source (container or process-group): " +
+          "a budget-breached attempt ran a worker; never-spawned cannot be attested for it",
+      );
+    }
     this.#leases.recordKillConfirm(plan.environmentId, plan.lease.generation, source);
     this.#recordAttemptIfActive(
       this.#recorder.currentState("attempt", plan.attemptId),
@@ -689,6 +788,9 @@ export class AttemptScheduler {
     const view = this.#recorder.currentView;
     const settledNeverSpawned: string[] = [];
     const requiresKillConfirm: InterruptedAttempt[] = [];
+    const settledFromDurableOutcome: SchedulerRecoveryReport["settledFromDurableOutcome"][number][] =
+      [];
+    const succeededAwaitingSubmission: InterruptedAttempt[] = [];
     // ORPHAN LEASES first: a held lease whose holder attempt has NO
     // recorded attempt entity is a dispatch killed between the grant
     // (step 1) and the attempt record (step 3) — by the protocol
@@ -740,18 +842,186 @@ export class AttemptScheduler {
         settledNeverSpawned.push(issueId);
         continue;
       }
-      // implementing: the worker may still be alive (kill -9 killed the
-      // daemon, not the worker). Re-grant only after kill-confirm.
-      requiresKillConfirm.push({
+      // implementing: consult the DISPATCH'S OWN lease row first (round-1
+      // finding 5). A RELEASED lease proves the dispatch lifecycle
+      // COMPLETED — the worker group is gone (release is sequenced after
+      // group-gone) and the outcome is durably recorded. Recovery routes
+      // that outcome; it never re-classifies a durably-settled dispatch as
+      // a kill-confirm case (which would count a success as a failure).
+      const leaseRow = this.#leases.at(environmentId, leaseGeneration);
+      const ref: InterruptedAttempt = {
         missionId,
         issueId,
         attemptId,
         environmentId,
         leaseGeneration,
         issueState: "implementing",
-      });
+      };
+      if (leaseRow?.state === "released" && leaseRow.releasedOutcome !== undefined) {
+        const outcome = leaseRow.releasedOutcome;
+        if (outcome === "succeeded") {
+          // NEVER auto-failed: the worker's product exists (workspace
+          // intact). Reported for completeSucceededInterrupted once the
+          // final head is re-fetched — or David's call.
+          succeededAwaitingSubmission.push(ref);
+        } else {
+          this.#settleFromReleasedOutcome(ref, outcome);
+          settledFromDurableOutcome.push({ issueId, attemptId, outcome });
+        }
+        continue;
+      }
+      // Held (worker may still be alive — kill -9 killed the daemon, not
+      // the worker) or already kill-confirmed or missing: a REAL
+      // kill-confirm settles it. Re-grant only after kill-confirm.
+      requiresKillConfirm.push(ref);
     }
-    return { settledNeverSpawned, requiresKillConfirm };
+    return {
+      settledNeverSpawned,
+      requiresKillConfirm,
+      settledFromDurableOutcome,
+      succeededAwaitingSubmission,
+    };
+  }
+
+  /**
+   * Route a durably-released dispatch's outcome during recovery. The
+   * kill-confirm attestations here are licensed by the RELEASE itself:
+   * the lifecycle releases strictly after the worker process group is
+   * confirmed gone (WP-105 ordering), so "the worker is stopped" is
+   * durable fact, not an assumption.
+   */
+  #settleFromReleasedOutcome(
+    ref: InterruptedAttempt,
+    outcome: Exclude<DispatchRecord["outcome"], "succeeded">,
+  ): void {
+    const attemptState = this.#recorder.currentState("attempt", ref.attemptId);
+    switch (outcome) {
+      case "quota-blocked": {
+        this.#recordAttemptIfActive(attemptState, ref.attemptId, "rate-limited", {});
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-quota-blocked", {
+          attemptId: ref.attemptId,
+        });
+        return; // queued-quota; the wait never counts (A.2#11)
+      }
+      case "cancelled": {
+        // The original cancel context did not survive the crash; the
+        // recovery record says so and uses the non-counting A.2#12 row —
+        // a cancel must never inflate the failure counter.
+        this.#record({
+          entityKind: "attempt",
+          entityId: ref.attemptId,
+          event: "attempt-cancel-requested",
+          cause:
+            "recovery: dispatch settled cancelled before outcome recording; original cancel context not durable",
+          payload: { reason: "pause", settledBy: "kill-confirm", summaryWritten: true },
+        });
+        this.#writeRecoverySummary(ref, "cancelled", "cancelled:recovered");
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-cancelled", {
+          reason: "pause",
+          summaryWritten: true,
+        });
+        return;
+      }
+      case "killed-budget": {
+        this.#recordAttemptIfActive(attemptState, ref.attemptId, "attempt-budget-breached", {
+          killConfirmed: true,
+        });
+        this.#writeRecoverySummary(ref, "killed-budget", "budget-breach");
+        this.#recordIssueIfIn(ref, ["implementing", "claimed"], "attempt-budget-breached", {
+          killConfirmed: true,
+        });
+        return; // escalated; never auto-retried (A.2#10)
+      }
+      case "requirement-failed":
+      case "killed": {
+        this.#recordAttemptIfActive(attemptState, ref.attemptId, "heartbeat-lapsed", {
+          killConfirmed: true,
+        });
+        this.#writeRecoverySummary(ref, "expired", `recovered:${outcome}`);
+        this.#recordIssueIfIn(ref, ["implementing"], "attempt-failed", {
+          attemptId: ref.attemptId,
+        });
+        return; // counted — the dispatch genuinely failed (A.2#9)
+      }
+    }
+  }
+
+  /**
+   * Complete a recovered SUCCEEDED dispatch: the caller re-fetched the
+   * intact workspace's final head (the fetch is idempotent — the crash
+   * lost the in-memory record, not the workspace). Routes A.3#3 →
+   * submitted; quarantine/validation take it from there.
+   */
+  completeSucceededInterrupted(
+    ref: InterruptedAttempt,
+    evidence: { finalHeadFetched: boolean },
+  ): void {
+    if (evidence.finalHeadFetched !== true) {
+      throw new TypeError(
+        "completeSucceededInterrupted requires finalHeadFetched: true — without a re-fetched head " +
+          "the submission cannot proceed; escalate to David instead of guessing",
+      );
+    }
+    this.#recordAttemptIfActive(
+      this.#recorder.currentState("attempt", ref.attemptId),
+      ref.attemptId,
+      "worker-completed",
+      { finalHeadFetched: true },
+    );
+  }
+
+  /** A minimal, honest recovery summary (durations/streams not durable → zeros). */
+  #writeRecoverySummary(
+    ref: InterruptedAttempt,
+    terminal: SummaryAttemptTerminal,
+    failureClass: string,
+  ): void {
+    const contract = latestContracts(this.#contracts(ref.missionId)).get(ref.issueId);
+    if (contract === undefined) return; // no contract → no summary (foreign state; events still routed)
+    const table = this.#policyTable();
+    const attemptRecord = this.#events
+      .read({ entityKind: "attempt", entityId: ref.attemptId })
+      .find((r) => r.event === "attempt-dispatched" && r.outcome === "applied");
+    const recordedAssignment = attemptRecord?.payload["assignment"] as
+      { harness: string; model: string | null; reasoningTier: string } | undefined;
+    const assignment =
+      recordedAssignment ??
+      resolveAssignment(table, "implementer", { template: "feature", riskTier: "medium" });
+    const outcomeByTerminal: Record<string, DispatchRecord["outcome"]> = {
+      "killed-budget": "killed-budget",
+      cancelled: "cancelled",
+      expired: "requirement-failed",
+    };
+    try {
+      this.#summaries.record({
+        schemaVersion: ATTEMPT_SUMMARY_SCHEMA_VERSION,
+        attemptId: ref.attemptId,
+        issueId: ref.issueId,
+        missionId: ref.missionId,
+        contractRef: {
+          issueId: contract.issueId,
+          contractVersion: contract.version,
+          contractHash: contract.contractHash,
+        },
+        harness: assignment.harness,
+        family: harnessFamily(assignment.harness),
+        model: assignment.model,
+        reasoningTier: assignment.reasoningTier as AttemptSummary["reasoningTier"],
+        outcome: outcomeByTerminal[terminal] ?? "requirement-failed",
+        attemptTerminal: terminal,
+        failureClass,
+        quotaSignalSeen: false,
+        exitCode: null,
+        durationMs: 0,
+        streamedEvents: 0,
+        headline: "recovered after daemon interruption; details not durable",
+        recordedAt: this.#instant(),
+      });
+    } catch {
+      // A summary that already exists (idempotent replay) or fails
+      // validation must not abort recovery routing; the events carry the
+      // authoritative state either way.
+    }
   }
 
   /**

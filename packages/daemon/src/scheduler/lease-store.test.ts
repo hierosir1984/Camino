@@ -104,14 +104,36 @@ describe("exactly one fenced owner per environment", () => {
         )
         .run(),
     ).toThrow(/exactly one fenced owner|replacement rejected/);
-    // Nor can it decrement the generation counter…
+    // Nor can it move the generation counter anywhere but exactly +1…
     expect(() =>
       raw
         .prepare(
           "UPDATE lease_environments SET current_generation = 0 WHERE environment_id = 'env'",
         )
         .run(),
-    ).toThrow(/monotonic/);
+    ).toThrow(/exactly one/);
+    expect(() =>
+      raw
+        .prepare(
+          "UPDATE lease_environments SET current_generation = 9 WHERE environment_id = 'env'",
+        )
+        .run(),
+    ).toThrow(/exactly one/);
+    // …forge an evidence-free settlement (round-1 finding 4)…
+    expect(() =>
+      raw.prepare("UPDATE leases SET state = 'released' WHERE environment_id = 'env'").run(),
+    ).toThrow(/evidence-free release/);
+    expect(() =>
+      raw.prepare("UPDATE leases SET state = 'kill-confirmed' WHERE environment_id = 'env'").run(),
+    ).toThrow(/evidence-free confirm/);
+    // …backdate a heartbeat…
+    expect(() =>
+      raw
+        .prepare(
+          "UPDATE leases SET heartbeat_at = '1999-01-01T00:00:00.000Z' WHERE environment_id = 'env'",
+        )
+        .run(),
+    ).toThrow(/never regress/);
     // …rewrite a lease's identity, delete evidence, or resurrect a row.
     expect(() =>
       raw

@@ -93,4 +93,19 @@ describe("summaryHeadline", () => {
   it("never throws, even over hostile input", () => {
     expect(summaryHeadline(null as unknown as string)).toBeTypeOf("string");
   });
+
+  it("scrubs credential-token literals; the validator refuses them outright (round-1 finding 13)", () => {
+    const pat = `ghp_${"A".repeat(36)}`;
+    const line = summaryHeadline(`auth failed for ${pat} while pushing`);
+    expect(line).not.toContain(pat);
+    expect(line).toContain("[token-scrubbed]");
+    expect(
+      attemptSummaryProblems({ ...VALID, headline: `leaked ${pat}` }).some((p) =>
+        p.includes("credential-token"),
+      ),
+    ).toBe(true);
+    expect(
+      attemptSummaryProblems({ ...VALID, headline: `leaked github_pat_${"b".repeat(30)}` }),
+    ).not.toEqual([]);
+  });
 });

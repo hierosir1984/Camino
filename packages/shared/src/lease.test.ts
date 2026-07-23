@@ -32,6 +32,14 @@ describe("leaseLapsed", () => {
   it("unreadable heartbeat evidence fails closed as lapsed", () => {
     expect(leaseLapsed({ heartbeatAt: "not a date", state: "held" }, beat)).toBe(true);
   });
+
+  it("a heartbeat dated implausibly in the FUTURE fails toward fencing (round-1 finding 17)", () => {
+    // Within one TTL of clock skew: tolerated (not lapsed).
+    expect(leaseLapsed(base, beat - LEASE_TTL_MS)).toBe(false);
+    // Beyond one TTL in the future: a forward clock excursion's residue —
+    // treated as lapsed (kill-confirm-required), never as extended liveness.
+    expect(leaseLapsed(base, beat - LEASE_TTL_MS - 1)).toBe(true);
+  });
 });
 
 describe("environment ids", () => {

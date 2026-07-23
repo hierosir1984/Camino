@@ -285,6 +285,7 @@ export {
   ATTEMPT_SUMMARY_SCHEMA_VERSION,
   HEADLINE_MAX_CHARS,
   SUMMARY_ATTEMPT_TERMINALS,
+  TOKEN_LITERAL_PATTERN_SOURCE,
   attemptSummaryProblems,
   summaryHeadline,
 } from "./attempt-summary.js";

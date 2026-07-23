@@ -157,6 +157,8 @@ export const STATE_FILES = Object.freeze({
   leases: "leases.sqlite",
   attemptSummaries: "attempt-summaries.sqlite",
   archiveLedger: "archive-ledger.sqlite",
+  /** WP-106 window observations (opened by the daemon composition, not here). */
+  windows: "windows.sqlite",
 } as const);
 
 /**

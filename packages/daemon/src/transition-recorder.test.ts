@@ -106,6 +106,7 @@ describe("TransitionRecorder", () => {
       apply(recorder, "attempt", "a1", "attempt-dispatched", {
         leaseGranted: true,
         leaseGeneration: 1,
+        contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
       }),
     ).toBe("running");
     apply(recorder, "attempt", "a1", "worker-completed", { finalHeadFetched: true });
@@ -431,6 +432,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a1", "attempt-dispatched", {
       leaseGranted: true,
       leaseGeneration: 1,
+      contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     // The attempt expires before worker start; the issue returns to ready.
     apply(recorder, "attempt", "a1", "heartbeat-lapsed", { killConfirmed: true });
@@ -449,6 +451,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a2", "attempt-dispatched", {
       leaseGranted: true,
       leaseGeneration: 2,
+      contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     apply(recorder, "attempt", "a2", "rate-limited", {});
     expect(
@@ -471,6 +474,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a1", "attempt-dispatched", {
       leaseGranted: true,
       leaseGeneration: 1,
+      contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     expect(
       apply(recorder, "attempt", "a1", "attempt-budget-breached", { killConfirmed: true }),
@@ -602,6 +606,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a1", "attempt-dispatched", {
       leaseGranted: true,
       leaseGeneration: 1,
+      contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     apply(recorder, "attempt", "a1", "worker-completed", { finalHeadFetched: true });
     apply(recorder, "attempt", "a1", "verdict-recorded", {
@@ -688,6 +693,7 @@ describe("TransitionRecorder", () => {
     apply(recorder, "attempt", "a1", "attempt-dispatched", {
       leaseGranted: true,
       leaseGeneration: 1,
+      contractRef: { issueId: "i1", contractVersion: 1, contractHash: "a".repeat(64) },
     });
     apply(recorder, "attempt", "a1", "rate-limited", {});
     recorder.record({

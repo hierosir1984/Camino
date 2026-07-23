@@ -6,6 +6,17 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { resolveTrustedTool } from "../scheduler/image-provenance.js";
+
+// git resolves from the trusted directory list, never the ambient PATH
+// (the WP-107 trusted-toolchain handoff; falsification round 1, finding 8).
+// Resolved lazily and cached: a host without git fails at first USE with
+// the precise refusal, not at module import.
+let trustedGitPath: string | null = null;
+function trustedGit(): string {
+  trustedGitPath ??= resolveTrustedTool("git");
+  return trustedGitPath;
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MAKE_SAMPLE_REPO = resolve(here, "..", "..", "..", "..", "scripts", "make-sample-repo.mjs");
@@ -16,7 +27,7 @@ export function makeWorkspace(): string {
 }
 
 function git(workdir: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", workdir, ...args], {
+  return execFileSync(trustedGit(), ["-C", workdir, ...args], {
     stdio: ["ignore", "pipe", "ignore"],
   })
     .toString()
@@ -34,9 +45,13 @@ export function headSha(workdir: string): string | null {
 /** Is `ancestor` an ancestor of `descendant`? */
 function isAncestor(workdir: string, ancestor: string, descendant: string): boolean {
   try {
-    execFileSync("git", ["-C", workdir, "merge-base", "--is-ancestor", ancestor, descendant], {
-      stdio: "ignore",
-    });
+    execFileSync(
+      trustedGit(),
+      ["-C", workdir, "merge-base", "--is-ancestor", ancestor, descendant],
+      {
+        stdio: "ignore",
+      },
+    );
     return true;
   } catch {
     return false;

@@ -4,11 +4,15 @@
  *
  * The summary is the ONLY cross-attempt handoff artifact: the next attempt
  * (and the WP-113 context pack that briefs it) sees this record, never the
- * worker's transcript. That is enforced STRUCTURALLY — the schema has no
- * field a transcript could ride in: `headline` is a single bounded line
- * (the classification headline, capped at HEADLINE_MAX_CHARS), and the
- * validator refuses unknown fields, so an events array or transcript blob
- * cannot be smuggled in without failing validation.
+ * worker's transcript. What the schema enforces, stated precisely
+ * (falsification round 1, finding 13): the field set is CLOSED (an events
+ * array or transcript blob has no field to ride in — unknown fields fail
+ * validation), the one prose field is a SINGLE BOUNDED LINE
+ * (HEADLINE_MAX_CHARS), and credential-token literals are refused in it.
+ * NAMED BOUNDARY: within those bounds the headline's semantic content is
+ * whatever the producer derived — a bound on SIZE and SHAPE, not a
+ * semantic proof that no transcript fragment appears; producers derive it
+ * only through summaryHeadline (first line, control-stripped, scrubbed).
  *
  * Every summary carries the ContractRef it executed under (CAM-PLAN-04 —
  * the attempt-record obligation row in CONTRACT_REFERENCE_OBLIGATIONS) and
@@ -28,6 +32,22 @@ export const ATTEMPT_SUMMARY_SCHEMA_VERSION = 1;
 
 /** The one bounded prose field (a classification headline, never a transcript). */
 export const HEADLINE_MAX_CHARS = 400;
+
+/**
+ * Credential-token literal shapes refused in summary text (round-1 finding
+ * 13's probe put a GitHub PAT in a headline): the current GitHub token
+ * prefixes plus the generic long-opaque-token shape. A summary is handoff
+ * material read by later model attempts — a token that survives into it
+ * outlives the attempt that leaked it. Scrubbed by summaryHeadline and
+ * REFUSED by the validator (defense at both the producer and the store).
+ */
+const TOKEN_LITERAL_RE = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+export const TOKEN_LITERAL_PATTERN_SOURCE: string = TOKEN_LITERAL_RE.source;
+
+function containsTokenLiteral(text: string): boolean {
+  TOKEN_LITERAL_RE.lastIndex = 0;
+  return TOKEN_LITERAL_RE.test(text);
+}
 
 const OUTCOMES: readonly DispatchOutcome[] = Object.freeze([
   "succeeded",
@@ -228,6 +248,9 @@ export function attemptSummaryProblems(value: unknown): string[] {
     problems.push("streamedEvents must be a non-negative integer");
   }
   boundedLine("headline", record["headline"], HEADLINE_MAX_CHARS, problems);
+  if (typeof record["headline"] === "string" && containsTokenLiteral(record["headline"])) {
+    problems.push("headline contains a credential-token literal");
+  }
   const recordedAt = record["recordedAt"];
   if (
     typeof recordedAt !== "string" ||
@@ -257,8 +280,12 @@ export function summaryHeadline(finalText: string): string {
     const firstLine = String(finalText).split(/[\r\n]/, 1)[0] ?? "";
     // eslint-disable-next-line no-control-regex
     const cleaned = firstLine.replace(/[\u0000-\u001f\u007f]/g, " ");
+    // Scrub credential-token literals BEFORE capping (a token straddling
+    // the cap must not survive as a recognizable prefix).
+    TOKEN_LITERAL_RE.lastIndex = 0;
+    const scrubbed = cleaned.replace(TOKEN_LITERAL_RE, "[token-scrubbed]");
     const capped =
-      cleaned.length > HEADLINE_MAX_CHARS ? cleaned.slice(0, HEADLINE_MAX_CHARS) : cleaned;
+      scrubbed.length > HEADLINE_MAX_CHARS ? scrubbed.slice(0, HEADLINE_MAX_CHARS) : scrubbed;
     line = Buffer.from(capped, "utf16le").toString("utf16le");
   } catch {
     line = "";

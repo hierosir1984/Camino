@@ -741,6 +741,11 @@ describe("recovery (CAM-STATE-06) — the scheduler half", () => {
       leaseGeneration: 1,
       environmentId: `validation:${h.repoId}`,
       issueId: h.issue1,
+      contractRef: {
+        issueId: h.issue1,
+        contractVersion: 1,
+        contractHash: "a".repeat(64),
+      },
     });
     const report = h.scheduler.recoverInterrupted();
     expect(report.settledNeverSpawned).toEqual([h.issue1]);
@@ -782,6 +787,65 @@ describe("recovery (CAM-STATE-06) — the scheduler half", () => {
     expect(() => h.scheduler.settleInterrupted(interrupted, "never-spawned")).toThrow(
       /never-spawned/,
     );
+  });
+
+  it("a durably RELEASED succeeded dispatch is NEVER recovered as a failure (round-1 finding 5)", () => {
+    const h = newWorld();
+    const decision = h.scheduler.dispatchNext(h.missionId, { features: FEATURES, budget: BUDGET });
+    if (decision.kind !== "dispatch") throw new Error("expected dispatch");
+    // The lifecycle settled the lease with outcome=succeeded, then the
+    // daemon died before recordOutcome. The durable release IS the
+    // evidence: worker gone, dispatch succeeded.
+    void h.scheduler.leaseHandle(decision.plan).release({ groupGone: true, outcome: "succeeded" });
+    const report = h.scheduler.recoverInterrupted();
+    expect(report.requiresKillConfirm).toEqual([]);
+    expect(report.succeededAwaitingSubmission).toMatchObject([
+      { issueId: h.issue1, attemptId: decision.plan.attemptId },
+    ]);
+    // No failure was counted; the attempt still holds its running state
+    // until the head is re-fetched.
+    expect(h.recorder.currentView.issues.get(h.issue1)?.failureCount).toBe(0);
+    expect(h.recorder.currentState("attempt", decision.plan.attemptId)).toBe("running");
+    const awaiting = report.succeededAwaitingSubmission[0];
+    if (awaiting === undefined) throw new Error("expected an awaiting entry");
+    h.scheduler.completeSucceededInterrupted(awaiting, { finalHeadFetched: true });
+    expect(h.recorder.currentState("attempt", decision.plan.attemptId)).toBe("submitted");
+    expect(h.recorder.currentState("issue", h.issue1)).toBe("implementing");
+    expect(() =>
+      h.scheduler.completeSucceededInterrupted(awaiting, { finalHeadFetched: false }),
+    ).toThrow(/finalHeadFetched/);
+  });
+
+  it("a durably RELEASED quota-blocked dispatch recovers to queued-quota, never a failure", () => {
+    const h = newWorld();
+    const decision = h.scheduler.dispatchNext(h.missionId, { features: FEATURES, budget: BUDGET });
+    if (decision.kind !== "dispatch") throw new Error("expected dispatch");
+    void h.scheduler
+      .leaseHandle(decision.plan)
+      .release({ groupGone: true, outcome: "quota-blocked" });
+    const report = h.scheduler.recoverInterrupted();
+    expect(report.settledFromDurableOutcome).toMatchObject([
+      { issueId: h.issue1, outcome: "quota-blocked" },
+    ]);
+    expect(h.recorder.currentState("issue", h.issue1)).toBe("queued-quota");
+    expect(h.recorder.currentState("attempt", decision.plan.attemptId)).toBe("quota-blocked");
+    expect(h.recorder.currentView.issues.get(h.issue1)?.failureCount).toBe(0);
+  });
+
+  it("a durably RELEASED failed dispatch recovers as the failure it was (counted once)", () => {
+    const h = newWorld();
+    const decision = h.scheduler.dispatchNext(h.missionId, { features: FEATURES, budget: BUDGET });
+    if (decision.kind !== "dispatch") throw new Error("expected dispatch");
+    void h.scheduler
+      .leaseHandle(decision.plan)
+      .release({ groupGone: true, outcome: "requirement-failed" });
+    const report = h.scheduler.recoverInterrupted();
+    expect(report.settledFromDurableOutcome).toMatchObject([
+      { issueId: h.issue1, outcome: "requirement-failed" },
+    ]);
+    expect(h.recorder.currentState("issue", h.issue1)).toBe("ready");
+    expect(h.recorder.currentView.issues.get(h.issue1)?.failureCount).toBe(1);
+    expect(h.summaries.get(decision.plan.attemptId)?.headline).toContain("recovered");
   });
 });
 

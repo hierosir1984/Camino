@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_POLICY_TABLE } from "@camino/shared";
 import type { AttemptBudget, TaskFeatures } from "@camino/shared";
-import { openRecoveredState } from "../recovery.js";
+import { STATE_FILES, openRecoveredState } from "../recovery.js";
 import type { RecoveredState } from "../recovery.js";
 import { QuotaWindowTracker } from "../routing/window-tracker.js";
 import { AttemptScheduler } from "../scheduler/attempt-scheduler.js";
@@ -65,13 +65,19 @@ function prepareWorld(): { dir: string; stateDir: string; github: FakeGitHub } {
   };
 }
 
-function runChild(dir: string, killPoint?: KillPointName) {
+function runChild(
+  dir: string,
+  killPoint?: KillPointName,
+  outcome?: "succeeded" | "requirement-failed",
+) {
   const env: NodeJS.ProcessEnv = { ...process.env };
   delete env["CAMINO_KILL_POINT"];
   delete env["CAMINO_KILL_OCCURRENCE"];
   delete env["CAMINO_KILL_NTH"];
+  delete env["CAMINO_CHAOS_OUTCOME"];
   env["CAMINO_CHAOS_DIR"] = dir;
   if (killPoint !== undefined) env["CAMINO_KILL_POINT"] = killPoint;
+  if (outcome !== undefined) env["CAMINO_CHAOS_OUTCOME"] = outcome;
   const result = spawnSync(process.execPath, ["--import", "tsx", CHILD_PATH], {
     cwd: REPO_ROOT,
     env,
@@ -96,7 +102,7 @@ interface RecoveredWorld {
 function recover(world: { stateDir: string; github: FakeGitHub }): RecoveredWorld {
   const state = openRecoveredState(world.stateDir, { github: world.github });
   cleanups.push(() => state.close());
-  const windows = new QuotaWindowTracker(join(world.stateDir, "windows.sqlite"), {
+  const windows = new QuotaWindowTracker(join(world.stateDir, STATE_FILES.windows), {
     writerLock: state.lock,
   });
   cleanups.push(() => windows.close());
@@ -169,6 +175,26 @@ describe("scheduler dispatch protocol under kill -9 (deterministic matrix)", () 
     expect(
       r.state.leases.current(`validation:${r.state.domain.listAllMissions()[0]?.repoId}`)?.state,
     ).toBe("released");
+  });
+
+  it("kill between the durable lease release and outcome recording NEVER fails a succeeded dispatch (round-1 finding 5)", () => {
+    const world = prepareWorld();
+    const result = runChild(world.dir, "scheduler-before-outcome-recorded", "succeeded");
+    expect(result.signal).toBe("SIGKILL");
+    const r = recover(world);
+    const issue1 = `${r.missionId}.I1`;
+    const report = r.scheduler.recoverInterrupted();
+    // The lease's durable released outcome (succeeded) is honored: no
+    // kill-confirm case, no counted failure, submission awaits the
+    // re-fetched head.
+    expect(report.requiresKillConfirm).toEqual([]);
+    expect(report.succeededAwaitingSubmission).toMatchObject([{ issueId: issue1 }]);
+    expect(r.state.recorder.currentView.issues.get(issue1)?.failureCount).toBe(0);
+    assertUniversalInvariants(r);
+    const awaiting = report.succeededAwaitingSubmission[0];
+    if (awaiting === undefined) throw new Error("expected an awaiting entry");
+    r.scheduler.completeSucceededInterrupted(awaiting, { finalHeadFetched: true });
+    expect(r.state.recorder.currentState("attempt", awaiting.attemptId)).toBe("submitted");
   });
 
   for (const point of SCHEDULER_KILL_POINTS) {

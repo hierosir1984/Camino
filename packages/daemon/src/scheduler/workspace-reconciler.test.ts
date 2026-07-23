@@ -82,7 +82,11 @@ function record(w: World, event: string, payload: Record<string, unknown>): void
 }
 
 function driveAttemptTo(w: World, terminal: "failed" | "running" | "archived-mismatch"): void {
-  record(w, "attempt-dispatched", { leaseGranted: true, leaseGeneration: 1 });
+  record(w, "attempt-dispatched", {
+    leaseGranted: true,
+    leaseGeneration: 1,
+    contractRef: { issueId: ISSUE, contractVersion: 1, contractHash: "a".repeat(64) },
+  });
   if (terminal === "running") return;
   record(w, "worker-completed", { finalHeadFetched: true });
   record(w, "verdict-recorded", {

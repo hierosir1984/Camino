@@ -95,8 +95,6 @@ export interface WorkerImageProvenance {
 export interface BuildWorkerImageOptions {
   /** Human tag for the build (the run always uses the ID). */
   readonly tag?: string;
-  /** Override the build context (tests build a derivative profile). */
-  readonly contextDir?: string;
   /** Injectable clock (tests). */
   readonly now?: () => Date;
 }
@@ -117,11 +115,18 @@ function runDocker(
  * Build the worker image from the in-repo profile and return its
  * provenance. Synchronous and long (docker build); call at daemon startup
  * or in test setup, not per dispatch.
+ *
+ * The build context is PINNED to the in-repo profile (round-1 finding 14:
+ * a caller-supplied context would let this function stamp the Camino label
+ * onto foreign bytes — the label would then attest something the build
+ * boundary never inspected). A derivative toolchain image (`FROM
+ * camino-worker-profile`) is WP-119's runner glue and gets its own
+ * reviewed context there.
  */
 export function buildWorkerImage(options: BuildWorkerImageOptions = {}): WorkerImageProvenance {
   const dockerPath = resolveTrustedTool("docker");
   const tag = options.tag ?? "camino-worker-profile:local";
-  const contextDir = options.contextDir ?? WORKER_PROFILE_DIR;
+  const contextDir = WORKER_PROFILE_DIR;
   const build = runDocker(dockerPath, [
     "build",
     "--label",

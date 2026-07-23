@@ -224,6 +224,15 @@ export interface EnvironmentLeaseStore {
   /** The newest lease row for an environment, or undefined if none ever. */
   current(environmentId: string): EnvironmentLeaseView | undefined;
 
+  /**
+   * The exact lease row for (environment, generation), or undefined. Later
+   * grants never obscure an older row — recovery reads the row a recorded
+   * dispatch names, whatever happened since (round-1 finding 5: a released
+   * lease's recorded outcome is durable evidence the dispatch COMPLETED,
+   * and recovery must consult it before classifying anything).
+   */
+  at(environmentId: string, generation: number): EnvironmentLeaseView | undefined;
+
   /** Every environment's newest lease row (inspection surface). */
   listCurrent(): EnvironmentLeaseView[];
 
@@ -236,7 +245,19 @@ export interface EnvironmentLeaseStore {
   inspectRecovered(now?: Date): LeaseRecoveryReport;
 }
 
-/** Has this lease's heartbeat lapsed past the TTL at `nowMs`? Pure. */
+/**
+ * Has this lease's heartbeat lapsed past the TTL at `nowMs`? Pure.
+ *
+ * Clock anomalies fail toward FENCING (kill-confirm-required), never
+ * toward liveness: an unreadable heartbeat counts as lapsed, and so does
+ * a heartbeat dated implausibly far in the FUTURE (beyond one TTL past
+ * `now`) — the residue of a forward wall-clock jump that would otherwise
+ * pin the lease "live" for the whole excursion. NAMED BOUNDARY
+ * (falsification round 1, finding 17): TTL arithmetic is wall-clock; a
+ * clock stepped backward by less than one TTL extends apparent liveness
+ * by at most that step, in the safe (fenced-longer) direction —
+ * monotonic-clock hardening is future work, not claimed here.
+ */
 export function leaseLapsed(
   lease: Pick<EnvironmentLeaseView, "heartbeatAt" | "state">,
   nowMs: number,
@@ -245,6 +266,7 @@ export function leaseLapsed(
   if (lease.state !== "held") return false;
   const beat = Date.parse(lease.heartbeatAt);
   if (Number.isNaN(beat)) return true; // unreadable evidence fails closed: treat as lapsed
+  if (beat - nowMs > ttlMs) return true; // future-dated beyond one TTL: anomaly, fail toward fencing
   return nowMs - beat > ttlMs;
 }
 

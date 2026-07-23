@@ -66,7 +66,9 @@ function main(): void {
   const summaries = new AttemptSummaryStore(join(stateDir, STATE_FILES.attemptSummaries), {
     writerLock: lock,
   });
-  const windows = new QuotaWindowTracker(join(stateDir, "windows.sqlite"), { writerLock: lock });
+  const windows = new QuotaWindowTracker(join(stateDir, STATE_FILES.windows), {
+    writerLock: lock,
+  });
   const recorder = new TransitionRecorder(events);
   const intake = new MissionIntake(domain, recorder, events);
   const serialization = new SerializationScheduler(domain, recorder, events);
@@ -180,14 +182,24 @@ function main(): void {
 
   // No real worker is spawned in the chaos matrix — the "worker run" is
   // simulated between the two outcome-side kill points, exactly where the
-  // real external call sits in the protocol.
+  // real external call sits in the protocol. (The REAL process-kill paths
+  // are proven elsewhere: WP-105's kill-confirm suite for process groups
+  // and the supervisor's docker suite for containers; this matrix owns
+  // the DURABLE-PROTOCOL invariants under kill -9.)
+  //
+  // CAMINO_CHAOS_OUTCOME selects the simulated outcome: the succeeded
+  // variant exists to pin round-1 finding 5 — a crash between the durable
+  // lease release (outcome recorded) and the outcome routing must NEVER
+  // be recovered as a failure.
+  const outcome =
+    process.env["CAMINO_CHAOS_OUTCOME"] === "succeeded" ? "succeeded" : "requirement-failed";
   const record: DispatchRecord = {
     adapter: "claude-code",
-    outcome: "requirement-failed",
+    outcome,
     spawned: true,
     streamedEvents: 1,
-    finalText: "chaos worker failed",
-    committedSha: null,
+    finalText: outcome === "succeeded" ? "chaos worker done" : "chaos worker failed",
+    committedSha: outcome === "succeeded" ? "a".repeat(40) : null,
     envPosture: {
       keys: [],
       githubCredentialKeys: [],

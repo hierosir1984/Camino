@@ -1,13 +1,13 @@
-// WP-114: the compositional credential-free guarantee + supervisor arming
-// (the WP-107 handoff, unit half — a shim stands in for docker so the
-// compose path is exercised without a daemon; the real-image path lives in
-// container-obligations.test.ts).
+// WP-114: the compositional credential-free guarantee + the race-free
+// create → arm → start protocol (the WP-107 handoff, unit half — a shim
+// stands in for docker so the compose path is exercised without a daemon;
+// the real-image path lives in container-obligations.test.ts).
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AttemptBudget } from "@camino/shared";
-import { ContainerInputError, composeContainerRun } from "./container-inputs.js";
+import { ContainerInputError, composeContainerRun, provisionAndArm } from "./container-inputs.js";
 import type { WorkerImageProvenance } from "./image-provenance.js";
 import type { AttestedWorkerNetwork } from "./worker-network.js";
 
@@ -17,6 +17,7 @@ afterEach(() => {
 });
 
 const BUDGET: AttemptBudget = { wallClockMs: 60_000 };
+const NETWORK_ID = "d".repeat(64);
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -24,11 +25,28 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
-/** A docker shim that answers the provenance label inspect with "1". */
+/**
+ * A docker shim answering exactly the calls composition makes: the image
+ * label inspect ("1"), the network attestation inspect (well-formed TSV
+ * for the test network id), and `create` (success). Everything else exits
+ * 0 silently.
+ */
 function shimWorld(): { provenance: WorkerImageProvenance; network: AttestedWorkerNetwork } {
   const dir = tempDir("camino-shim-");
   const dockerPath = join(dir, "docker");
-  writeFileSync(dockerPath, '#!/bin/sh\necho "1"\n');
+  writeFileSync(
+    dockerPath,
+    [
+      "#!/bin/sh",
+      'case "$1" in',
+      '  image) echo "1";;',
+      `  network) printf '${NETWORK_ID}\\tcamino-worker-test\\tbridge\\tcamino\\n';;`,
+      "  create) echo shim-container-id;;",
+      "  *) exit 0;;",
+      "esac",
+      "",
+    ].join("\n"),
+  );
   chmodSync(dockerPath, 0o755);
   const provenance: WorkerImageProvenance = {
     imageId: `sha256:${"c".repeat(64)}`,
@@ -37,7 +55,7 @@ function shimWorld(): { provenance: WorkerImageProvenance; network: AttestedWork
     dockerPath,
   };
   const network: AttestedWorkerNetwork = {
-    id: "d".repeat(64),
+    id: NETWORK_ID,
     name: "camino-worker-test",
     driver: "bridge",
     attestedAt: "2026-07-23T10:00:00.000Z",
@@ -75,46 +93,88 @@ describe("composeContainerRun — credential-free composition (CAM-EXEC-02 / CAM
     }
   });
 
-  it("refuses a provider-auth mount carrying GitHub credential material", () => {
+  it("refuses a token literal in an env VALUE under an innocent key name (round-1 finding 14)", () => {
+    expect(() =>
+      composeContainerRun({
+        ...baseOptions(),
+        env: { INNOCENT_NAME: `ghp_${"A".repeat(36)}` },
+      }),
+    ).toThrow(/token literal in its VALUE/);
+  });
+
+  it("refuses a provider-auth mount carrying credential-shaped files", () => {
     const opts = baseOptions();
     const authDir = tempDir("camino-auth-");
     mkdirSync(join(authDir, "provider"), { recursive: true });
     writeFileSync(
       join(authDir, "provider", ".git-credentials"),
-      "https://x-access-token:ghp_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX@github.com\n",
+      `https://x-access-token:ghp_${"X".repeat(36)}@github.com\n`,
     );
     expect(() =>
       composeContainerRun({
         ...opts,
         providerAuthMounts: [{ hostPath: authDir, containerPath: "/auth/provider" }],
       }),
-    ).toThrow(/GitHub-credential-shaped material/);
+    ).toThrow(/GitHub-credential material/);
   });
 
-  it("composes a clean run: image by content ID, network by attested ID, supervisor armed", () => {
+  it("refuses a token LITERAL inside an innocuously named auth file (round-1 finding 14)", () => {
     const opts = baseOptions();
-    const t0 = Date.parse("2026-07-23T10:00:00.000Z");
-    const composed = composeContainerRun({ ...opts, now: () => new Date(t0) });
+    const authDir = tempDir("camino-auth-");
+    writeFileSync(
+      join(authDir, "provider.json"),
+      JSON.stringify({ auth: `github_pat_${"a".repeat(30)}` }),
+    );
+    expect(() =>
+      composeContainerRun({
+        ...opts,
+        providerAuthMounts: [{ hostPath: authDir, containerPath: "/auth/provider" }],
+      }),
+    ).toThrow(/token literal|GitHub-credential material/);
+  });
+
+  it("composes a clean create/start pair: image by content ID, network re-attested by ID", () => {
+    const opts = baseOptions();
+    const composed = composeContainerRun(opts);
+    expect(composed.createArgs[0]).toBe("create");
+    expect(composed.createArgs).toContain(opts.image.imageId);
+    expect(composed.createArgs).toContain(opts.network.id);
+    expect(composed.createArgs).toContain(composed.containerName);
+    expect(composed.startArgs).toEqual(["start", "-a", composed.containerName]);
+    expect(composed.dockerPath).toBe(opts.image.dockerPath);
+  });
+
+  it("re-attests the network at composition: a record describing ANOTHER network refuses", () => {
+    const opts = baseOptions();
+    // The shim answers every network inspect with NETWORK_ID's record;
+    // composing against a DIFFERENT id must refuse — an answer about some
+    // other network attests nothing about this one (round-1 finding 14).
+    const evil = { ...opts.network, id: "e".repeat(64) };
+    expect(() => composeContainerRun({ ...opts, network: evil })).toThrow(
+      /not the requested|refusing a record/,
+    );
+  });
+});
+
+describe("provisionAndArm — the race-free arming protocol (round-1 finding 2)", () => {
+  it("creates the container FIRST, then arms the supervisor for that exact name", async () => {
+    const opts = baseOptions();
+    const composed = composeContainerRun(opts);
+    const supervisor = await provisionAndArm(composed);
     try {
-      expect(composed.runArgs).toContain(opts.image.imageId);
-      expect(composed.runArgs).toContain(opts.network.id);
-      expect(composed.runArgs).toContain("--name");
-      expect(composed.runArgs).toContain(composed.containerName);
-      // The authoritative out-of-process bound exists BEFORE anything runs,
-      // for exactly this container, at exactly the budget deadline.
-      expect(composed.supervisor.containerName).toBe(composed.containerName);
-      expect(composed.supervisor.deadlineMs).toBe(t0 + BUDGET.wallClockMs);
+      expect(supervisor.containerName).toBe(composed.containerName);
+      expect(supervisor.deadlineMs).toBeGreaterThan(Date.now());
+      expect(supervisor.deadlineMs).toBeLessThanOrEqual(Date.now() + BUDGET.wallClockMs + 1000);
     } finally {
-      composed.supervisor.disarm();
+      supervisor.disarm();
     }
   });
 
-  it("a render refusal happens before the supervisor is armed (no orphan supervisors)", () => {
+  it("a create failure throws with NOTHING armed and nothing running", async () => {
     const opts = baseOptions();
-    // A reserved env key passes the credential checks but the composer's
-    // own fence refuses it at render time — before arming.
-    expect(() =>
-      composeContainerRun({ ...opts, env: { CAMINO_EGRESS_ALLOWLIST: "spoof" } }),
-    ).toThrow(/reserved/);
+    const composed = composeContainerRun(opts);
+    // A dockerPath whose create fails: /usr/bin/false exits 1 for any argv.
+    const failing = { ...composed, dockerPath: "/usr/bin/false" };
+    await expect(provisionAndArm(failing)).rejects.toThrow(/nothing armed, nothing running/);
   });
 });
