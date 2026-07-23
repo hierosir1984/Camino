@@ -998,6 +998,81 @@ describe("round-7 falsification fixes", () => {
   });
 });
 
+describe("round-8 falsification fixes", () => {
+  it("refuses a worker `.git/config` that is a FIFO or uses an include directive — r8 #1", () => {
+    // A `[include] path = <fifo>` makes the serving upload-pack block on the FIFO,
+    // orphaning it — even for a fully stopped worker (persistent state).
+    const a = mkdtempTestDir();
+    mkdirSync(join(a, ".git", "objects"), { recursive: true });
+    writeFileSync(join(a, ".git", "config"), "[include]\n\tpath = config.fifo\n");
+    execFileSync("mkfifo", [join(a, ".git", "config.fifo")]);
+    expect(() => assertSelfContainedObjectStore(a)).toThrow(/include/);
+
+    // A `.git/config` that is itself a FIFO is refused before it is read.
+    const b = mkdtempTestDir();
+    mkdirSync(join(b, ".git", "objects"), { recursive: true });
+    execFileSync("mkfifo", [join(b, ".git", "config")]);
+    expect(() => assertSelfContainedObjectStore(b)).toThrow(/not a regular file/);
+  });
+
+  it("snapshots a toJSON/object-backed contractRef field as an owned primitive — r8 #3", () => {
+    const fx = acceptedFixture();
+    const liveIssueId = {
+      value: "m1.I1",
+      toJSON(): string {
+        return this.value;
+      },
+    };
+    const liveRef = {
+      issueId: liveIssueId as unknown as string,
+      contractVersion: 1,
+      contractHash: "a".repeat(64),
+    };
+    const r = runIntake(fx.repo, fx.head, { ...fx.assignment, contractRef: liveRef });
+    expect(r.accepted).toBe(true);
+    // Emitted as a primitive string, detached from the live object.
+    expect(typeof r.diff!.contractRef!.issueId).toBe("string");
+    expect(r.diff!.contractRef!.issueId).toBe("m1.I1");
+    liveIssueId.value = ""; // mutate the original after return
+    expect(r.diff!.contractRef!.issueId).toBe("m1.I1"); // unchanged
+    expect(quarantinedDiffProblems(r.diff)).toEqual([]); // still valid
+  });
+
+  it("refuses an unbound candidate when requireContractRef is set (production provenance) — r8 #4", () => {
+    const fx = acceptedFixture();
+    // Corpus default (no requirement) accepts the null-binding form.
+    expect(runIntake(fx.repo, fx.head, fx.assignment).accepted).toBe(true);
+    // Production mode refuses a missing binding.
+    expect(() => runIntake(fx.repo, fx.head, fx.assignment, { requireContractRef: true })).toThrow(
+      /contract binding/,
+    );
+  });
+
+  it("does NOT flag a tilde name containing 8.3-forbidden punctuation (FOO+~1) — r8 #8", () => {
+    const repo = initRepo();
+    const app = hashBlob(repo, "console.log('app');\n");
+    const base = commitTree(
+      repo,
+      buildTree(repo, [{ mode: "100644", sha: app, path: "src/app.js" }]),
+      [],
+      "base",
+    );
+    const blob = hashBlob(repo, "x\n");
+    const head = commitTree(
+      repo,
+      buildTree(repo, [
+        { mode: "100644", sha: app, path: "src/app.js" },
+        { mode: "100644", sha: blob, path: "docs/FOO+~1.txt" }, // '+' is forbidden in 8.3
+      ]),
+      [base],
+      "legit punctuation tilde name",
+    );
+    const r = runIntake(repo, head, { base, allowedPaths: ["**"] });
+    expect(r.accepted).toBe(true);
+    expect(r.rejections).toEqual([]);
+  });
+});
+
 // --- helpers ---
 
 function mkdtempTestDir(): string {

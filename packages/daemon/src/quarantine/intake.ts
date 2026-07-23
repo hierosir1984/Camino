@@ -70,6 +70,15 @@ export interface IntakeOptions {
    * base, which production must not do.
    */
   baseRepo?: string;
+  /**
+   * When true, a null/absent `contractRef` is REFUSED — the emitted diff must
+   * carry a WP-110 contract binding. Production dispatch (WP-114) sets this so
+   * every downstream artifact resolves the exact frozen contract (CAM-PLAN-04 /
+   * CONTRACT_REFERENCE_OBLIGATIONS); the WP-003 corpus fixtures, which have no
+   * contract, leave it false and emit the null (no-binding) form (review r8
+   * finding 4). Default false.
+   */
+  requireContractRef?: boolean;
 }
 
 /** Read the stored targets of every in-bounds symlink leaf (never an oversized one). */
@@ -117,20 +126,31 @@ export function runIntake(
   // these locals, never `assignment.*` again.
   const base = assignment.base;
   const allowedPaths: readonly string[] = Object.freeze([...assignment.allowedPaths]);
-  // DEEP-snapshot the contractRef too (review r7 finding 7): capturing the
-  // reference alone would let a getter-backed ref pass validation at emit yet
-  // read as MALFORMED afterward (the emitted diff would fail the same validator
-  // that accepted it). Copy its own fields into a plain object ONCE, each read a
-  // single time, so the emitted artifact is stable plain data.
+  // SNAPSHOT the contractRef as OWNED PRIMITIVES via a JSON round-trip (review r7
+  // finding 7, r8 finding 3): a field-by-field copy still captured a value that
+  // was itself a live object with a `toJSON()` (it passed the round-trip
+  // validator at emit, then mutated to malformed after return). JSON round-trip
+  // resolves getters/`toJSON` to plain primitives detached from the live object,
+  // so the emitted artifact is stable; a non-serializable ref fails closed.
   const rawRef = assignment.contractRef ?? null;
-  const contractRef: ContractRef | null =
-    rawRef == null
-      ? null
-      : {
-          issueId: rawRef.issueId,
-          contractVersion: rawRef.contractVersion,
-          contractHash: rawRef.contractHash,
-        };
+  let contractRef: ContractRef | null = null;
+  if (rawRef != null) {
+    try {
+      contractRef = JSON.parse(JSON.stringify(rawRef)) as ContractRef;
+    } catch {
+      throw new QuarantineGitError(
+        "assignment.contractRef is not JSON-serializable — refused (fail-closed; review r8 finding 3)",
+      );
+    }
+  }
+  // Production provenance: WP-114 sets requireContractRef so an unbound candidate
+  // is refused (review r8 finding 4). The corpus fixtures leave it false.
+  if (options.requireContractRef === true && contractRef == null) {
+    throw new QuarantineGitError(
+      "a contract binding (contractRef) is required but the assignment supplied none — refused " +
+        "(CAM-PLAN-04 provenance; review r8 finding 4)",
+    );
+  }
   // Overrides may only TIGHTEN the default tree-size budget, never widen it
   // (review r1 finding 7) — a per-issue contract cannot loosen the policy cap.
   const budgets = effectiveBudgets(assignment.budgets);

@@ -259,6 +259,9 @@ function is83ShortName(seg: string): boolean {
   // — do not over-reject it (review r7 finding 10). `[\x21-\x7e]` is printable
   // ASCII excluding both space (0x20) and every codepoint >= 0x80.
   if (!/^[\x21-\x7e]*$/.test(ext)) return false;
+  // Punctuation Windows FORBIDS in a short name but ALLOWS in a long name, so its
+  // presence proves the segment is not a genuine 8.3 alias (review r8 finding 8).
+  if (/[+,;=[\]]/.test(base) || /[+,;=[\]]/.test(ext)) return false;
   return /^[\x21-\x7e]*~[0-9]+$/.test(base);
 }
 

@@ -20,7 +20,9 @@ import {
   lstatSync,
   mkdtempSync,
   opendirSync,
+  readFileSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
@@ -78,10 +80,16 @@ function resolveGitBinary(): string | null {
       if (dir.length === 0 || !isAbsolute(dir)) continue;
       const candidate = join(dir, "git");
       try {
-        accessSync(candidate, constants.X_OK);
-        return candidate;
+        // Require a regular FILE: `accessSync(X_OK)` also succeeds on a DIRECTORY
+        // named `git`, which would stop the search then fail EACCES at exec
+        // (review r8 finding 6). statSync follows a symlinked git (a legit
+        // install); the resolved target must be a file.
+        if (statSync(candidate).isFile()) {
+          accessSync(candidate, constants.X_OK);
+          return candidate;
+        }
       } catch {
-        // not here; try the next PATH entry
+        // not here (or not a file); try the next PATH entry
       }
     }
   }
@@ -185,6 +193,14 @@ export function initPristineRepo(prefix = "camino-quarantine-pristine-"): string
   git(dir, "config", "core.precomposeunicode", "false");
   git(dir, "config", "core.protectHFS", "false");
   git(dir, "config", "core.protectNTFS", "false");
+  // KEEP the received pack (never unpack to loose objects), so the fetch's
+  // on-disk footprint IS the received pack — the transfer boundary the byte
+  // budget must cap (review r8 finding 2). Unpacking to loose objects would let a
+  // pack a few bytes OVER 500 MB shrink to a store delta UNDER the cap. With
+  // unpackLimit=1, any fetch of ≥1 object is kept as a pack whose size (+ its
+  // `.idx`) storeSizeBytes measures.
+  git(dir, "config", "fetch.unpackLimit", "1");
+  git(dir, "config", "transfer.unpackLimit", "1");
   return dir;
 }
 
@@ -214,15 +230,16 @@ export function removePristineRepo(dir: string): void {
  * anywhere in the object-store tree, and an alternates file (review r2/r3/r5/r6/r7).
  *
  * NAMED BOUNDARY — a stopped-worker CUSTODY PRECONDITION, not a live-attacker
- * proof (review r6 finding 1, r7 findings 1/4). This scan and the fetch that
- * follows it (intake.ts) are separate operations on the source directory, so no
- * pair of filesystem scans can be proof against an adversary who mutates the
- * source DURING the fetch — planting a transient `objects/info/alternates` (so
- * upload-pack serves a borrowed object) or swapping the requested object for a
- * FIFO (so a serving-side `upload-pack` orphan hangs) only while `git fetch`
- * runs, removing it before either scan sees it. This is fundamental: WP-108 is a
- * LIBRARY that receives a repo PATH and cannot hold a lock over another process's
- * directory. What discharges the AC is therefore a PRECONDITION the CALLER owns:
+ * proof (review r6 finding 1, r7 findings 1/4, r8 finding 10). This scan and the
+ * fetch that follows it (intake.ts) are separate operations on the source
+ * directory, so no pair of filesystem SCANS can be proof against an adversary who
+ * mutates the source DURING the fetch — planting a transient
+ * `objects/info/alternates` (so upload-pack serves a borrowed object) or swapping
+ * the requested object for a FIFO (so a serving-side `upload-pack` orphan hangs)
+ * only while `git fetch` runs, removing it before either scan sees it. A pair of
+ * scans is the wrong tool for a live-mutated source; WP-108 is a LIBRARY that
+ * receives a repo PATH and does not hold a lock over another process's directory.
+ * What discharges the AC in v1 is therefore a PRECONDITION the CALLER owns:
  *   - WP-107 provisions the worker clone self-contained (its authoritative
  *     `assertWorkerCloneIsolation` — alternate-free, no hardlinks), and
  *   - the caller (WP-114 dispatch) invokes `runIntake` ONLY against a STOPPED
@@ -231,11 +248,13 @@ export function removePristineRepo(dir: string): void {
  * WP-108's pre- AND post-fetch scans are best-effort defense in depth (they
  * catch a persistent/non-adversarial borrowing store), and every git call has a
  * wall-clock timeout that bounds the DIRECT process; a serving-side descendant
- * is bounded by the daemon/container lifecycle (WP-107 teardown). Whether WP-108
- * must instead implement its OWN custody (snapshot the objects into a
- * Camino-owned dir before fetching — which still cannot be TOCTOU-free against a
- * live-mutated source) is a SCOPE DECISION flagged for David; the recommendation
- * is to keep the precondition, owned by WP-107 + WP-114.
+ * is bounded by the daemon/container lifecycle (WP-107 teardown). A DIFFERENT
+ * custody IMPLEMENTATION could close the race internally — a privileged
+ * filesystem snapshot, or a daemon-owned fd-relative copy of the objects followed
+ * by full object verification, converts the race into a stable closure (review r8
+ * finding 10). That is a heavier design, out of v1 scope; whether to adopt it
+ * instead of the caller precondition is a SCOPE DECISION flagged for David, with
+ * the recommendation to keep the precondition (owned by WP-107 + WP-114).
  */
 /** Entry cap for the object-store walk — a hostile store over it is itself refused. */
 const OBJECT_STORE_SCAN_CAP = 300_000;
@@ -377,6 +396,48 @@ export function assertSelfContainedObjectStore(repo: string): void {
       );
     }
   }
+
+  // The worker's repo-local `.git/config` is read by the `upload-pack` server we
+  // spawn in the worker dir. A config `[include]`/`[includeIf]` whose `path` is a
+  // FIFO makes upload-pack BLOCK on it, orphaning a server descendant the direct
+  // timeout does not reap — even for a fully STOPPED worker (persistent state, not
+  // a live TOCTOU; review r8 finding 1). Refuse the config indirection surface:
+  // the config must be a regular file (not a FIFO/symlink) and must carry no
+  // include directive (a WP-107-provisioned clone has none). NAMED BOUNDARY: the
+  // broader repo-config surface (an include pointing at a FIFO OUTSIDE `.git`, or
+  // other config-triggered blocking) is bounded by the daemon/container process
+  // lifecycle (WP-107 teardown reaps descendants), the same in-process-best-
+  // effort / out-of-process-authoritative split WP-107 states.
+  const configPath = join(gitDir, "config");
+  let configStat;
+  try {
+    configStat = lstatSync(configPath);
+  } catch {
+    configStat = null;
+  }
+  if (configStat !== null) {
+    if (!configStat.isFile()) {
+      throw new QuarantineGitError(
+        "fetch source `.git/config` is not a regular file (FIFO/symlink/special) — refused; " +
+          "it could block or redirect the serving `upload-pack` (CAM-EXEC-02 / review r8 finding 1)",
+      );
+    }
+    let configText = "";
+    try {
+      configText = readFileSync(configPath, "utf8");
+    } catch {
+      throw new QuarantineGitError(
+        "fetch source `.git/config` is unreadable — refused (fail-closed; review r8 finding 1)",
+      );
+    }
+    if (/^\s*\[\s*include(if)?\b/im.test(configText) || /^\s*include(if)?\./im.test(configText)) {
+      throw new QuarantineGitError(
+        "fetch source `.git/config` uses an `include`/`includeIf` directive — refused; a worker " +
+          "clone must not indirect its config (an include path could be a FIFO the serving " +
+          "`upload-pack` blocks on; CAM-EXEC-02 / review r8 finding 1)",
+      );
+    }
+  }
 }
 
 /** A git object name: 40-hex (sha-1) or 64-hex (sha-256), lower-case. */
@@ -506,21 +567,32 @@ export function fetchedObjectCount(dir: string, commit: string, treeSha: string)
 
 /**
  * The EXACT on-disk byte size of `dir`'s object store — the summed `lstat` size
- * of every file under `.git/objects` (pack + `.idx` + `.rev` + loose). The intake
- * takes this BEFORE and AFTER the worker-head fetch; the delta bounds the fetch
- * by its on-disk footprint.
+ * of every file under `.git/objects`. The intake takes this BEFORE and AFTER the
+ * worker-head fetch; the delta bounds the fetch by its RECEIVED-PACK footprint.
+ *
+ * The pristine repo sets `fetch.unpackLimit=1` (initPristineRepo), so a fetch is
+ * KEPT AS A PACK, never unpacked to loose objects — the delta is therefore the
+ * received `.pack` (+ its `.idx`), the transfer boundary the cap must bound. A
+ * pack a few bytes OVER 500 MB that unpacked to loose objects could otherwise
+ * measure a store delta UNDER the cap (review r8 finding 2).
  *
  * Measured by a filesystem walk, NOT `count-objects -v`: that reports pack size
  * in KiB (rounds DOWN) and omits `.rev`, and because the intake SUBTRACTS a
  * before-measurement the fixed overhead cancels, leaving a real ~KiB UNDERcount
  * — so a fetch a hair over 500 MB could measure at/under the cap (review r7
- * finding 6). Summing actual byte sizes never under-bounds the pack (it counts
- * the `.idx`/`.rev` overhead too, the safe direction for an admission cap). The
- * walk is bounded by the same scan cap; an object store with more files than the
- * cap returns MAX_SAFE_INTEGER so the byte budget fails closed.
+ * finding 6). Summing actual byte sizes never under-bounds the pack (the safe
+ * direction for an admission cap). The walk is bounded by the same scan cap;
+ * more files than the cap, OR any read failure on an existing entry (an absent
+ * objects dir alone is a legitimately empty 0-byte store), returns
+ * MAX_SAFE_INTEGER so the byte budget fails CLOSED (review r8 finding 2).
  */
 export function storeSizeBytes(dir: string): number {
   const objectsDir = join(dir, ".git", "objects");
+  // An entirely ABSENT objects dir is a legitimately empty store (0 bytes). Any
+  // OTHER read failure mid-walk fails CLOSED (review r8 finding 2): if the size
+  // cannot be attested, the byte budget must not silently pass — an unreadable
+  // store returns MAX_SAFE_INTEGER so the admission cap rejects it.
+  if (!existsSync(objectsDir)) return 0;
   let total = 0;
   let seen = 0;
   const walk = (abs: string): boolean => {
@@ -528,14 +600,14 @@ export function storeSizeBytes(dir: string): number {
     try {
       st = lstatSync(abs);
     } catch {
-      return true; // absent path contributes nothing
+      return false; // an existing entry we cannot stat — fail closed
     }
     if (st.isDirectory()) {
       let d;
       try {
         d = opendirSync(abs);
       } catch {
-        return true;
+        return false; // an existing dir we cannot open — fail closed
       }
       try {
         let ent = d.readSync();

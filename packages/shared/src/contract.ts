@@ -175,7 +175,16 @@ export function contractProblems(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return ["contract must be a plain object"];
   }
-  const record = value as Record<string, unknown>;
+  // Validate OWN-ENUMERABLE fields only (review r8 finding 5): reading through
+  // `record[field]` would follow the prototype chain, so an inherited-only record
+  // (`Object.create(validContract)`) or a non-enumerable `Object.prototype`
+  // pollution would read as populated yet serialize to `{}`. Copy own-enumerable
+  // props into a NULL-proto record — the exact fields that persist on a store
+  // round-trip — and validate that.
+  const record: Record<string, unknown> = Object.create(null);
+  for (const k of Object.keys(value as Record<string, unknown>)) {
+    record[k] = (value as Record<string, unknown>)[k];
+  }
   const problems: string[] = [];
   if (record["schemaVersion"] !== CONTRACT_SCHEMA_VERSION) {
     problems.push(
@@ -324,15 +333,16 @@ export function contractRefProblems(value: unknown): string[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return ["contractRef must be a plain object"];
   }
-  // OWN properties only (review r7 finding 11): a value whose fields live on the
-  // PROTOTYPE (`Object.create(validRef)`) reads as populated here but serializes
-  // to `{}` on a store round-trip — the adoption threat. Require a plain object
-  // (own fields), so the fields the validator sees are the fields that persist.
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) {
-    return ["contractRef must be a plain object (own properties only, no forged prototype)"];
+  // OWN-ENUMERABLE fields only (review r7 finding 11, r8 finding 5): reading
+  // through `record[field]` follows the prototype chain, so an inherited-only ref
+  // (`Object.create(validRef)`) OR a non-enumerable `Object.prototype` pollution
+  // (which makes even `{}` read as populated) would pass yet serialize to `{}`.
+  // Copy own-enumerable props into a NULL-proto record — the fields that persist
+  // on a store round-trip — and validate that.
+  const record: Record<string, unknown> = Object.create(null);
+  for (const k of Object.keys(value as Record<string, unknown>)) {
+    record[k] = (value as Record<string, unknown>)[k];
   }
-  const record = value as Record<string, unknown>;
   const problems: string[] = [];
   boundedText("contractRef.issueId", record["issueId"], problems);
   const version = record["contractVersion"];

@@ -39,6 +39,14 @@ so every downstream artifact resolves to the exact approved contract without a
 store lookup. The `ContractRef` never drives a policy decision — it is identity,
 not scope.
 
+The binding is OPTIONAL by default (the WP-003 corpus fixtures have no contract
+and emit the `null` no-binding form), but production dispatch (WP-114) passes
+`IntakeOptions.requireContractRef`, which REFUSES an unbound candidate — so every
+production artifact carries provenance (CAM-PLAN-04 / `CONTRACT_REFERENCE_OBLIGATIONS`;
+review r8 finding 4). A caller-supplied `contractRef` is snapshotted through a
+JSON round-trip so the emitted artifact holds owned primitives, never a live
+`toJSON`/getter-backed object that could mutate after return (review r8 finding 3).
+
 ## Boundaries (stated, not hidden)
 
 - **Canonical path identity uses ICU for the case fold; the residual is named.**
@@ -77,18 +85,27 @@ not scope.
   host process** whose cwd is the worker repo, but it inherits the same
   credential-free, config-neutralized env. Git does **not** honour a repo-local
   `uploadpack.packObjectsHook` (that command is read only from protected system
-  config), so a worker cannot use it to run code during the fetch. The residual
-  git-config exec surface is unbounded in principle — the structural bound is
-  that the fetch env carries no credential and no host `HOME`, the same boundary
-  WP-107's `clone.ts` names. The `git` **binary itself** is resolved to an
+  config), so a worker cannot use it to run code during the fetch. The intake
+  ALSO refuses a worker `.git/config` that is a FIFO/special node or that uses an
+  `[include]`/`[includeIf]` directive: an include `path` pointing at a FIFO makes
+  the serving `upload-pack` BLOCK, orphaning a descendant even for a fully stopped
+  worker (review r8 finding 1). The remaining repo-config exec/indirection surface
+  (e.g. an include pointing OUTSIDE `.git`) is bounded by the fetch env carrying
+  no credential and no host `HOME`, and by the daemon/container process lifecycle
+  (WP-107 teardown reaps descendants) — the same boundary WP-107's `clone.ts`
+  names. The `git` **binary itself** is resolved to an
   absolute path ONCE at module load (scanning the startup PATH), and every call
   invokes that pinned path — so a PATH entry that becomes worker-writable mid-run
-  cannot swap it. Two fail-closed properties (review r7 finding 5): only
+  cannot swap it. Fail-closed properties (review r7 finding 5, r8 finding 6): only
   **ABSOLUTE** PATH entries are considered (a relative `relbin`/`.` would resolve
-  against the exec-time cwd, so it is skipped, never pinned), and if NO absolute
-  git is found at load the module **throws on first call** rather than falling
-  back to a bare `"git"` re-resolved from a possibly-attacker-extended ambient
-  PATH. **Named boundary / flagged for David (review r6 finding 10):** the
+  against the exec-time cwd, so it is skipped, never pinned), the candidate must
+  be a regular **FILE** (an `X_OK` check alone also passes a directory named
+  `git`), and if NO absolute git is found at load the module **throws on first
+  call** rather than falling back to a bare `"git"` re-resolved from a
+  possibly-attacker-extended ambient PATH. Pinning a PATHNAME is not
+  executable-identity pinning (replacing the binary at that path would run the
+  replacement) — that residual is the named trusted-PATH boundary. **Named
+  boundary / flagged for David (review r6 finding 10):** the
   daemon's PATH at startup is a trusted deployment input (the control plane owns
   its process env; a WP-107 worker cannot write the daemon host's PATH
   directories), the same trusted-PATH residual WP-107 states. Every git call also
@@ -126,9 +143,14 @@ not scope.
   guarantee is therefore a PRECONDITION the caller owns: **WP-107** provisions the
   clone self-contained, and **WP-114** invokes `runIntake` only against a STOPPED,
   quiescent worker. WP-108's pre-/post-fetch scans are best-effort defense in
-  depth. My recommendation: keep the precondition (owned by WP-107 + WP-114)
-  rather than build a WP-108-internal custody/snapshot mechanism (which still
-  cannot be TOCTOU-free against a live-mutated source).
+  depth (they also refuse a config `[include]`/FIFO surface that would hang a
+  serving `upload-pack`; review r8 finding 1). A DIFFERENT custody
+  IMPLEMENTATION could close the race internally — a privileged filesystem
+  snapshot, or a daemon-owned fd-relative copy of the objects followed by full
+  object verification, converts the race into a stable closure (review r8 finding
+  10); that is a heavier design, out of v1 scope. My recommendation: keep the
+  caller precondition (owned by WP-107 + WP-114) rather than build that
+  WP-108-internal custody mechanism now.
 - **The registry-item-11 fetch budget is a DISTINCT-footprint ADMISSION check.**
   It caps the shallow-fetch footprint at ≤5,000 objects / ≤500 MB (from the one
   `@camino/shared` source), counting **distinct** git objects — deduplicated by
@@ -137,15 +159,18 @@ not scope.
   counts are read PATH-FREE (`--format=%(objectname)`) and checked BEFORE the
   leaves are read, so a pathological tree (huge count or very-long paths) is
   rejected on its count rather than overrunning a path-bearing read buffer
-  (review r4 finding 3). Bytes are the EXACT on-disk STORE-FOOTPRINT delta of the
-  worker fetch — the summed `lstat` size of every file under `.git/objects`
-  (pack + `.idx` + `.rev` + loose). This is measured by a filesystem walk, NOT
-  `count-objects -v`: that rounds pack size DOWN to KiB and omits `.rev`, and
-  because the intake subtracts a before-measurement the fixed overhead cancels,
-  leaving a real ~KiB UNDERcount that could let a fetch a hair over 500 MB measure
-  at/under the cap (review r7 finding 6). Summing actual byte sizes never
-  under-bounds the pack (the safe direction for an admission cap), and the walk
-  fails closed (returns MAX_SAFE_INTEGER) past the scan cap. Worker-controlled
+  (review r4 finding 3). Bytes are the EXACT summed `lstat` size of every file
+  under `.git/objects`, measured by a filesystem walk (NOT `count-objects -v`,
+  which rounds pack size DOWN to KiB and omits `.rev` — a real ~KiB UNDERcount
+  once the before-measurement is subtracted, review r7 finding 6). The pristine
+  repo sets `fetch.unpackLimit=1`, so a fetch is KEPT AS A PACK (never unpacked to
+  loose objects): the delta is therefore the RECEIVED `.pack` — the transfer
+  boundary — not a post-unpack store that a pack a few bytes over 500 MB could
+  shrink under the cap (review r8 finding 2). Summing actual byte sizes never
+  under-bounds the pack (the safe direction), and the walk fails CLOSED (returns
+  MAX_SAFE_INTEGER) past the scan cap OR on any read failure of an existing entry
+  (an absent objects dir alone is a legitimately empty 0-byte store; review r8
+  finding 2). Worker-controlled
   commit metadata is separately bounded: a commit object over 1 MiB is rejected
   (`commit-metadata-budget`) before it is read, and the authored candidate
   message is passed on stdin (never argv) and clipped — so an unbounded worker
@@ -236,20 +261,38 @@ not scope.
   digits included) is ≤8 **ASCII-non-space** chars — matching MS-FSCC's 8-char
   ASCII-no-space base limit, so it catches git's zero-prefix/hash fallback forms
   (`~1000000`, `GI7D29~1`) yet does not over-reject an impossible-as-8.3 long
-  name — an 11-char base like `report~2024` (review r6 findings 3, 9), or a
+  name — an 11-char base like `report~2024` (review r6 findings 3, 9), a
   non-ASCII/spaced base like `café~1` / `foo ~1` that MS-FSCC forbids in an 8.3
-  name (review r7 finding 10). The exact NTFS/HFS checkout algorithm is git's own
+  name (review r7 finding 10), or a base containing punctuation forbidden in a
+  short name but legal in a long name (`+ , ; = [ ]`, e.g. `FOO+~1`; review r8
+  finding 8). The exact NTFS/HFS checkout algorithm is git's own
   (`core.protectNTFS`/`protectHFS`); these are the intake's bounded shape rules
   over the tree's raw bytes.
+- **Portability enforcement is macOS/Linux-scoped for v1 (a named residual).**
+  The intake targets the filesystems Camino runs on; it rejects `\` and `:`
+  segments (Windows separator / NTFS ADS) but PERMITS other Windows-illegal
+  characters (`* ? " < > |`, control bytes) because they are valid on the target
+  filesystems — rejecting them would over-reject legitimate macOS/Linux names
+  (review r8 finding 9). A cross-platform materialization guard belongs to a
+  portability-lint layer, not this admission check; flagged as a low-severity
+  scope note.
 - **The durable diff validator refuses what a store round-trip cannot represent.**
   Beyond the r1–r6 checks, a changed path carrying U+FFFD (git's non-UTF-8
   substitution) or an unpaired surrogate is rejected — the intake never emits such
   a path, so a forged WP-111/WP-116 artifact bearing one is refused at adoption
-  (review r7 finding 9). Contract identity is consistent end to end: both the
-  `IssueContract` validator and its `ContractRef` require a `Number.isSafeInteger`
-  version (review r7 finding 8), and `contractRefProblems` requires a plain object
-  (own fields, no forged prototype) so an inherited-only ref that serializes to
-  `{}` cannot license adoption (review r7 finding 11).
+  (review r7 finding 9). A LITERAL U+FFFD filename is thereby over-rejected too
+  (it is indistinguishable from a decode substitution and is non-portable anyway —
+  the same over-reject-safe direction the intake already takes). Contract identity
+  is consistent end to end: both the `IssueContract` validator and its
+  `ContractRef` require a `Number.isSafeInteger` version (review r7 finding 8),
+  and BOTH validators copy own-enumerable fields into a null-proto record before
+  checking, so an inherited-only record (`Object.create(valid)`) OR a
+  non-enumerable `Object.prototype` pollution (which makes even `{}` read as
+  populated) — either of which serializes to `{}` — cannot license adoption
+  (review r7 finding 11, r8 finding 5). The intake also snapshots a caller's
+  `contractRef` through a JSON round-trip, so a `toJSON`/getter-backed ref is
+  emitted as owned primitives that cannot mutate to malformed after return (review
+  r8 finding 3).
 
 ## Running the suites
 

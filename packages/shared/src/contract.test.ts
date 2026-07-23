@@ -209,6 +209,38 @@ describe("contractRefProblems", () => {
     const ownNull = Object.assign(Object.create(null), valid);
     expect(contractRefProblems(ownNull)).toEqual([]);
   });
+
+  it("refuses an inherited-only contract and Object.prototype-polluted fields (own-enumerable only) — r8", () => {
+    // An inherited-only IssueContract serializes to {} — must be rejected.
+    const inheritedContract = Object.create(contract()) as Record<string, unknown>;
+    expect(JSON.stringify(inheritedContract)).toBe("{}");
+    expect(contractProblems(inheritedContract)).not.toEqual([]);
+
+    // Object.prototype pollution: valid fields installed NON-ENUMERABLY on the
+    // global prototype make even {} read as populated via the chain. Both
+    // validators must still reject {} (they copy own-enumerable fields only).
+    const fields: Record<string, unknown> = {
+      issueId: "m1.I1",
+      contractVersion: 1,
+      contractHash: "a".repeat(64),
+    };
+    for (const [k, v] of Object.entries(fields)) {
+      Object.defineProperty(Object.prototype, k, {
+        value: v,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+    }
+    try {
+      expect(JSON.stringify({})).toBe("{}");
+      expect(contractRefProblems({})).not.toEqual([]);
+    } finally {
+      for (const k of Object.keys(fields)) {
+        delete (Object.prototype as Record<string, unknown>)[k];
+      }
+    }
+  });
 });
 
 describe("CONTRACT_REFERENCE_OBLIGATIONS", () => {
