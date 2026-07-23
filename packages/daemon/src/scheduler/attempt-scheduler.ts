@@ -241,6 +241,18 @@ export interface AttemptSchedulerDeps {
   readonly killHook?: (point: string) => void;
 }
 
+/** Internal signal: the mission left `executing` between protocol records. */
+class MidProtocolPauseError extends Error {
+  constructor(missionId: string) {
+    super(`mission ${missionId} left executing mid-protocol`);
+    this.name = "MidProtocolPauseError";
+  }
+}
+
+function escapeForRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** The issue id inside an attempt id (`<issueId>.a<n>`), or undefined. */
 function holderIssueId(attemptId: string): string | undefined {
   const match = /^(.*)\.a[1-9]\d*$/.exec(attemptId);
@@ -310,7 +322,9 @@ export class AttemptScheduler {
     const missionIssueIds = new Set(this.#contracts(missionId).map((c) => c.issueId));
     for (const [attemptId, snapshot] of view.attempts) {
       if (snapshot.state !== "running" && snapshot.state !== "submitted") continue;
-      const owner = holderIssueId(attemptId);
+      // Ownership comes from the DURABLE A.3#1 record's issueId (round-2
+      // finding 2: id-shape parsing was confusable; the payload is not).
+      const owner = this.#attemptOwner(attemptId);
       if (owner !== undefined && missionIssueIds.has(owner)) {
         return { kind: "held", hold: { kind: "attempt-active", issueId: owner } };
       }
@@ -381,7 +395,18 @@ export class AttemptScheduler {
       contractHash: contract.contractHash,
     };
 
+    // Refuses mid-protocol the instant the mission leaves `executing`
+    // (round-2 finding 3: the chaos hooks between records are INJECTED
+    // calls — a no-op in production, but the guarantee must not depend on
+    // that). Thrown to the catch below, which settles the lease
+    // never-spawned and unwinds the issue.
+    const assertStillExecuting = (): void => {
+      if (this.#recorder.currentState("mission", missionId) !== "executing") {
+        throw new MidProtocolPauseError(missionId);
+      }
+    };
     try {
+      assertStillExecuting();
       this.#record({
         entityKind: "issue",
         entityId: issueId,
@@ -397,6 +422,7 @@ export class AttemptScheduler {
       });
       this.#hook("scheduler-after-issue-claimed");
 
+      assertStillExecuting();
       this.#record({
         entityKind: "attempt",
         entityId: attemptId,
@@ -426,6 +452,7 @@ export class AttemptScheduler {
       });
       this.#hook("scheduler-after-attempt-recorded");
 
+      assertStillExecuting();
       const fence = this.#leases.admitOperation(environmentId, lease.generation);
       this.#record({
         entityKind: "issue",
@@ -436,11 +463,20 @@ export class AttemptScheduler {
       });
       this.#hook("scheduler-after-worker-started");
     } catch (error) {
-      // A refused record mid-protocol: nothing was spawned (spawn happens
-      // strictly after step 4), so settle the lease honestly and rethrow —
-      // the disagreement between scheduler and machine is a bug to surface,
-      // never a stranded lease.
+      // Nothing was spawned (spawn happens strictly after step 4): settle
+      // the lease honestly. A mid-protocol PAUSE additionally unwinds the
+      // partial records through the machine's own rows (attempt expires,
+      // issue re-queues via A.2#7a) and reports idle; any other refusal is
+      // a scheduler/machine disagreement — a bug to surface loudly.
       this.#leases.recordKillConfirm(environmentId, lease.generation, "never-spawned");
+      if (error instanceof MidProtocolPauseError) {
+        this.#unwindNeverSpawned(issueId, attemptId);
+        return {
+          kind: "idle",
+          reason: "mission-not-executing",
+          missionState: this.#recorder.currentState("mission", missionId),
+        };
+      }
       throw error;
     }
 
@@ -602,12 +638,15 @@ export class AttemptScheduler {
     this.#hook("scheduler-before-outcome-recorded");
 
     // 1. Window observation — idempotent on attemptId (WP-106 contract).
+    // `at` is deliberately OMITTED (round-2 finding 9): an omitted instant
+    // is the tracker's own clock derivation, which its replay rule does not
+    // compare — a crash-replay at a later time returns the original row
+    // instead of refusing as conflicting evidence.
     this.#windows.recordDispatch(plan.family, {
       dispatchId: plan.attemptId,
       outcome: record.outcome,
       durationMs: record.durationMs,
       quotaSignalSeen: record.quotaSignalSeen,
-      at: this.#now(),
     });
 
     const attemptState = this.#recorder.currentState("attempt", plan.attemptId);
@@ -848,6 +887,10 @@ export class AttemptScheduler {
       // group-gone) and the outcome is durably recorded. Recovery routes
       // that outcome; it never re-classifies a durably-settled dispatch as
       // a kill-confirm case (which would count a success as a failure).
+      // An attempt already past `running` (submitted, terminal) needs no
+      // settlement — and must not be re-reported on every recovery pass
+      // (round-2 finding 5's replay case).
+      if (attemptState !== "running") continue;
       const leaseRow = this.#leases.at(environmentId, leaseGeneration);
       const ref: InterruptedAttempt = {
         missionId,
@@ -870,9 +913,20 @@ export class AttemptScheduler {
         }
         continue;
       }
+      if (leaseRow?.state === "kill-confirmed") {
+        // The kill was already confirmed (a prior recovery, or the budget
+        // path): settle directly instead of demanding a second external
+        // confirmation (round-2 finding 5).
+        this.#recordAttemptIfActive(attemptState, attemptId, "heartbeat-lapsed", {
+          killConfirmed: true,
+        });
+        this.#recordIssueIfIn({ issueId }, ["implementing"], "attempt-failed", { attemptId });
+        settledFromDurableOutcome.push({ issueId, attemptId, outcome: "kill-confirmed" });
+        continue;
+      }
       // Held (worker may still be alive — kill -9 killed the daemon, not
-      // the worker) or already kill-confirmed or missing: a REAL
-      // kill-confirm settles it. Re-grant only after kill-confirm.
+      // the worker) or missing: a REAL kill-confirm settles it. Re-grant
+      // only after kill-confirm.
       requiresKillConfirm.push(ref);
     }
     return {
@@ -901,6 +955,7 @@ export class AttemptScheduler {
         this.#recordIssueIfIn(ref, ["implementing"], "attempt-quota-blocked", {
           attemptId: ref.attemptId,
         });
+        this.#backfillWindowObservation(ref, "quota-blocked");
         return; // queued-quota; the wait never counts (A.2#11)
       }
       case "cancelled": {
@@ -915,7 +970,8 @@ export class AttemptScheduler {
             "recovery: dispatch settled cancelled before outcome recording; original cancel context not durable",
           payload: { reason: "pause", settledBy: "kill-confirm", summaryWritten: true },
         });
-        this.#writeRecoverySummary(ref, "cancelled", "cancelled:recovered");
+        this.#writeRecoverySummary(ref, "cancelled", "cancelled:recovered", "cancelled");
+        this.#backfillWindowObservation(ref, "cancelled");
         this.#recordIssueIfIn(ref, ["implementing"], "attempt-cancelled", {
           reason: "pause",
           summaryWritten: true,
@@ -926,7 +982,8 @@ export class AttemptScheduler {
         this.#recordAttemptIfActive(attemptState, ref.attemptId, "attempt-budget-breached", {
           killConfirmed: true,
         });
-        this.#writeRecoverySummary(ref, "killed-budget", "budget-breach");
+        this.#writeRecoverySummary(ref, "killed-budget", "budget-breach", "killed-budget");
+        this.#backfillWindowObservation(ref, "killed-budget");
         this.#recordIssueIfIn(ref, ["implementing", "claimed"], "attempt-budget-breached", {
           killConfirmed: true,
         });
@@ -937,13 +994,45 @@ export class AttemptScheduler {
         this.#recordAttemptIfActive(attemptState, ref.attemptId, "heartbeat-lapsed", {
           killConfirmed: true,
         });
-        this.#writeRecoverySummary(ref, "expired", `recovered:${outcome}`);
+        this.#writeRecoverySummary(ref, "expired", `recovered:${outcome}`, outcome);
+        this.#backfillWindowObservation(ref, outcome);
         this.#recordIssueIfIn(ref, ["implementing"], "attempt-failed", {
           attemptId: ref.attemptId,
         });
         return; // counted — the dispatch genuinely failed (A.2#9)
       }
     }
+  }
+
+  /**
+   * Backfill the WP-106 window ledger for a recovered dispatch: idempotent
+   * on the attempt id, and a row the ORIGINAL recording already wrote (with
+   * richer content) wins — the conflict refusal is caught, never propagated
+   * (round-2 finding 5: recovered quota exhaustion must reach the ledger).
+   */
+  #backfillWindowObservation(ref: InterruptedAttempt, outcome: DispatchRecord["outcome"]): void {
+    const family = this.#attemptFamily(ref.attemptId);
+    if (family === undefined) return;
+    try {
+      this.#windows.recordDispatch(family, {
+        dispatchId: ref.attemptId,
+        outcome,
+        durationMs: 0,
+        quotaSignalSeen: outcome === "quota-blocked",
+      });
+    } catch {
+      // The original, richer row exists — better evidence stands.
+    }
+  }
+
+  /** The family the durable A.3#1 record names, if readable. */
+  #attemptFamily(attemptId: string): ProviderFamily | undefined {
+    const rows = this.#events.read({ entityKind: "attempt", entityId: attemptId });
+    const created = rows.find((r) => r.event === "attempt-dispatched" && r.outcome === "applied");
+    const family = created?.payload["family"];
+    return (PROVIDER_FAMILIES as readonly string[]).includes(family as string)
+      ? (family as ProviderFamily)
+      : undefined;
   }
 
   /**
@@ -975,6 +1064,7 @@ export class AttemptScheduler {
     ref: InterruptedAttempt,
     terminal: SummaryAttemptTerminal,
     failureClass: string,
+    outcome: DispatchRecord["outcome"],
   ): void {
     const contract = latestContracts(this.#contracts(ref.missionId)).get(ref.issueId);
     if (contract === undefined) return; // no contract → no summary (foreign state; events still routed)
@@ -987,11 +1077,7 @@ export class AttemptScheduler {
     const assignment =
       recordedAssignment ??
       resolveAssignment(table, "implementer", { template: "feature", riskTier: "medium" });
-    const outcomeByTerminal: Record<string, DispatchRecord["outcome"]> = {
-      "killed-budget": "killed-budget",
-      cancelled: "cancelled",
-      expired: "requirement-failed",
-    };
+
     try {
       this.#summaries.record({
         schemaVersion: ATTEMPT_SUMMARY_SCHEMA_VERSION,
@@ -1007,7 +1093,7 @@ export class AttemptScheduler {
         family: harnessFamily(assignment.harness),
         model: assignment.model,
         reasoningTier: assignment.reasoningTier as AttemptSummary["reasoningTier"],
-        outcome: outcomeByTerminal[terminal] ?? "requirement-failed",
+        outcome,
         attemptTerminal: terminal,
         failureClass,
         quotaSignalSeen: false,
@@ -1202,12 +1288,52 @@ export class AttemptScheduler {
    * and the `a<n>` leaf cannot collide with plan issue ids (`I<n>`).
    */
   #mintAttemptId(issueId: string, attemptIds: Iterable<string>): string {
-    let count = 0;
-    const prefix = `${issueId}.a`;
+    // Collision-free by construction (round-2 finding 2): take 1 + the MAX
+    // ordinal among ids of exactly this issue's grammar, then walk forward
+    // past any existing entity — a foreign id sharing the prefix can skew
+    // a COUNT but never the max-ordinal/existence pair.
+    const exact = new RegExp(`^${escapeForRegExp(issueId)}\\.a([1-9]\\d*)$`);
+    const existing = new Set<string>();
+    let maxOrdinal = 0;
     for (const id of attemptIds) {
-      if (id.startsWith(prefix)) count++;
+      existing.add(id);
+      const match = exact.exec(id);
+      if (match !== null) maxOrdinal = Math.max(maxOrdinal, Number(match[1]));
     }
-    return `${prefix}${count + 1}`;
+    let ordinal = maxOrdinal + 1;
+    while (existing.has(`${issueId}.a${ordinal}`)) ordinal++;
+    return `${issueId}.a${ordinal}`;
+  }
+
+  /** The issueId the durable A.3#1 record names for an attempt, if any. */
+  #attemptOwner(attemptId: string): string | undefined {
+    const rows = this.#events.read({ entityKind: "attempt", entityId: attemptId });
+    const created = rows.find((r) => r.event === "attempt-dispatched" && r.outcome === "applied");
+    const issueId = created?.payload["issueId"];
+    return typeof issueId === "string" && issueId.length > 0 ? issueId : undefined;
+  }
+
+  /** Unwind a mid-protocol pause: attempt (if recorded) expires with the
+   * never-spawned confirm; a claimed issue re-queues via A.2#7a. */
+  #unwindNeverSpawned(issueId: string, attemptId: string): void {
+    if (this.#recorder.currentState("attempt", attemptId) === "running") {
+      this.#record({
+        entityKind: "attempt",
+        entityId: attemptId,
+        event: "heartbeat-lapsed",
+        cause: "mission left executing mid-protocol; never spawned (kill-confirm trivial)",
+        payload: { killConfirmed: true },
+      });
+    }
+    if (this.#recorder.currentState("issue", issueId) === "claimed") {
+      this.#record({
+        entityKind: "issue",
+        entityId: issueId,
+        event: "attempt-pre-start-terminal",
+        cause: "mission left executing mid-protocol; issue re-queued (A.2#7a)",
+        payload: { attemptTerminal: "expired", recorded: true },
+      });
+    }
   }
 
   /** The latest applied `dispatched` record's payload facts for an issue. */

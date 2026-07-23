@@ -17,6 +17,7 @@
  * resume + lease inspection) then AttemptScheduler.recoverInterrupted —
  * and asserts the CAM-STATE-04/-06 invariants.
  */
+import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_POLICY_TABLE } from "@camino/shared";
 import type { AttemptBudget, DispatchRecord, TaskFeatures } from "@camino/shared";
@@ -212,6 +213,13 @@ function main(): void {
     events: [],
     quotaSignalSeen: false,
   };
+  // The simulated worker's REAL side effect (round-2 finding 13): one
+  // append per dispatched attempt, exactly where the external call sits.
+  // The parent asserts each attempt id appears AT MOST ONCE whatever the
+  // kill point — the §4.4 zero-duplicates posture over a genuine effect.
+  // (Real-backend assertion of the full matrix is WP-126 per the plan's
+  // WP-104 timing note; this matrix is the fake-backed half it names.)
+  appendFileSync(join(dir, "worker-effects.log"), `${decision.plan.attemptId}\n`);
   void scheduler.leaseHandle(decision.plan).release({ groupGone: true, outcome: record.outcome });
   scheduler.recordOutcome(decision.plan, record, { finalHeadFetched: true });
 

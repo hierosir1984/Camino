@@ -12,6 +12,11 @@
  *   - immune to daemon-loop stalls (separate process, own timer);
  *   - survives a daemon crash (detached + unref: an orphan still fires at
  *     the deadline, then exits — bounded and self-terminating);
+ *   - NAMED BOUNDARY (round-2 finding 6): the supervisor's exit code is
+ *     evidence only to a waiter, and production deliberately does not wait
+ *     (the daemon must be allowed to die first). Non-zero exits surface in
+ *     the docker suite and in the enforced state itself — a container that
+ *     outlives its budget is what recovery's lease fencing then refuses;
  *   - covers the "tokens where reportable" residual: usage hidden in an
  *     over-cap output line is unreportable, and is bounded by THIS kill,
  *     not by the token budget (the WP-107 review record's wording).
@@ -105,10 +110,17 @@ export function armContainerSupervisor(options: ArmSupervisorOptions): ArmedSupe
     containerName,
     deadlineMs,
     disarm(): void {
+      // The child is detached (its own process GROUP): signal the group so
+      // an in-flight tool child dies with it (round-2 finding 6), falling
+      // back to the pid alone where the group is already gone.
       try {
-        process.kill(pid, "SIGKILL");
+        process.kill(-pid, "SIGKILL");
       } catch {
-        /* already exited or fired — both are settled states */
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* already exited or fired — both are settled states */
+        }
       }
     },
   };

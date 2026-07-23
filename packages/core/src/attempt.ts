@@ -53,9 +53,17 @@ export interface AttemptContractRef {
 export function isAttemptContractRef(value: unknown): value is AttemptContractRef {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  // CLOSED shape (round-2 finding 11): exactly the three fields, a
+  // non-blank bounded issueId — matching the shared validator's strictness
+  // so the guard cannot admit what contractRefProblems would refuse.
+  if (keys.length !== 3) return false;
+  const issueId = record["issueId"];
   return (
-    typeof record["issueId"] === "string" &&
-    record["issueId"].length > 0 &&
+    typeof issueId === "string" &&
+    issueId.trim().length > 0 &&
+    issueId.length <= 300 &&
+    !issueId.includes("\u0000") &&
     typeof record["contractVersion"] === "number" &&
     Number.isInteger(record["contractVersion"]) &&
     record["contractVersion"] >= 1 &&

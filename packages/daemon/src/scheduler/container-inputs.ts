@@ -46,7 +46,11 @@ import {
   type WorkerContainerRun,
 } from "../worker/egress.js";
 import { scanForGithubCredentialMaterial } from "../worker/clone.js";
-import { assertCaminoBuiltImage, type WorkerImageProvenance } from "./image-provenance.js";
+import {
+  TRUSTED_TOOL_DIRS,
+  assertCaminoBuiltImage,
+  type WorkerImageProvenance,
+} from "./image-provenance.js";
 import { attestWorkerNetwork, type AttestedWorkerNetwork } from "./worker-network.js";
 import { armContainerSupervisor, type ArmedSupervisor } from "./supervisor.js";
 
@@ -210,16 +214,28 @@ export function composeContainerRun(options: ComposeContainerRunOptions): Compos
     }
   }
 
+  // The ATTESTOR itself must be trusted (round-2 finding 8): a provenance
+  // object carrying a docker path outside the trusted directories would
+  // let the caller answer its own attestation. This is the cheap
+  // accidental-bypass fence (the WP-105 provenance lesson); an in-process
+  // caller who can forge the whole object is the named in-process boundary.
+  if (!TRUSTED_TOOL_DIRS.some((dir) => image.dockerPath.startsWith(`${dir}/`))) {
+    throw new ContainerInputError(
+      `provenance docker path ${JSON.stringify(image.dockerPath)} is outside the trusted ` +
+        "directories — a composition must not attest through a caller-selected executable",
+    );
+  }
   // IMAGE + NETWORK: RE-attested at composition time (provenance and
   // ownership are live properties of the local Docker state, not one-time
-  // build facts — round-1 finding 14).
+  // build facts — round-1 finding 14). The run uses the FULL id the
+  // re-attestation returned, never the (possibly prefix) input.
   assertCaminoBuiltImage(image.imageId, image);
-  attestWorkerNetwork(network.id, { dockerPath: image.dockerPath });
+  const attestedNetwork = attestWorkerNetwork(network.id, { dockerPath: image.dockerPath });
 
   const containerName = `camino-attempt-${randomUUID().slice(0, 12)}`;
   const run: WorkerContainerRun = {
     image: image.imageId,
-    network: network.id,
+    network: attestedNetwork.id,
     allowlist: options.allowlist,
     workspaceHostPath: options.workspaceHostPath,
     ...(options.providerAuthMounts === undefined

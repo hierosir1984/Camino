@@ -98,11 +98,32 @@ export async function reconcileRetainedWorkspace(
   ref: RetainedWorkspaceRef,
   deps: ReconcilerDeps,
 ): Promise<ReconciliationOutcome> {
-  const lease = deps.leases.current(ref.environmentId);
-  if (lease !== undefined && lease.state === "held") {
-    return { kind: "deferred-lease-held", holderAttemptId: lease.holderAttemptId };
+  // The janitor is a FENCED OWNER like any attempt (A.4: "exactly one
+  // fenced owner (attempt or janitor) per validation environment"; round-2
+  // finding 7): reconciliation GRANTS the environment lease for its whole
+  // async span, so a dispatch racing the archival is refused by the grant
+  // gate instead of interleaving with the destroy. A refused grant defers.
+  const janitorGrant = deps.leases.grant(ref.environmentId, `janitor.${ref.attemptId}`);
+  if (!janitorGrant.ok) {
+    return { kind: "deferred-lease-held", holderAttemptId: janitorGrant.holder.holderAttemptId };
   }
+  try {
+    return await reconcileHoldingJanitorLease(ref, deps);
+  } finally {
+    // groupGone is literally true: a janitor lease never spawns anything.
+    // The settled lease is the durable record that a janitor pass ran.
+    deps.leases.release(ref.environmentId, janitorGrant.lease.generation, {
+      groupGone: true,
+      outcome: "succeeded",
+    });
+  }
+}
 
+/** The reconciliation body; runs ONLY under a held janitor lease. */
+async function reconcileHoldingJanitorLease(
+  ref: RetainedWorkspaceRef,
+  deps: ReconcilerDeps,
+): Promise<ReconciliationOutcome> {
   const attemptState = deps.recorder.currentState("attempt", ref.attemptId);
   if (attemptState === undefined) {
     return {

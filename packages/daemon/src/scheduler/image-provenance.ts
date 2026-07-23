@@ -37,9 +37,14 @@ export const CAMINO_IMAGE_LABEL = "ai.camino.built";
 
 /**
  * Fixed trusted directories for daemon-side tools, in resolution order.
- * System paths first; the Homebrew prefixes admit the macOS dev host
- * (docker/git installed via Homebrew are root-owned under /opt/homebrew
- * or /usr/local). Linux CI resolves everything in the system dirs.
+ * System paths first; the Homebrew prefixes admit the macOS dev host.
+ * NAMED BOUNDARY (round-2 finding 10): on a default macOS host the
+ * Homebrew prefix is owned by the daemon USER — "trusted" here means the
+ * daemon user's own administrative surface, and a hostile writer running
+ * AS that user is outside every in-process guarantee (it could patch this
+ * daemon's node_modules directly). What resolution additionally refuses,
+ * fail-closed, is the accident class: a WORLD-writable directory or tool
+ * file, and any $PATH consultation at all.
  */
 export const TRUSTED_TOOL_DIRS = Object.freeze([
   "/usr/bin",
@@ -68,8 +73,11 @@ export function resolveTrustedTool(name: string): string {
   for (const dir of TRUSTED_TOOL_DIRS) {
     const candidate = join(dir, name);
     try {
+      const dirStat = statSync(dir);
+      if ((dirStat.mode & 0o002) !== 0) continue; // world-writable dir: never trusted
       const stat = statSync(candidate);
       if (!stat.isFile()) continue;
+      if ((stat.mode & 0o002) !== 0) continue; // world-writable tool: never trusted
       accessSync(candidate, constants.X_OK);
       return candidate;
     } catch {

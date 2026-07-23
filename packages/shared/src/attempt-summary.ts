@@ -35,13 +35,16 @@ export const HEADLINE_MAX_CHARS = 400;
 
 /**
  * Credential-token literal shapes refused in summary text (round-1 finding
- * 13's probe put a GitHub PAT in a headline): the current GitHub token
- * prefixes plus the generic long-opaque-token shape. A summary is handoff
- * material read by later model attempts — a token that survives into it
- * outlives the attempt that leaked it. Scrubbed by summaryHeadline and
- * REFUSED by the validator (defense at both the producer and the store).
+ * 13; boundaries dropped per round-2 finding 12 — `\b` let a token glued
+ * to word characters slip through, and `_` is itself a word character).
+ * COVERAGE, stated precisely: the current GitHub token prefixes ONLY. A
+ * generic long-opaque-token detector is deliberately NOT attempted —
+ * 40/64-hex opaque strings are also commit ids and archive hashes, which
+ * legitimately appear in summaries; a generic rule is either blind or
+ * false-positive-ridden (the regenerating-denylist class). Scrubbed by
+ * summaryHeadline and REFUSED by the validator.
  */
-const TOKEN_LITERAL_RE = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+const TOKEN_LITERAL_RE = /(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g;
 export const TOKEN_LITERAL_PATTERN_SOURCE: string = TOKEN_LITERAL_RE.source;
 
 function containsTokenLiteral(text: string): boolean {

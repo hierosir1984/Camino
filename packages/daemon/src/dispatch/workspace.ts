@@ -23,7 +23,7 @@ const MAKE_SAMPLE_REPO = resolve(here, "..", "..", "..", "..", "scripts", "make-
 
 /** Materialize a fresh, isolated worker clone of the sample repo. */
 export function makeWorkspace(): string {
-  return execFileSync("node", [MAKE_SAMPLE_REPO]).toString().trim();
+  return execFileSync(process.execPath, [MAKE_SAMPLE_REPO]).toString().trim();
 }
 
 function git(workdir: string, ...args: string[]): string {

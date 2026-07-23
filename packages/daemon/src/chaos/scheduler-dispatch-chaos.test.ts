@@ -18,7 +18,7 @@
  *   - the event log replays and verifies; zero serialization violations.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,6 +122,20 @@ function recover(world: { stateDir: string; github: FakeGitHub }): RecoveredWorl
   return { state, scheduler, windows, missionId };
 }
 
+/** Zero duplicate external effects: each attempt appended at most once. */
+function assertEffectsAtMostOnce(dir: string): void {
+  const path = join(dir, "worker-effects.log");
+  if (!existsSync(path)) return;
+  const lines = readFileSync(path, "utf8")
+    .split("\n")
+    .filter((l) => l.length > 0);
+  const seen = new Map<string, number>();
+  for (const line of lines) seen.set(line, (seen.get(line) ?? 0) + 1);
+  for (const [attemptId, count] of seen) {
+    expect(count, `external effect for ${attemptId} applied ${count} times`).toBeLessThanOrEqual(1);
+  }
+}
+
 function assertUniversalInvariants(r: RecoveredWorld): void {
   // The log replays and verifies (CAM-STATE-05 co-recovery).
   expect(r.state.recorder.verify()).toEqual([]);
@@ -166,6 +180,7 @@ describe("scheduler dispatch protocol under kill -9 (deterministic matrix)", () 
     expect(result.completed).toBe(true);
     const r = recover(world);
     assertUniversalInvariants(r);
+    assertEffectsAtMostOnce(world.dir);
     // The child's requirement-failed outcome routed fully: issue ready
     // with one counted failure and a structured summary on record.
     const issue1 = `${r.missionId}.I1`;
@@ -224,6 +239,7 @@ describe("scheduler dispatch protocol under kill -9 (deterministic matrix)", () 
       }
 
       assertUniversalInvariants(r);
+      assertEffectsAtMostOnce(world.dir);
 
       // NOTHING IS LOST: the mission proceeds — a follow-up dispatch grants
       // the NEXT monotonic generation and claims the issue again.

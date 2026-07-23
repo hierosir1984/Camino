@@ -133,48 +133,32 @@ describe("composeContainerRun — credential-free composition (CAM-EXEC-02 / CAM
     ).toThrow(/token literal|GitHub-credential material/);
   });
 
-  it("composes a clean create/start pair: image by content ID, network re-attested by ID", () => {
+  it("refuses an attestor outside the trusted directories (round-2 finding 8)", () => {
+    // The shim lives under /tmp: composition must refuse to attest through
+    // it — the compose success path runs docker-side in
+    // container-obligations.test.ts with the genuinely trusted binary.
     const opts = baseOptions();
-    const composed = composeContainerRun(opts);
-    expect(composed.createArgs[0]).toBe("create");
-    expect(composed.createArgs).toContain(opts.image.imageId);
-    expect(composed.createArgs).toContain(opts.network.id);
-    expect(composed.createArgs).toContain(composed.containerName);
-    expect(composed.startArgs).toEqual(["start", "-a", composed.containerName]);
-    expect(composed.dockerPath).toBe(opts.image.dockerPath);
-  });
-
-  it("re-attests the network at composition: a record describing ANOTHER network refuses", () => {
-    const opts = baseOptions();
-    // The shim answers every network inspect with NETWORK_ID's record;
-    // composing against a DIFFERENT id must refuse — an answer about some
-    // other network attests nothing about this one (round-1 finding 14).
-    const evil = { ...opts.network, id: "e".repeat(64) };
-    expect(() => composeContainerRun({ ...opts, network: evil })).toThrow(
-      /not the requested|refusing a record/,
-    );
+    expect(() => composeContainerRun(opts)).toThrow(/outside the trusted directories/);
   });
 });
 
-describe("provisionAndArm — the race-free arming protocol (round-1 finding 2)", () => {
-  it("creates the container FIRST, then arms the supervisor for that exact name", async () => {
-    const opts = baseOptions();
-    const composed = composeContainerRun(opts);
-    const supervisor = await provisionAndArm(composed);
-    try {
-      expect(supervisor.containerName).toBe(composed.containerName);
-      expect(supervisor.deadlineMs).toBeGreaterThan(Date.now());
-      expect(supervisor.deadlineMs).toBeLessThanOrEqual(Date.now() + BUDGET.wallClockMs + 1000);
-    } finally {
-      supervisor.disarm();
-    }
-  });
-
+describe("provisionAndArm — validation half (docker-side proof in container-obligations)", () => {
   it("a create failure throws with NOTHING armed and nothing running", async () => {
-    const opts = baseOptions();
-    const composed = composeContainerRun(opts);
-    // A dockerPath whose create fails: /usr/bin/false exits 1 for any argv.
-    const failing = { ...composed, dockerPath: "/usr/bin/false" };
-    await expect(provisionAndArm(failing)).rejects.toThrow(/nothing armed, nothing running/);
+    const { provenance, network } = shimWorld();
+    const composed = {
+      containerName: "camino-attempt-unit",
+      createArgs: ["create", "camino-attempt-unit"],
+      startArgs: ["start", "-a", "camino-attempt-unit"],
+      dockerPath: "/usr/bin/false",
+      budget: BUDGET,
+      run: {
+        image: provenance.imageId,
+        network: network.id,
+        allowlist: [],
+        env: {},
+        name: "camino-attempt-unit",
+      },
+    };
+    await expect(provisionAndArm(composed)).rejects.toThrow(/nothing armed, nothing running/);
   });
 });

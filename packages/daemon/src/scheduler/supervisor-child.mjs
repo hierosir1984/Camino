@@ -43,11 +43,26 @@ if (
   process.exit(2);
 }
 
+// Every tool call is BOUNDED (round-2 finding 6: a hung docker call froze
+// the loop before its window bound could apply): execFile's timeout kills
+// the tool child, the loop iterates, and the confirm window stays the
+// authoritative deadline.
+const TOOL_CALL_TIMEOUT_MS = 60_000;
+
 function run(args) {
   return new Promise((resolve) => {
-    execFile(dockerPath, args, (error, stdout, stderr) => {
-      resolve({ code: error ? 1 : 0, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
-    });
+    execFile(
+      dockerPath,
+      args,
+      { timeout: TOOL_CALL_TIMEOUT_MS, killSignal: "SIGKILL" },
+      (error, stdout, stderr) => {
+        resolve({
+          code: error ? 1 : 0,
+          stdout: String(stdout ?? ""),
+          stderr: String(stderr ?? ""),
+        });
+      },
+    );
   });
 }
 

@@ -151,6 +151,11 @@ export async function main(): Promise<void> {
           "re-granted; it stays fenced until the worker-run loop (WP-119) settles it.",
       );
     }
+    for (const settled of recovered.settledFromDurableOutcome) {
+      console.log(
+        `Recovery routed attempt ${settled.attemptId} by its durable lease outcome (${settled.outcome}).`,
+      );
+    }
     for (const awaiting of recovered.succeededAwaitingSubmission) {
       console.warn(
         `Attempt ${awaiting.attemptId} completed successfully before the interruption; its ` +
