@@ -97,10 +97,12 @@ export interface BudgetedDispatchResult {
  * either because a kill-confirm sequence ran and confirmed group-gone, or
  * because the worker exited on its own before the breach was detected (a late
  * usage report) — in both cases the worker is stopped, so escalation (never
- * auto-retry) is the correct next step. When the group can NOT be confirmed
- * gone, killConfirmed is FALSE and the guard refuses the clean escalation,
- * routing to the cleanup-failed path (A.2 "cleanup failure during teardown →
- * blocked") — a failed kill is never papered over.
+ * auto-retry) is the correct next step. When the group can NOT be confirmed gone,
+ * killConfirmed is FALSE. This module SURFACES that signal (killConfirmed:false); it
+ * does not itself execute cleanup — the state-machine guard (A.2#10/A.3#5) refuses
+ * the clean escalation on it and the scheduler (WP-114) drives the cleanup-failed
+ * path (A.2 "cleanup failure during teardown → blocked"). A failed kill is never
+ * papered over, but the ROUTING is downstream, not here (round-19 finding 7).
  *
  * BOUNDARY (round-1 finding 9), the same group-vs-tree boundary WP-105 states
  * throughout: "group gone" is process-GROUP scope. A descendant that changed

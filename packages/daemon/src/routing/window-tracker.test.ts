@@ -293,7 +293,7 @@ describe("append-only guards for the dispatch key (round-6 findings 1, 5)", () =
     db.pragma("user_version = 1");
     db.close();
     expect(() => new QuotaWindowTracker(path, { writerLock: null })).toThrow(
-      /schema version 1; this daemon expects 2/,
+      /schema version 1; this daemon expects 3/,
     );
   });
 });

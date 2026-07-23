@@ -51,7 +51,11 @@ import { CAPABILITY_SEED } from "./capability-seed.js";
 // at an older version is refused with the precise version message (round-6
 // review finding 5). Migration machinery starts with the first released
 // version.
-const SCHEMA_VERSION = 2;
+// Bumped 2 → 3 (round-18 finding 2 / round-19 finding 4): the `outcome` CHECK now
+// admits 'killed-budget'. Per the pre-release policy above, an existing v2 store is
+// REFUSED with the precise version message (not silently kept on the old CHECK),
+// rather than migrated — no store has shipped.
+const SCHEMA_VERSION = 3;
 
 const OUTCOMES: readonly DispatchOutcome[] = [
   "succeeded",

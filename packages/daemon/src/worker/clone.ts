@@ -16,7 +16,15 @@
 // posture is composeWorkerEnv (WP-105), asserted again inside the container
 // by the worker suite.
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, openSync, readSync, readdirSync, lstatSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  opendirSync,
+  readSync,
+  readdirSync,
+  lstatSync,
+} from "node:fs";
 import { join } from "node:path";
 
 /** A provisioning or isolation-attestation failure. Always fail-closed. */
@@ -541,16 +549,24 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
       findings.push(`${rel}/ (beyond scan depth — not fully scanned)`);
       return;
     }
-    let names: string[];
+    // STREAMING enumeration (round-19 finding 2): opendir + readSync check the entry
+    // cap PER entry, so a hostile repo's single directory of millions of entries is
+    // bounded to SCAN_MAX_ENTRIES instead of being materialized whole by readdirSync
+    // (which the total cap does not prevent). The Dir handle is closed on every exit;
+    // recursion holds at most SCAN_MAX_DEPTH handles open (bounded).
+    let dir;
     try {
-      names = readdirSync(abs);
+      dir = opendirSync(abs);
     } catch {
       findings.push(`${rel}/ (unreadable — not fully scanned)`);
       return;
     }
-    for (const name of names) {
+    let dirent;
+    while ((dirent = dir.readSync()) !== null) {
+      const name = dirent.name;
       if (++entriesSeen > SCAN_MAX_ENTRIES) {
         findings.push(`${rel}/ (beyond scan entry cap — not fully scanned)`);
+        dir.closeSync();
         return;
       }
       const absChild = join(abs, name);
@@ -613,6 +629,7 @@ export function scanForGithubCredentialMaterial(dir: string): string[] {
         if (contentHasCredential(text)) findings.push(relChild);
       }
     }
+    dir.closeSync();
   };
   walk(dir, "", 0);
   return findings.sort();

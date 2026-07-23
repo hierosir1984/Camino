@@ -75,10 +75,13 @@ export type ArchivalStage =
 export class ArchivalError extends Error {
   readonly stage: ArchivalStage;
   /**
-   * True when the workspace is known to be fully in place. Every PRE-destroy stage
-   * sets it true; a failure DURING the destroy sets it false (round-18 finding 3),
-   * since a partial recursive delete is not transactional — the tree may be
-   * incomplete, so it is NOT claimed retained (still fail-closed → cleanup-failed).
+   * True when the workspace is known to be fully in place under the daemon
+   * single-writer contract. Every PRE-destroy stage sets it true; a failure DURING
+   * the destroy sets it false (round-18 finding 3), since a partial recursive delete
+   * is not transactional. BOUNDARY (round-19 finding 5): "true" assumes no
+   * out-of-band mutation — a recordLedgerRow callback or another process that removes
+   * the workspace mid-attempt is the named daemon-side single-writer boundary, not
+   * reflected by this flag. It is still fail-closed either way (→ cleanup-failed).
    */
   readonly workspaceRetained: boolean;
   constructor(stage: ArchivalStage, message: string, workspaceRetained = true) {
@@ -165,48 +168,62 @@ export function workspaceSizeBytes(dir: string): number {
 const MAX_WORKSPACE_ENTRIES = 1_000_000;
 
 /**
+ * A DEPTH bound (round-19 finding 3). Real repos are shallow; an absurdly deep tree
+ * is both an abuse vector (unbounded recursion / one open Dir handle per level, since
+ * `for await` holds the parent open across a recursive await) and the shape that
+ * drives a joined absolute path past PATH_MAX so `lstat` fails and a subtree would
+ * SILENTLY vanish from the count/size accounting while tar still archives it.
+ */
+const MAX_WORKSPACE_DEPTH = 256;
+
+/**
  * Async twin of workspaceSizeBytes used on the archival path (round-13 finding 1):
  * walks with async fs and YIELDS every YIELD_EVERY entries, so sizing a workspace
  * with a huge file count does not monopolize the daemon loop and defeat another
  * attempt's budget. Same accounting (lstat, symlinks not followed). Enforces
- * MAX_WORKSPACE_ENTRIES (round-17 finding 1) via a STREAMING enumeration
- * (`opendir`, round-18 finding 1): `readdir` MATERIALIZES a whole directory before
- * the count check, so a SINGLE directory with millions of entries would blow memory
- * (OOM) before the walk could short-circuit. `opendir` yields entries incrementally,
- * so the count is checked and the refusal thrown BEFORE a pathological single dir is
- * fully read. (`for await` closes the Dir handle on normal end AND on throw.)
+ * MAX_WORKSPACE_ENTRIES via a STREAMING `opendir` enumeration (round-18 finding 1:
+ * `readdir` materializes a whole directory before the count check). FAIL-CLOSED
+ * (round-19 finding 3): an entry that cannot be `lstat`ed (a joined path past
+ * PATH_MAX) or a directory that cannot be opened is REFUSED, not skipped — a skipped
+ * subtree would evade BOTH the entry and byte caps while tar still archived it; a
+ * DEPTH cap bounds the recursion (and the open-handle count). Together these make the
+ * entry cap a HARD bound on everything downstream (tar, hash, destroy).
  */
 async function workspaceSizeBytesAsync(dir: string, maxEntries: number): Promise<number> {
   const YIELD_EVERY = 2_000;
   let total = 0;
   let seen = 0;
-  const walk = async (abs: string): Promise<void> => {
+  // Returns the staged refusal error; callers `throw refuse(...)` so control-flow
+  // analysis sees the throw and narrows accordingly.
+  const refuse = (why: string): ArchivalError =>
+    new ArchivalError(
+      "workspace-quota",
+      `refusing archival — ${why} (a defensive bound: empty/deep/long-path trees evade the byte quota but impose unbounded post-worker traversal/tar/hash the container/WP-114 timeout cannot cover); workspace retained for escalation`,
+    );
+  const walk = async (abs: string, depth: number): Promise<void> => {
+    if (depth > MAX_WORKSPACE_DEPTH)
+      throw refuse(`tree deeper than ${MAX_WORKSPACE_DEPTH} at ${abs}`);
     let handle;
     try {
       handle = await opendirAsync(abs);
-    } catch {
-      return;
+    } catch (err) {
+      throw refuse(`could not enumerate ${abs}: ${describeError(err, 120)}`);
     }
     for await (const dirent of handle) {
       if (++seen % YIELD_EVERY === 0) await Promise.resolve(); // yield to the loop
-      if (seen > maxEntries) {
-        throw new ArchivalError(
-          "workspace-quota",
-          `workspace exceeds ${maxEntries} entries — refusing archival (a defensive cardinality bound: empty files evade the byte quota but impose unbounded post-worker traversal/tar/hash the container/WP-114 timeout cannot cover); workspace retained for escalation`,
-        );
-      }
+      if (seen > maxEntries) throw refuse(`workspace exceeds ${maxEntries} entries`);
       const child = join(abs, dirent.name);
       let stat;
       try {
         stat = await lstatAsync(child); // lstat (not the dirent type) so symlinks are not followed and DT_UNKNOWN is resolved
-      } catch {
-        continue;
+      } catch (err) {
+        throw refuse(`could not stat ${child}: ${describeError(err, 120)}`);
       }
-      if (stat.isDirectory()) await walk(child);
+      if (stat.isDirectory()) await walk(child, depth + 1);
       else total += stat.size;
     }
   };
-  await walk(dir);
+  await walk(dir, 0);
   return total;
 }
 
@@ -794,6 +811,15 @@ function assertWorkspaceUnchanged(
  * non-retained error on failure.
  */
 async function destroyWorkspaceOrThrow(workspaceDir: string): Promise<void> {
+  // BOUNDARY, stated (round-19 finding 1): fs.rm({recursive}) readdir's a directory
+  // per level, so it materializes a single flat directory. That is BOUNDED here — the
+  // destroy runs only AFTER the fail-closed size-walk (workspaceSizeBytesAsync) has
+  // already refused any workspace over MAX_WORKSPACE_ENTRIES (and any deep/long-path
+  // tree), so the recursive delete sees at most ~1M entries (~100 MB transient in
+  // one readdir), well within a normally-configured daemon heap. A hard per-operation
+  // memory ceiling BELOW that (e.g. a <200 MB-heap daemon) is a deployment concern,
+  // not an unbounded worker-reachable exhaustion. (A resume-destroy targets the same
+  // workspace the original attempt's size-walk already bounded.)
   try {
     await rmAsync(workspaceDir, { recursive: true, force: true });
   } catch (err) {
@@ -1226,7 +1252,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   } catch (err) {
     throw new ArchivalError(
       "ledger-row",
-      `ledger row failed after the archive was written: ${describeError(err, 300)} — archive (no sidecar) and workspace retained; retry recovers`,
+      `ledger row failed after the archive was written: ${describeError(err, 300)} — archive (no sidecar) and workspace retained; recovers on a RECONCILED retry (janitor/escalation), never an automatic one`,
     );
   }
   const ledgerRowAt = nextStamp(nowMs, archiveWrittenAt);
@@ -1235,7 +1261,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   // archive — the ledger row already references it durably; removing it would
   // orphan that reference. Throw a staged error; the archive is kept and
   // retention treats a sidecar-less archive as UNDATABLE (never pruned,
-  // fail-closed), and a retry recompletes it.
+  // fail-closed), and a RECONCILED retry (not an automatic one) recompletes it.
   const sidecar: ArchiveSidecar = {
     issueId: opts.issueId,
     attemptId: opts.attemptId,
@@ -1254,7 +1280,7 @@ export async function archiveAttempt(opts: ArchiveAttemptOptions): Promise<Archi
   } catch (err) {
     throw new ArchivalError(
       "ledger-row",
-      `sidecar write failed after the ledger row: ${describeError(err, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; retry recompletes)`,
+      `sidecar write failed after the ledger row: ${describeError(err, 300)} — archive + ledger row durable, workspace retained (retention keeps the archive; a RECONCILED retry recompletes it, never an automatic one)`,
     );
   }
   await syncFileAndParentDir(sidecarPath); // flush the sidecar to stable storage (round-9 finding 9)
