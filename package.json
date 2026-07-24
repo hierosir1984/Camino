@@ -15,6 +15,7 @@
     "test": "eslint . && prettier --check . && tsc -b && vitest run",
     "test:gui": "tsc -b && PLAYWRIGHT_FORCE_ASYNC_LOADER=1 playwright test",
     "daemon": "node packages/gui/build.mjs && node --import tsx packages/daemon/src/main.ts",
+    "load-test": "node scripts/load-test.mjs",
     "dispatch:smoke": "node --import tsx packages/daemon/src/dispatch/smoke.ts",
     "spike:test": "vitest run spikes",
     "spike:dispatch": "node --import tsx spikes/dispatch/run.ts",

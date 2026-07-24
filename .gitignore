@@ -7,6 +7,9 @@ coverage/
 # local gate record (the committed attestations live in docs/plan/)
 .camino/gate-record.json
 
+# load-test evidence records (disposable; scripts/load-test.mjs writes them)
+.camino/load-test/
+
 # transient fence-trip fixtures created by tests
 **/__fence_trip__*
 
