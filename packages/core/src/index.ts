@@ -182,3 +182,61 @@ export type {
   PlantedAmbiguity,
   AmbiguityCoverage,
 } from "./plan-validate.js";
+
+// WP-113: knowledge lifecycle folds (CAM-CANON-09) — candidate→approved
+// promotion via curation or the two deterministic rule-classes, revert
+// invalidation, contradiction escalation, and the pack-visibility rules.
+export {
+  emptyKnowledgeView,
+  foldKnowledge,
+  knowledgeAppendProblems,
+  knowledgeClaimsConflict,
+  standingApprovedConflicts,
+  knowledgeCurationQueue,
+  visibleKnowledgeFor,
+} from "./knowledge.js";
+export type {
+  CommandTally,
+  QuarantineConfirmation,
+  KnowledgePromotionRecord,
+  KnowledgeResolutionRecord,
+  KnowledgeInvalidationRecord,
+  KnowledgeEntrySnapshot,
+  KnowledgeView,
+  CommandObservationPayload,
+  QuarantineConfirmationPayload,
+  EntryPromotedPayload,
+  EntryResolutionPayload,
+  ValidityBaseRevertedPayload,
+  KnowledgeContradiction,
+  KnowledgeReader,
+  KnowledgeVisibility,
+  VisibleKnowledgeEntry,
+} from "./knowledge.js";
+
+// WP-113: the .camino/knowledge.md projection (approved entries only —
+// the repo channel must not leak candidates across missions).
+export { knowledgeFragment, renderKnowledge } from "./knowledge-render.js";
+export type { RenderKnowledgeOptions } from "./knowledge-render.js";
+
+// WP-113: context-pack assembly (CAM-EXEC-07/-09 + the WP-110 amendment) —
+// pure assembly with hash-locked, length-delimited provenance fences.
+export {
+  PACK_CONTENT_CLASSES,
+  UNTRUSTED_CHANNELS,
+  assembleContextPack,
+  parseContextPack,
+  verifyPackDigest,
+} from "./context-pack.js";
+export type {
+  PackContentClass,
+  UntrustedChannel,
+  CanonExcerpt,
+  PackDependencyInterface,
+  UntrustedAttachment,
+  ContextPackInput,
+  PackSectionInfo,
+  AssembledContextPack,
+  ParsedPackSection,
+  PackSegment,
+} from "./context-pack.js";

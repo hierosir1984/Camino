@@ -305,6 +305,37 @@ export {
 } from "./attempt-summary.js";
 export type { AttemptSummary, SummaryAttemptTerminal } from "./attempt-summary.js";
 
+// WP-113: per-repo operational knowledge (CAM-CANON-09; design §3.7) —
+// entry vocabulary, event vocabulary, promotion rule-class constants, and
+// the total entry validator. Lifecycle folds live in @camino/core.
+export {
+  KNOWLEDGE_ENTRY_CLASSES,
+  COMMAND_CLAIMS,
+  FLAKY_TEST_CLAIMS,
+  KNOWLEDGE_ENTRY_STATES,
+  KNOWLEDGE_EVENTS,
+  COMMAND_RULE_MIN_SUCCESSES,
+  COMMAND_RULE_MIN_MISSIONS,
+  KNOWLEDGE_MAX_TEXT_LENGTH,
+  isGitSha,
+  knowledgeEntryProblems,
+} from "./knowledge.js";
+export type {
+  KnowledgeEntryClass,
+  CommandClaim,
+  FlakyTestClaim,
+  KnowledgeEntryState,
+  KnowledgeScope,
+  KnowledgeProvenance,
+  KnowledgeValidity,
+  KnowledgeEntryInput,
+  KnowledgePromotionAuthority,
+  KnowledgeEventName,
+  KnowledgeAppendInput,
+  KnowledgeEventRecord,
+  KnowledgeReadFilter,
+} from "./knowledge.js";
+
 export { ENTITY_KINDS } from "./event-log.js";
 export type {
   AppendOptions,
