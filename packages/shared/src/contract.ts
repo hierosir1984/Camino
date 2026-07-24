@@ -166,16 +166,89 @@ function sortedStringList(
 }
 
 /**
+ * A RECURSIVE own-data snapshot of `value`: JSON round-trip (resolving getters/
+ * `toJSON`/Proxy to plain data, refusing non-serializable / circular / revoked-
+ * Proxy input by throwing) then a null prototype set on EVERY nested object. The
+ * validators check AND (for a contract) HASH this one snapshot, so:
+ *  - a NESTED inherited/polluted field is normalized at every level, not just the
+ *    top (review r10 finding 2);
+ *  - hashing reads the SAME snapshot that was validated, so a Proxy cannot expose
+ *    one terms shape to validation and another to the hash recompute (r10 #1);
+ *  - the snapshot is the canonical plain-data form a store persists.
+ * A live object that serializes DIFFERENTLY across calls (a stateful Proxy) is a
+ * caller-trust boundary: the validator validates ONE snapshot; a caller that then
+ * adopts the live object rather than a serialized record owns that risk (the same
+ * scope quarantinedDiffProblems states).
+ */
+function ownDataSnapshot(value: unknown): unknown {
+  const snapshot = JSON.parse(JSON.stringify(value)) as unknown;
+  const nullProtoDeep = (v: unknown): void => {
+    if (Array.isArray(v)) {
+      for (const item of v) nullProtoDeep(item);
+    } else if (v !== null && typeof v === "object") {
+      Object.setPrototypeOf(v, null);
+      for (const k of Object.keys(v as Record<string, unknown>)) {
+        nullProtoDeep((v as Record<string, unknown>)[k]);
+      }
+    }
+  };
+  nullProtoDeep(snapshot);
+  return snapshot;
+}
+
+/**
+ * Extract a message that NEVER throws (review r11 finding 2): a thrown non-Error
+ * (`null`, a hostile object) or an `Error` whose `message`/`toString` is a
+ * throwing getter would make `(err as Error).message` itself throw, breaking the
+ * validators' "total" guarantee. Every access is guarded.
+ */
+function safeErrorMessage(err: unknown): string {
+  try {
+    if (err instanceof Error) {
+      const m = err.message;
+      return typeof m === "string" ? m : "error";
+    }
+    return typeof err === "string" ? err : "non-Error thrown";
+  } catch {
+    return "unstringifiable error";
+  }
+}
+
+/**
  * Total validator for a contract record, hash INCLUDED: an empty result
  * means the record is well-formed and its contractHash equals the
  * recomputed hash of its terms. Used at freeze (before insert) and at
  * adoption (a store row that fails this is refused, never repaired).
  */
 export function contractProblems(value: unknown): string[] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // UNCONDITIONALLY total (review r12 finding 3): even input whose serialization
+  // POISONS realm intrinsics — a `toJSON` that replaces `JSON.stringify` /
+  // `Number.isSafeInteger` during the snapshot, i.e. in-process compromise, the
+  // named live-object boundary — returns a problem rather than throwing. The
+  // static-string return in the catch cannot itself throw.
+  try {
+    return contractProblemsImpl(value);
+  } catch {
+    return ["contract validation failed unexpectedly (unserializable/hostile input)"];
+  }
+}
+
+function contractProblemsImpl(value: unknown): string[] {
+  // TOTAL — never throw, even on a revoked Proxy (whose `Array.isArray` throws):
+  // do the serializable-shape checks on the SNAPSHOT, inside the catch (review
+  // r10 finding 3). `typeof` on the original is safe (it does not trap).
+  if (value === null || typeof value !== "object") {
     return ["contract must be a plain object"];
   }
-  const record = value as Record<string, unknown>;
+  let record: Record<string, unknown>;
+  try {
+    record = ownDataSnapshot(value) as Record<string, unknown>;
+  } catch (err) {
+    return [`contract is not JSON-serializable: ${safeErrorMessage(err)}`];
+  }
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    return ["contract must be a plain object"];
+  }
   const problems: string[] = [];
   if (record["schemaVersion"] !== CONTRACT_SCHEMA_VERSION) {
     problems.push(
@@ -192,8 +265,12 @@ export function contractProblems(value: unknown): string[] {
     problems.push("issueId must be namespaced under missionId (`<missionId>.<planIssueId>`)");
   }
   const version = record["version"];
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    problems.push("version must be an integer >= 1");
+  // SAFE integer, matching contractRefProblems (review r7 finding 8): a contract
+  // minted with an unstable version (2^53, 1.8e308, a JSON literal past 2^53
+  // that lost precision on parse) could otherwise pass here yet its ContractRef
+  // be rejected — the record and its reference must agree on what a version is.
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    problems.push("version must be a safe integer >= 1");
   }
   const template = record["template"];
   if (
@@ -267,7 +344,10 @@ export function contractProblems(value: unknown): string[] {
     // canonicalizer refuses becomes a named problem, never a throw
     // (r1 finding 7).
     try {
-      const recomputed = contractHash(contractTermsOf(value as IssueContract));
+      // Hash the validated SNAPSHOT, not the original `value` (review r10 finding
+      // 1): a stateful Proxy could otherwise serialize terms T1 to validation but
+      // expose T2 to this recompute, passing while its persisted form fails.
+      const recomputed = contractHash(contractTermsOf(record as unknown as IssueContract));
       if (recomputed !== hash) {
         problems.push(
           `contractHash ${hash} does not match the recomputed terms hash ${recomputed} — ` +
@@ -317,15 +397,43 @@ export interface ContractRef {
 
 /** Total validator for a ContractRef; empty result licenses the cast. */
 export function contractRefProblems(value: unknown): string[] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  // UNCONDITIONALLY total (review r12 finding 3): an outer guard so even
+  // intrinsic-poisoning input returns a problem, never throws. See contractProblems.
+  try {
+    return contractRefProblemsImpl(value);
+  } catch {
+    return ["contractRef validation failed unexpectedly (unserializable/hostile input)"];
+  }
+}
+
+function contractRefProblemsImpl(value: unknown): string[] {
+  // TOTAL and OWN-DATA-ONLY (review r7 finding 11, r8 finding 5, r9 finding 5,
+  // r10 finding 3): validate a recursive null-proto JSON snapshot — the exact
+  // plain data a store persists — so an inherited-only ref, a non-enumerable
+  // `Object.prototype` pollution (which makes even `{}` read as populated), and a
+  // stateful/revoked `Proxy` are all normalized or refused, never accepted and
+  // never thrown on.
+  if (value === null || typeof value !== "object") {
     return ["contractRef must be a plain object"];
   }
-  const record = value as Record<string, unknown>;
+  let record: Record<string, unknown>;
+  try {
+    record = ownDataSnapshot(value) as Record<string, unknown>;
+  } catch (err) {
+    return [`contractRef is not JSON-serializable: ${safeErrorMessage(err)}`];
+  }
+  if (record === null || typeof record !== "object" || Array.isArray(record)) {
+    return ["contractRef must be a plain object"];
+  }
   const problems: string[] = [];
   boundedText("contractRef.issueId", record["issueId"], problems);
   const version = record["contractVersion"];
-  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-    problems.push("contractRef.contractVersion must be an integer >= 1");
+  // SAFE integer, not merely integer (review r6 finding 8): 2^53, 1.8e308, and a
+  // JSON literal like 9007199254740993 are all `Number.isInteger` yet lose
+  // precision on parse — an identity-bearing version that silently CHANGES across
+  // a store round-trip. Number.isSafeInteger also excludes ±Infinity and NaN.
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    problems.push("contractRef.contractVersion must be a safe integer >= 1");
   }
   const hash = record["contractHash"];
   if (typeof hash !== "string" || !isSha256Hex(hash)) {

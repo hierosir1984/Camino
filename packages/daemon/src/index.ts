@@ -174,6 +174,53 @@ export type {
   PruneOptions,
 } from "./worker/archive.js";
 
+// WP-108: quarantine module — squash-and-rebuild intake (CAM-EXEC-04). Runs
+// against the issue's frozen WP-110 contract within registry-item-11 fetch
+// budgets; emits the @camino/shared QuarantinedDiff for WP-111 / WP-116.
+export {
+  runIntake,
+  objectExists,
+  cleanupPristineRepos,
+  removePristineRepo,
+} from "./quarantine/intake.js";
+export type { IntakeOptions } from "./quarantine/intake.js";
+export { DEFAULT_BUDGETS, effectiveBudgets, MAX_STORED_PATH_LENGTH } from "./quarantine/types.js";
+export {
+  checkFetchBudget,
+  checkScopeAndProtected,
+  checkChangedPathValidity,
+  checkPathCollisions,
+  checkNameAliases,
+  checkPathLength,
+  checkDotGitPaths,
+  checkSubmodules,
+  checkSymlinks,
+  checkBudgets,
+  isProtectedPath,
+  matchesAnyGlob,
+  symlinkEscapes,
+  symlinkTargetDanger,
+  SYMLINK_TARGET_MAX_BYTES,
+  REGISTRY_ITEM_11_FETCH_BUDGET,
+} from "./quarantine/policy.js";
+export { QuarantineGitError } from "./quarantine/git.js";
+export {
+  analyzeWorkflow,
+  scanWorkflowPosture,
+  CANDIDATE_REFS,
+} from "./quarantine/workflow-posture.js";
+export type { WorkflowFinding } from "./quarantine/workflow-posture.js";
+export type {
+  Budgets,
+  FetchBudget,
+  QuarantineAssignment,
+  QuarantineResult,
+  RebuiltCandidate,
+  Rejection,
+  RejectionCode,
+  TreeEntry,
+} from "./quarantine/types.js";
+
 // WP-122: gap register — disposition log, service, HTTP surface
 // (CAM-CANON-05, CAM-CORE-09/10).
 export { GapDispositionsStore } from "./gap-dispositions.js";

@@ -1,16 +1,18 @@
-// WP-003 rejection-case fixtures. Each builds an untrusted "worker repo" with a base
-// and a final head via git PLUMBING, so the exact tree under test exists regardless
-// of the host filesystem (case-insensitive/Unicode-normalizing macOS cannot
-// hold most of these as real files). Every builder isolates ONE violation so
-// the suite can assert the exact rejection code.
-import { buildTree, commitTree, hashBlob, initRepo, type CacheEntry } from "./git.js";
-import type { Contract } from "./types.js";
+// WP-108 quarantine — WP-003 rejection-case fixtures (the acceptance corpus).
+//
+// Carried forward UNCHANGED from the WP-003 spike (spikes/quarantine/cases.ts):
+// each builder isolates ONE violation an untrusted worker could put in the head
+// it hands back, so the corpus can assert the exact rejection code against the
+// PRODUCT intake. The only edit vs the spike is the assignment type
+// (QuarantineAssignment replaces the spike's Contract) and import paths.
+import { buildTree, commitTree, hashBlob, initRepo, type CacheEntry } from "./corpus-git.js";
+import type { QuarantineAssignment } from "./types.js";
 
 export interface WorkerFixture {
   repo: string;
   /** The worker's final head (a bare commit sha). */
   head: string;
-  contract: Contract;
+  contract: QuarantineAssignment;
 }
 
 /** In-scope globs shared by fixtures whose violation is NOT a scope violation. */
@@ -43,7 +45,7 @@ function headWith(
   return commitTree(repo, tree, [base], subject);
 }
 
-function contract(base: string, allowedPaths = SCOPE): Contract {
+function contract(base: string, allowedPaths = SCOPE): QuarantineAssignment {
   return { base, allowedPaths };
 }
 
@@ -102,8 +104,11 @@ export function caseCollision(): WorkerFixture {
 export function unicodeCollision(): WorkerFixture {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
-  const composed = "src/café.txt"; // é as U+00E9
-  const decomposed = "src/café.txt"; // e + U+0301 combining acute
+  // Constructed from explicit code points, never a source literal: an editor or
+  // pipeline that NFC-normalizes the file would silently collapse the decomposed
+  // form to the composed one and neuter this exact fixture (the WP-003 hazard).
+  const composed = "src/caf" + String.fromCodePoint(0x00e9) + ".txt"; // precomposed é
+  const decomposed = "src/cafe" + String.fromCodePoint(0x0301) + ".txt"; // e + combining acute
   const a = hashBlob(repo, "composed\n");
   const b = hashBlob(repo, "decomposed\n");
   const head = headWith(repo, base, entries, [
@@ -387,7 +392,9 @@ export function hfsDotGit(): WorkerFixture {
   const repo = initRepo();
   const { base, entries } = makeBase(repo);
   const cfg = hashBlob(repo, "[core]\n\thooksPath = .\n");
-  const head = headWith(repo, base, entries, [{ mode: "100644", sha: cfg, path: ".git‌/config" }]);
+  const head = headWith(repo, base, entries, [
+    { mode: "100644", sha: cfg, path: ".git" + String.fromCodePoint(0x200c) + "/config" },
+  ]);
   return { repo, head, contract: contract(base, ["**"]) };
 }
 

@@ -20,7 +20,6 @@
     "spike:dispatch": "node --import tsx spikes/dispatch/run.ts",
     "spike:plan-probe": "node --import tsx spikes/plan-probe/run.ts",
     "spike:plan-probe:check": "node --import tsx spikes/plan-probe/check-packet.ts",
-    "spike:quarantine": "vitest run spikes/quarantine",
     "spike:untrusted": "node --import tsx spikes/untrusted-content/run.ts",
     "spike:untrusted:check": "node --import tsx spikes/untrusted-content/check-findings.ts",
     "spike:validation-env": "vitest run spikes/validation-env"

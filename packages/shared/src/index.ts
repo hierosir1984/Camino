@@ -253,6 +253,20 @@ export {
 } from "./contract.js";
 export type { ContractTerms, IssueContract, ContractRef } from "./contract.js";
 
+// WP-108: the quarantined final diff — the named artifact the quarantine intake
+// emits (CAM-EXEC-04); schema + total validator here, produced in `daemon`,
+// consumed by WP-111 (re-classification) and WP-116 (evidence).
+export {
+  CHANGED_PATH_KINDS,
+  GIT_OBJECT_NAME_PATTERN_SOURCE,
+  MAX_CHANGED_PATHS,
+  WORKER_ATTRIBUTION_TRAILER_KEY,
+  isGitObjectName,
+  workerAttributionTrailer,
+  quarantinedDiffProblems,
+} from "./quarantine-diff.js";
+export type { ChangedPath, ChangedPathKind, QuarantinedDiff } from "./quarantine-diff.js";
+
 // WP-114: the attempt-lease / environment-fencing interface (CAM-STATE-04;
 // PRD §5 registry item 5). The NAMED durable seam WP-115's validation
 // runner and any future janitor (CAM-STATE-07) present generations through.
