@@ -100,7 +100,6 @@ export async function main(): Promise<void> {
     console.error(`Refusing to start: ${(error as Error).message}`);
     process.exit(1);
   }
-
   let closed = false;
   let teardownFailures: unknown[] = [];
   const closeStores = (): unknown[] => {
@@ -172,6 +171,13 @@ export async function main(): Promise<void> {
         `${state.leaseRecovery.lapsed.length} lease(s) lapsed past the TTL — fenced pending kill-confirm.`,
       );
     }
+    // WP-113: the knowledge store is opened by openRecoveredState above (under
+    // the writer lock, fail-closed lifecycle adoption at boot) — a runtime
+    // fact through the FULL production composition, not a minimal boot. The
+    // dispatch-time invocation (materialize a pack into a worker workspace,
+    // record an attempt's candidates/observations, run the promotion sweep)
+    // is the remaining WP-114 dispatcher seam; the planning service it needs
+    // is now constructed in recovery, so that wiring is a follow-up, not a gap.
   } catch (error) {
     const message = (error as Error).message;
     closeStores();

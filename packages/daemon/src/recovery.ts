@@ -46,6 +46,7 @@ import type { LeaseRecoveryReport } from "@camino/shared";
 import { CanonFactsStore } from "./canon-facts.js";
 import { CanonLedgerStore } from "./canon-ledger.js";
 import { SqliteDomainStore } from "./domain-store.js";
+import { KnowledgeStore } from "./knowledge-store.js";
 import { SqliteEventStore } from "./event-store.js";
 import { GapDispositionsStore } from "./gap-dispositions.js";
 import { IntentJournal } from "./intent-journal.js";
@@ -105,6 +106,8 @@ export interface RecoveredState {
   readonly summaries: AttemptSummaryStore;
   /** WP-114: the archival ledger rows (A.4#5 step 2). */
   readonly archiveLedger: ArchiveLedgerStore;
+  /** WP-113: the knowledge lifecycle's event store (CAM-CANON-09). */
+  readonly knowledge: KnowledgeStore;
   readonly report: RecoveryReport;
   /**
    * WP-114 (decision-package item 7): PlanningService.resumePendingWork()
@@ -159,6 +162,8 @@ export const STATE_FILES = Object.freeze({
   archiveLedger: "archive-ledger.sqlite",
   /** WP-106 window observations (opened by the daemon composition, not here). */
   windows: "windows.sqlite",
+  // WP-113: the knowledge lifecycle's event store (CAM-CANON-09).
+  knowledge: "knowledge.sqlite",
 } as const);
 
 /**
@@ -190,6 +195,7 @@ export function openRecoveredState(
   let leases: SqliteLeaseStore | undefined;
   let summaries: AttemptSummaryStore | undefined;
   let archiveLedger: ArchiveLedgerStore | undefined;
+  let knowledge: KnowledgeStore | undefined;
   try {
     eventStore = new SqliteEventStore(join(stateDir, STATE_FILES.events), {
       ...(options.now === undefined ? {} : { now: options.now }),
@@ -241,6 +247,13 @@ export function openRecoveredState(
       ...(options.now === undefined ? {} : { now: options.now }),
       writerLock: lock,
     });
+    // WP-113: the knowledge store opens under the same lock, with the same
+    // fail-closed adoption verification (the fold re-runs every row through
+    // the append gate) in its constructor.
+    knowledge = new KnowledgeStore(join(stateDir, STATE_FILES.knowledge), {
+      ...(options.now === undefined ? {} : { now: options.now }),
+      writerLock: lock,
+    });
     const report = reconcileIntents(journal, queries, options);
     // WP-114: planning resume runs INSIDE recovery — interrupted freezes,
     // approvals, and ledger pairs complete (or refuse loudly) here, so
@@ -271,6 +284,7 @@ export function openRecoveredState(
     const openLeases = leases;
     const openSummaries = summaries;
     const openArchiveLedger = archiveLedger;
+    const openKnowledge = knowledge;
     return {
       lock,
       eventStore,
@@ -286,6 +300,7 @@ export function openRecoveredState(
       leases,
       summaries,
       archiveLedger,
+      knowledge,
       report,
       planningResume,
       leaseRecovery,
@@ -302,6 +317,7 @@ export function openRecoveredState(
         // failure. This is best-effort invocation with deterministic
         // precedence, not a proof that every underlying handle closed.
         const failures = closeAll([
+          () => openKnowledge.close(),
           () => openArchiveLedger.close(),
           () => openSummaries.close(),
           () => openLeases.close(),
@@ -322,6 +338,7 @@ export function openRecoveredState(
     // of everything opened so far INCLUDING the lock release, and the
     // ORIGINAL refusal (not a secondary close/release failure) rethrown.
     closeAll([
+      () => knowledge?.close(),
       () => archiveLedger?.close(),
       () => summaries?.close(),
       () => leases?.close(),

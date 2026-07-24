@@ -336,3 +336,24 @@ export type {
 } from "./planning.js";
 export { runPlannerCompile, plannerPrompt } from "./plan-runner.js";
 export type { PlannerRunOptions, PlannerRunRecord, RefusedLine } from "./plan-runner.js";
+
+// WP-113: the knowledge event store (CAM-CANON-09) — append-only lifecycle
+// events validated by @camino/core's fold at write AND at adoption.
+export { KnowledgeStore } from "./knowledge-store.js";
+export type { KnowledgeStoreOptions } from "./knowledge-store.js";
+
+// WP-113: context-pack composition (CAM-EXEC-07/-09 + the WP-110
+// amendment) — store-sourced inputs into the pure core assembler.
+export {
+  ContextPackService,
+  materializeContextPack,
+  CONTEXT_PACK_FILENAME,
+} from "./context-pack-service.js";
+export type {
+  AssemblePackRequest,
+  ContextPackServiceOptions,
+  PackPlanSource,
+  PackCanonSource,
+  PackFactsSource,
+  PackKnowledgeSource,
+} from "./context-pack-service.js";
